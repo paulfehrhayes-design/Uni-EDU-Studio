@@ -1,6 +1,6 @@
 ## Uni++ EDU Studio
 
-![1770285937894](image/README_CN/1770285937894.png)
+![1770294519056](image/README_CN/1770294519056.png)
 
 Uni++ EDU Studio是一个基于Blockly的Unitree机器人图形化编程平台。
 
