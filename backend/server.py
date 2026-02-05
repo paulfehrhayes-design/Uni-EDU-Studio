@@ -94,4 +94,4 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 if __name__ == "__main__":
     import uvicorn
     # 监听 0.0.0.0 允许局域网访问
-    uvicorn.run(app, host="localhost", port=5179)
+    uvicorn.run(app, host="0.0.0.0", port=5179)
