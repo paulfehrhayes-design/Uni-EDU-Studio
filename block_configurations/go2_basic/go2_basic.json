@@ -1,0 +1,426 @@
+[
+  {
+    "category": "系统",
+    "colour": "230",
+    "blocks": [
+      {
+        "type": "go2_start",
+        "message0": "开始",
+        "args0": [],
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "# uni plus edu studio official config\nimport time\nimport sys\nimport math\nimport json\nfrom dataclasses import dataclass\n"
+      },
+      {
+        "type": "go2_wait",
+        "message0": "等待 %1 秒",
+        "args0": [
+          { "type": "field_number", "name": "TIME", "value": 1, "min": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "time.sleep({{TIME}})\n"
+      },
+      {
+        "type": "go2_system_init",
+        "message0": "初始化 Go2 通道 Domain: %1 网卡: %2",
+        "args0": [
+          { "type": "field_number", "name": "DOMAIN", "value": 0, "precision": 1 },
+          { "type": "field_input", "name": "INTERFACE", "text": "eth0" }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher\n\nChannelFactoryInitialize({{DOMAIN}}, '{{INTERFACE}}')\n"
+      },
+      {
+        "type": "go2_load_modules",
+        "message0": "加载 Go2 依赖库",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "from unitree_sdk2py.go2.sport.sport_client import SportClient\nfrom unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client import ObstaclesAvoidClient\nfrom unitree_sdk2py.go2.robot_state.robot_state_client import RobotStateClient\nfrom unitree_sdk2py.go2.vui.vui_client import VuiClient\nfrom unitree_sdk2py.go2.video.video_client import VideoClient\nfrom unitree_sdk2py.idl.std_msgs.msg.dds_ import String_\nfrom unitree_sdk2py.idl.default import std_msgs_msg_dds__String_\n"
+      },
+      {
+        "type": "go2_init_sport_client",
+        "message0": "初始化运动控制客户端",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "sport_client = SportClient()\nsport_client.SetTimeout(10.0)\nsport_client.Init()\n"
+      },
+      {
+        "type": "go2_init_obstacles_avoid_client",
+        "message0": "初始化避障客户端",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "avoid_client = ObstaclesAvoidClient()\navoid_client.SetTimeout(10.0)\navoid_client.Init()\n"
+      },
+      {
+        "type": "go2_init_robot_state_client",
+        "message0": "初始化机器人服务客户端",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "robot_state_client = RobotStateClient()\nrobot_state_client.SetTimeout(10.0)\nrobot_state_client.Init()\n"
+      },
+      {
+        "type": "go2_init_vui_client",
+        "message0": "初始化语音灯光(VUI)客户端",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "vui_client = VuiClient()\nvui_client.SetTimeout(10.0)\nvui_client.Init()\n"
+      },
+      {
+        "type": "go2_init_video_client",
+        "message0": "初始化视频客户端",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "video_client = VideoClient()\nvideo_client.SetTimeout(10.0)\nvideo_client.Init()\n"
+      },
+      {
+        "type": "go2_utlidar_init_publisher",
+        "message0": "初始化 UTLidar 开关发布器",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "utlidar_pub = ChannelPublisher('rt/utlidar/switch', String_)\nutlidar_pub.Init()\n"
+      }
+    ]
+  },
+  {
+    "category": "运动控制",
+    "colour": "160",
+    "blocks": [
+      { "type": "go2_sport_damp", "message0": "阻尼 (Damp)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Damp()\n" },
+      { "type": "go2_sport_stand_up", "message0": "站起 (StandUp)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StandUp()\n" },
+      { "type": "go2_sport_stand_down", "message0": "趴下 (StandDown)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StandDown()\n" },
+      { "type": "go2_sport_recovery_stand", "message0": "自恢复站立 (RecoveryStand)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.RecoveryStand()\n" },
+      { "type": "go2_sport_balance_stand", "message0": "平衡站立 (BalanceStand)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.BalanceStand()\n" },
+      {
+        "type": "go2_sport_move",
+        "message0": "移动 VX(m/s) %1 VY(m/s) %2 转向(rad/s) %3",
+        "args0": [
+          { "type": "field_number", "name": "VX", "value": 0 },
+          { "type": "field_number", "name": "VY", "value": 0 },
+          { "type": "field_number", "name": "VYAW", "value": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.Move({{VX}}, {{VY}}, {{VYAW}})\n"
+      },
+      { "type": "go2_sport_stop_move", "message0": "停止运动 (StopMove)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StopMove()\n" },
+      { "type": "go2_sport_sit", "message0": "坐下 (Sit)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Sit()\n" },
+      { "type": "go2_sport_rise_sit", "message0": "起身 (RiseSit)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.RiseSit()\n" },
+      {
+        "type": "go2_sport_euler",
+        "message0": "姿态 Euler Roll %1 Pitch %2 Yaw %3",
+        "args0": [
+          { "type": "field_number", "name": "ROLL", "value": 0 },
+          { "type": "field_number", "name": "PITCH", "value": 0 },
+          { "type": "field_number", "name": "YAW", "value": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.Euler({{ROLL}}, {{PITCH}}, {{YAW}})\n"
+      },
+      {
+        "type": "go2_sport_speed_level",
+        "message0": "速度档位 SpeedLevel %1",
+        "args0": [{ "type": "field_number", "name": "LEVEL", "value": 1, "min": 0 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SpeedLevel(int({{LEVEL}}))\n"
+      },
+      { "type": "go2_sport_hello", "message0": "打招呼 (Hello)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Hello()\n" },
+      { "type": "go2_sport_stretch", "message0": "伸展 (Stretch)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Stretch()\n" },
+      { "type": "go2_sport_content", "message0": "卖萌 (Content)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Content()\n" },
+      { "type": "go2_sport_dance1", "message0": "跳舞 1 (Dance1)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Dance1()\n" },
+      { "type": "go2_sport_dance2", "message0": "跳舞 2 (Dance2)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Dance2()\n" },
+      { "type": "go2_sport_scrape", "message0": "刨地 (Scrape)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Scrape()\n" },
+      { "type": "go2_sport_front_flip", "message0": "前空翻 (FrontFlip)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.FrontFlip()\n" },
+      { "type": "go2_sport_left_flip", "message0": "左侧翻 (LeftFlip)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.LeftFlip()\n" },
+      { "type": "go2_sport_back_flip", "message0": "后空翻 (BackFlip)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.BackFlip()\n" },
+      {
+        "type": "go2_sport_hand_stand",
+        "message0": "倒立 HandStand %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.HandStand({{FLAG}})\n"
+      },
+      { "type": "go2_sport_free_walk", "message0": "自由行走 (FreeWalk)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.FreeWalk()\n" },
+      {
+        "type": "go2_sport_free_bound",
+        "message0": "自由跳跃步态 FreeBound %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.FreeBound({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_free_jump",
+        "message0": "自由跳 FreeJump %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.FreeJump({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_free_avoid",
+        "message0": "自由避障 FreeAvoid %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.FreeAvoid({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_walk_upright",
+        "message0": "直立行走 WalkUpright %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.WalkUpright({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_cross_step",
+        "message0": "交叉步 CrossStep %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.CrossStep({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_switch_joystick",
+        "message0": "切换手柄控制 SwitchJoystick %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SwitchJoystick({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_pose",
+        "message0": "保持姿态 Pose %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.Pose({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_auto_recovery_set",
+        "message0": "自动恢复开关 AutoRecoverySet %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.AutoRecoverySet({{FLAG}})\n"
+      },
+      {
+        "type": "go2_sport_auto_recovery_get",
+        "message0": "获取自动恢复开关并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "code, enabled = sport_client.AutoRecoveryGet()\nprint('AutoRecovery:', code, enabled)\n"
+      },
+      { "type": "go2_sport_switch_avoid_mode", "message0": "切换避障模式 (SwitchAvoidMode)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.SwitchAvoidMode()\n" }
+    ]
+  },
+  {
+    "category": "避障",
+    "colour": "60",
+    "blocks": [
+      {
+        "type": "go2_avoid_switch_set",
+        "message0": "避障开关 SwitchSet %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 60,
+        "codeTemplate": "avoid_client.SwitchSet({{FLAG}})\n"
+      },
+      {
+        "type": "go2_avoid_switch_get",
+        "message0": "获取避障开关并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 60,
+        "codeTemplate": "code, enabled = avoid_client.SwitchGet()\nprint('Avoid enabled:', code, enabled)\n"
+      },
+      {
+        "type": "go2_avoid_move",
+        "message0": "避障移动 VX %1 VY %2 Yaw %3",
+        "args0": [
+          { "type": "field_number", "name": "VX", "value": 0 },
+          { "type": "field_number", "name": "VY", "value": 0 },
+          { "type": "field_number", "name": "YAW", "value": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 60,
+        "codeTemplate": "avoid_client.Move({{VX}}, {{VY}}, {{YAW}})\n"
+      },
+      {
+        "type": "go2_avoid_move_abs",
+        "message0": "移动到绝对位置 X %1 Y %2 Yaw %3",
+        "args0": [
+          { "type": "field_number", "name": "X", "value": 0 },
+          { "type": "field_number", "name": "Y", "value": 0 },
+          { "type": "field_number", "name": "YAW", "value": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 60,
+        "codeTemplate": "avoid_client.MoveToAbsolutePosition({{X}}, {{Y}}, {{YAW}})\n"
+      },
+      {
+        "type": "go2_avoid_move_inc",
+        "message0": "移动增量 X %1 Y %2 Yaw %3",
+        "args0": [
+          { "type": "field_number", "name": "X", "value": 0 },
+          { "type": "field_number", "name": "Y", "value": 0 },
+          { "type": "field_number", "name": "YAW", "value": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 60,
+        "codeTemplate": "avoid_client.MoveToIncrementPosition({{X}}, {{Y}}, {{YAW}})\n"
+      },
+      {
+        "type": "go2_avoid_use_remote_cmd",
+        "message0": "使用 API 远程指令 UseRemoteCommandFromApi %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 60,
+        "codeTemplate": "avoid_client.UseRemoteCommandFromApi({{FLAG}})\n"
+      }
+    ]
+  },
+  {
+    "category": "机器人服务",
+    "colour": "120",
+    "blocks": [
+      {
+        "type": "go2_robot_state_service_list",
+        "message0": "列出服务(ServiceList)并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 120,
+        "codeTemplate": "code, services = robot_state_client.ServiceList()\nprint('ServiceList:', code)\nif services:\n    for s in services:\n        print(s.name, s.status, s.protect)\n"
+      },
+      {
+        "type": "go2_robot_state_service_switch",
+        "message0": "切换服务 ServiceSwitch 名称 %1 开关 %2",
+        "args0": [
+          { "type": "field_input", "name": "NAME", "text": "service_name" },
+          { "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 120,
+        "codeTemplate": "robot_state_client.ServiceSwitch('{{NAME}}', {{FLAG}})\n"
+      }
+    ]
+  },
+  {
+    "category": "语音灯光(VUI)",
+    "colour": "210",
+    "blocks": [
+      {
+        "type": "go2_vui_set_switch",
+        "message0": "VUI 开关 SetSwitch %1",
+        "args0": [{ "type": "field_dropdown", "name": "ENABLE", "options": [["开启", "1"], ["关闭", "0"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "vui_client.SetSwitch(int({{ENABLE}}))\n"
+      },
+      {
+        "type": "go2_vui_get_switch",
+        "message0": "获取 VUI 开关并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "code, enable = vui_client.GetSwitch()\nprint('VUI switch:', code, enable)\n"
+      },
+      {
+        "type": "go2_vui_set_volume",
+        "message0": "设置音量 SetVolume %1",
+        "args0": [{ "type": "field_number", "name": "VOLUME", "value": 50, "min": 0, "max": 100 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "vui_client.SetVolume(int({{VOLUME}}))\n"
+      },
+      {
+        "type": "go2_vui_get_volume",
+        "message0": "获取音量并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "code, volume = vui_client.GetVolume()\nprint('VUI volume:', code, volume)\n"
+      },
+      {
+        "type": "go2_vui_set_brightness",
+        "message0": "设置亮度 SetBrightness %1",
+        "args0": [{ "type": "field_number", "name": "BRIGHTNESS", "value": 50, "min": 0, "max": 100 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "vui_client.SetBrightness(int({{BRIGHTNESS}}))\n"
+      },
+      {
+        "type": "go2_vui_get_brightness",
+        "message0": "获取亮度并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "code, brightness = vui_client.GetBrightness()\nprint('VUI brightness:', code, brightness)\n"
+      }
+    ]
+  },
+  {
+    "category": "传感器/雷达",
+    "colour": "300",
+    "blocks": [
+      {
+        "type": "go2_utlidar_switch",
+        "message0": "UTLidar 开关 %1",
+        "args0": [{ "type": "field_dropdown", "name": "STATUS", "options": [["ON", "ON"], ["OFF", "OFF"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 300,
+        "codeTemplate": "msg = std_msgs_msg_dds__String_()\nmsg.data = '{{STATUS}}'\nutlidar_pub.Write(msg)\n"
+      }
+    ]
+  }
+]
