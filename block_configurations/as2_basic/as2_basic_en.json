@@ -1,0 +1,163 @@
+[
+  {
+    "category": "System",
+    "colour": "230",
+    "blocks": [
+      {
+        "type": "as2_start",
+        "message0": "Start",
+        "args0": [],
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "# uni plus edu studio official config\nimport time\nimport sys\nimport math\nimport json\nfrom dataclasses import dataclass\n"
+      },
+      {
+        "type": "as2_system_init",
+        "message0": "Init AS2 Channel Domain: %1 Interface: %2",
+        "args0": [
+          { "type": "field_number", "name": "DOMAIN", "value": 0, "precision": 1 },
+          { "type": "field_input", "name": "INTERFACE", "text": "eth0" }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "from unitree_sdk2py.core.channel import ChannelFactoryInitialize\nfrom unitree_sdk2py.as2.sport.sport_client import SportClient\n\nChannelFactoryInitialize({{DOMAIN}}, '{{INTERFACE}}')\n"
+      },
+      {
+        "type": "as2_sport_init",
+        "message0": "Init Sport Client",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "sport_client = SportClient()\nsport_client.SetTimeout(25.0)\nsport_client.Init()\n"
+      }
+    ]
+  },
+  {
+    "category": "Sport",
+    "colour": "160",
+    "blocks": [
+      { "type": "as2_sport_damp", "message0": "Damp", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Damp()\n" },
+      { "type": "as2_sport_balance_stand", "message0": "BalanceStand", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.BalanceStand()\n" },
+      { "type": "as2_sport_stop_move", "message0": "StopMove", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StopMove()\n" },
+      { "type": "as2_sport_stand_up", "message0": "StandUp", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StandUp()\n" },
+      { "type": "as2_sport_stand_down", "message0": "StandDown", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StandDown()\n" },
+      { "type": "as2_sport_recovery_stand", "message0": "RecoveryStand", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.RecoveryStand()\n" },
+      {
+        "type": "as2_sport_move",
+        "message0": "Move VX %1 VY %2 Yaw %3",
+        "args0": [
+          { "type": "field_number", "name": "VX", "value": 0 },
+          { "type": "field_number", "name": "VY", "value": 0 },
+          { "type": "field_number", "name": "VYAW", "value": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.Move({{VX}}, {{VY}}, {{VYAW}})\n"
+      },
+      {
+        "type": "as2_sport_switch_gait",
+        "message0": "SwitchGait %1",
+        "args0": [{ "type": "field_number", "name": "GAIT", "value": 0, "min": 0 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SwitchGait(int({{GAIT}}))\n"
+      },
+      {
+        "type": "as2_sport_speed_level",
+        "message0": "SpeedLevel %1",
+        "args0": [{ "type": "field_number", "name": "LEVEL", "value": 1, "min": 0 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SpeedLevel(int({{LEVEL}}))\n"
+      },
+      {
+        "type": "as2_sport_set_auto_recovery",
+        "message0": "SetAutoRecovery %1",
+        "args0": [{ "type": "field_dropdown", "name": "SW", "options": [["On", "1"], ["Off", "0"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SetAutoRecovery(int({{SW}}))\n"
+      },
+      {
+        "type": "as2_sport_body_height",
+        "message0": "BodyHeight %1",
+        "args0": [{ "type": "field_number", "name": "H", "value": 0.3 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.BodyHeight({{H}})\n"
+      },
+      {
+        "type": "as2_sport_left_side_gait",
+        "message0": "LeftSideGait %1",
+        "args0": [{ "type": "field_dropdown", "name": "ENTER", "options": [["Enter", "1"], ["Exit", "0"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.LeftSideGait(int({{ENTER}}))\n"
+      },
+      {
+        "type": "as2_sport_handstand",
+        "message0": "HandStand %1",
+        "args0": [{ "type": "field_dropdown", "name": "ENTER", "options": [["Enter", "1"], ["Exit", "0"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.HandStand(int({{ENTER}}))\n"
+      },
+      { "type": "as2_sport_front_flip", "message0": "FrontFlip", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.FrontFlip()\n" },
+      { "type": "as2_sport_back_flip", "message0": "BackFlip", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.BackFlip()\n" },
+      {
+        "type": "as2_sport_body_position",
+        "message0": "BodyPosition X %1 Y %2 Z %3 Yaw %4",
+        "args0": [
+          { "type": "field_number", "name": "X", "value": 0.2 },
+          { "type": "field_number", "name": "Y", "value": 0.2 },
+          { "type": "field_number", "name": "Z", "value": -0.2 },
+          { "type": "field_number", "name": "YAW", "value": 0.2 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.BodyPosition({{X}}, {{Y}}, {{Z}}, {{YAW}})\n"
+      },
+      {
+        "type": "as2_sport_euler",
+        "message0": "Euler Roll %1 Pitch %2 Yaw %3",
+        "args0": [
+          { "type": "field_number", "name": "ROLL", "value": 0.2 },
+          { "type": "field_number", "name": "PITCH", "value": 0.3 },
+          { "type": "field_number", "name": "YAW", "value": 0.3 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.Euler({{ROLL}}, {{PITCH}}, {{YAW}})\n"
+      },
+      {
+        "type": "as2_sport_switch_joystick",
+        "message0": "SwitchJoystick %1",
+        "args0": [{ "type": "field_dropdown", "name": "SW", "options": [["On", "1"], ["Off", "0"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SwitchJoystick(int({{SW}}))\n"
+      },
+      {
+        "type": "as2_sport_get_state_print",
+        "message0": "GetState and Print",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "state_map = {}\ncode = sport_client.GetState(state_map)\nprint('GetState:', code, state_map)\n"
+      }
+    ]
+  }
+]

@@ -1,0 +1,82 @@
+[
+  {
+    "category": "系统",
+    "colour": "230",
+    "blocks": [
+      {
+        "type": "r1_start",
+        "message0": "开始",
+        "args0": [],
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "# uni plus edu studio official config\nimport time\nimport sys\nimport math\nimport json\nfrom dataclasses import dataclass\n"
+      },
+      {
+        "type": "r1_system_init",
+        "message0": "初始化 R1 通道 Domain: %1 网卡: %2",
+        "args0": [
+          { "type": "field_number", "name": "DOMAIN", "value": 0, "precision": 1 },
+          { "type": "field_input", "name": "INTERFACE", "text": "eth0" }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "from unitree_sdk2py.core.channel import ChannelFactoryInitialize\nfrom unitree_sdk2py.r1.loco.r1_loco_client import LocoClient\n\nChannelFactoryInitialize({{DOMAIN}}, '{{INTERFACE}}')\n"
+      },
+      {
+        "type": "r1_loco_init",
+        "message0": "初始化运动控制客户端",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "sport_client = LocoClient()\nsport_client.SetTimeout(10.0)\nsport_client.Init()\n"
+      }
+    ]
+  },
+  {
+    "category": "运动控制",
+    "colour": "160",
+    "blocks": [
+      { "type": "r1_damp", "message0": "阻尼 (Damp)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Damp()\n" },
+      { "type": "r1_stance", "message0": "站姿/准备 (Stance)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Stance()\n" },
+      { "type": "r1_start_loco", "message0": "进入运动模式 (Start)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Start()\n" },
+      {
+        "type": "r1_move",
+        "message0": "移动 VX %1 VY %2 转向 %3 持续运动 %4",
+        "args0": [
+          { "type": "field_number", "name": "VX", "value": 0 },
+          { "type": "field_number", "name": "VY", "value": 0 },
+          { "type": "field_number", "name": "VYAW", "value": 0 },
+          { "type": "field_dropdown", "name": "CONTINUOUS", "options": [["是", "True"], ["否", "False"]] }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.Move({{VX}}, {{VY}}, {{VYAW}}, {{CONTINUOUS}})\n"
+      },
+      { "type": "r1_stop_move", "message0": "停止运动 (StopMove)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StopMove()\n" },
+      { "type": "r1_zero_torque", "message0": "零力矩 (ZeroTorque)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.ZeroTorque()\n" },
+      {
+        "type": "r1_wave_hand",
+        "message0": "挥手 WaveHand 转身 %1",
+        "args0": [{ "type": "field_dropdown", "name": "TURN", "options": [["否", "False"], ["是", "True"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.WaveHand({{TURN}})\n"
+      },
+      {
+        "type": "r1_shake_hand",
+        "message0": "握手 (ShakeHand) 切换阶段",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.ShakeHand()\n"
+      },
+      { "type": "r1_lie_to_stand", "message0": "躺到站立 (Lie2StandUp)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Lie2StandUp()\n" },
+      { "type": "r1_stand_to_lie", "message0": "站立到躺 (StandUp2Lie)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StandUp2Lie()\n" }
+    ]
+  }
+]

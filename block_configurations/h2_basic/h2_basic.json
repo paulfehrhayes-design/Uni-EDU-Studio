@@ -1,0 +1,124 @@
+[
+  {
+    "category": "系统",
+    "colour": "230",
+    "blocks": [
+      {
+        "type": "h2_start",
+        "message0": "开始",
+        "args0": [],
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "# uni plus edu studio official config\nimport time\nimport sys\nimport math\nimport json\nfrom dataclasses import dataclass\n"
+      },
+      {
+        "type": "h2_system_init",
+        "message0": "初始化 H2 通道 Domain: %1 网卡: %2",
+        "args0": [
+          { "type": "field_number", "name": "DOMAIN", "value": 0, "precision": 1 },
+          { "type": "field_input", "name": "INTERFACE", "text": "eth0" }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "from unitree_sdk2py.core.channel import ChannelFactoryInitialize\nfrom unitree_sdk2py.h2.loco.h2_loco_client import LocoClient\n\nChannelFactoryInitialize({{DOMAIN}}, '{{INTERFACE}}')\n"
+      },
+      {
+        "type": "h2_loco_init",
+        "message0": "初始化运动控制客户端",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 230,
+        "codeTemplate": "sport_client = LocoClient()\nsport_client.SetTimeout(10.0)\nsport_client.Init()\n"
+      }
+    ]
+  },
+  {
+    "category": "运动控制",
+    "colour": "160",
+    "blocks": [
+      { "type": "h2_damp", "message0": "阻尼 (Damp)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Damp()\n" },
+      { "type": "h2_start_loco", "message0": "进入运动模式 (Start)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Start()\n" },
+      { "type": "h2_stand_up", "message0": "站起 (StandUp)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StandUp()\n" },
+      { "type": "h2_squat", "message0": "下蹲 (Squat)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Squat()\n" },
+      { "type": "h2_sit", "message0": "坐下 (Sit)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Sit()\n" },
+      { "type": "h2_zero_torque", "message0": "零力矩 (ZeroTorque)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.ZeroTorque()\n" },
+      { "type": "h2_stop_move", "message0": "停止运动 (StopMove)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.StopMove()\n" },
+      {
+        "type": "h2_move",
+        "message0": "移动 VX %1 VY %2 转向 %3",
+        "args0": [
+          { "type": "field_number", "name": "VX", "value": 0 },
+          { "type": "field_number", "name": "VY", "value": 0 },
+          { "type": "field_number", "name": "VYAW", "value": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.Move({{VX}}, {{VY}}, {{VYAW}})\n"
+      },
+      {
+        "type": "h2_switch_move_mode",
+        "message0": "持续运动模式 SwitchMoveMode %1",
+        "args0": [{ "type": "field_dropdown", "name": "FLAG", "options": [["开启", "True"], ["关闭", "False"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SwitchMoveMode({{FLAG}})\n"
+      },
+      {
+        "type": "h2_set_speed_mode",
+        "message0": "速度模式 SetSpeedMode %1",
+        "args0": [{ "type": "field_number", "name": "MODE", "value": 1, "min": 0 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SetSpeedMode(int({{MODE}}))\n"
+      },
+      {
+        "type": "h2_set_fsm_id",
+        "message0": "设置 FSM ID SetFsmId %1",
+        "args0": [{ "type": "field_number", "name": "ID", "value": 4, "min": 0 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SetFsmId(int({{ID}}))\n"
+      },
+      {
+        "type": "h2_set_velocity",
+        "message0": "设置速度 SetVelocity VX %1 VY %2 Omega %3 Duration %4 秒",
+        "args0": [
+          { "type": "field_number", "name": "VX", "value": 0 },
+          { "type": "field_number", "name": "VY", "value": 0 },
+          { "type": "field_number", "name": "OMEGA", "value": 0 },
+          { "type": "field_number", "name": "DURATION", "value": 1.0, "min": 0 }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SetVelocity({{VX}}, {{VY}}, {{OMEGA}}, {{DURATION}})\n"
+      },
+      {
+        "type": "h2_get_fsm_id_print",
+        "message0": "获取 FSM ID 并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "code, fsm_id = sport_client.GetFsmId()\nprint('GetFsmId:', code, fsm_id)\n"
+      },
+      {
+        "type": "h2_get_fsm_mode_print",
+        "message0": "获取 FSM Mode 并打印",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "code, fsm_mode = sport_client.GetFsmMode()\nprint('GetFsmMode:', code, fsm_mode)\n"
+      },
+      { "type": "h2_enable_arm_sdk", "message0": "启用手臂 SDK (EnableArmSDK)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.EnableArmSDK()\n" },
+      { "type": "h2_disable_arm_sdk", "message0": "禁用手臂 SDK (DisableArmSDK)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.DisableArmSDK()\n" }
+    ]
+  }
+]
