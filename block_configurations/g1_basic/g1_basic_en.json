@@ -55,7 +55,7 @@
         "previousStatement": null,
         "nextStatement": null,
         "colour": 230,
-        "codeTemplate": "from unitree_sdk2py.idl.default import unitree_go_msg_dds__SportModeState_\nfrom unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_\n"
+        "codeTemplate": "from unitree_sdk2py.idl.default import unitree_go_msg_dds__SportModeState_\nfrom unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_\nfrom unitree_sdk2py.g1.loco.g1_loco_api import InternalFsmMode\n"
       },
       {
         "type": "g1_load_arm_module",
@@ -90,6 +90,14 @@
         "colour": 160,
         "codeTemplate": "sport_client = LocoClient()\nsport_client.SetTimeout(10.0)\nsport_client.Init()\n"
       },
+      { "type": "g1_loco_damp", "message0": "Damp", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Damp()\n" },
+      { "type": "g1_loco_start", "message0": "Start", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Start()\n" },
+      { "type": "g1_loco_squat2stand", "message0": "Squat2StandUp", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Squat2StandUp()\n" },
+      { "type": "g1_loco_lie2stand", "message0": "Lie2StandUp", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Lie2StandUp()\n" },
+      { "type": "g1_loco_sit", "message0": "Sit", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Sit()\n" },
+      { "type": "g1_loco_zero_torque", "message0": "ZeroTorque", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.ZeroTorque()\n" },
+      { "type": "g1_loco_high_stand", "message0": "HighStand", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.HighStand()\n" },
+      { "type": "g1_loco_low_stand", "message0": "LowStand", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.LowStand()\n" },
       {
         "type": "g1_loco_move",
         "message0": "Move Forward(m/s) %1 Sideward(m/s) %2 Turn(rad/s) %3 Continuous %4",
@@ -151,6 +159,63 @@
         "nextStatement": null,
         "colour": 160,
         "codeTemplate": "sport_client.SetFsmId(801)\n"
+      },
+      {
+        "type": "g1_loco_set_balance_mode",
+        "message0": "SetBalanceMode %1",
+        "args0": [{ "type": "field_number", "name": "MODE", "value": 0, "min": 0 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SetBalanceMode(int({{MODE}}))\n"
+      },
+      {
+        "type": "g1_loco_set_speed_mode",
+        "message0": "SetSpeedMode %1",
+        "args0": [{ "type": "field_number", "name": "MODE", "value": 0, "min": 0 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SetSpeedMode(int({{MODE}}))\n"
+      },
+      { "type": "g1_loco_switch_user_ctrl", "message0": "SwitchToUserCtrl", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.SwitchToUserCtrl()\n" },
+      {
+        "type": "g1_loco_switch_internal_ctrl",
+        "message0": "SwitchToInternalCtrl %1",
+        "args0": [
+          {
+            "type": "field_dropdown",
+            "name": "MODE",
+            "options": [
+              ["LAST", "InternalFsmMode.LAST"],
+              ["PASSIVE", "InternalFsmMode.PASSIVE"],
+              ["WALKRUN", "InternalFsmMode.WALKRUN"]
+            ]
+          }
+        ],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.SwitchToInternalCtrl({{MODE}})\n"
+      },
+      {
+        "type": "g1_loco_wave_hand",
+        "message0": "WaveHand Turn %1",
+        "args0": [{ "type": "field_dropdown", "name": "TURN", "options": [["No", "False"], ["Yes", "True"]] }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "sport_client.WaveHand({{TURN}})\n"
+      },
+      { "type": "g1_loco_shake_hand", "message0": "ShakeHand (Toggle Stage)", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.ShakeHand()\n" },
+      {
+        "type": "g1_loco_get_fsm_id_print",
+        "message0": "GetFsmId and Print",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 160,
+        "codeTemplate": "code, fsm_id = sport_client.GetFsmId()\nprint('GetFsmId:', code, fsm_id)\n"
       }
     ]
   },
@@ -166,6 +231,15 @@
         "nextStatement": null,
         "colour": 20,
         "codeTemplate": "armAction_client = G1ArmActionClient()\narmAction_client.SetTimeout(10.0)\narmAction_client.Init()\n"
+      },
+      {
+        "type": "g1_arm_get_action_list_print",
+        "message0": "GetActionList and Print",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 20,
+        "codeTemplate": "code, data = armAction_client.GetActionList()\nprint('GetActionList:', code, data)\n"
       },
       {
         "type": "g1_arm_execute_action",
@@ -260,6 +334,15 @@
         "codeTemplate": "audio_client.SetVolume({{VOLUME}})\n"
       },
       {
+        "type": "g1_audio_get_volume_print",
+        "message0": "Get Volume and Print",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "code, data = audio_client.GetVolume()\nprint('GetVolume:', code, data)\n"
+      },
+      {
         "type": "g1_audio_led_control",
         "message0": "Set Head LED R: %1 G: %2 B: %3",
         "args0": [
@@ -271,6 +354,15 @@
         "nextStatement": null,
         "colour": 210,
         "codeTemplate": "audio_client.LedControl({{R}}, {{G}}, {{B}})\n"
+      },
+      {
+        "type": "g1_audio_play_stop",
+        "message0": "PlayStop AppName %1",
+        "args0": [{ "type": "field_input", "name": "APP", "text": "example" }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 210,
+        "codeTemplate": "audio_client.PlayStop('{{APP}}')\n"
       }
     ]
   }
