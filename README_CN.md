@@ -11,15 +11,22 @@ Uni++ EDU Studio支持运行在任意Linux平台上，但考虑便利性，推�
 
 部署完成后，Web App支持被任意拥有浏览器的设备访问，但不建议竖屏模式使用。
 
-Uni++ EDU Studio支持通过导入配置来控制不同的机器人。目前已支持的配置文件：
+Uni++ EDU Studio支持通过导入配置来控制不同的机器人。目前仓库内置的参考配置包括：
 
-- Unitree G1
-  - 高层控制（仅开放安全的动作）
-  - 手臂动作控制
-    - 支持录制好的示教动作
+- Unitree G1（block_configurations/g1_basic）
+  - 高层运动控制（仅开放安全的动作）
+  - 手臂动作控制（含示教动作）
   - 音频灯光接口控制
+- Unitree Go2（block_configurations/go2_basic）
+  - 运动控制 / 避障 / 服务开关 / VUI / UTLidar 开关
+- Unitree AS2（block_configurations/as2_basic）
+  - 运动控制（SportClient）
+- Unitree R1（block_configurations/r1_basic）
+  - 高层运动控制（LocoClient）
+- Unitree H2（block_configurations/h2_basic）
+  - 高层运动控制（LocoClient）
 
-配置还会持续更新，也支持自定义配置（文档将会晚些上传）。
+配置还会持续更新，也支持自定义配置。配置文件格式说明见 [block_configurations 配置说明](file:///home/unitree/brigham/DEV/Uni-EDU-Studio/docs/block_configurations_cn.md)。
 
 Uni++ EDU Studio编辑器支持：
 

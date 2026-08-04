@@ -9,15 +9,22 @@ Uni++ EDU Studio supports running on any Linux platform, but for convenience, it
 * Unitree G1's PC2
 * Unitree Go2's docking station
 
-Uni++ EDU Studio supports controlling different robots by importing configurations. Currently supported configuration files include:
+Uni++ EDU Studio supports controlling different robots by importing configurations. Built-in reference configurations in this repo:
 
-* Unitree G1
-* High-level control (only safe actions available)
-* Arm motion control
-* Supports recorded teaching playback
-* Audio and light interface control
+* Unitree G1 (`block_configurations/g1_basic`)
+  * High-level locomotion (safe actions only)
+  * Arm actions (including recorded actions)
+  * Audio & lights
+* Unitree Go2 (`block_configurations/go2_basic`)
+  * Sport / obstacles avoid / service switch / VUI / UTLidar switch
+* Unitree AS2 (`block_configurations/as2_basic`)
+  * Sport control (SportClient)
+* Unitree R1 (`block_configurations/r1_basic`)
+  * High-level locomotion (LocoClient)
+* Unitree H2 (`block_configurations/h2_basic`)
+  * High-level locomotion (LocoClient)
 
-Configurations will be continuously updated, and custom configurations are also supported (documentation will be uploaded later).
+Configurations will be continuously updated, and custom configurations are also supported.
 
 The Uni++ EDU Studio editor supports:
 
