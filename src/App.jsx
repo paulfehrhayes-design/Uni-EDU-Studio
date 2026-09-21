@@ -1713,6 +1713,101 @@ export default function App() {
 
   if (!isBlocklyLoaded) return <div className="flex h-screen items-center justify-center bg-gray-50 flex-col gap-4"><Loader2 className="animate-spin text-blue-600" size={48} /><p className="text-gray-500 font-medium">{UI_TEXT.en.loading}</p></div>;
 
+  const robotAnchor = { x: 110 + simulatorState.x * 1.5, y: 110 - simulatorState.y * 1.5 };
+  const robotJoints = simulatorState.joints || {};
+  const toRadians = (degrees) => (degrees * Math.PI) / 180;
+  const armLen = 22;
+  const forearmLen = 20;
+  const legLen = 30;
+  const shinLen = 28;
+  const getJointAngle = (name, defaultValue = 0) => Number(robotJoints[name] ?? defaultValue);
+
+  const leftArm = (() => {
+    const shoulder = getJointAngle('left_shoulder_pitch', 12);
+    const elbow = getJointAngle('left_elbow_pitch', 8);
+    const shoulderRad = toRadians(shoulder + 180);
+    const elbowRad = toRadians(elbow + 110);
+    const shoulderX = 0;
+    const shoulderY = -28;
+    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
+    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
+    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
+    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
+    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
+  })();
+
+  const rightArm = (() => {
+    const shoulder = getJointAngle('right_shoulder_pitch', 12);
+    const elbow = getJointAngle('right_elbow_pitch', 8);
+    const shoulderRad = toRadians(shoulder + 180);
+    const elbowRad = toRadians(elbow + 110);
+    const shoulderX = 0;
+    const shoulderY = -28;
+    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
+    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
+    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
+    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
+    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
+  })();
+
+  const leftLeg = (() => {
+    const hip = getJointAngle('left_hip_pitch', 8);
+    const knee = getJointAngle('left_knee_pitch', 10);
+    const hipRad = toRadians(hip + 200);
+    const kneeRad = toRadians(knee + 80);
+    const hipX = 0;
+    const hipY = 28;
+    const kneeX = hipX + Math.cos(hipRad) * legLen;
+    const kneeY = hipY + Math.sin(hipRad) * legLen;
+    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
+    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
+    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
+  })();
+
+  const rightLeg = (() => {
+    const hip = getJointAngle('right_hip_pitch', 8);
+    const knee = getJointAngle('right_knee_pitch', 10);
+    const hipRad = toRadians(hip + 200);
+    const kneeRad = toRadians(knee + 80);
+    const hipX = 0;
+    const hipY = 28;
+    const kneeX = hipX + Math.cos(hipRad) * legLen;
+    const kneeY = hipY + Math.sin(hipRad) * legLen;
+    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
+    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
+    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
+  })();
+
+  const robotBody = (
+    <g transform={`translate(${robotAnchor.x} ${robotAnchor.y}) rotate(${simulatorState.heading})`}>
+      <ellipse cx="0" cy="44" rx="38" ry="10" fill="rgba(15,23,42,0.18)" />
+      <g stroke="#dfe7f3" strokeWidth="2" strokeLinecap="round" fill="none">
+        <line x1="0" y1="-10" x2="0" y2="-42" stroke="#b4c4d8" strokeWidth="6" />
+        <line x1="0" y1="-42" x2="0" y2="-70" stroke="#b4c4d8" strokeWidth="8" />
+        <ellipse cx="0" cy="-70" rx="16" ry="18" fill="#e2e8f0" stroke="#475569" strokeWidth="2" />
+        <circle cx="0" cy="-74" r="5" fill="#94a3b8" />
+        <line x1="-8" y1="-66" x2="-18" y2="-58" stroke="#475569" strokeWidth="2" />
+        <line x1="8" y1="-66" x2="18" y2="-58" stroke="#475569" strokeWidth="2" />
+
+        <line x1="-10" y1="-40" x2={leftArm.shoulderX} y2={leftArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
+        <line x1={leftArm.shoulderX} y1={leftArm.shoulderY} x2={leftArm.elbowX} y2={leftArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
+        <line x1={leftArm.elbowX} y1={leftArm.elbowY} x2={leftArm.wristX} y2={leftArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
+
+        <line x1="10" y1="-40" x2={rightArm.shoulderX} y2={rightArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
+        <line x1={rightArm.shoulderX} y1={rightArm.shoulderY} x2={rightArm.elbowX} y2={rightArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
+        <line x1={rightArm.elbowX} y1={rightArm.elbowY} x2={rightArm.wristX} y2={rightArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
+
+        <line x1="-8" y1="8" x2={leftLeg.hipX} y2={leftLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
+        <line x1={leftLeg.hipX} y1={leftLeg.hipY} x2={leftLeg.kneeX} y2={leftLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
+        <line x1={leftLeg.kneeX} y1={leftLeg.kneeY} x2={leftLeg.ankleX} y2={leftLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
+
+        <line x1="8" y1="8" x2={rightLeg.hipX} y2={rightLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
+        <line x1={rightLeg.hipX} y1={rightLeg.hipY} x2={rightLeg.kneeX} y2={rightLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
+        <line x1={rightLeg.kneeX} y1={rightLeg.kneeY} x2={rightLeg.ankleX} y2={rightLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
+      </g>
+    </g>
+  );
+
   return (
     <div className="flex flex-col h-screen bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
       
@@ -2298,11 +2393,7 @@ export default function App() {
               strokeLinecap="round"
               opacity="0.9"
             />
-            <g transform={`translate(${110 + simulatorState.x * 1.5}, ${110 - simulatorState.y * 1.5}) rotate(${simulatorState.heading})`}>
-              <rect x="-12" y="-10" width="24" height="20" rx="6" fill="#2563eb" stroke="#0f172a" strokeWidth="2"/>
-              <polygon points="18,0 28,6 18,12" fill="#f59e0b"/>
-              <circle cx="0" cy="0" r="3" fill="#f8fafc"/>
-            </g>
+            {robotBody}
           </svg>
         </div>
 

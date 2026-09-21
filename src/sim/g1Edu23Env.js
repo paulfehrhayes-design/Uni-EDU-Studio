@@ -342,6 +342,24 @@ export function simulateG1Edu23Program(pythonCode, options = {}) {
   const goalReached = !!finalGoal && Math.hypot(x - finalGoal.x, y - finalGoal.y) <= (finalGoal.radius || 8);
   const blocked = mode === 'advanced-physics' && collisionCount > 0;
 
+  const walkPhase = Math.min(path.length, 30) / 30;
+  const leftSwing = Math.sin(walkPhase * Math.PI * 2) * 26;
+  const rightSwing = Math.sin(walkPhase * Math.PI * 2 + Math.PI) * 26;
+
+  jointState.left_hip_pitch = Number((leftSwing * 0.8 + torsoPitch * 0.4).toFixed(2));
+  jointState.right_hip_pitch = Number((rightSwing * 0.8 + torsoPitch * 0.4).toFixed(2));
+  jointState.left_knee_pitch = Number((Math.abs(leftSwing) * 0.9 + 8).toFixed(2));
+  jointState.right_knee_pitch = Number((Math.abs(rightSwing) * 0.9 + 8).toFixed(2));
+  jointState.left_ankle_pitch = Number((-Math.abs(leftSwing) * 0.4).toFixed(2));
+  jointState.right_ankle_pitch = Number((-Math.abs(rightSwing) * 0.4).toFixed(2));
+  jointState.left_shoulder_pitch = Number((Math.sin(walkPhase * Math.PI) * 18 + torsoPitch * 0.3).toFixed(2));
+  jointState.right_shoulder_pitch = Number((Math.sin(walkPhase * Math.PI + Math.PI) * 18 + torsoPitch * 0.3).toFixed(2));
+  jointState.left_shoulder_yaw = Number((Math.sin(walkPhase * Math.PI / 2) * 12 + torsoRoll * 0.6).toFixed(2));
+  jointState.right_shoulder_yaw = Number((Math.sin(walkPhase * Math.PI / 2 + Math.PI) * 12 + torsoRoll * 0.6).toFixed(2));
+  jointState.waist_yaw = Number((heading * 0.28).toFixed(2));
+  jointState.waist_pitch = Number((torsoPitch * 0.6).toFixed(2));
+  jointState.waist_roll = Number((torsoRoll * 0.8).toFixed(2));
+
   return {
     x: Number(x.toFixed(2)),
     y: Number(y.toFixed(2)),
