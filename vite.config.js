@@ -11,10 +11,12 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    host: '0.0.0.0',
+    port: 5173,
     proxy: {
-      // 代理：让本地开发时能连上本地跑的 python server (如果有的话)
+      // 代理：让本地开发时能连上本地跑的 python server
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: 'http://127.0.0.1:5179',
         changeOrigin: true,
       }
     }

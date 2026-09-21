@@ -139,6 +139,24 @@ conda activate UnippEduStudio
 
 Subsequently, you can access the robot's `IP address:5179` under the same Wi-Fi to enter Uni++ EDU Studio.
 
+## Classroom Mode
+
+This project now supports a simple classroom workflow for one robot and many students.
+
+- Open the app at `http://<g1-ip>:5179`
+- Teacher login: `teacher / teacher`
+- Student login: `student1 / student1` or another username with the same password
+- Each student can save their own code and submit it to the teacher queue
+- The teacher dashboard shows queued submissions, previews them, can delete entries, pause the current run, resume the next job, and clear the queue
+
+This keeps the robot safe by allowing only one active run at a time, while still letting students work from their own devices.
+
+## Quick Guides
+
+- [Student Guide](docs/student_guide.md)
+- [Teacher Guide](docs/teacher_guide.md)
+- [Environment and Host Setup](docs/environment_and_host_setup.md)
+
 ## Usage Instructions
 
 ### 1001 Import Configuration

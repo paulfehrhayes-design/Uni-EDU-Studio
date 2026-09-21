@@ -78,6 +78,66 @@
     ]
   },
   {
+    "category": "Beginner Motion",
+    "colour": "140",
+    "blocks": [
+      {
+        "type": "g1_kid_walk_forward",
+        "message0": "Walk Forward for %1 s",
+        "args0": [{ "type": "field_number", "name": "SECONDS", "value": 1, "min": 0, "max": 30 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 140,
+        "codeTemplate": "sport_client.Move(0.4, 0.0, 0.0, False)\ntime.sleep({{SECONDS}})\nsport_client.StopMove()\n"
+      },
+      {
+        "type": "g1_kid_walk_backward",
+        "message0": "Walk Backward for %1 s",
+        "args0": [{ "type": "field_number", "name": "SECONDS", "value": 1, "min": 0, "max": 30 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 140,
+        "codeTemplate": "sport_client.Move(-0.4, 0.0, 0.0, False)\ntime.sleep({{SECONDS}})\nsport_client.StopMove()\n"
+      },
+      {
+        "type": "g1_kid_turn_left",
+        "message0": "Turn Left for %1 s",
+        "args0": [{ "type": "field_number", "name": "SECONDS", "value": 1, "min": 0, "max": 30 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 140,
+        "codeTemplate": "sport_client.Move(0.0, 0.0, 0.6, False)\ntime.sleep({{SECONDS}})\nsport_client.StopMove()\n"
+      },
+      {
+        "type": "g1_kid_turn_right",
+        "message0": "Turn Right for %1 s",
+        "args0": [{ "type": "field_number", "name": "SECONDS", "value": 1, "min": 0, "max": 30 }],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 140,
+        "codeTemplate": "sport_client.Move(0.0, 0.0, -0.6, False)\ntime.sleep({{SECONDS}})\nsport_client.StopMove()\n"
+      },
+      {
+        "type": "g1_kid_stop",
+        "message0": "Stop",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 140,
+        "codeTemplate": "sport_client.StopMove()\n"
+      },
+      {
+        "type": "g1_kid_stand_up",
+        "message0": "Stand Up",
+        "args0": [],
+        "previousStatement": null,
+        "nextStatement": null,
+        "colour": 140,
+        "codeTemplate": "sport_client.Squat2StandUp()\n"
+      }
+    ]
+  },
+  {
     "category": "Motion",
     "colour": "160",
     "blocks": [
