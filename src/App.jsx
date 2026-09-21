@@ -2332,10 +2332,11 @@ export default function App() {
         </div>
       </div>
 
-      <div className="relative flex-1 overflow-hidden bg-slate-200">
+      <div className="relative flex-1 overflow-hidden scene-shell">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
+        <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
         <div className="absolute inset-0">
-          <svg viewBox="0 0 220 220" className="h-full w-full block">
+          <svg viewBox="0 0 220 220" className="scene-svg h-full w-full block">
             <defs>
               <pattern id="workspace-grid" width="20" height="20" patternUnits="userSpaceOnUse">
                 <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
