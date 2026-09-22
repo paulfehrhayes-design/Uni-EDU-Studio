@@ -11,7 +11,11 @@ const NUMBER_WORDS = {
   ten: 10,
 };
 
-function findNumber(text, fallback) {
+function findNumber(text, fallback, contextPattern = null) {
+  if (contextPattern) {
+    const contextual = text.match(contextPattern);
+    if (contextual) return Number(contextual[1]);
+  }
   const numeric = text.match(/\d+(?:\.\d+)?/);
   if (numeric) return Number(numeric[0]);
   const word = Object.keys(NUMBER_WORDS).find((item) => new RegExp(`\\b${item}\\b`, 'i').test(text));
@@ -30,9 +34,9 @@ export function compileMotionPrompt(prompt = '') {
   const normalized = prompt.toLowerCase().replace(/[,.!?;:]/g, ' ');
   const steps = [];
   const unknown = [];
-  const distance = clamp(findNumber(normalized, 3), 1, 10);
-  const angle = clamp(findNumber(normalized, 90), 5, 180);
-  const seconds = clamp(findNumber(normalized, 1), 0.1, 5);
+  const distance = clamp(findNumber(normalized, 3, /(?:forward|backward|back|walk|step|走|步)[^\d]*(\d+(?:\.\d+)?)/), 1, 10);
+  const angle = clamp(findNumber(normalized, 90, /(?:turn|rotate|degree|角度|转)[^\d]*(\d+(?:\.\d+)?)/), 5, 180);
+  const seconds = clamp(findNumber(normalized, 1, /(?:wait|pause|second|等待|停留)[^\d]*(\d+(?:\.\d+)?)/), 0.1, 5);
 
   if (/\b(square|box pattern|四边形|正方形)\b/.test(normalized)) {
     const side = clamp(findNumber(normalized, 2), 1, 8);
