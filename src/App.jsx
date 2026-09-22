@@ -13,6 +13,8 @@ import 'blockly/blocks';
 import g1BasicConfigZh from '../block_configurations/g1_basic/g1_basic.json';
 import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
 import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import G1Simulation3D from './components/G1Simulation3D';
+import { compileMotionPrompt } from './sim/textToMotion';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -622,6 +624,9 @@ export default function App() {
   const [mainTab, setMainTab] = useState('blocks');
   const [toolPanelWidth, setToolPanelWidth] = useState(420);
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
+  const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
+  const [motionPrompt, setMotionPrompt] = useState('Walk forward 3 steps, turn left 90 degrees, then wave');
+  const [motionPromptResult, setMotionPromptResult] = useState(null);
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
   const [simulatorChallenge, setSimulatorChallenge] = useState('simple-path');
   const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
@@ -715,6 +720,7 @@ export default function App() {
   const overlayTabs = [
     { id: 'blocks', label: 'Blocks' },
     { id: 'planner', label: 'Motion Planner' },
+    { id: 'prompt', label: 'Prompt to Motion' },
     { id: 'camera', label: 'Camera Motion Tracker' },
     { id: 'ide', label: 'IDE' },
   ];
@@ -1477,6 +1483,14 @@ export default function App() {
     }
   }, [syncBlocksFromGeneratedCode]);
 
+  const generateMotionFromPrompt = () => {
+    const result = compileMotionPrompt(motionPrompt);
+    setMotionPromptResult(result);
+    if (result.code) {
+      updateGeneratedCode(result.code);
+    }
+  };
+
   const insertRobotCommand = (snippet) => {
     const nextCode = generatedCode ? `${generatedCode.trimEnd()}\n${snippet}\n` : `${snippet}\n`;
     updateGeneratedCode(nextCode);
@@ -1937,6 +1951,9 @@ export default function App() {
         <button onClick={handleRunCode} className={`flex items-center gap-2 px-4 py-1.5 text-white rounded font-medium text-sm transition-colors shadow-sm ${isRunning ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`} title={isRunning ? t.btnStop : t.btnRun}>
           {isRunning ? <Square size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />} {isRunning ? t.btnStop : t.btnRun}
         </button>
+        <button onClick={() => setIsSimulatorOpen(true)} className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded border border-slate-200 bg-white text-slate-600 hover:bg-slate-50" title="Open simulator">
+          <Globe size={16} /> Simulator
+        </button>
         <div className="flex-1"></div>
         <div className="flex items-center gap-2 text-xs text-slate-500">
           <span className="rounded-full bg-slate-100 px-2 py-1 font-medium">{currentUser.role}</span>
@@ -1946,11 +1963,18 @@ export default function App() {
         <button onClick={() => setIsCodeOpen(!isCodeOpen)} className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded border transition-all ${isCodeOpen ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'}`}><Code size={16} />{isCodeOpen ? 'Hide Code' : 'Show Code'}</button>
       </div>
 
-      <div className="absolute right-4 top-20 z-40 w-[320px] flex flex-col gap-3">
+      {isSimulatorOpen && (
+      <div className="fixed inset-0 z-50 bg-slate-950/20" onClick={() => setIsSimulatorOpen(false)}>
+      <div className="absolute right-4 top-24 z-10 flex max-h-[calc(100vh-7rem)] w-[min(360px,calc(100vw-2rem))] flex-col gap-3 overflow-auto" onClick={(event) => event.stopPropagation()}>
         <div className="max-h-[420px] overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl">
           <div className="border-b border-slate-200 p-3 bg-slate-50 flex items-center justify-between">
             <h3 className="font-semibold text-slate-800">{currentUser.role === 'teacher' ? 'Teacher Queue' : 'My Saved Code'}</h3>
-            <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1">{classroomStatus}</span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1">{classroomStatus}</span>
+              <button type="button" onClick={() => setIsSimulatorOpen(false)} className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800" aria-label="Close simulator">
+                <X size={16} />
+              </button>
+            </div>
           </div>
           <div className="p-3 space-y-3">
             {currentUser.role === 'teacher' && (
@@ -2316,6 +2340,8 @@ export default function App() {
           </div>
         </div>
       </div>
+      </div>
+      )}
 
       <div className="border-b border-slate-200 bg-slate-900 px-4 py-3 shadow-sm">
         <div className="flex items-center gap-2 overflow-x-auto">
@@ -2397,6 +2423,13 @@ export default function App() {
             {robotBody}
           </svg>
         </div>
+
+        <G1Simulation3D
+          code={generatedCode}
+          simulatorState={simulatorState}
+          obstacles={activeObstacles}
+          isPlaying={isPreviewPlaying}
+        />
 
         {mainTab === 'blocks' && (
           <div className="absolute inset-0 z-10 pointer-events-none">
@@ -2508,6 +2541,47 @@ export default function App() {
                           </div>
                         </div>
                       ))
+                    )}
+                  </div>
+                )}
+
+                {mainTab === 'prompt' && (
+                  <div className="space-y-3 text-slate-200">
+                    <div className="rounded-xl border border-cyan-400/30 bg-cyan-500/10 p-3">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">Text to motion</p>
+                      <p className="mt-2 text-xs leading-5 text-slate-300">Describe a short safe movement sequence. The generated commands sync to Blocks, IDE, and the live G1 simulation.</p>
+                    </div>
+                    <textarea
+                      value={motionPrompt}
+                      onChange={(event) => setMotionPrompt(event.target.value)}
+                      className="h-28 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 text-sm leading-6 text-slate-100 outline-none focus:border-cyan-400"
+                      placeholder="Example: walk forward 3 steps, turn left, wave"
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      {[
+                        'Walk forward 3 steps, turn left 90 degrees, then wave',
+                        'Walk backward 2 steps and sit',
+                        'Repeat a square path 2 times',
+                      ].map((example) => (
+                        <button key={example} type="button" onClick={() => setMotionPrompt(example)} className="rounded-md bg-slate-800 px-2 py-1.5 text-left text-[10px] text-slate-300 hover:bg-slate-700">
+                          {example}
+                        </button>
+                      ))}
+                    </div>
+                    <button type="button" onClick={generateMotionFromPrompt} className="w-full rounded-md bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400">
+                      Generate and sync motion
+                    </button>
+                    {motionPromptResult && (
+                      <div className="space-y-2 rounded-xl border border-slate-700 bg-slate-900 p-3">
+                        <p className="text-xs font-semibold text-cyan-200">{motionPromptResult.summary}</p>
+                        {motionPromptResult.steps.map((step, index) => (
+                          <div key={`${step.code}-${index}`} className="flex items-center justify-between gap-2 rounded-md bg-slate-800 px-2 py-1.5 text-[10px]">
+                            <span className="text-slate-200">{index + 1}. {step.label}</span>
+                            <code className="text-cyan-300">{step.code}</code>
+                          </div>
+                        ))}
+                        {motionPromptResult.unknown.map((message) => <p key={message} className="text-xs text-amber-300">{message}</p>)}
+                      </div>
                     )}
                   </div>
                 )}

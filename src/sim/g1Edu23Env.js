@@ -125,7 +125,7 @@ function isBlockedByObstacle(x, y, obstacles = []) {
   });
 }
 
-export function buildG1SimulationFrames(pythonCode, options = {}) {
+export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   const { mode = 'kid-preview', obstacles = G1_EDU_23_ENV.defaultObstacles, challenge = null } = options;
 
   if (!pythonCode || !pythonCode.trim()) {
