@@ -168,3 +168,7 @@ http://<host-ip>:5179
 
 ## Important reminder
 This app is designed for classroom learning and safe robot use. Students should test in simulation before running on the physical robot.
+
+## G1 3D model assets
+
+The hosted frontend includes the Unitree G1 mesh rig under `public/g1`. Run `npm run build` after changing or replacing these assets so the backend serves the updated model. The browser loads the STL meshes and `g1.xml` asynchronously; the procedural model remains visible briefly while the full mesh rig loads.

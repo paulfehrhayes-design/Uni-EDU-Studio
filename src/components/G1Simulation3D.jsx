@@ -1,9 +1,10 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { buildG1SimulationFrames, G1_EDU_23_ENV } from '../sim/g1Edu23Env';
 
 const JOINT_AXES = {
-  left_hip_pitch: 'x', right_hip_pitch: 'x', left_knee_pitch: 'x', right_knee_pitch: 'x',
+  left_hip_pitch: 'x', right_hip_pitch: 'x', left_knee: 'x', right_knee: 'x', left_knee_pitch: 'x', right_knee_pitch: 'x',
   left_ankle_pitch: 'x', right_ankle_pitch: 'x', waist_pitch: 'x',
   left_hip_roll: 'z', right_hip_roll: 'z', left_ankle_roll: 'z', right_ankle_roll: 'z', waist_roll: 'z',
   left_hip_yaw: 'y', right_hip_yaw: 'y', waist_yaw: 'y',
@@ -108,6 +109,105 @@ function createRobot() {
   return { robot, joints };
 }
 
+const MUJOCO_TO_VIEW = new THREE.Matrix4().set(
+  0, 1, 0, 0,
+  0, 0, 1, 0,
+  1, 0, 0, 0,
+  0, 0, 0, 1,
+);
+
+function parseFloatVector(value, fallback = [0, 0, 0]) {
+  return value ? value.trim().split(/\s+/).map(Number) : fallback;
+}
+
+function quatFromWxyz(value) {
+  const [w, x, y, z] = parseFloatVector(value, [1, 0, 0, 0]);
+  return new THREE.Quaternion(x, y, z, w);
+}
+
+function convertPosition(position) {
+  return new THREE.Vector3(...parseFloatVector(position)).applyMatrix4(MUJOCO_TO_VIEW);
+}
+
+function convertQuaternion(quaternion) {
+  const rotation = new THREE.Matrix4().makeRotationFromQuaternion(quatFromWxyz(quaternion));
+  const converted = MUJOCO_TO_VIEW.clone().multiply(rotation).multiply(MUJOCO_TO_VIEW.clone().invert());
+  return new THREE.Quaternion().setFromRotationMatrix(converted);
+}
+
+async function loadG1MeshRig() {
+  const xmlText = await fetch('/g1/g1.xml').then((response) => {
+    if (!response.ok) throw new Error(`G1 rig unavailable (${response.status})`);
+    return response.text();
+  });
+  const xml = new DOMParser().parseFromString(xmlText, 'application/xml');
+  const meshFiles = new Map([...xml.querySelectorAll('asset > mesh')].map((mesh) => [mesh.getAttribute('name'), mesh.getAttribute('file')]));
+  const loader = new STLLoader();
+  const geometryCache = new Map();
+  const materialCache = new Map();
+  const rootBody = xml.querySelector('worldbody > body');
+  const robot = new THREE.Group();
+  robot.name = 'G1-34Link-MeshRig';
+  const joints = {};
+
+  const loadGeometry = async (meshName) => {
+    if (!geometryCache.has(meshName)) {
+      const file = meshFiles.get(meshName);
+      if (!file) return null;
+      const geometry = await loader.loadAsync(`/g1/meshes/${file}`);
+      geometry.applyMatrix4(MUJOCO_TO_VIEW);
+      geometry.computeVertexNormals();
+      geometryCache.set(meshName, geometry);
+    }
+    return geometryCache.get(meshName);
+  };
+
+  const getMaterial = (meshName) => {
+    const dark = /pelvis|hip|knee|waist|torso|head|logo|elbow|hand/.test(meshName);
+    const key = dark ? 'dark' : 'light';
+    if (!materialCache.has(key)) {
+      materialCache.set(key, new THREE.MeshStandardMaterial({
+        color: dark ? 0x263241 : 0xcbd5e1,
+        metalness: 0.5,
+        roughness: 0.36,
+      }));
+    }
+    return materialCache.get(key);
+  };
+
+  const visitBody = async (bodyElement, parent) => {
+    const body = new THREE.Group();
+    body.name = bodyElement.getAttribute('name') || 'g1-link';
+    body.position.copy(convertPosition(bodyElement.getAttribute('pos')));
+    body.quaternion.copy(convertQuaternion(bodyElement.getAttribute('quat')));
+    parent.add(body);
+
+    const joint = bodyElement.querySelector(':scope > joint');
+    if (joint?.getAttribute('name')) joints[joint.getAttribute('name')] = body;
+
+    const geomElements = [...bodyElement.querySelectorAll(':scope > geom[mesh]')];
+    await Promise.all(geomElements.map(async (geom) => {
+      const meshName = geom.getAttribute('mesh');
+      const geometry = await loadGeometry(meshName);
+      if (!geometry) return;
+      const mesh = new THREE.Mesh(geometry, getMaterial(meshName));
+      mesh.name = meshName;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.copy(convertPosition(geom.getAttribute('pos')));
+      mesh.quaternion.copy(convertQuaternion(geom.getAttribute('quat')));
+      body.add(mesh);
+    }));
+
+    for (const child of bodyElement.querySelectorAll(':scope > body')) {
+      await visitBody(child, body);
+    }
+  };
+
+  await visitBody(rootBody, robot);
+  return { robot, joints };
+}
+
 export default function G1Simulation3D({ code, simulatorState, obstacles = [], isPlaying = false }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
@@ -199,6 +299,25 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
     robotRef.current = built.robot;
     jointRefs.current = built.joints;
     scene.add(built.robot);
+    let disposed = false;
+    loadG1MeshRig().then((loaded) => {
+      if (disposed) {
+        loaded.robot.traverse((object) => {
+          if (object.geometry) object.geometry.dispose();
+        });
+        return;
+      }
+      scene.remove(built.robot);
+      built.robot.traverse((object) => {
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) object.material.dispose();
+      });
+      robotRef.current = loaded.robot;
+      jointRefs.current = loaded.joints;
+      scene.add(loaded.robot);
+    }).catch((error) => {
+      console.warn('G1 mesh rig unavailable; using procedural fallback.', error);
+    });
 
     const resize = () => {
       const width = mount.clientWidth || 1;
@@ -259,7 +378,8 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
         robotRef.current.rotation.y = THREE.MathUtils.degToRad(-(frame.heading || 0));
         Object.entries(jointRefs.current).forEach(([name, group]) => {
           const normalizedName = name.replace('_joint', '');
-          const value = Number(frame.joints?.[name] ?? frame.joints?.[normalizedName] ?? 0);
+          const stateName = normalizedName.endsWith('_knee') ? `${normalizedName}_pitch` : normalizedName;
+          const value = Number(frame.joints?.[name] ?? frame.joints?.[normalizedName] ?? frame.joints?.[stateName] ?? 0);
           const axis = JOINT_AXES[normalizedName] || (normalizedName.includes('pitch') ? 'x' : 'y');
           group.rotation[axis] = THREE.MathUtils.degToRad(value);
         });
@@ -278,6 +398,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
     let animationFrame = requestAnimationFrame(animate);
 
     return () => {
+      disposed = true;
       cancelAnimationFrame(animationFrame);
       observer.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
