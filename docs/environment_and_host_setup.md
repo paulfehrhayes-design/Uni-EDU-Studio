@@ -137,7 +137,12 @@ http://localhost:5173
 cd /workspaces/Uni-EDU-Studio
 npm install
 npm run build
-cd backend
+python backend/server.py
+```
+
+Alternative from the backend folder:
+```bash
+cd /workspaces/Uni-EDU-Studio/backend
 python server.py
 ```
 
@@ -145,6 +150,8 @@ Open:
 ```text
 http://<host-ip>:5179
 ```
+
+> Use either of the two backend-start commands above, but do not start the Vite dev server and the Python backend together unless you intentionally want the two modes mixed.
 
 ---
 

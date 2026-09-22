@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -14,7 +15,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -24,6 +25,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+G1_URDF_PATH = os.path.join(PROJECT_ROOT, "g1_23dof.urdf.txt")
 
 app = FastAPI()
 
@@ -641,6 +644,32 @@ def clear_queue(user: dict = Depends(auth_required)):
         raise HTTPException(status_code=403, detail="Teacher role required")
     clear_queue_items()
     return {"status": "cleared"}
+
+
+@app.get("/api/g1-model")
+def g1_model_info():
+    if not os.path.exists(G1_URDF_PATH):
+        raise HTTPException(status_code=404, detail="G1 URDF not found")
+
+    with open(G1_URDF_PATH, "r", encoding="utf-8") as urdf_file:
+        urdf_text = urdf_file.read()
+
+    joint_names = re.findall(r'<joint\s+name="([^"]+)"[^>]*type="revolute"[^>]*>', urdf_text)
+    links = re.findall(r'<link\s+name="([^"]+)"', urdf_text)
+
+    return {
+        "robotType": "Unitree G1",
+        "source": "URDF",
+        "sourceFile": "g1_23dof.urdf.txt",
+        "baseLink": "pelvis" if "pelvis" in links else (links[0] if links else "pelvis"),
+        "jointCount": len(joint_names),
+        "joints": joint_names,
+    }
+
+
+@app.get("/g1_23dof.urdf.txt")
+def serve_g1_urdf():
+    return FileResponse(G1_URDF_PATH)
 
 
 @app.get("/api/classroom/status")
