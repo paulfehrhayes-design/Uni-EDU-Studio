@@ -1,6 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+import { ChevronDown, ChevronUp, Pause, Play, RotateCcw } from 'lucide-react';
 import { buildG1SimulationFrames, G1_EDU_23_ENV } from '../sim/g1Edu23Env';
 
 const JOINT_AXES = {
@@ -135,6 +136,36 @@ function convertQuaternion(quaternion) {
   return new THREE.Quaternion().setFromRotationMatrix(converted);
 }
 
+function interpolateAngle(from = 0, to = 0, amount) {
+  const delta = ((to - from + 540) % 360) - 180;
+  return from + delta * amount;
+}
+
+function easeMotion(amount) {
+  return amount * amount * (3 - 2 * amount);
+}
+
+function interpolateSimulationFrame(from, to, amount) {
+  if (!from) return to;
+  if (!to) return from;
+  const eased = easeMotion(amount);
+  const joints = {};
+  const jointNames = new Set([...Object.keys(from.joints || {}), ...Object.keys(to.joints || {})]);
+  jointNames.forEach((name) => {
+    joints[name] = THREE.MathUtils.lerp(Number(from.joints?.[name] ?? 0), Number(to.joints?.[name] ?? 0), eased);
+  });
+  return {
+    ...to,
+    x: THREE.MathUtils.lerp(from.x || 0, to.x || 0, eased),
+    y: THREE.MathUtils.lerp(from.y || 0, to.y || 0, eased),
+    heading: interpolateAngle(from.heading || 0, to.heading || 0, eased),
+    torsoPitch: THREE.MathUtils.lerp(from.torsoPitch || 0, to.torsoPitch || 0, eased),
+    torsoRoll: THREE.MathUtils.lerp(from.torsoRoll || 0, to.torsoRoll || 0, eased),
+    joints,
+    path: from.path || to.path || [],
+  };
+}
+
 async function loadG1MeshRig() {
   const xmlText = await fetch('/g1/g1.xml').then((response) => {
     if (!response.ok) throw new Error(`G1 rig unavailable (${response.status})`);
@@ -208,7 +239,7 @@ async function loadG1MeshRig() {
   return { robot, joints };
 }
 
-export default function G1Simulation3D({ code, simulatorState, obstacles = [], isPlaying = false }) {
+export default function G1Simulation3D({ code, simulatorState, obstacles = [], isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const framesRef = useRef([]);
@@ -217,12 +248,39 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
   const jointRefs = useRef({});
   const obstacleGroupRef = useRef(null);
   const simulatorStateRef = useRef(simulatorState);
-  const viewRef = useRef({ yaw: 0.55, pitch: 0.62, distance: 7, dragging: false, x: 0, y: 0 });
+  const viewRef = useRef({
+    yaw: 0.55,
+    pitch: 0.62,
+    distance: 7,
+    target: new THREE.Vector3(0, 1.05, 0),
+    focusOffset: new THREE.Vector3(0, 0, 0),
+    pointers: new Map(),
+    pinchDistance: 0,
+    pinchMidpoint: null,
+  });
   const isPlayingRef = useRef(isPlaying);
+  const playbackSpeedRef = useRef(playbackSpeed);
+  const playbackProgressRef = useRef(playbackProgress);
+  const playbackProgressCallbackRef = useRef(onPlaybackProgress);
+  const playbackToggleCallbackRef = useRef(onPlaybackToggle);
+  const [isPlaybackBarOpen, setIsPlaybackBarOpen] = useState(true);
 
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  useEffect(() => {
+    playbackSpeedRef.current = playbackSpeed;
+  }, [playbackSpeed]);
+
+  useEffect(() => {
+    playbackProgressRef.current = playbackProgress;
+  }, [playbackProgress]);
+
+  useEffect(() => {
+    playbackProgressCallbackRef.current = onPlaybackProgress;
+    playbackToggleCallbackRef.current = onPlaybackToggle;
+  }, [onPlaybackProgress, onPlaybackToggle]);
 
   useEffect(() => {
     simulatorStateRef.current = simulatorState;
@@ -244,7 +302,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
         new THREE.CylinderGeometry(Math.max(0.18, obstacle.radius / 12), Math.max(0.26, obstacle.radius / 10), 0.25, 24),
         new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, transparent: true, opacity: 0.72 }),
       );
-      mesh.position.set(obstacle.x / 5, 0.13, -obstacle.y / 5);
+      mesh.position.set(obstacle.x, 0.13, -obstacle.y);
       mesh.castShadow = true;
       group.add(mesh);
     });
@@ -261,6 +319,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
     cameraRef.current = camera;
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.domElement.style.touchAction = 'none';
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     mount.appendChild(renderer.domElement);
@@ -275,11 +334,11 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
     rim.position.set(-4, 3, -3);
     scene.add(rim);
 
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshStandardMaterial({ color: 0x0e1b2a, roughness: 0.85, metalness: 0.1 }));
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(gridSize, gridSize), new THREE.MeshStandardMaterial({ color: 0x0e1b2a, roughness: 0.85, metalness: 0.1 }));
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     scene.add(ground);
-    const grid = new THREE.GridHelper(40, 40, 0x2b6b83, 0x163449);
+    const grid = new THREE.GridHelper(gridSize, Math.round(gridSize), 0x2b6b83, 0x163449);
     grid.position.y = 0.01;
     scene.add(grid);
 
@@ -294,6 +353,15 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
     const obstacleGroup = new THREE.Group();
     obstacleGroupRef.current = obstacleGroup;
     scene.add(obstacleGroup);
+    obstacles.forEach((obstacle) => {
+      const mesh = new THREE.Mesh(
+        new THREE.CylinderGeometry(Math.max(0.18, obstacle.radius / 12), Math.max(0.26, obstacle.radius / 10), 0.25, 24),
+        new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, transparent: true, opacity: 0.72 }),
+      );
+      mesh.position.set(obstacle.x, 0.13, -obstacle.y);
+      mesh.castShadow = true;
+      obstacleGroup.add(mesh);
+    });
 
     const built = createRobot();
     robotRef.current = built.robot;
@@ -332,65 +400,122 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
 
     const updateCamera = () => {
       const view = viewRef.current;
+      if (robotRef.current) {
+        view.target.x = robotRef.current.position.x + view.focusOffset.x;
+        view.target.z = robotRef.current.position.z + view.focusOffset.z;
+      }
       camera.position.set(
-        Math.sin(view.yaw) * Math.cos(view.pitch) * view.distance,
-        Math.sin(view.pitch) * view.distance + 1.1,
-        Math.cos(view.yaw) * Math.cos(view.pitch) * view.distance,
+        view.target.x + Math.sin(view.yaw) * Math.cos(view.pitch) * view.distance,
+        view.target.y + Math.sin(view.pitch) * view.distance,
+        view.target.z + Math.cos(view.yaw) * Math.cos(view.pitch) * view.distance,
       );
-      camera.lookAt(0, 1.05, 0);
+      camera.lookAt(view.target);
     };
     updateCamera();
 
     const onPointerDown = (event) => {
-      viewRef.current.dragging = true;
-      viewRef.current.x = event.clientX;
-      viewRef.current.y = event.clientY;
+      const view = viewRef.current;
+      view.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
       renderer.domElement.setPointerCapture?.(event.pointerId);
+      if (view.pointers.size === 2) {
+        const points = [...view.pointers.values()];
+        view.pinchDistance = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+        view.pinchMidpoint = {
+          x: (points[0].x + points[1].x) / 2,
+          y: (points[0].y + points[1].y) / 2,
+        };
+      }
     };
     const onPointerMove = (event) => {
       const view = viewRef.current;
-      if (!view.dragging) return;
-      view.yaw -= (event.clientX - view.x) * 0.008;
-      view.pitch = Math.max(0.2, Math.min(1.35, view.pitch + (event.clientY - view.y) * 0.006));
-      view.x = event.clientX;
-      view.y = event.clientY;
+      if (!view.pointers.has(event.pointerId)) return;
+      const previous = view.pointers.get(event.pointerId);
+      view.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+      if (view.pointers.size >= 2) {
+        const points = [...view.pointers.values()];
+        const midpoint = {
+          x: (points[0].x + points[1].x) / 2,
+          y: (points[0].y + points[1].y) / 2,
+        };
+        const pinchDistance = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+        const width = renderer.domElement.clientWidth || 1;
+        const zoomRatio = view.pinchDistance ? view.pinchDistance / Math.max(1, pinchDistance) : 1;
+        view.distance = Math.max(3.4, Math.min(12, view.distance * zoomRatio));
+        if (view.pinchMidpoint) {
+          const deltaX = midpoint.x - view.pinchMidpoint.x;
+          const deltaY = midpoint.y - view.pinchMidpoint.y;
+          const panScale = view.distance / width;
+          const right = new THREE.Vector3(Math.cos(view.yaw), 0, -Math.sin(view.yaw));
+          const forward = new THREE.Vector3(Math.sin(view.yaw), 0, Math.cos(view.yaw));
+          view.focusOffset.addScaledVector(right, -deltaX * panScale * 0.9);
+          view.focusOffset.addScaledVector(forward, deltaY * panScale * 0.9);
+        }
+        view.pinchDistance = pinchDistance;
+        view.pinchMidpoint = midpoint;
+      } else {
+        const deltaX = event.clientX - previous.x;
+        const deltaY = event.clientY - previous.y;
+        view.yaw -= deltaX * 0.008;
+        view.pitch = Math.max(0.2, Math.min(1.35, view.pitch + deltaY * 0.006));
+      }
       updateCamera();
     };
-    const onPointerUp = () => { viewRef.current.dragging = false; };
+    const onPointerUp = (event) => {
+      const view = viewRef.current;
+      view.pointers.delete(event.pointerId);
+      if (view.pointers.size < 2) {
+        view.pinchDistance = 0;
+        view.pinchMidpoint = null;
+      }
+    };
     const onWheel = (event) => {
-      viewRef.current.distance = Math.max(3.8, Math.min(11, viewRef.current.distance + event.deltaY * 0.008));
+      const zoomFactor = Math.exp(event.deltaY * 0.0012);
+      viewRef.current.distance = Math.max(2.5, Math.min(30, viewRef.current.distance * zoomFactor));
       updateCamera();
     };
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
+    renderer.domElement.addEventListener('pointercancel', onPointerUp);
     renderer.domElement.addEventListener('pointerleave', onPointerUp);
     renderer.domElement.addEventListener('wheel', onWheel, { passive: true });
 
     const clock = new THREE.Clock();
     const animate = () => {
-      const elapsed = clock.getElapsedTime();
+      const delta = Math.min(clock.getDelta(), 0.05);
       const frames = framesRef.current;
-      const frameIndex = frames.length && isPlayingRef.current ? Math.floor(elapsed * 2.2) % frames.length : Math.max(0, frames.length - 1);
-      const frame = frames[frameIndex] || simulatorStateRef.current;
+      let frame = frames[frames.length - 1] || simulatorStateRef.current;
+      if (frames.length) {
+        if (frames.length > 1 && isPlayingRef.current) {
+          playbackProgressRef.current = Math.min(1, playbackProgressRef.current + (delta * playbackSpeedRef.current * 30) / (frames.length - 1));
+          playbackProgressCallbackRef.current?.(playbackProgressRef.current);
+          if (playbackProgressRef.current >= 1) playbackToggleCallbackRef.current?.(false);
+        }
+        const framePosition = playbackProgressRef.current * Math.max(0, frames.length - 1);
+        const frameIndex = Math.min(frames.length - 1, Math.floor(framePosition));
+        const nextIndex = Math.min(frames.length - 1, frameIndex + 1);
+        frame = interpolateSimulationFrame(frames[frameIndex], frames[nextIndex], framePosition - frameIndex);
+      }
       if (robotRef.current && frame) {
-        robotRef.current.position.set((frame.x || 0) / 5, 0, -(frame.y || 0) / 5);
-        robotRef.current.rotation.y = THREE.MathUtils.degToRad(-(frame.heading || 0));
+        robotRef.current.position.set(frame.x || 0, 0, -(frame.y || 0));
+        robotRef.current.rotation.y = THREE.MathUtils.degToRad((frame.heading || 0) - 90);
         Object.entries(jointRefs.current).forEach(([name, group]) => {
           const normalizedName = name.replace('_joint', '');
           const stateName = normalizedName.endsWith('_knee') ? `${normalizedName}_pitch` : normalizedName;
-          const value = Number(frame.joints?.[name] ?? frame.joints?.[normalizedName] ?? frame.joints?.[stateName] ?? 0);
+          const value = Number(frame.joints?.[normalizedName] ?? frame.joints?.[stateName] ?? frame.joints?.[name] ?? 0);
           const axis = JOINT_AXES[normalizedName] || (normalizedName.includes('pitch') ? 'x' : 'y');
           group.rotation[axis] = THREE.MathUtils.degToRad(value);
         });
         const path = frame.path || [];
-        pathLine.geometry.setFromPoints(path.map((point) => new THREE.Vector3(point.x / 5, 0.035, -point.y / 5)));
+        pathLine.geometry.setFromPoints(path.map((point) => new THREE.Vector3(point.x, 0.035, -point.y)));
         if (frame.goal) {
           goal.visible = true;
-          goal.position.set(frame.goal.x / 5, 0.03, -frame.goal.y / 5);
+          goal.position.set(frame.goal.x, 0.03, -frame.goal.y);
         } else {
           goal.visible = false;
         }
+        updateCamera();
       }
       renderer.render(scene, camera);
       animationFrame = requestAnimationFrame(animate);
@@ -404,17 +529,48 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('pointercancel', onPointerUp);
       renderer.domElement.removeEventListener('pointerleave', onPointerUp);
       renderer.domElement.removeEventListener('wheel', onWheel);
       renderer.dispose();
       mount.removeChild(renderer.domElement);
     };
-  }, []);
+  }, [gridSize]);
 
   return (
-    <div ref={mountRef} className="absolute inset-0 overflow-hidden" aria-label={`Live ${G1_EDU_23_ENV.robotType} 3D simulation`}>
+    <div ref={mountRef} className="absolute inset-0 overflow-hidden touch-none" aria-label={`Live ${G1_EDU_23_ENV.robotType} 3D simulation`}>
       <div className="pointer-events-none absolute left-4 top-4 rounded-lg border border-cyan-300/20 bg-slate-950/55 px-3 py-2 text-[10px] uppercase tracking-[0.16em] text-cyan-100 backdrop-blur-sm">
         Live G1 23-DoF simulation
+      </div>
+      <div className={`absolute bottom-4 left-4 right-4 z-30 transition-transform ${isPlaybackBarOpen ? '' : 'translate-y-[calc(100%-2.5rem)]'}`}>
+        <div className="overflow-hidden rounded-xl border border-cyan-200/20 bg-slate-950/80 shadow-2xl backdrop-blur-md">
+          <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2">
+            <button type="button" onClick={() => setIsPlaybackBarOpen((value) => !value)} className="rounded-md p-1 text-slate-300 hover:bg-white/10" aria-label={isPlaybackBarOpen ? 'Collapse playback controls' : 'Expand playback controls'}>
+              {isPlaybackBarOpen ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+            </button>
+            <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-100">Motion playback</span>
+            <span className="ml-auto text-[10px] text-slate-400">{Math.round(playbackProgress * 100)}%</span>
+          </div>
+          {isPlaybackBarOpen && (
+            <div className="space-y-2 px-3 py-2">
+              <div className="flex items-center gap-3">
+                <button type="button" onClick={() => onPlaybackToggle?.(!isPlaying)} className="rounded-md bg-cyan-400 p-2 text-slate-950 hover:bg-cyan-300" aria-label={isPlaying ? 'Pause simulation' : 'Play simulation'}>
+                  {isPlaying ? <Pause size={15} fill="currentColor" /> : <Play size={15} fill="currentColor" />}
+                </button>
+                <button type="button" onClick={() => onPlaybackReset?.()} className="rounded-md bg-slate-800 p-2 text-slate-200 hover:bg-slate-700" aria-label="Reset simulation playback">
+                  <RotateCcw size={15} />
+                </button>
+                <input aria-label="Motion timeline" type="range" min="0" max="1" step="0.001" value={playbackProgress} onChange={(event) => onPlaybackProgress?.(Number(event.target.value))} className="min-w-0 flex-1 accent-cyan-400" />
+              </div>
+              <div className="flex items-center gap-2 text-[10px] text-slate-300">
+                <label htmlFor="motion-playback-speed" className="font-semibold uppercase tracking-wide text-cyan-100">Speed</label>
+                <input id="motion-playback-speed" aria-label="Motion playback speed" type="range" min="0.1" max="3" step="0.1" value={playbackSpeed} onChange={(event) => onPlaybackSpeedChange?.(Number(event.target.value))} className="min-w-0 flex-1 accent-cyan-400" />
+                <input aria-label="Motion playback speed value" type="number" min="0.1" max="3" step="0.1" value={playbackSpeed.toFixed(1)} onChange={(event) => onPlaybackSpeedChange?.(event.target.value)} className="w-14 rounded border border-white/15 bg-slate-900 px-1.5 py-1 text-right text-[10px] text-white" />
+                <span className="text-slate-400">x</span>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

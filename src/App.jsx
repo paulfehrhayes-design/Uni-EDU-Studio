@@ -608,12 +608,12 @@ export default function App() {
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
   const [generatedCode, setGeneratedCode] = useState("");
+  const generatedCodeRef = useRef('');
   const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_ROBOT_CONFIG_EN, null, 2));
   
   const [activeMenu, setActiveMenu] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
-  const [isCodeOpen, setIsCodeOpen] = useState(false);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
   const [promptState, setPromptState] = useState({ isOpen: false, message: '', defaultValue: '', callback: null, inputValue: '' });
@@ -622,18 +622,22 @@ export default function App() {
   // 运行状态管理
   const [isRunning, setIsRunning] = useState(false);
   const [mainTab, setMainTab] = useState('blocks');
-  const [toolPanelWidth, setToolPanelWidth] = useState(420);
+  const [toolPanelRect, setToolPanelRect] = useState({ top: 12, right: 16, width: 520, height: 760 });
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
+  const toolPanelInteractionRef = useRef(null);
   const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
   const [motionPrompt, setMotionPrompt] = useState('Walk forward 3 steps, turn left 90 degrees, then wave');
   const [motionPromptResult, setMotionPromptResult] = useState(null);
+  const [motionPromptStatus, setMotionPromptStatus] = useState('local');
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
-  const [simulatorChallenge, setSimulatorChallenge] = useState('simple-path');
   const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
   const [sceneObjects, setSceneObjects] = useState([]);
   const [projectName, setProjectName] = useState('default');
   const [projectLibrary, setProjectLibrary] = useState([]);
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
+  const [playbackProgress, setPlaybackProgress] = useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [gridSize, setGridSize] = useState(20);
   const [plannerWaypoints, setPlannerWaypoints] = useState([
     { id: 'planner-1', x: -8, y: 0 },
     { id: 'planner-2', x: 0, y: 10 },
@@ -664,6 +668,10 @@ export default function App() {
 
   const t = UI_TEXT[lang];
   const sceneObjectsKey = session?.user?.username ? `edu-scene-objects:${session.user.username}` : 'edu-scene-objects';
+
+  useEffect(() => {
+    generatedCodeRef.current = generatedCode;
+  }, [generatedCode]);
   const insertRobotCommandWithValue = (commandType, defaultValue = 3, unitLabel = 'steps') => {
     const valueText = window.prompt(`Enter ${unitLabel}:`, String(defaultValue));
     if (valueText === null) return;
@@ -719,10 +727,10 @@ export default function App() {
 
   const overlayTabs = [
     { id: 'blocks', label: 'Blocks' },
-    { id: 'planner', label: 'Motion Planner' },
-    { id: 'prompt', label: 'Prompt to Motion' },
-    { id: 'camera', label: 'Camera Motion Tracker' },
     { id: 'ide', label: 'IDE' },
+    { id: 'planner', label: 'Path Planner' },
+    { id: 'prompt', label: 'Prompt to Motion' },
+    { id: 'camera', label: 'Vision to Motion' },
   ];
 
   const apiFetch = async (url, options = {}) => {
@@ -961,11 +969,20 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      window.Blockly = Object.assign({}, Blockly, { Python: pythonGenerator });
-      window.Blockly.setLocale(lang === 'zh' ? Zh : En);
-      window.Blockly.Msg["PROCEDURES_DEFNORETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
-      window.Blockly.Msg["PROCEDURES_DEFRETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
-      setIsBlocklyLoaded(true);
+      try {
+        window.Blockly = Object.assign({}, Blockly, { Python: pythonGenerator });
+        if (typeof window.Blockly.setLocale === 'function') {
+          window.Blockly.setLocale(lang === 'zh' ? Zh : En);
+        }
+        if (window.Blockly.Msg) {
+          window.Blockly.Msg["PROCEDURES_DEFNORETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
+          window.Blockly.Msg["PROCEDURES_DEFRETURN_TITLE"] = lang === 'zh' ? "功能名称：" : "Function Name:";
+        }
+      } catch (error) {
+        console.error('Blockly startup configuration failed; continuing with default locale.', error);
+      } finally {
+        setIsBlocklyLoaded(true);
+      }
     }
   }, [lang]);
 
@@ -1112,7 +1129,7 @@ export default function App() {
   }, [lang]);
 
   useEffect(() => {
-    if (!isBlocklyLoaded || !blocklyDiv.current) return;
+    if (!isBlocklyLoaded || mainTab !== 'blocks' || !blocklyDiv.current) return;
     
     Blockly.dialog.setPrompt(function(message, defaultValue, callback) {
       setPromptState({ isOpen: true, message, defaultValue, inputValue: defaultValue, callback });
@@ -1172,12 +1189,17 @@ export default function App() {
           } catch(e) {}
         };
         workspaceRef.current.addChangeListener(updateCode);
+        setTimeout(() => {
+          if (workspaceRef.current && generatedCodeRef.current.trim()) {
+            syncBlocksFromGeneratedCode(generatedCodeRef.current);
+          }
+        }, 150);
     }, 100);
     
     return () => {
       if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
     };
-  }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang]);
+  }, [isBlocklyLoaded, mainTab, registerBlocks, generateToolboxXML, robotConfig, lang]);
 
   const handleApplyConfig = () => { try { setRobotConfig(JSON.parse(configText)); setShowConfigEditor(false); } catch (e) { alert("JSON Error: " + e.message); } };
   const handleImportConfig = (e) => { const r = new FileReader(); r.onload = (ev) => setConfigText(ev.target.result); if(e.target.files[0]) r.readAsText(e.target.files[0]); };
@@ -1256,6 +1278,7 @@ export default function App() {
       alert('Add at least two waypoints before compiling a motion path.');
       return;
     }
+    if (generatedCode.trim() && !window.confirm('Compiling this path will replace the current Blocks and IDE code. Continue?')) return;
 
     const ordered = [...plannerWaypoints].sort((a, b) => a.x - b.x || a.y - b.y);
     const commands = ['robot.stand();', 'robot.wait(0.5);'];
@@ -1297,50 +1320,53 @@ export default function App() {
     }
   };
 
-  const challengeConfig = useMemo(
-    () => G1_EDU_23_ENV.challengeLayouts[simulatorChallenge] || G1_EDU_23_ENV.challengeLayouts['simple-path'],
-    [simulatorChallenge],
-  );
-  const activeObstacles = useMemo(
-    () => (currentUser.role === 'teacher'
-      ? challengeConfig.obstacles
-      : [...challengeConfig.obstacles, ...sceneObjects]),
-    [challengeConfig, currentUser.role, sceneObjects],
-  );
+  const activeObstacles = useMemo(() => sceneObjects, [sceneObjects]);
 
   const previewPreviewState = useCallback(() => {
     const state = simulateG1Edu23Program(generatedCode, {
       mode: simulatorMode,
       obstacles: activeObstacles,
-      challenge: challengeConfig,
     });
     setSimulatorState(state);
-  }, [generatedCode, simulatorMode, challengeConfig, activeObstacles]);
+  }, [generatedCode, simulatorMode, activeObstacles]);
 
   useEffect(() => {
-    if (!isPreviewPlaying) return;
-    const interval = setInterval(() => {
-      previewPreviewState();
-    }, 700);
-    return () => clearInterval(interval);
-  }, [isPreviewPlaying, previewPreviewState]);
+    setPlaybackProgress(0);
+    setIsPreviewPlaying(false);
+  }, [generatedCode]);
 
   const startSimulationPreview = () => {
     if (!generatedCode.trim()) {
       alert('Add some robot commands before starting the simulation preview.');
       return;
     }
+    setPlaybackProgress((progress) => progress >= 1 ? 0 : progress);
     setIsPreviewPlaying(true);
     previewPreviewState();
   };
 
   const pauseSimulationPreview = () => {
     setIsPreviewPlaying(false);
-    setSimulatorState(simulateG1Edu23Program(generatedCode, {
-      mode: simulatorMode,
-      obstacles: activeObstacles,
-      challenge: challengeConfig,
-    }));
+  };
+
+  const resetSimulationPreview = () => {
+    setIsPreviewPlaying(false);
+    setPlaybackProgress(0);
+  };
+
+  const handleRunSimulation = () => {
+    if (!generatedCode.trim()) {
+      alert('Add code or blocks before running the simulation.');
+      return;
+    }
+    setPlaybackProgress(0);
+    setIsPreviewPlaying(true);
+  };
+
+  const handlePlaybackSpeedChange = (value) => {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return;
+    setPlaybackSpeed(Math.min(3, Math.max(0.1, Math.round(numericValue * 10) / 10)));
   };
 
   const syncBlocksFromGeneratedCode = useCallback((code) => {
@@ -1469,7 +1495,7 @@ export default function App() {
     });
 
     if (workspace.getAllBlocks().length) {
-      workspace.centerOnBlocks();
+      workspace.zoomToFit(0.8);
     }
   }, []);
 
@@ -1483,11 +1509,31 @@ export default function App() {
     }
   }, [syncBlocksFromGeneratedCode]);
 
-  const generateMotionFromPrompt = () => {
-    const result = compileMotionPrompt(motionPrompt);
-    setMotionPromptResult(result);
-    if (result.code) {
-      updateGeneratedCode(result.code);
+  const applyMotionPromptResult = (promptText, source) => {
+    const result = compileMotionPrompt(promptText);
+    setMotionPromptResult({ ...result, source });
+    if (result.code) updateGeneratedCode(result.code);
+  };
+
+  const generateMotionFromPrompt = async (useHuggingFace = false) => {
+    if (generatedCode.trim() && !window.confirm('Generating this motion will replace the current Blocks and IDE code. Continue?')) return;
+    setMotionPromptStatus(useHuggingFace ? 'loading' : 'local');
+    if (!useHuggingFace) {
+      applyMotionPromptResult(motionPrompt, 'Local safe compiler');
+      return;
+    }
+
+    try {
+      const response = await apiFetch('/api/hf/text-to-motion', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: motionPrompt }),
+      });
+      setMotionPrompt(response.text);
+      applyMotionPromptResult(response.text, `Hugging Face: ${response.model}`);
+      setMotionPromptStatus('hf');
+    } catch (error) {
+      applyMotionPromptResult(motionPrompt, 'Local fallback');
+      setMotionPromptStatus('fallback');
     }
   };
 
@@ -1518,15 +1564,11 @@ export default function App() {
   };
 
   useEffect(() => {
-    setSimulatorState(simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles, challenge: challengeConfig }));
-  }, [generatedCode, simulatorMode, challengeConfig, activeObstacles]);
+    setSimulatorState(simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles }));
+  }, [generatedCode, simulatorMode, activeObstacles]);
 
   const applyMotionTemplate = (template) => {
     updateGeneratedCode(template.code);
-  };
-
-  const handleChallengeChange = (challengeKey) => {
-    setSimulatorChallenge(challengeKey);
   };
 
   const addStudentObstacle = (type = 'box') => {
@@ -1555,15 +1597,21 @@ export default function App() {
 
   const obstacleDragRef = useRef(null);
   const plannerDragRef = useRef(null);
+  const sceneOrigin = 110;
+  const sceneScale = 220 / gridSize;
+  const sceneX = (meters) => sceneOrigin + meters * sceneScale;
+  const sceneY = (meters) => sceneOrigin - meters * sceneScale;
 
   const getSvgCoords = (event) => {
     const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
     const rect = svg.getBoundingClientRect();
-    const localX = (event.clientX - rect.left - 110) / 1.5;
-    const localY = (110 - (event.clientY - rect.top - 110) / 1.5);
+    const svgX = ((event.clientX - rect.left) / rect.width) * 220;
+    const svgY = ((event.clientY - rect.top) / rect.height) * 220;
+    const localX = (svgX - sceneOrigin) / sceneScale;
+    const localY = (sceneOrigin - svgY) / sceneScale;
     return {
-      x: Math.max(-35, Math.min(35, localX)),
-      y: Math.max(-35, Math.min(35, localY)),
+      x: Math.max(-gridSize / 2, Math.min(gridSize / 2, localX)),
+      y: Math.max(-gridSize / 2, Math.min(gridSize / 2, localY)),
     };
   };
 
@@ -1617,6 +1665,58 @@ export default function App() {
       fileInputRef.current.click();
     }
     setActiveMenu(null);
+  };
+
+  const beginToolPanelInteraction = (event, mode) => {
+    if (toolPanelCollapsed) return;
+    event.preventDefault();
+    event.stopPropagation();
+    toolPanelInteractionRef.current = {
+      mode,
+      startX: event.clientX,
+      startY: event.clientY,
+      rect: { ...toolPanelRect },
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+
+  const updateToolPanelInteraction = (event) => {
+    const interaction = toolPanelInteractionRef.current;
+    if (!interaction) return;
+
+    const deltaX = event.clientX - interaction.startX;
+    const deltaY = event.clientY - interaction.startY;
+    const nextRect = { ...interaction.rect };
+    const minimumWidth = 320;
+    const minimumHeight = 360;
+    const maximumWidth = Math.max(minimumWidth, window.innerWidth - 32);
+    const maximumHeight = Math.max(minimumHeight, window.innerHeight - 110);
+
+    if (interaction.mode === 'move') {
+      nextRect.right = Math.max(8, interaction.rect.right - deltaX);
+      nextRect.top = Math.max(8, interaction.rect.top + deltaY);
+    } else {
+      if (interaction.mode.includes('left')) {
+        nextRect.width = Math.min(maximumWidth, Math.max(minimumWidth, interaction.rect.width - deltaX));
+        nextRect.right = Math.max(8, interaction.rect.right + deltaX);
+      }
+      if (interaction.mode.includes('right')) {
+        nextRect.width = Math.min(maximumWidth, Math.max(minimumWidth, interaction.rect.width + deltaX));
+      }
+      if (interaction.mode.includes('top')) {
+        nextRect.height = Math.min(maximumHeight, Math.max(minimumHeight, interaction.rect.height - deltaY));
+        nextRect.top = Math.max(8, interaction.rect.top + deltaY);
+      }
+      if (interaction.mode.includes('bottom')) {
+        nextRect.height = Math.min(maximumHeight, Math.max(minimumHeight, interaction.rect.height + deltaY));
+      }
+    }
+
+    setToolPanelRect(nextRect);
+  };
+
+  const endToolPanelInteraction = () => {
+    toolPanelInteractionRef.current = null;
   };
 
   if (!session) {
@@ -1727,7 +1827,7 @@ export default function App() {
 
   if (!isBlocklyLoaded) return <div className="flex h-screen items-center justify-center bg-gray-50 flex-col gap-4"><Loader2 className="animate-spin text-blue-600" size={48} /><p className="text-gray-500 font-medium">{UI_TEXT.en.loading}</p></div>;
 
-  const robotAnchor = { x: 110 + simulatorState.x * 1.5, y: 110 - simulatorState.y * 1.5 };
+  const robotAnchor = { x: sceneX(simulatorState.x), y: sceneY(simulatorState.y) };
   const robotJoints = simulatorState.joints || {};
   const toRadians = (degrees) => (degrees * Math.PI) / 180;
   const armLen = 22;
@@ -1832,6 +1932,25 @@ export default function App() {
           -ms-overflow-style: none;
           scrollbar-width: none;
         }
+        .blocklyToolbox {
+          background-color: #f8fafc !important;
+          color: #334155 !important;
+        }
+        .blocklyToolboxCategoryLabel,
+        .blocklyToolboxCategoryLabelText {
+          color: #334155 !important;
+          font-weight: 600;
+        }
+        .blocklyToolboxCategory:hover,
+        .blocklyToolboxCategory[aria-selected="true"] {
+          background-color: #e2e8f0 !important;
+        }
+        .blocklyFlyout {
+          background-color: #f8fafc !important;
+        }
+        .blocklyFlyoutLabelText {
+          fill: #334155 !important;
+        }
         .blocklyToolboxDiv::-webkit-scrollbar {
           display: none;
         }
@@ -1920,7 +2039,7 @@ export default function App() {
           {[
             { id: 'file', label: t.menuFile, content: <><MenuItem label={t.actNew} icon={FileText} onClick={() => { handleClear(); setActiveMenu(null); }} /><MenuItem label={t.actOpen} icon={FolderOpen} onClick={handleOpenProjectClick} /><MenuItem label={t.actSave} icon={Save} onClick={() => { saveProject(); setActiveMenu(null); }} /><div className="h-px bg-gray-200 my-1"></div><MenuItem label={t.actExportPy} icon={Download} onClick={() => { downloadPython(); setActiveMenu(null); }} /></> },
             { id: 'edit', label: t.menuEdit, content: <><MenuItem label={t.actUndo} icon={Undo} shortcut="Ctrl+Z" onClick={() => { handleUndo(); setActiveMenu(null); }} /><MenuItem label={t.actRedo} icon={Redo} shortcut="Ctrl+Y" onClick={() => { handleRedo(); setActiveMenu(null); }} /></> },
-            { id: 'view', label: t.menuView, content: <><MenuItem label={t.actToggleCode} icon={Sidebar} onClick={() => { setIsCodeOpen(!isCodeOpen); setActiveMenu(null); }} /></> },
+            { id: 'view', label: t.menuView, content: <><MenuItem label="Open IDE" icon={Code} onClick={() => { setMainTab('ide'); setActiveMenu(null); }} /></> },
             { id: 'help', label: t.menuHelp, content: <><MenuItem label={t.actAbout} icon={Info} onClick={() => { setShowAbout(true); setActiveMenu(null); }} /></> }
           ].map(menu => (
             <div key={menu.id} className="relative h-full"><button className={`h-full px-3 hover:bg-gray-200 transition-colors ${activeMenu === menu.id ? 'bg-gray-200 text-blue-700' : 'text-gray-700'}`} onClick={(e) => { e.stopPropagation(); setActiveMenu(activeMenu === menu.id ? null : menu.id); }}>{menu.label}</button>{activeMenu === menu.id && (<div className="absolute top-full left-0 w-56 bg-white border shadow-xl rounded-b-lg rounded-r-lg py-1 z-50 animate-in fade-in zoom-in-95 duration-100" onClick={e => e.stopPropagation()}>{menu.content}</div>)}</div>
@@ -1930,42 +2049,9 @@ export default function App() {
         <button onClick={toggleLanguage} className="flex items-center gap-1 text-xs text-gray-500 hover:text-blue-600 px-3 transition-colors"><Globe size={12} /> {lang === 'zh' ? 'English' : '中文'}</button>
       </div>
 
-      <div className="h-12 bg-white border-b flex items-center px-4 gap-2 z-30 shadow-sm">
-        <button onClick={() => setShowConfigEditor(true)} className="p-2 text-gray-600 hover:bg-blue-50 hover:text-blue-600 rounded transition-colors" title={t.configTitle}><Settings size={20} /></button>
-        <div className="w-px h-6 bg-gray-200 mx-1"></div>
-        <button onClick={handleUndo} className="p-2 text-gray-600 hover:bg-gray-100 rounded transition-colors" title={t.actUndo}><Undo size={20} /></button>
-        <button onClick={handleRedo} className="p-2 text-gray-600 hover:bg-gray-100 rounded transition-colors" title={t.actRedo}><Redo size={20} /></button>
-        <div className="w-px h-6 bg-gray-200 mx-1"></div>
-        {currentUser.role === 'teacher' ? (
-          <>
-            <button onClick={handleRunNext} className="flex items-center gap-2 px-3 py-1.5 text-white bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium">Run Next</button>
-            <button onClick={handleStopCurrent} className="flex items-center gap-2 px-3 py-1.5 text-white bg-amber-500 hover:bg-amber-600 rounded text-sm font-medium">Pause</button>
-            <button onClick={handleClearQueue} className="flex items-center gap-2 px-3 py-1.5 text-white bg-red-500 hover:bg-red-600 rounded text-sm font-medium">Clear Queue</button>
-          </>
-        ) : (
-          <>
-            <button onClick={handleSaveCodeToAccount} className="flex items-center gap-2 px-3 py-1.5 text-white bg-emerald-600 hover:bg-emerald-700 rounded text-sm font-medium">Save</button>
-            <button onClick={handleSubmitToQueue} className="flex items-center gap-2 px-3 py-1.5 text-white bg-violet-600 hover:bg-violet-700 rounded text-sm font-medium">Submit</button>
-          </>
-        )}
-        <button onClick={handleRunCode} className={`flex items-center gap-2 px-4 py-1.5 text-white rounded font-medium text-sm transition-colors shadow-sm ${isRunning ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`} title={isRunning ? t.btnStop : t.btnRun}>
-          {isRunning ? <Square size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />} {isRunning ? t.btnStop : t.btnRun}
-        </button>
-        <button onClick={() => setIsSimulatorOpen(true)} className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded border border-slate-200 bg-white text-slate-600 hover:bg-slate-50" title="Open simulator">
-          <Globe size={16} /> Simulator
-        </button>
-        <div className="flex-1"></div>
-        <div className="flex items-center gap-2 text-xs text-slate-500">
-          <span className="rounded-full bg-slate-100 px-2 py-1 font-medium">{currentUser.role}</span>
-          <span>{currentUser.username}</span>
-          <button onClick={handleLogout} className="px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">Logout</button>
-        </div>
-        <button onClick={() => setIsCodeOpen(!isCodeOpen)} className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded border transition-all ${isCodeOpen ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'}`}><Code size={16} />{isCodeOpen ? 'Hide Code' : 'Show Code'}</button>
-      </div>
-
       {isSimulatorOpen && (
       <div className="fixed inset-0 z-50 bg-slate-950/20" onClick={() => setIsSimulatorOpen(false)}>
-      <div className="absolute right-4 top-24 z-10 flex max-h-[calc(100vh-7rem)] w-[min(360px,calc(100vw-2rem))] flex-col gap-3 overflow-auto" onClick={(event) => event.stopPropagation()}>
+      <div className="absolute right-4 top-24 z-10 flex max-h-[calc(100vh-7rem)] w-[min(360px,calc(100vw-2rem))] flex-col gap-3 overflow-y-auto overscroll-contain pr-1" onClick={(event) => event.stopPropagation()}>
         <div className="max-h-[420px] overflow-auto rounded-xl border border-slate-200 bg-white shadow-xl">
           <div className="border-b border-slate-200 p-3 bg-slate-50 flex items-center justify-between">
             <h3 className="font-semibold text-slate-800">{currentUser.role === 'teacher' ? 'Teacher Queue' : 'My Saved Code'}</h3>
@@ -2006,6 +2092,12 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <button type="button" onClick={handleRunNext} className="rounded-lg bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-700">Run next</button>
+                  <button type="button" onClick={handleStopCurrent} className="rounded-lg bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 hover:bg-amber-400">Pause</button>
+                  <button type="button" onClick={handleClearQueue} className="rounded-lg bg-red-500 px-2 py-2 text-[10px] font-semibold text-white hover:bg-red-600">Clear queue</button>
                 </div>
               </>
             )}
@@ -2051,7 +2143,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className="rounded-xl border border-slate-200 bg-white shadow-xl overflow-hidden">
+        <div className="flex max-h-[calc(100vh-8rem)] min-h-0 flex-col rounded-xl border border-slate-200 bg-white shadow-xl">
           <div className="border-b border-slate-200 bg-slate-50 p-3 flex items-center justify-between">
             <div>
               <h3 className="font-semibold text-slate-800">{G1_EDU_23_ENV.robotType} Internal Simulator</h3>
@@ -2080,7 +2172,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="p-3 space-y-3">
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-3">
             {simulatorSidebarTab === 'add-object' && (
               <>
                 <div className="grid grid-cols-3 gap-2">
@@ -2097,21 +2189,6 @@ export default function App() {
                   ))}
                 </div>
 
-                <div className="rounded-lg border border-slate-200 bg-white p-2">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-500 mb-2">Teacher challenge</p>
-                  <div className="grid grid-cols-2 gap-2">
-                    {Object.entries(G1_EDU_23_ENV.challengeLayouts).map(([key, challenge]) => (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => handleChallengeChange(key)}
-                        className={`rounded-md px-2 py-1.5 text-[10px] font-medium ${simulatorChallenge === key ? 'bg-emerald-600 text-white' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
-                      >
-                        {challenge.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
               </>
             )}
 
@@ -2154,7 +2231,7 @@ export default function App() {
                 </div>
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[10px] text-slate-600">
                   <p className="font-semibold uppercase tracking-wide text-slate-500">Planner instructions</p>
-                  <p className="mt-2">Place and drag waypoints in the scene. Compile creates robot walk commands that update the IDE and block output.</p>
+                      <p className="mt-2">Each grid square is 1 m. Place and drag waypoints in the scene. Compile creates robot walk commands that update the IDE and block output.</p>
                 </div>
                 {plannerWaypoints.length === 0 ? (
                   <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">No waypoints yet.</p>
@@ -2201,34 +2278,30 @@ export default function App() {
 
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[11px] text-slate-600">
                   <div className="flex items-center justify-between"><span>Robot</span><span className="font-medium text-slate-700">{G1_EDU_23_ENV.robotType}</span></div>
+                  <div className="mt-2 flex items-center justify-between"><span>Grid cells</span><span className="font-medium text-slate-700">1 m x 1 m</span></div>
                   <div className="mt-2 flex items-center justify-between"><span>Goal</span><span className="font-medium text-slate-700">{simulatorState.goal ? `${simulatorState.goal.x.toFixed(1)}, ${simulatorState.goal.y.toFixed(1)}` : 'None'}</span></div>
                   <div className="mt-2 flex items-center justify-between"><span>Collisions</span><span className="font-medium text-slate-700">{simulatorState.collisions || 0}</span></div>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-white p-2 text-[10px] text-slate-600">
+                  <label className="flex items-center justify-between font-semibold">
+                    <span>Grid size</span>
+                    <span>{gridSize} m x {gridSize} m</span>
+                  </label>
+                  <input type="range" min="10" max="80" step="1" value={gridSize} onChange={(event) => setGridSize(Number(event.target.value))} className="mt-2 w-full accent-blue-600" />
+                  <label className="mt-3 flex items-center justify-between font-semibold">
+                    <span>Simulation speed</span>
+                    <span>{playbackSpeed.toFixed(1)}x</span>
+                  </label>
+                  <input type="range" min="0.1" max="3" step="0.1" value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))} className="mt-2 w-full accent-cyan-600" />
+                  <p className="mt-2 text-[10px] text-slate-500">Speed changes timing only. Distances remain in meters.</p>
                 </div>
               </div>
             )}
 
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={startSimulationPreview}
-                className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold ${isPreviewPlaying ? 'bg-slate-200 text-slate-600' : 'bg-emerald-600 text-white hover:bg-emerald-700'}`}
-                disabled={isPreviewPlaying}
-              >
-                Play sim
-              </button>
-              <button
-                type="button"
-                onClick={pauseSimulationPreview}
-                className={`flex-1 rounded-lg px-2 py-1.5 text-[10px] font-semibold ${isPreviewPlaying ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-              >
-                Pause sim
-              </button>
-            </div>
-
             <div className="rounded-xl border border-slate-200 bg-slate-100 p-2">
-              <svg viewBox="0 0 220 220" className="w-full h-40 block" onPointerMove={handleObstaclePointerMove} onPointerUp={handleObstaclePointerUp} onPointerLeave={handleObstaclePointerUp}>
+              <svg viewBox="0 0 220 220" className="block aspect-square w-full" onPointerMove={handleObstaclePointerMove} onPointerUp={handleObstaclePointerUp} onPointerLeave={handleObstaclePointerUp}>
                 <defs>
-                  <pattern id="grid-pattern" width="20" height="20" patternUnits="userSpaceOnUse">
+                  <pattern id="grid-pattern" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
                     <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
                   </pattern>
                 </defs>
@@ -2240,23 +2313,23 @@ export default function App() {
                   return (
                     <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? 'grab' : 'default' }}>
                       <circle
-                        cx={110 + obstacle.x * 1.5}
-                        cy={110 - obstacle.y * 1.5}
-                        r={obstacle.radius * 1.5}
+                        cx={sceneX(obstacle.x)}
+                        cy={sceneY(obstacle.y)}
+                        r={obstacle.radius * sceneScale}
                         fill={color}
                         fillOpacity={isStudentObstacle ? 0.45 : 0.35}
                         stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
                         strokeWidth={isEditable ? 2.5 : 2}
                         strokeDasharray={isEditable ? '0' : '6 3'}
                       />
-                      {isEditable && <text x={110 + obstacle.x * 1.5} y={110 - obstacle.y * 1.5 + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
+                      {isEditable && <text x={sceneX(obstacle.x)} y={sceneY(obstacle.y) + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
                     </g>
                   );
                 })}
                 {plannerWaypoints.length > 0 && (
                   <g>
                     <polyline
-                      points={plannerWaypoints.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
+                      points={plannerWaypoints.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
                       fill="none"
                       stroke="#22c55e"
                       strokeWidth="3"
@@ -2265,20 +2338,20 @@ export default function App() {
                     />
                     {plannerWaypoints.map((point, index) => (
                       <g key={point.id} onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)} style={{ cursor: 'pointer' }}>
-                        <circle cx={110 + point.x * 1.5} cy={110 - point.y * 1.5} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                        <text x={110 + point.x * 1.5} y={110 - point.y * 1.5 + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
+                        <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
+                        <text x={sceneX(point.x)} y={sceneY(point.y) + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
                       </g>
                     ))}
                   </g>
                 )}
                 {simulatorState.goal && (
                   <g>
-                    <circle cx={110 + simulatorState.goal.x * 1.5} cy={110 - simulatorState.goal.y * 1.5} r={simulatorState.goal.radius * 1.5} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2"/>
-                    <text x={110 + simulatorState.goal.x * 1.5} y={110 - simulatorState.goal.y * 1.5 - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
+                    <circle cx={sceneX(simulatorState.goal.x)} cy={sceneY(simulatorState.goal.y)} r={simulatorState.goal.radius * sceneScale} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2"/>
+                    <text x={sceneX(simulatorState.goal.x)} y={sceneY(simulatorState.goal.y) - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
                   </g>
                 )}
                 <polyline
-                  points={simulatorState.path.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
+                  points={simulatorState.path.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
                   fill="none"
                   stroke="#60a5fa"
                   strokeWidth="3"
@@ -2286,7 +2359,7 @@ export default function App() {
                   strokeLinecap="round"
                   opacity="0.9"
                 />
-                <g transform={`translate(${110 + simulatorState.x * 1.5}, ${110 - simulatorState.y * 1.5}) rotate(${simulatorState.heading})`}>
+                <g transform={`translate(${sceneX(simulatorState.x)}, ${sceneY(simulatorState.y)}) rotate(${simulatorState.heading})`}>
                   <rect x="-12" y="-10" width="24" height="20" rx="6" fill="#2563eb" stroke="#0f172a" strokeWidth="2"/>
                   <polygon points="18,0 28,6 18,12" fill="#f59e0b"/>
                   <circle cx="0" cy="0" r="3" fill="#f8fafc"/>
@@ -2343,28 +2416,13 @@ export default function App() {
       </div>
       )}
 
-      <div className="border-b border-slate-200 bg-slate-900 px-4 py-3 shadow-sm">
-        <div className="flex items-center gap-2 overflow-x-auto">
-          {overlayTabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setMainTab(tab.id)}
-              className={`rounded-lg px-3 py-2 text-sm font-medium transition whitespace-nowrap ${mainTab === tab.id ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-      </div>
-
       <div className="relative flex-1 overflow-hidden scene-shell">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
         <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
         <div className="absolute inset-0">
           <svg viewBox="0 0 220 220" className="scene-svg h-full w-full block">
             <defs>
-              <pattern id="workspace-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+              <pattern id="workspace-grid" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
                 <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
               </pattern>
             </defs>
@@ -2375,9 +2433,9 @@ export default function App() {
               return (
                 <g key={obstacle.id}>
                   <circle
-                    cx={110 + obstacle.x * 1.5}
-                    cy={110 - obstacle.y * 1.5}
-                    r={obstacle.radius * 1.5}
+                    cx={sceneX(obstacle.x)}
+                    cy={sceneY(obstacle.y)}
+                    r={obstacle.radius * sceneScale}
                     fill={color}
                     fillOpacity={isStudentObstacle ? 0.45 : 0.35}
                     stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
@@ -2390,7 +2448,7 @@ export default function App() {
             {plannerWaypoints.length > 0 && (
               <g>
                 <polyline
-                  points={plannerWaypoints.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
+                  points={plannerWaypoints.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
                   fill="none"
                   stroke="#22c55e"
                   strokeWidth="3"
@@ -2399,20 +2457,20 @@ export default function App() {
                 />
                 {plannerWaypoints.map((point, index) => (
                   <g key={point.id}>
-                    <circle cx={110 + point.x * 1.5} cy={110 - point.y * 1.5} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                    <text x={110 + point.x * 1.5} y={110 - point.y * 1.5 + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
+                    <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
+                    <text x={sceneX(point.x)} y={sceneY(point.y) + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
                   </g>
                 ))}
               </g>
             )}
             {simulatorState.goal && (
               <g>
-                <circle cx={110 + simulatorState.goal.x * 1.5} cy={110 - simulatorState.goal.y * 1.5} r={simulatorState.goal.radius * 1.5} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2" />
-                <text x={110 + simulatorState.goal.x * 1.5} y={110 - simulatorState.goal.y * 1.5 - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
+                <circle cx={sceneX(simulatorState.goal.x)} cy={sceneY(simulatorState.goal.y)} r={simulatorState.goal.radius * sceneScale} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2" />
+                <text x={sceneX(simulatorState.goal.x)} y={sceneY(simulatorState.goal.y) - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
               </g>
             )}
             <polyline
-              points={simulatorState.path.map((point) => `${110 + point.x * 1.5},${110 - point.y * 1.5}`).join(' ')}
+              points={simulatorState.path.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
               fill="none"
               stroke="#60a5fa"
               strokeWidth="3"
@@ -2429,22 +2487,45 @@ export default function App() {
           simulatorState={simulatorState}
           obstacles={activeObstacles}
           isPlaying={isPreviewPlaying}
+          playbackSpeed={playbackSpeed}
+          playbackProgress={playbackProgress}
+          gridSize={gridSize}
+          onPlaybackProgress={setPlaybackProgress}
+          onPlaybackToggle={(playing) => playing ? startSimulationPreview() : pauseSimulationPreview()}
+          onPlaybackReset={resetSimulationPreview}
+          onPlaybackSpeedChange={handlePlaybackSpeedChange}
         />
 
-        {mainTab === 'blocks' && (
-          <div className="absolute inset-0 z-10 pointer-events-none">
-            <div ref={blocklyDiv} className="absolute inset-y-0 left-0 right-20 overflow-hidden pointer-events-auto" />
-          </div>
-        )}
-
         <div
-          className="absolute right-0 top-0 bottom-0 z-20 flex flex-col border-l border-slate-700 bg-slate-950/85 backdrop-blur-sm shadow-[0_0_30px_rgba(15,23,42,0.4)] transition-all duration-300"
-          style={{ width: toolPanelCollapsed ? 48 : toolPanelWidth }}
+          className="absolute z-20 flex flex-col overflow-visible rounded-xl border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm"
+          style={{
+            top: toolPanelRect.top,
+            right: toolPanelCollapsed ? 16 : toolPanelRect.right,
+            width: toolPanelCollapsed ? 48 : toolPanelRect.width,
+            height: toolPanelCollapsed ? 48 : toolPanelRect.height,
+            maxHeight: 'calc(100% - 24px)',
+          }}
+          onPointerMove={updateToolPanelInteraction}
+          onPointerUp={endToolPanelInteraction}
+          onPointerCancel={endToolPanelInteraction}
         >
-          <div className="flex items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2">
+          {!toolPanelCollapsed && (
+            <>
+              <div className="absolute -left-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left')} />
+              <div className="absolute -right-1 top-3 bottom-3 z-40 w-2 cursor-ew-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right')} />
+              <div className="absolute left-3 right-3 -top-1 z-40 h-2 cursor-ns-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'top')} />
+              <div className="absolute left-3 right-3 -bottom-1 z-40 h-2 cursor-ns-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'bottom')} />
+              <div className="absolute -left-1 -top-1 z-40 h-3 w-3 cursor-nwse-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left top')} />
+              <div className="absolute -right-1 -top-1 z-40 h-3 w-3 cursor-nesw-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right top')} />
+              <div className="absolute -left-1 -bottom-1 z-40 h-3 w-3 cursor-nesw-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'left bottom')} />
+              <div className="absolute -right-1 -bottom-1 z-40 h-3 w-3 cursor-nwse-resize" onPointerDown={(event) => beginToolPanelInteraction(event, 'right bottom')} />
+            </>
+          )}
+          <div className="flex cursor-move items-center justify-between border-b border-slate-700 bg-slate-900 px-2 py-2" onPointerDown={(event) => beginToolPanelInteraction(event, 'move')}>
             <button
               type="button"
               onClick={() => setToolPanelCollapsed((value) => !value)}
+              onPointerDown={(event) => event.stopPropagation()}
               className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700"
             >
               {toolPanelCollapsed ? '»' : '«'}
@@ -2454,17 +2535,46 @@ export default function App() {
                 {overlayTabs.find((tab) => tab.id === mainTab)?.label}
               </span>
             )}
-            {!toolPanelCollapsed && (
-              <button
-                type="button"
-                onClick={() => setToolPanelWidth((value) => Math.min(560, value + 40))}
-                className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-slate-800 text-slate-200 hover:bg-slate-700"
-                aria-label="Expand panel"
-              >
-                +
-              </button>
-            )}
+            {!toolPanelCollapsed && <div className="h-7 w-7" aria-hidden="true" />}
           </div>
+
+          {!toolPanelCollapsed && (
+            <div className="border-b border-slate-700 bg-slate-900/90 p-2">
+              <div className="flex gap-2">
+                <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-emerald-400">
+                  {isPreviewPlaying ? 'Running simulation' : 'Run simulation'}
+                </button>
+                {currentUser.role === 'student' && (
+                  <>
+                    <button type="button" onClick={handleSubmitToQueue} className="flex-1 rounded-md bg-violet-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-violet-400">
+                      Submit to teacher
+                    </button>
+                    <button type="button" onClick={() => setIsSimulatorOpen(true)} className="rounded-md bg-slate-700 px-2 py-2 text-[10px] font-bold text-white hover:bg-slate-600" title="Open saved code">
+                      Library
+                    </button>
+                  </>
+                )}
+                {currentUser.role === 'teacher' && (
+                  <>
+                    <button type="button" onClick={() => setIsSimulatorOpen(true)} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
+                      Open queue
+                    </button>
+                    <button type="button" onClick={handleRunCode} className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400" title="Run code on connected robot">
+                      {isRunning ? 'Stop robot' : 'Robot run'}
+                    </button>
+                  </>
+                )}
+              </div>
+              <div className="mt-2 flex items-center justify-between text-[10px] text-slate-400">
+                <span>{currentUser.role === 'teacher' ? 'Teacher workspace' : 'Student workspace'}</span>
+                <div className="flex items-center gap-2">
+                  <button type="button" onClick={handleSaveCodeToAccount} className="text-slate-300 hover:text-white">Save</button>
+                  <button type="button" onClick={handleLogout} className="text-slate-300 hover:text-white">Logout</button>
+                  <button type="button" onClick={() => setShowConfigEditor(true)} className="text-slate-300 hover:text-white">Settings</button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {toolPanelCollapsed ? (
             <div className="flex flex-1 flex-col items-center gap-2 overflow-hidden py-2">
@@ -2495,16 +2605,17 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="flex-1 overflow-auto p-3">
+              <div className="min-h-0 flex-1 overflow-auto p-3">
                 {mainTab === 'blocks' && (
                   <div className="space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Workspace</p>
                       <div className="mt-3 flex gap-2">
-                        <button type="button" onClick={handleRunCode} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run</button>
+                        <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run simulation</button>
                         <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
                       </div>
                     </div>
+                    <div ref={blocklyDiv} className="h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-950" />
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Generated code</p>
                       <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-slate-200">
@@ -2568,9 +2679,17 @@ export default function App() {
                         </button>
                       ))}
                     </div>
-                    <button type="button" onClick={generateMotionFromPrompt} className="w-full rounded-md bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400">
-                      Generate and sync motion
-                    </button>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button type="button" onClick={() => generateMotionFromPrompt(false)} className="rounded-md bg-slate-700 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-600">
+                        Local generate
+                      </button>
+                      <button type="button" onClick={() => generateMotionFromPrompt(true)} disabled={motionPromptStatus === 'loading'} className="rounded-md bg-cyan-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-cyan-400 disabled:opacity-60">
+                        {motionPromptStatus === 'loading' ? 'Generating...' : 'Generate with HF'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-400">
+                      {motionPromptStatus === 'hf' ? motionPromptResult?.source : motionPromptStatus === 'fallback' ? 'HF unavailable; local compiler used.' : 'Both paths sync to Blocks, IDE, and 3D.'}
+                    </p>
                     {motionPromptResult && (
                       <div className="space-y-2 rounded-xl border border-slate-700 bg-slate-900 p-3">
                         <p className="text-xs font-semibold text-cyan-200">{motionPromptResult.summary}</p>
@@ -2634,10 +2753,11 @@ export default function App() {
                       onChange={(event) => {
                         const result = sanitizeRobotCode(event.target.value);
                         const nextCode = result.code || event.target.value;
+                        generatedCodeRef.current = nextCode;
                         setGeneratedCode(nextCode);
                         setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
-                        syncBlocksFromGeneratedCode(nextCode);
                       }}
+                      onBlur={() => syncBlocksFromGeneratedCode(generatedCodeRef.current)}
                       spellCheck={false}
                       className="h-64 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 font-mono text-[11px] leading-6 text-slate-100 outline-none"
                     />
@@ -2645,20 +2765,8 @@ export default function App() {
                 )}
               </div>
 
-              <div className="border-t border-slate-700 bg-slate-900 p-2">
-                <label className="flex items-center justify-between gap-2 text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                  <span>Panel width</span>
-                  <span>{toolPanelWidth}px</span>
-                </label>
-                <input
-                  type="range"
-                  min="280"
-                  max="560"
-                  step="20"
-                  value={toolPanelWidth}
-                  onChange={(event) => setToolPanelWidth(Number(event.target.value))}
-                  className="mt-2 w-full accent-blue-500"
-                />
+              <div className="border-t border-slate-700 bg-slate-900 p-2 text-center text-[10px] uppercase tracking-[0.14em] text-slate-500">
+                Drag the header to move. Drag any edge to resize.
               </div>
             </>
           )}

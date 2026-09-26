@@ -45,6 +45,9 @@ current_process: Optional[subprocess.Popen] = None
 class CodeRequest(BaseModel):
     code: str
 
+class HFTextMotionRequest(BaseModel):
+    prompt: str
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -476,6 +479,46 @@ async def github_proxy(url: Optional[str] = Query(None)):
             )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch the target URL: {exc}") from exc
+
+
+@app.post("/api/hf/text-to-motion")
+async def hf_text_to_motion(request: HFTextMotionRequest, user: dict = Depends(auth_required)):
+    token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_TOKEN")
+    model = os.getenv("HF_TEXT_TO_MOTION_MODEL", "HuggingFaceTB/SmolLM3-3B")
+    if not token:
+        raise HTTPException(status_code=503, detail="Hugging Face inference is not configured on the server")
+    if not request.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt is required")
+
+    instruction = (
+        "Convert the user's robot movement request into one short plain-English sequence "
+        "using only walking, turning, waving, raising arms, lowering arms, sitting, standing, "
+        "stopping, waiting, square path, or zigzag. Return only the sequence, no explanation.\n"
+        f"User request: {request.prompt.strip()}"
+    )
+    endpoint = f"https://router.huggingface.co/hf-inference/models/{model}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+            response = await client.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {token}"},
+                json={"inputs": instruction, "parameters": {"max_new_tokens": 120, "return_full_text": False}},
+            )
+        data = response.json()
+        if response.status_code >= 400:
+            detail = data.get("error", "Hugging Face inference failed") if isinstance(data, dict) else "Hugging Face inference failed"
+            raise HTTPException(status_code=502, detail=detail)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            generated_text = data[0].get("generated_text", "")
+        elif isinstance(data, dict):
+            generated_text = data.get("generated_text", "")
+        else:
+            generated_text = ""
+        if not generated_text.strip():
+            raise HTTPException(status_code=502, detail="Hugging Face returned no generated text")
+        return {"model": model, "text": generated_text.strip()}
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Hugging Face request failed: {exc}") from exc
 
 
 @app.post("/api/classroom/signup")

@@ -12,8 +12,8 @@ test('App loads without runtime initialization errors', async ({ page }) => {
   });
 
   await page.goto('/');
-  await expect(page.getByText('Log In')).toBeVisible();
-  await expect(page.getByText('Create Account')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Log In' }).first()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create Account' }).first()).toBeVisible();
 
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);

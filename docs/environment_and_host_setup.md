@@ -35,6 +35,12 @@ cd /workspaces/Uni-EDU-Studio
 npm install
 ```
 
+Install the Python backend dependencies:
+
+```bash
+python -m pip install -r backend/requirements.txt
+```
+
 ### Step 3: Start the frontend in development mode
 ```bash
 npm run dev -- --host 0.0.0.0 --port 5173
@@ -137,6 +143,7 @@ http://localhost:5173
 cd /workspaces/Uni-EDU-Studio
 npm install
 npm run build
+python -m pip install -r backend/requirements.txt
 python backend/server.py
 ```
 
@@ -158,6 +165,18 @@ http://<host-ip>:5179
 ## Default login accounts
 - Teacher: `teacher` / `teacher`
 - Student: `student1` / `student1`
+
+## Optional Hugging Face prompt generation
+
+The Prompt to Motion tab works locally by default. To enable the optional Hugging Face generator, configure the backend process environment before starting the server:
+
+```bash
+export HUGGINGFACE_API_TOKEN="your-token"
+export HF_TEXT_TO_MOTION_MODEL="HuggingFaceTB/SmolLM3-3B"
+python backend/server.py
+```
+
+The token stays on the backend and is never sent to the browser. Hugging Face output is treated as plain text and passed through the local safe motion compiler before it can update Blocks, IDE, or the simulator. If the service is unavailable, the app automatically uses the local compiler.
 
 ## Recommended classroom setup
 - One robot

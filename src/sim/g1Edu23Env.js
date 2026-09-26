@@ -167,12 +167,14 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   const timeline = [];
   const jointState = Object.fromEntries(G1_EDU_23_ENV.joints.map((joint) => [joint, 0]));
   let collisionCount = 0;
+  let gaitPhase = 0;
+  const poseTargets = {};
 
-  const addFrame = () => {
+  const addFrame = (isInitial = false) => {
     const finalGoal = challenge?.goal || null;
     const goalReached = !!finalGoal && Math.hypot(x - finalGoal.x, y - finalGoal.y) <= (finalGoal.radius || 8);
     const blocked = mode === 'advanced-physics' && collisionCount > 0;
-    const walkPhase = Math.min(path.length, 30) / 30;
+    const walkPhase = isInitial ? 0 : gaitPhase;
     const leftSwing = Math.sin(walkPhase * Math.PI * 2) * 26;
     const rightSwing = Math.sin(walkPhase * Math.PI * 2 + Math.PI) * 26;
 
@@ -189,6 +191,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     jointState.waist_yaw = Number((heading * 0.28).toFixed(2));
     jointState.waist_pitch = Number((torsoPitch * 0.6).toFixed(2));
     jointState.waist_roll = Number((torsoRoll * 0.8).toFixed(2));
+    Object.assign(jointState, poseTargets);
 
     frames.push({
       x: Number(x.toFixed(2)),
@@ -209,16 +212,45 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     });
   };
 
+  addFrame(true);
+
+  const walkThrough = (distance, direction, label, summary) => {
+    const radians = (heading * Math.PI) / 180;
+    const frameCount = Math.max(8, Math.ceil(Math.abs(distance) * 12));
+    const stepX = Math.cos(radians) * distance / frameCount;
+    const stepY = Math.sin(radians) * distance / frameCount;
+    actions.push({ label, summary });
+    timeline.push({ label, summary });
+    for (let index = 0; index < frameCount; index += 1) {
+      x = Number((x + stepX).toFixed(3));
+      y = Number((y + stepY).toFixed(3));
+      gaitPhase += 1 / 8;
+      torsoPitch = direction < 0 ? -8 : 8;
+      path.push({ x, y });
+      addFrame();
+    }
+    torsoPitch = 0;
+  };
+
+  const animateAction = (frameCount, update, label, summary) => {
+    actions.push({ label, summary });
+    timeline.push({ label, summary });
+    for (let index = 1; index <= frameCount; index += 1) {
+      update(index / frameCount);
+      addFrame();
+    }
+  };
+
   commandMatches.forEach((match) => {
     const rawCommand = match[0];
     if (rawCommand.startsWith('sport_client.Move')) {
       const rawArgs = (match[1] || '').split(',').map((part) => part.trim());
       const vx = Number(rawArgs[0] ?? 0);
       const vz = Number(rawArgs[2] ?? 0);
-      const distance = Math.hypot(vx, vz) * 10;
+      const distance = Math.hypot(vx, vz) * 2;
       const radians = (heading * Math.PI) / 180;
-      const nextX = x + Math.cos(radians) * (vx * 12);
-      const nextY = y + Math.sin(radians) * (vx * 12);
+      const nextX = x + Math.cos(radians) * (vx * 2);
+      const nextY = y + Math.sin(radians) * (vx * 2);
 
       if (mode === 'advanced-physics' && isBlockedByObstacle(nextX, nextY, obstacles)) {
         collisionCount += 1;
@@ -232,23 +264,27 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       }
 
       if (Math.abs(vx) > 0.001) {
-        x = Number(nextX.toFixed(2));
-        y = Number(nextY.toFixed(2));
-        torsoPitch = Math.min(20, Math.max(-20, vx * 28));
-        actions.push({ label: vx > 0 ? 'Walk forward' : 'Walk backward', summary: `${Math.abs(vx).toFixed(2)} speed` });
-        timeline.push({ label: vx > 0 ? 'Walk forward' : 'Walk backward', summary: `${Math.abs(vx).toFixed(2)} speed` });
+        walkThrough(vx * 2, vx > 0 ? 1 : -1, vx > 0 ? 'Walk forward' : 'Walk backward', `${Math.abs(vx).toFixed(2)} m`);
       }
 
       if (Math.abs(vz) > 0.001) {
         const turnDegrees = distance * 0.7;
-        heading += turnDegrees;
-        torsoRoll = Math.min(18, Math.max(-18, vz * 18));
-        actions.push({ label: vz > 0 ? 'Turn left' : 'Turn right', summary: `${Math.abs(vz).toFixed(2)} turn` });
-        timeline.push({ label: vz > 0 ? 'Turn left' : 'Turn right', summary: `${Math.abs(turnDegrees).toFixed(0)}°` });
+        const startingHeading = heading;
+        animateAction(12, (progress) => {
+          heading = startingHeading + turnDegrees * progress;
+          torsoRoll = Math.sin(progress * Math.PI) * Math.min(18, Math.max(-18, vz * 18));
+          poseTargets.left_hip_roll = Math.sin(progress * Math.PI * 2) * 5;
+          poseTargets.right_hip_roll = -poseTargets.left_hip_roll;
+        }, vz > 0 ? 'Turn left' : 'Turn right', `${Math.abs(turnDegrees).toFixed(0)}°`);
+        torsoRoll = 0;
+        delete poseTargets.left_hip_roll;
+        delete poseTargets.right_hip_roll;
       }
 
-      path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
-      addFrame();
+      if (Math.abs(vx) <= 0.001) {
+        path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+        addFrame();
+      }
       return;
     }
 
@@ -256,7 +292,10 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       actions.push({ label: 'Stop', summary: 'Robot stops movement.' });
       timeline.push({ label: 'Stop', summary: 'Movement stopped' });
       path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
-      addFrame();
+      animateAction(6, () => {
+        torsoPitch *= 0.8;
+        torsoRoll *= 0.8;
+      }, 'Stop', 'Movement stopped');
       return;
     }
 
@@ -266,7 +305,9 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       actions.push({ label: 'Stand up', summary: 'Return to neutral standing stance.' });
       timeline.push({ label: 'Stand up', summary: 'Ready again' });
       path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
-      addFrame();
+      animateAction(12, (progress) => {
+        torsoPitch = 12 * (1 - progress);
+      }, 'Stand up', 'Return to neutral standing stance.');
       return;
     }
 
@@ -276,76 +317,87 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
 
     if (methodName === 'walkForward' || methodName === 'walkForwardSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount * 10;
-      const nextX = x + Math.cos((heading * Math.PI) / 180) * stride;
-      const nextY = y + Math.sin((heading * Math.PI) / 180) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Forward', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Forward', summary: `${stepCount.toFixed(1)} steps` });
+      const stride = 0.4 * stepCount;
+      walkThrough(stride, 1, 'Walk Forward', `${stepCount.toFixed(1)} steps`);
     }
 
     if (methodName === 'walkBackward' || methodName === 'walkBackwardSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount * 10;
-      const nextX = x - Math.cos((heading * Math.PI) / 180) * stride;
-      const nextY = y - Math.sin((heading * Math.PI) / 180) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Back', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Back', summary: `${stepCount.toFixed(1)} steps` });
+      const stride = 0.4 * stepCount;
+      walkThrough(-stride, -1, 'Walk Back', `${stepCount.toFixed(1)} steps`);
     }
 
     if (methodName === 'walkSidewaysLeft' || methodName === 'walkSidewaysLeftSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.3 * stepCount * 10;
-      const nextX = x + Math.cos((heading * Math.PI / 180 + Math.PI / 2)) * stride;
-      const nextY = y + Math.sin((heading * Math.PI / 180 + Math.PI / 2)) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Sideways Left', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Sideways Left', summary: `${stepCount.toFixed(1)} steps` });
+      const stride = 0.3 * stepCount;
+      const previousHeading = heading;
+      heading += 90;
+      walkThrough(stride, 1, 'Walk Sideways Left', `${stepCount.toFixed(1)} steps`);
+      heading = previousHeading;
+      addFrame();
     }
 
     if (methodName === 'walkSidewaysRight' || methodName === 'walkSidewaysRightSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.3 * stepCount * 10;
-      const nextX = x + Math.cos((heading * Math.PI / 180 - Math.PI / 2)) * stride;
-      const nextY = y + Math.sin((heading * Math.PI / 180 - Math.PI / 2)) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Sideways Right', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Sideways Right', summary: `${stepCount.toFixed(1)} steps` });
+      const stride = 0.3 * stepCount;
+      const previousHeading = heading;
+      heading -= 90;
+      walkThrough(stride, 1, 'Walk Sideways Right', `${stepCount.toFixed(1)} steps`);
+      heading = previousHeading;
+      addFrame();
     }
 
     if (methodName === 'turnLeft') {
-      heading += firstNumber || 90;
-      actions.push({ label: 'Turn Left', summary: `${firstNumber || 90}°` });
-      timeline.push({ label: 'Turn Left', summary: `${firstNumber || 90}°` });
+      const amount = firstNumber || 90;
+      const startingHeading = heading;
+      animateAction(14, (progress) => {
+        heading = startingHeading + amount * progress;
+        torsoRoll = Math.sin(progress * Math.PI) * 8;
+        poseTargets.left_hip_roll = Math.sin(progress * Math.PI * 2) * 5;
+        poseTargets.right_hip_roll = -poseTargets.left_hip_roll;
+      }, 'Turn Left', `${amount}°`);
+      torsoRoll = 0;
+      delete poseTargets.left_hip_roll;
+      delete poseTargets.right_hip_roll;
     }
 
     if (methodName === 'turnRight') {
-      heading -= firstNumber || 90;
-      actions.push({ label: 'Turn Right', summary: `${firstNumber || 90}°` });
-      timeline.push({ label: 'Turn Right', summary: `${firstNumber || 90}°` });
+      const amount = firstNumber || 90;
+      const startingHeading = heading;
+      animateAction(14, (progress) => {
+        heading = startingHeading - amount * progress;
+        torsoRoll = -Math.sin(progress * Math.PI) * 8;
+        poseTargets.left_hip_roll = -Math.sin(progress * Math.PI * 2) * 5;
+        poseTargets.right_hip_roll = -poseTargets.left_hip_roll;
+      }, 'Turn Right', `${amount}°`);
+      torsoRoll = 0;
+      delete poseTargets.left_hip_roll;
+      delete poseTargets.right_hip_roll;
     }
 
     if (methodName === 'wait' || methodName === 'waitSeconds') {
       actions.push({ label: 'Wait', summary: `${firstNumber || 0.5}s` });
       timeline.push({ label: 'Wait', summary: `${firstNumber || 0.5}s` });
+      animateAction(8, () => {}, 'Wait', `${firstNumber || 0.5}s`);
     }
 
     if (methodName === 'stand') {
+      const startingPitch = torsoPitch;
+      animateAction(12, (progress) => {
+        torsoPitch = startingPitch * (1 - progress);
+        torsoRoll *= 1 - progress;
+      }, 'Stand', 'Robot stands upright.');
       torsoPitch = 0;
       torsoRoll = 0;
-      actions.push({ label: 'Stand', summary: 'Robot stands upright.' });
-      timeline.push({ label: 'Stand', summary: 'Ready again' });
+      Object.keys(poseTargets).forEach((joint) => { poseTargets[joint] = 0; });
     }
 
     if (methodName === 'sit') {
+      const startingPitch = torsoPitch;
+      animateAction(14, (progress) => {
+        torsoPitch = startingPitch + (12 - startingPitch) * progress;
+      }, 'Sit', 'Robot lowers into a seated pose.');
       torsoPitch = 12;
-      actions.push({ label: 'Sit', summary: 'Robot lowers into a seated pose.' });
-      timeline.push({ label: 'Sit', summary: 'Seated pose' });
     }
 
     if (methodName === 'stop') {
@@ -354,8 +406,53 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     }
 
     if (methodName === 'raiseBothArms' || methodName === 'lowerBothArms') {
-      actions.push({ label: methodName === 'raiseBothArms' ? 'Raise Both Arms' : 'Lower Both Arms', summary: 'Arm pose adjusted.' });
-      timeline.push({ label: methodName === 'raiseBothArms' ? 'Raise Both Arms' : 'Lower Both Arms', summary: 'Arm pose adjusted.' });
+      const target = methodName === 'raiseBothArms' ? -75 : 0;
+      animateAction(14, (progress) => {
+        poseTargets.left_shoulder_pitch = target * progress;
+        poseTargets.right_shoulder_pitch = target * progress;
+        poseTargets.left_elbow = target * progress * 0.4;
+        poseTargets.right_elbow = target * progress * 0.4;
+      }, methodName === 'raiseBothArms' ? 'Raise Both Arms' : 'Lower Both Arms', 'Arm pose adjusted.');
+    }
+
+    if (methodName === 'waveLeft' || methodName === 'waveRight') {
+      const side = methodName === 'waveLeft' ? 'left' : 'right';
+      animateAction(18, (progress) => {
+        const wave = Math.sin(progress * Math.PI * 4) * 35;
+        poseTargets[`${side}_shoulder_pitch`] = -55;
+        poseTargets[`${side}_shoulder_roll`] = side === 'left' ? -30 : 30;
+        poseTargets[`${side}_elbow`] = -75;
+        poseTargets[`${side}_wrist_roll`] = wave;
+      }, methodName === 'waveLeft' ? 'Wave left' : 'Wave right', 'Arm gesture');
+    }
+
+    if (methodName === 'raiseLeftArm' || methodName === 'raiseRightArm') {
+      const side = methodName === 'raiseLeftArm' ? 'left' : 'right';
+      const degrees = Math.min(180, Math.max(10, firstNumber || 90));
+      animateAction(16, (progress) => {
+        poseTargets[`${side}_shoulder_pitch`] = -degrees * progress;
+        poseTargets[`${side}_shoulder_roll`] = (side === 'left' ? -1 : 1) * degrees * 0.35 * progress;
+        poseTargets[`${side}_elbow`] = -degrees * 0.45 * progress;
+      }, methodName === 'raiseLeftArm' ? 'Raise left arm' : 'Raise right arm', `${degrees} degrees`);
+    }
+
+    if (methodName === 'raiseLeftKnee' || methodName === 'raiseRightKnee') {
+      const side = methodName === 'raiseLeftKnee' ? 'left' : 'right';
+      animateAction(14, (progress) => {
+        poseTargets[`${side}_hip_pitch`] = -25 * progress;
+        poseTargets[`${side}_knee_pitch`] = 8 + 65 * progress;
+        poseTargets[`${side}_ankle_pitch`] = -20 * progress;
+      }, methodName === 'raiseLeftKnee' ? 'Raise left knee' : 'Raise right knee', 'leg pose');
+    }
+
+    if (methodName === 'raiseLeftLeg' || methodName === 'raiseRightLeg' || methodName === 'kick') {
+      const side = methodName === 'raiseRightLeg' ? 'right' : 'left';
+      animateAction(18, (progress) => {
+        const kick = Math.sin(progress * Math.PI) * 55;
+        poseTargets[`${side}_hip_pitch`] = kick * 0.45;
+        poseTargets[`${side}_knee_pitch`] = 10 + kick;
+        poseTargets[`${side}_ankle_pitch`] = -kick * 0.35;
+      }, side === 'left' ? 'Kick left' : 'Kick right', 'leg gesture');
     }
 
     path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
@@ -369,7 +466,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   return frames;
 }
 
-export function buildG1SimulationFrames(pythonCode, options = {}) {
+function buildUnusedDuplicateG1SimulationFrames(pythonCode, options = {}) {
   const { mode = 'kid-preview', obstacles = G1_EDU_23_ENV.defaultObstacles, challenge = null } = options;
 
   if (!pythonCode || !pythonCode.trim()) {
@@ -412,11 +509,11 @@ export function buildG1SimulationFrames(pythonCode, options = {}) {
   const jointState = Object.fromEntries(G1_EDU_23_ENV.joints.map((joint) => [joint, 0]));
   let collisionCount = 0;
 
-  const addFrame = () => {
+  const addFrame = (isInitial = false) => {
     const finalGoal = challenge?.goal || null;
     const goalReached = !!finalGoal && Math.hypot(x - finalGoal.x, y - finalGoal.y) <= (finalGoal.radius || 8);
     const blocked = mode === 'advanced-physics' && collisionCount > 0;
-    const walkPhase = Math.min(path.length, 30) / 30;
+    const walkPhase = isInitial ? 0 : Math.min(path.length, 30) / 30;
     const leftSwing = Math.sin(walkPhase * Math.PI * 2) * 26;
     const rightSwing = Math.sin(walkPhase * Math.PI * 2 + Math.PI) * 26;
 
@@ -453,13 +550,15 @@ export function buildG1SimulationFrames(pythonCode, options = {}) {
     });
   };
 
+  addFrame(true);
+
   commandMatches.forEach((match) => {
     const rawCommand = match[0];
     if (rawCommand.startsWith('sport_client.Move')) {
       const rawArgs = (match[1] || '').split(',').map((part) => part.trim());
       const vx = Number(rawArgs[0] ?? 0);
       const vz = Number(rawArgs[2] ?? 0);
-      const distance = Math.hypot(vx, vz) * 10;
+      const distance = Math.hypot(vx, vz) * 2;
       const radians = (heading * Math.PI) / 180;
       const nextX = x + Math.cos(radians) * (vx * 12);
       const nextY = y + Math.sin(radians) * (vx * 12);
@@ -520,7 +619,7 @@ export function buildG1SimulationFrames(pythonCode, options = {}) {
 
     if (methodName === 'walkForward' || methodName === 'walkForwardSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount * 10;
+      const stride = 0.4 * stepCount;
       const nextX = x + Math.cos((heading * Math.PI) / 180) * stride;
       const nextY = y + Math.sin((heading * Math.PI) / 180) * stride;
       x = Number(nextX.toFixed(2));
@@ -531,7 +630,7 @@ export function buildG1SimulationFrames(pythonCode, options = {}) {
 
     if (methodName === 'walkBackward' || methodName === 'walkBackwardSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount * 10;
+      const stride = 0.4 * stepCount;
       const nextX = x - Math.cos((heading * Math.PI) / 180) * stride;
       const nextY = y - Math.sin((heading * Math.PI) / 180) * stride;
       x = Number(nextX.toFixed(2));
@@ -542,7 +641,7 @@ export function buildG1SimulationFrames(pythonCode, options = {}) {
 
     if (methodName === 'walkSidewaysLeft' || methodName === 'walkSidewaysLeftSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.3 * stepCount * 10;
+      const stride = 0.3 * stepCount;
       const nextX = x + Math.cos((heading * Math.PI / 180 + Math.PI / 2)) * stride;
       const nextY = y + Math.sin((heading * Math.PI / 180 + Math.PI / 2)) * stride;
       x = Number(nextX.toFixed(2));
@@ -553,7 +652,7 @@ export function buildG1SimulationFrames(pythonCode, options = {}) {
 
     if (methodName === 'walkSidewaysRight' || methodName === 'walkSidewaysRightSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.3 * stepCount * 10;
+      const stride = 0.3 * stepCount;
       const nextX = x + Math.cos((heading * Math.PI / 180 - Math.PI / 2)) * stride;
       const nextY = y + Math.sin((heading * Math.PI / 180 - Math.PI / 2)) * stride;
       x = Number(nextX.toFixed(2));
@@ -622,4 +721,8 @@ export function simulateG1Edu23Program(pythonCode, options = {}) {
     collisions: 0,
     goal: challenge?.goal || null,
   };
+}
+
+export function buildG1SimulationFrames(pythonCode, options = {}) {
+  return buildLegacyG1SimulationFrames(pythonCode, options);
 }
