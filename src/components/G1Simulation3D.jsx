@@ -166,6 +166,126 @@ function interpolateSimulationFrame(from, to, amount) {
   };
 }
 
+function createWaypointLabelTexture(label) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 128;
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, 128, 128);
+  context.beginPath();
+  context.arc(64, 64, 56, 0, Math.PI * 2);
+  context.fillStyle = '#0284c7';
+  context.fill();
+  context.lineWidth = 8;
+  context.strokeStyle = '#bae6fd';
+  context.stroke();
+  context.fillStyle = '#f8fafc';
+  context.font = 'bold 66px sans-serif';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText(String(label), 64, 67);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function createWaypointMarker(id, index) {
+  const marker = new THREE.Group();
+  marker.userData.waypointId = id;
+  marker.userData.index = index;
+
+  const hitTarget = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.36, 0.36, 0.24, 24),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, colorWrite: false, depthWrite: false }),
+  );
+  hitTarget.position.y = 0.12;
+  hitTarget.userData.waypointId = id;
+  marker.add(hitTarget);
+
+  const pad = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.19, 0.19, 0.09, 32),
+    new THREE.MeshStandardMaterial({ color: 0x0ea5e9, emissive: 0x075985, roughness: 0.35, metalness: 0.2 }),
+  );
+  pad.position.y = 0.08;
+  pad.userData.waypointId = id;
+  marker.add(pad);
+
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.23, 0.29, 40),
+    new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.82, side: THREE.DoubleSide }),
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.025;
+  ring.userData.waypointId = id;
+  marker.add(ring);
+
+  const labelMaterial = new THREE.SpriteMaterial({ map: createWaypointLabelTexture(index + 1), transparent: true, depthTest: false });
+  const label = new THREE.Sprite(labelMaterial);
+  label.scale.set(0.31, 0.31, 1);
+  label.position.y = 0.34;
+  label.renderOrder = 4;
+  marker.add(label);
+
+  marker.userData.pad = pad;
+  marker.userData.ring = ring;
+  marker.userData.label = label;
+  return marker;
+}
+
+function disposeWaypointMarker(marker) {
+  marker.traverse((object) => {
+    object.geometry?.dispose();
+    if (object.material) {
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      materials.forEach((entry) => {
+        entry.map?.dispose();
+        entry.dispose();
+      });
+    }
+  });
+}
+
+function syncWaypointMarkers(group, pathLine, waypoints) {
+  if (!group) return;
+  const existing = new Map(group.children.map((marker) => [marker.userData.waypointId, marker]));
+  const activeIds = new Set();
+
+  waypoints.forEach((waypoint, index) => {
+    const id = String(waypoint.id);
+    activeIds.add(id);
+    let marker = existing.get(id);
+    if (!marker) {
+      marker = createWaypointMarker(id, index);
+      group.add(marker);
+    }
+    marker.position.set(Number(waypoint.x) || 0, 0, -(Number(waypoint.y) || 0));
+    if (marker.userData.index !== index) {
+      marker.userData.label.material.map.dispose();
+      marker.userData.label.material.map = createWaypointLabelTexture(index + 1);
+      marker.userData.index = index;
+    }
+  });
+
+  [...group.children].forEach((marker) => {
+    if (activeIds.has(marker.userData.waypointId)) return;
+    group.remove(marker);
+    disposeWaypointMarker(marker);
+  });
+
+  if (pathLine) {
+    pathLine.geometry.setFromPoints(waypoints.map((waypoint) => new THREE.Vector3(Number(waypoint.x) || 0, 0.045, -(Number(waypoint.y) || 0))));
+    pathLine.visible = waypoints.length > 1;
+  }
+}
+
+function setWaypointMarkerDragging(marker, isDragging) {
+  if (!marker) return;
+  marker.scale.setScalar(isDragging ? 1.18 : 1);
+  marker.userData.pad.material.emissive.set(isDragging ? 0x22d3ee : 0x075985);
+  marker.userData.ring.material.color.set(isDragging ? 0xa5f3fc : 0x22d3ee);
+  marker.userData.ring.material.opacity = isDragging ? 1 : 0.82;
+}
+
 async function loadG1MeshRig() {
   const xmlText = await fetch('/g1/g1.xml').then((response) => {
     if (!response.ok) throw new Error(`G1 rig unavailable (${response.status})`);
@@ -239,7 +359,7 @@ async function loadG1MeshRig() {
   return { robot, joints };
 }
 
-export default function G1Simulation3D({ code, simulatorState, obstacles = [], isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
+export default function G1Simulation3D({ code, simulatorState, obstacles = [], waypoints = [], isObstacleEditable = false, onObstacleChange, onWaypointChange, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const framesRef = useRef([]);
@@ -247,6 +367,12 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
   const robotRef = useRef(null);
   const jointRefs = useRef({});
   const obstacleGroupRef = useRef(null);
+  const waypointGroupRef = useRef(null);
+  const plannerLineRef = useRef(null);
+  const waypointsRef = useRef(waypoints);
+  const obstacleChangeCallbackRef = useRef(onObstacleChange);
+  const waypointChangeCallbackRef = useRef(onWaypointChange);
+  const draggingMarkerRef = useRef(null);
   const simulatorStateRef = useRef(simulatorState);
   const viewRef = useRef({
     yaw: 0.55,
@@ -287,6 +413,12 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
   }, [simulatorState]);
 
   useEffect(() => {
+    waypointsRef.current = waypoints;
+    obstacleChangeCallbackRef.current = onObstacleChange;
+    waypointChangeCallbackRef.current = onWaypointChange;
+  }, [waypoints, onObstacleChange, onWaypointChange]);
+
+  useEffect(() => {
     framesRef.current = buildG1SimulationFrames(code, {
       obstacles,
       challenge: simulatorState?.goal ? { goal: simulatorState.goal } : null,
@@ -304,6 +436,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
       );
       mesh.position.set(obstacle.x, 0.13, -obstacle.y);
       mesh.castShadow = true;
+      mesh.userData.obstacleId = String(obstacle.id);
       group.add(mesh);
     });
   }, [obstacles]);
@@ -314,7 +447,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x08111d);
-    scene.fog = new THREE.Fog(0x08111d, 8, 22);
+    scene.fog = new THREE.Fog(0x08111d, 11, 28);
     const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
     cameraRef.current = camera;
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -334,13 +467,22 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
     rim.position.set(-4, 3, -3);
     scene.add(rim);
 
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(gridSize, gridSize), new THREE.MeshStandardMaterial({ color: 0x0e1b2a, roughness: 0.85, metalness: 0.1 }));
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(gridSize, gridSize), new THREE.MeshStandardMaterial({ color: 0x101c29, roughness: 0.85, metalness: 0.1 }));
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     scene.add(ground);
-    const grid = new THREE.GridHelper(gridSize, Math.round(gridSize), 0x2b6b83, 0x163449);
-    grid.position.y = 0.01;
+    const grid = new THREE.GridHelper(gridSize, Math.max(1, Math.round(gridSize)), 0x67c9ed, 0x49677f);
+    grid.position.y = 0.012;
+    grid.material.transparent = true;
+    grid.material.opacity = 0.9;
+    grid.material.depthWrite = false;
     scene.add(grid);
+    const majorGrid = new THREE.GridHelper(gridSize, Math.max(1, Math.round(gridSize / 5)), 0xa5e6ff, 0x7197ad);
+    majorGrid.position.y = 0.018;
+    majorGrid.material.transparent = true;
+    majorGrid.material.opacity = 0.62;
+    majorGrid.material.depthWrite = false;
+    scene.add(majorGrid);
 
     const goal = new THREE.Mesh(new THREE.RingGeometry(0.7, 0.76, 48), new THREE.MeshBasicMaterial({ color: 0x34d399, transparent: true, opacity: 0.8, side: THREE.DoubleSide }));
     goal.rotation.x = -Math.PI / 2;
@@ -349,6 +491,18 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
 
     const pathLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.6 }));
     scene.add(pathLine);
+
+    const waypointGroup = new THREE.Group();
+    waypointGroupRef.current = waypointGroup;
+    scene.add(waypointGroup);
+    const plannerLine = new THREE.Line(
+      new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.92 }),
+    );
+    plannerLine.visible = false;
+    plannerLineRef.current = plannerLine;
+    scene.add(plannerLine);
+    syncWaypointMarkers(waypointGroup, plannerLine, waypointsRef.current);
 
     const obstacleGroup = new THREE.Group();
     obstacleGroupRef.current = obstacleGroup;
@@ -360,6 +514,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
       );
       mesh.position.set(obstacle.x, 0.13, -obstacle.y);
       mesh.castShadow = true;
+      mesh.userData.obstacleId = String(obstacle.id);
       obstacleGroup.add(mesh);
     });
 
@@ -413,7 +568,45 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
     };
     updateCamera();
 
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const readPointer = (event) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+    };
+    const setObstacleHighlight = (obstacleId, isDragging) => {
+      const mesh = obstacleGroup.children.find((obstacle) => obstacle.userData.obstacleId === obstacleId);
+      if (mesh?.material?.emissive) mesh.material.emissive.set(isDragging ? 0x22d3ee : 0x000000);
+    };
+
     const onPointerDown = (event) => {
+      readPointer(event);
+      const waypointHit = raycaster.intersectObjects(waypointGroup.children, true)
+        .find((hit) => hit.object.userData.waypointId !== undefined);
+      if (waypointHit) {
+        const waypointId = waypointHit.object.userData.waypointId;
+        const marker = waypointGroup.children.find((item) => item.userData.waypointId === waypointId);
+        draggingMarkerRef.current = { kind: 'waypoint', id: waypointId, pointerId: event.pointerId };
+        setWaypointMarkerDragging(marker, true);
+        renderer.domElement.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+        return;
+      }
+      if (isObstacleEditable) {
+        const obstacleHit = raycaster.intersectObjects(obstacleGroup.children, false)
+          .find((hit) => hit.object.userData.obstacleId !== undefined);
+        if (obstacleHit) {
+          const obstacleId = obstacleHit.object.userData.obstacleId;
+          draggingMarkerRef.current = { kind: 'obstacle', id: obstacleId, pointerId: event.pointerId };
+          setObstacleHighlight(obstacleId, true);
+          renderer.domElement.setPointerCapture?.(event.pointerId);
+          event.preventDefault();
+          return;
+        }
+      }
       const view = viewRef.current;
       view.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
       renderer.domElement.setPointerCapture?.(event.pointerId);
@@ -427,6 +620,25 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
       }
     };
     const onPointerMove = (event) => {
+      const draggingMarker = draggingMarkerRef.current;
+      if (draggingMarker?.pointerId === event.pointerId) {
+        readPointer(event);
+        const worldPosition = raycaster.ray.intersectPlane(groundPlane, new THREE.Vector3());
+        if (!worldPosition) return;
+        const halfGrid = gridSize / 2;
+        const x = Number(THREE.MathUtils.clamp(worldPosition.x, -halfGrid, halfGrid).toFixed(2));
+        const y = Number(THREE.MathUtils.clamp(-worldPosition.z, -halfGrid, halfGrid).toFixed(2));
+        if (draggingMarker.kind === 'waypoint') {
+          const marker = waypointGroup.children.find((item) => item.userData.waypointId === draggingMarker.id);
+          if (marker) marker.position.set(x, 0, -y);
+          waypointChangeCallbackRef.current?.(draggingMarker.id, { x, y });
+        } else {
+          const obstacle = obstacleGroup.children.find((item) => item.userData.obstacleId === draggingMarker.id);
+          if (obstacle) obstacle.position.set(x, 0.13, -y);
+          obstacleChangeCallbackRef.current?.(draggingMarker.id, { x, y });
+        }
+        return;
+      }
       const view = viewRef.current;
       if (!view.pointers.has(event.pointerId)) return;
       const previous = view.pointers.get(event.pointerId);
@@ -462,6 +674,17 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
       updateCamera();
     };
     const onPointerUp = (event) => {
+      const draggingMarker = draggingMarkerRef.current;
+      if (draggingMarker?.pointerId === event.pointerId) {
+        if (draggingMarker.kind === 'waypoint') {
+          const marker = waypointGroup.children.find((item) => item.userData.waypointId === draggingMarker.id);
+          setWaypointMarkerDragging(marker, false);
+        } else {
+          setObstacleHighlight(draggingMarker.id, false);
+        }
+        draggingMarkerRef.current = null;
+        return;
+      }
       const view = viewRef.current;
       view.pointers.delete(event.pointerId);
       if (view.pointers.size < 2) {
@@ -534,8 +757,18 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], i
       renderer.domElement.removeEventListener('wheel', onWheel);
       renderer.dispose();
       mount.removeChild(renderer.domElement);
+      waypointGroup.children.forEach(disposeWaypointMarker);
+      plannerLine.geometry.dispose();
+      plannerLine.material.dispose();
+      waypointGroupRef.current = null;
+      plannerLineRef.current = null;
+      obstacleGroupRef.current = null;
     };
-  }, [gridSize]);
+  }, [gridSize, isObstacleEditable]);
+
+  useEffect(() => {
+    syncWaypointMarkers(waypointGroupRef.current, plannerLineRef.current, waypoints);
+  }, [waypoints]);
 
   return (
     <div ref={mountRef} className="absolute inset-0 overflow-hidden touch-none" aria-label={`Live ${G1_EDU_23_ENV.robotType} 3D simulation`}>

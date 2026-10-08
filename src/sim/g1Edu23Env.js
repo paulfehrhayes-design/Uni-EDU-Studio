@@ -1,4 +1,4 @@
-import { G1_MODEL_INFO } from './g1ModelRuntime';
+import { G1_MODEL_INFO } from './g1ModelRuntime.js';
 
 export const G1_EDU_23_ENV = {
   robotType: G1_MODEL_INFO.robotType,
@@ -116,6 +116,130 @@ function normalizeAngle(angle) {
   return (((angle % 360) + 360) % 360);
 }
 
+function normalizeTurnDelta(angle) {
+  const normalized = normalizeAngle(angle);
+  return normalized > 180 ? normalized - 360 : normalized;
+}
+
+export function normalizePlannerMotionSegment(from = { x: 0, y: 0 }, to = { x: 0, y: 0 }, currentHeading = 0) {
+  const dx = Number(to.x ?? 0) - Number(from.x ?? 0);
+  const dy = Number(to.y ?? 0) - Number(from.y ?? 0);
+  const distanceMeters = Math.hypot(dx, dy);
+  const targetHeading = (Math.atan2(dy, dx) * 180) / Math.PI;
+  const relativeHeading = normalizeTurnDelta(targetHeading - currentHeading);
+  const shouldWalkBackward = Math.abs(relativeHeading) > 150;
+  const turnDelta = shouldWalkBackward
+    ? (relativeHeading > 0 ? relativeHeading - 180 : relativeHeading + 180)
+    : relativeHeading;
+  const stepCount = Number.isFinite(distanceMeters) && distanceMeters > 0.05
+    ? Math.max(1, Math.round(distanceMeters / 4))
+    : 0;
+
+  return {
+    dx,
+    dy,
+    distanceMeters,
+    targetHeading: Number(normalizeAngle(targetHeading || 0).toFixed(2)),
+    relativeHeading: Number(relativeHeading.toFixed(2)),
+    turnDelta: Number(turnDelta.toFixed(2)),
+    stepCount,
+    shouldWalkBackward,
+    direction: distanceMeters > 0.05 ? (shouldWalkBackward ? 'backward' : 'forward') : 'stop',
+  };
+}
+
+export function clampScenePoint(x, y, gridSize = 20) {
+  const halfSize = Number(gridSize) > 0 ? Number(gridSize) / 2 : 10;
+  const safeX = Number.isFinite(Number(x)) ? Number(x) : 0;
+  const safeY = Number.isFinite(Number(y)) ? Number(y) : 0;
+
+  return {
+    x: Math.max(-halfSize, Math.min(halfSize, safeX)),
+    y: Math.max(-halfSize, Math.min(halfSize, safeY)),
+  };
+}
+
+export function derivePlannerWaypointsFromCode(code = '') {
+  if (!code || !code.trim()) return [];
+
+  const commandMatches = [...code.matchAll(/robot\.(walkForward|walkBackward|walkSidewaysLeft|walkSidewaysRight|turnLeft|turnRight|turn)\(([^)]*)\)/g)];
+  if (!commandMatches.length) return [];
+
+  let x = 0;
+  let y = 0;
+  let heading = 0;
+  const points = [{ id: 'planner-0', x, y }];
+
+  commandMatches.forEach((match) => {
+    const [, methodName, argsRaw = ''] = match;
+    const numeric = Number((argsRaw.match(/-?\d*\.?\d+/) || ['0'])[0]);
+    const amount = Number.isFinite(numeric) ? numeric : 0;
+
+    if (methodName === 'walkForward' || methodName === 'walkBackward') {
+      const stepDistance = methodName === 'walkBackward' ? -amount : amount;
+      x += Math.cos((heading * Math.PI) / 180) * stepDistance;
+      y += Math.sin((heading * Math.PI) / 180) * stepDistance;
+    }
+
+    if (methodName === 'walkSidewaysLeft' || methodName === 'walkSidewaysRight') {
+      const direction = methodName === 'walkSidewaysLeft' ? 1 : -1;
+      const sidewaysHeading = heading + (direction > 0 ? 90 : -90);
+      x += Math.cos((sidewaysHeading * Math.PI) / 180) * amount;
+      y += Math.sin((sidewaysHeading * Math.PI) / 180) * amount;
+    }
+
+    if (methodName === 'turnLeft' || methodName === 'turnRight') {
+      heading += methodName === 'turnLeft' ? amount : -amount;
+    }
+
+    if (methodName === 'turn') {
+      const turnArgs = argsRaw.match(/"([^"]+)"\s*,\s*(\d+(?:\.\d+)?)/) || argsRaw.match(/'([^']+)'\s*,\s*(\d+(?:\.\d+)?)/);
+      if (turnArgs) {
+        const direction = (turnArgs[1] || 'left').toLowerCase();
+        const turnAmount = Number(turnArgs[2] || 0);
+        heading += direction === 'right' ? -turnAmount : turnAmount;
+      }
+    }
+
+    points.push({ id: `planner-${points.length}`, x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+  });
+
+  return points;
+}
+
+export function buildPlannerMotionCommands(waypoints = []) {
+  if (!Array.isArray(waypoints) || waypoints.length < 2) {
+    return ['robot.stand();', 'robot.wait(0.5);', 'robot.stand();', 'console.log("Program complete!");'];
+  }
+
+  const commands = ['robot.stand();', 'robot.wait(0.5);'];
+  let heading = 0;
+
+  for (let i = 1; i < waypoints.length; i += 1) {
+    const from = waypoints[i - 1];
+    const to = waypoints[i];
+    const segment = normalizePlannerMotionSegment(from, to, heading);
+
+    if (segment.distanceMeters <= 0.05) continue;
+
+    if (Math.abs(segment.turnDelta) > 1) {
+      const direction = segment.turnDelta > 0 ? 'Left' : 'Right';
+      const angle = Math.min(180, Math.abs(Math.round(segment.turnDelta)));
+      commands.push(`robot.turn${direction}(${angle});`);
+      heading += segment.turnDelta;
+    }
+
+    if (segment.stepCount > 0) {
+      const action = segment.shouldWalkBackward ? 'robot.walkBackward' : 'robot.walkForward';
+      commands.push(`${action}(${segment.stepCount});`);
+    }
+  }
+
+  commands.push('robot.stand();');
+  commands.push('console.log("Program complete!");');
+  return commands;
+}
+
 function isBlockedByObstacle(x, y, obstacles = []) {
   if (!obstacles.length) return false;
   return obstacles.some((obstacle) => {
@@ -215,20 +339,25 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   addFrame(true);
 
   const walkThrough = (distance, direction, label, summary) => {
+    const normalizedDirection = direction === 0 ? 0 : (direction > 0 ? 1 : -1);
     const radians = (heading * Math.PI) / 180;
-    const frameCount = Math.max(8, Math.ceil(Math.abs(distance) * 12));
-    const stepX = Math.cos(radians) * distance / frameCount;
-    const stepY = Math.sin(radians) * distance / frameCount;
+    const travelDistance = Math.abs(distance);
+    const frameCount = Math.max(10, Math.ceil(travelDistance * 16));
+    const stepScale = travelDistance / frameCount;
+    const stepX = Math.cos(radians) * stepScale * normalizedDirection;
+    const stepY = Math.sin(radians) * stepScale * normalizedDirection;
     actions.push({ label, summary });
     timeline.push({ label, summary });
+
     for (let index = 0; index < frameCount; index += 1) {
       x = Number((x + stepX).toFixed(3));
       y = Number((y + stepY).toFixed(3));
-      gaitPhase += 1 / 8;
-      torsoPitch = direction < 0 ? -8 : 8;
+      gaitPhase += 0.18;
+      torsoPitch = Math.sin(gaitPhase * Math.PI) * (normalizedDirection >= 0 ? 8 : -8);
       path.push({ x, y });
       addFrame();
     }
+
     torsoPitch = 0;
   };
 

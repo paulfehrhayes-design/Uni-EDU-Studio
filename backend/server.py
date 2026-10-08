@@ -697,16 +697,40 @@ def g1_model_info():
     with open(G1_URDF_PATH, "r", encoding="utf-8") as urdf_file:
         urdf_text = urdf_file.read()
 
-    joint_names = re.findall(r'<joint\s+name="([^"]+)"[^>]*type="revolute"[^>]*>', urdf_text)
-    links = re.findall(r'<link\s+name="([^"]+)"', urdf_text)
+    cleaned_urdf = re.sub(r'<!--.*?-->', '', urdf_text, flags=re.DOTALL)
+    joint_blocks = re.findall(r'<joint\b[^>]*>.*?</joint>', cleaned_urdf, flags=re.DOTALL)
+    joint_details = []
+    for block in joint_blocks:
+        name_match = re.search(r'<joint\s+name="([^"]+)"', block)
+        type_match = re.search(r'<joint\s+[^>]*type="([^"]+)"', block)
+        if not name_match:
+            continue
+        joint_details.append({
+            "name": name_match.group(1),
+            "type": type_match.group(1) if type_match else "fixed",
+            "parent": re.search(r'<parent\s+link="([^"]+)"', block).group(1) if re.search(r'<parent\s+link="([^"]+)"', block) else None,
+            "child": re.search(r'<child\s+link="([^"]+)"', block).group(1) if re.search(r'<child\s+link="([^"]+)"', block) else None,
+            "axis": re.search(r'<axis\s+xyz="([^"]+)"', block).group(1) if re.search(r'<axis\s+xyz="([^"]+)"', block) else "0 0 0",
+            "origin": re.search(r'<origin\s+xyz="([^"]+)"', block).group(1) if re.search(r'<origin\s+xyz="([^"]+)"', block) else "0 0 0",
+        })
+
+    all_joints = [joint["name"] for joint in joint_details if not joint["name"].startswith("floating_")]
+    revolute_joints = [joint["name"] for joint in joint_details if joint["type"] == "revolute" and not joint["name"].startswith("floating_")]
+    fixed_joints = [joint["name"] for joint in joint_details if joint["type"] == "fixed" and not joint["name"].startswith("floating_")]
+    links = re.findall(r'<link\s+name="([^"]+)"', cleaned_urdf)
 
     return {
         "robotType": "Unitree G1",
         "source": "URDF",
         "sourceFile": "g1_23dof.urdf.txt",
         "baseLink": "pelvis" if "pelvis" in links else (links[0] if links else "pelvis"),
-        "jointCount": len(joint_names),
-        "joints": joint_names,
+        "jointCount": len(revolute_joints),
+        "joints": revolute_joints,
+        "revoluteJoints": revolute_joints,
+        "fixedJoints": fixed_joints,
+        "allJoints": all_joints,
+        "links": links,
+        "jointDetails": joint_details,
     }
 
 

@@ -12,7 +12,7 @@ import * as Zh from 'blockly/msg/zh-hans';
 import 'blockly/blocks';
 import g1BasicConfigZh from '../block_configurations/g1_basic/g1_basic.json';
 import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
-import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
 import G1Simulation3D from './components/G1Simulation3D';
 import { compileMotionPrompt } from './sim/textToMotion';
 
@@ -632,6 +632,7 @@ export default function App() {
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
   const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
   const [sceneObjects, setSceneObjects] = useState([]);
+  const [activeDragItem, setActiveDragItem] = useState(null);
   const [projectName, setProjectName] = useState('default');
   const [projectLibrary, setProjectLibrary] = useState([]);
   const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
@@ -793,7 +794,7 @@ export default function App() {
             setPlannerWaypoints(response.project.plannerWaypoints);
           }
           if (response.project && typeof response.project.generatedCode === 'string') {
-            setGeneratedCode(response.project.generatedCode);
+            applyGeneratedCode(response.project.generatedCode, { syncBlocks: true });
           }
         })
         .catch(() => {
@@ -1165,7 +1166,7 @@ export default function App() {
 
         const handleBlocklyEvents = (event) => {
           if ([Blockly.Events.BLOCK_CHANGE, Blockly.Events.BLOCK_MOVE, Blockly.Events.BLOCK_DELETE, Blockly.Events.VAR_CREATE, Blockly.Events.VAR_DELETE, Blockly.Events.VAR_RENAME].includes(event.type)) {
-            try { setGeneratedCode(pythonGenerator.workspaceToCode(workspaceRef.current)); } catch(e) {}
+            try { applyGeneratedCode(pythonGenerator.workspaceToCode(workspaceRef.current), { syncBlocks: false }); } catch(e) {}
           }
           if (event.type === Blockly.Events.UI || event.element === 'category') {
              setTimeout(forceResize, 50);
@@ -1185,7 +1186,7 @@ export default function App() {
         const updateCode = () => {
           try {
             const code = pythonGenerator.workspaceToCode(workspaceRef.current);
-            setGeneratedCode(code);
+            applyGeneratedCode(code, { syncBlocks: false });
           } catch(e) {}
         };
         workspaceRef.current.addChangeListener(updateCode);
@@ -1231,7 +1232,7 @@ export default function App() {
       workspaceRef.current?.clear();
       setSceneObjects([]);
       setPlannerWaypoints([]);
-      setGeneratedCode('');
+      applyGeneratedCode('', { syncBlocks: false });
       setIsPreviewPlaying(false);
       if (session?.user?.username) {
         localStorage.removeItem(`edu-scene-objects:${session.user.username}`);
@@ -1244,29 +1245,36 @@ export default function App() {
     setProjectName(project.name || 'default');
     setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
     setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
-    setGeneratedCode(typeof project.generatedCode === 'string' ? project.generatedCode : '');
-    if (workspaceRef.current && window.Blockly) {
-      syncBlocksFromGeneratedCode(typeof project.generatedCode === 'string' ? project.generatedCode : '');
-    }
+    const nextCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
+    applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
   };
 
   const addPlannerWaypoint = () => {
     setPlannerWaypoints((prev) => {
       const lastPoint = prev[prev.length - 1] || { x: 0, y: 0 };
+      const nextPoint = clampScenePoint(lastPoint.x + 4, lastPoint.y + 2, gridSize);
       return [
         ...prev,
         {
           id: `planner-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          x: lastPoint.x + 4,
-          y: lastPoint.y + 2,
+          x: nextPoint.x,
+          y: nextPoint.y,
         },
       ];
     });
   };
 
   const updatePlannerWaypoint = (id, patch) => {
-    setPlannerWaypoints((prev) => prev.map((point) => point.id === id ? { ...point, ...patch } : point));
+    setPlannerWaypoints((prev) => prev.map((point) => {
+      if (point.id !== id) return point;
+      const nextPosition = clampScenePoint(
+        patch.x !== undefined ? patch.x : point.x,
+        patch.y !== undefined ? patch.y : point.y,
+        gridSize,
+      );
+      return { ...point, ...patch, x: nextPosition.x, y: nextPosition.y };
+    }));
   };
 
   const removePlannerWaypoint = (id) => {
@@ -1280,30 +1288,7 @@ export default function App() {
     }
     if (generatedCode.trim() && !window.confirm('Compiling this path will replace the current Blocks and IDE code. Continue?')) return;
 
-    const ordered = [...plannerWaypoints].sort((a, b) => a.x - b.x || a.y - b.y);
-    const commands = ['robot.stand();', 'robot.wait(0.5);'];
-
-    for (let i = 1; i < ordered.length; i += 1) {
-      const from = ordered[i - 1];
-      const to = ordered[i];
-      const dx = to.x - from.x;
-      const dy = to.y - from.y;
-      const distance = Math.hypot(dx, dy);
-      const turn = Math.atan2(dy, dx) * (180 / Math.PI);
-
-      if (Math.abs(turn) > 1) {
-        const direction = turn > 0 ? 'Left' : 'Right';
-        const angle = Math.min(180, Math.abs(turn));
-        commands.push(`robot.turn${direction}(${angle.toFixed(0)});`);
-      }
-
-      if (distance > 0.1) {
-        commands.push(`robot.walkForward(${Math.max(1, Math.round(distance / 4))});`);
-      }
-    }
-
-    commands.push('robot.stand();');
-    commands.push('console.log("Program complete!");');
+    const commands = buildPlannerMotionCommands(plannerWaypoints);
     updateGeneratedCode(commands.join('\n'));
     setMainTab('ide');
   };
@@ -1329,11 +1314,6 @@ export default function App() {
     });
     setSimulatorState(state);
   }, [generatedCode, simulatorMode, activeObstacles]);
-
-  useEffect(() => {
-    setPlaybackProgress(0);
-    setIsPreviewPlaying(false);
-  }, [generatedCode]);
 
   const startSimulationPreview = () => {
     if (!generatedCode.trim()) {
@@ -1499,15 +1479,88 @@ export default function App() {
     }
   }, []);
 
-  const updateGeneratedCode = useCallback((nextCode) => {
+  const derivePlannerWaypointsFromCode = useCallback((code = '') => {
+    if (!code || !code.trim()) {
+      return [{ id: 'planner-1', x: 0, y: 0 }];
+    }
+
+    const commandMatches = [...code.matchAll(/robot\.(walkForward|walkBackward|walkSidewaysLeft|walkSidewaysRight|turnLeft|turnRight|turn)\(([^)]*)\)/g)];
+    if (!commandMatches.length) {
+      return [{ id: 'planner-1', x: 0, y: 0 }];
+    }
+
+    let x = 0;
+    let y = 0;
+    let heading = 0;
+    const points = [{ id: 'planner-0', x, y }];
+
+    commandMatches.forEach((match) => {
+      const [, methodName, argsRaw = ''] = match;
+      const numeric = Number((argsRaw.match(/-?\d*\.?\d+/) || ['0'])[0]);
+      const amount = Number.isFinite(numeric) ? numeric : 0;
+
+      if (methodName === 'walkForward' || methodName === 'walkBackward') {
+        const stepDistance = methodName === 'walkBackward' ? -amount : amount;
+        x += Math.cos((heading * Math.PI) / 180) * stepDistance;
+        y += Math.sin((heading * Math.PI) / 180) * stepDistance;
+      }
+
+      if (methodName === 'walkSidewaysLeft' || methodName === 'walkSidewaysRight') {
+        const direction = methodName === 'walkSidewaysLeft' ? 1 : -1;
+        const sidewaysHeading = heading + (direction > 0 ? 90 : -90);
+        x += Math.cos((sidewaysHeading * Math.PI) / 180) * amount;
+        y += Math.sin((sidewaysHeading * Math.PI) / 180) * amount;
+      }
+
+      if (methodName === 'turnLeft' || methodName === 'turnRight') {
+        heading += methodName === 'turnLeft' ? amount : -amount;
+      }
+
+      if (methodName === 'turn') {
+        const turnArgs = argsRaw.match(/"([^"]+)"\s*,\s*(\d+(?:\.\d+)?)/) || argsRaw.match(/'([^']+)'\s*,\s*(\d+(?:\.\d+)?)/);
+        if (turnArgs) {
+          const direction = (turnArgs[1] || 'left').toLowerCase();
+          const turnAmount = Number(turnArgs[2] || 0);
+          heading += direction === 'right' ? -turnAmount : turnAmount;
+        }
+      }
+
+      points.push({ id: `planner-${points.length}`, x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+    });
+
+    if (points.length < 2) {
+      return [{ id: 'planner-1', x: 0, y: 0 }];
+    }
+
+    return points;
+  }, []);
+
+  useEffect(() => {
+    const nextWaypoints = derivePlannerWaypointsFromCode(generatedCode);
+    setPlannerWaypoints((previousWaypoints) => {
+      const previousSnapshot = JSON.stringify(previousWaypoints);
+      const nextSnapshot = JSON.stringify(nextWaypoints);
+      return previousSnapshot === nextSnapshot ? previousWaypoints : nextWaypoints;
+    });
+    setPlaybackProgress(0);
+    setIsPreviewPlaying(false);
+  }, [generatedCode, derivePlannerWaypointsFromCode]);
+
+  const applyGeneratedCode = useCallback((nextCode, options = {}) => {
+    const { syncBlocks = true } = options;
     const result = sanitizeRobotCode(nextCode);
     const safeCode = result.code || nextCode;
+    generatedCodeRef.current = safeCode;
     setGeneratedCode(safeCode);
     setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
-    if (workspaceRef.current && window.Blockly) {
+    if (syncBlocks && workspaceRef.current && window.Blockly) {
       syncBlocksFromGeneratedCode(safeCode);
     }
   }, [syncBlocksFromGeneratedCode]);
+
+  const updateGeneratedCode = useCallback((nextCode) => {
+    applyGeneratedCode(nextCode, { syncBlocks: true });
+  }, [applyGeneratedCode]);
 
   const applyMotionPromptResult = (promptText, source) => {
     const result = compileMotionPrompt(promptText);
@@ -1573,6 +1626,7 @@ export default function App() {
 
   const addStudentObstacle = (type = 'box') => {
     const preset = OBJECT_LIBRARY.find((item) => item.id === type) || OBJECT_LIBRARY[0];
+    const defaultPosition = clampScenePoint(0, 0, gridSize);
     setSceneObjects((prev) => [
       ...prev,
       {
@@ -1580,15 +1634,23 @@ export default function App() {
         type: preset.id,
         label: preset.label,
         color: preset.color,
-        x: 0,
-        y: 0,
+        x: defaultPosition.x,
+        y: defaultPosition.y,
         radius: preset.defaultRadius,
       },
     ]);
   };
 
   const updateStudentObstacle = (id, patch) => {
-    setSceneObjects((prev) => prev.map((obstacle) => obstacle.id === id ? { ...obstacle, ...patch } : obstacle));
+    setSceneObjects((prev) => prev.map((obstacle) => {
+      if (obstacle.id !== id) return obstacle;
+      const nextPosition = clampScenePoint(
+        patch.x !== undefined ? patch.x : obstacle.x,
+        patch.y !== undefined ? patch.y : obstacle.y,
+        gridSize,
+      );
+      return { ...obstacle, ...patch, x: nextPosition.x, y: nextPosition.y };
+    }));
   };
 
   const removeStudentObstacle = (id) => {
@@ -1604,11 +1666,12 @@ export default function App() {
 
   const getSvgCoords = (event) => {
     const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
-    const rect = svg.getBoundingClientRect();
-    const svgX = ((event.clientX - rect.left) / rect.width) * 220;
-    const svgY = ((event.clientY - rect.top) / rect.height) * 220;
-    const localX = (svgX - sceneOrigin) / sceneScale;
-    const localY = (sceneOrigin - svgY) / sceneScale;
+    const screenPoint = svg.createSVGPoint();
+    screenPoint.x = event.clientX;
+    screenPoint.y = event.clientY;
+    const svgPoint = screenPoint.matrixTransform(svg.getScreenCTM().inverse());
+    const localX = (svgPoint.x - sceneOrigin) / sceneScale;
+    const localY = (sceneOrigin - svgPoint.y) / sceneScale;
     return {
       x: Math.max(-gridSize / 2, Math.min(gridSize / 2, localX)),
       y: Math.max(-gridSize / 2, Math.min(gridSize / 2, localY)),
@@ -1618,29 +1681,48 @@ export default function App() {
   const handleObstaclePointerDown = (event, obstacleId) => {
     if (currentUser.role === 'teacher') return;
     obstacleDragRef.current = { obstacleId, pointerId: event.pointerId };
+    setActiveDragItem({ kind: 'obstacle', id: obstacleId });
+    event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
 
   const handlePlannerWaypointPointerDown = (event, waypointId) => {
     plannerDragRef.current = { waypointId, pointerId: event.pointerId };
+    setActiveDragItem({ kind: 'waypoint', id: waypointId });
+    event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
 
   const handleObstaclePointerMove = (event) => {
     if (!obstacleDragRef.current || currentUser.role === 'teacher') return;
-    const { x, y } = getSvgCoords(event);
+    const { x, y } = clampScenePoint(...Object.values(getSvgCoords(event)), gridSize);
     updateStudentObstacle(obstacleDragRef.current.obstacleId, { x, y });
   };
 
   const handlePlannerWaypointPointerMove = (event) => {
     if (!plannerDragRef.current) return;
-    const { x, y } = getSvgCoords(event);
+    const { x, y } = clampScenePoint(...Object.values(getSvgCoords(event)), gridSize);
     updatePlannerWaypoint(plannerDragRef.current.waypointId, { x, y });
+  };
+
+  const handleScenePointerMove = (event) => {
+    if (plannerDragRef.current) {
+      handlePlannerWaypointPointerMove(event);
+      return;
+    }
+    if (obstacleDragRef.current) {
+      handleObstaclePointerMove(event);
+    }
   };
 
   const handleObstaclePointerUp = () => {
     obstacleDragRef.current = null;
     plannerDragRef.current = null;
+    setActiveDragItem(null);
+  };
+
+  const handleScenePointerUp = () => {
+    handleObstaclePointerUp();
   };
 
   const handlePromptSubmit = () => { promptState.callback?.(promptState.inputValue); setPromptState({ ...promptState, isOpen: false }); };
@@ -1652,11 +1734,21 @@ export default function App() {
       if (block) {
         block.data = codeEditorState.code;
         if (workspaceRef.current) {
-           const event = new window.Blockly.Events.BlockChange(block, 'comment', null, '', ''); 
-           workspaceRef.current.fireChangeListener(event);
+          const event = new window.Blockly.Events.BlockChange(block, 'comment', null, '', '');
+          workspaceRef.current.fireChangeListener(event);
         }
       }
     }
+
+    if (workspaceRef.current && window.Blockly) {
+      try {
+        const nextCode = pythonGenerator.workspaceToCode(workspaceRef.current);
+        applyGeneratedCode(nextCode, { syncBlocks: true });
+      } catch (error) {
+        console.warn('Failed to refresh generated code after block edit.', error);
+      }
+    }
+
     setCodeEditorState({ ...codeEditorState, isOpen: false });
   };
 
@@ -2420,7 +2512,7 @@ export default function App() {
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
         <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
         <div className="absolute inset-0">
-          <svg viewBox="0 0 220 220" className="scene-svg h-full w-full block">
+          <svg viewBox="0 0 220 220" className="scene-svg h-full w-full block" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerLeave={handleScenePointerUp}>
             <defs>
               <pattern id="workspace-grid" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
                 <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
@@ -2495,6 +2587,68 @@ export default function App() {
           onPlaybackReset={resetSimulationPreview}
           onPlaybackSpeedChange={handlePlaybackSpeedChange}
         />
+
+        <div className="pointer-events-none absolute inset-0 z-10">
+          <svg viewBox="0 0 220 220" className="block h-full w-full" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerCancel={handleScenePointerUp}>
+            {activeObstacles.map((obstacle) => {
+              const isStudentObstacle = String(obstacle.id).startsWith('student-');
+              const isEditable = currentUser.role !== 'teacher' && isStudentObstacle;
+              const isDragging = activeDragItem?.kind === 'obstacle' && activeDragItem.id === obstacle.id;
+              const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
+              const x = sceneX(obstacle.x);
+              const y = sceneY(obstacle.y);
+              const radius = obstacle.radius * sceneScale;
+              return (
+                <g
+                  key={`interactive-${obstacle.id}`}
+                  className={isEditable ? 'pointer-events-auto touch-none' : 'pointer-events-none'}
+                  onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined}
+                  style={{ cursor: isEditable ? (isDragging ? 'grabbing' : 'grab') : 'default' }}
+                >
+                  {isDragging && <circle cx={x} cy={y} r={radius + 5} fill="none" stroke="#67e8f9" strokeWidth="3" strokeDasharray="5 3" />}
+                  <circle
+                    cx={x}
+                    cy={y}
+                    r={radius}
+                    fill={color}
+                    fillOpacity={isStudentObstacle ? 0.45 : 0.35}
+                    stroke={isDragging ? '#0891b2' : isStudentObstacle ? '#7c3aed' : '#f59e0b'}
+                    strokeWidth={isDragging ? 3 : 2}
+                    strokeDasharray={isStudentObstacle ? '0' : '6 3'}
+                  />
+                </g>
+              );
+            })}
+            {plannerWaypoints.length > 1 && (
+              <polyline
+                points={plannerWaypoints.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
+                fill="none"
+                stroke="#22c55e"
+                strokeWidth="3"
+                strokeDasharray="6 4"
+                opacity="0.9"
+                className="pointer-events-none"
+              />
+            )}
+            {plannerWaypoints.map((point, index) => {
+              const isDragging = activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id;
+              const x = sceneX(point.x);
+              const y = sceneY(point.y);
+              return (
+                <g
+                  key={`interactive-${point.id}`}
+                  className="pointer-events-auto touch-none"
+                  onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)}
+                  style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
+                >
+                  {isDragging && <circle cx={x} cy={y} r="11" fill="none" stroke="#67e8f9" strokeWidth="3" strokeDasharray="4 2" />}
+                  <circle cx={x} cy={y} r="7" fill="#22c55e" stroke={isDragging ? '#0891b2' : '#14532d'} strokeWidth={isDragging ? 3 : 2} />
+                  <text x={x} y={y + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700" className="pointer-events-none">{index + 1}</text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
 
         <div
           className="absolute z-20 flex flex-col overflow-visible rounded-xl border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm"
@@ -2751,11 +2905,8 @@ export default function App() {
                     <textarea
                       value={generatedCode || ''}
                       onChange={(event) => {
-                        const result = sanitizeRobotCode(event.target.value);
-                        const nextCode = result.code || event.target.value;
-                        generatedCodeRef.current = nextCode;
-                        setGeneratedCode(nextCode);
-                        setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
+                        const nextCode = event.target.value;
+                        applyGeneratedCode(nextCode, { syncBlocks: true });
                       }}
                       onBlur={() => syncBlocksFromGeneratedCode(generatedCodeRef.current)}
                       spellCheck={false}
