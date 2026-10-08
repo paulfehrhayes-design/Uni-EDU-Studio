@@ -162,7 +162,7 @@ export function clampScenePoint(x, y, gridSize = 20) {
 export function derivePlannerWaypointsFromCode(code = '') {
   if (!code || !code.trim()) return [];
 
-  const commandMatches = [...code.matchAll(/robot\.(walkForward|walkBackward|walkSidewaysLeft|walkSidewaysRight|turnLeft|turnRight|turn)\(([^)]*)\)/g)];
+  const commandMatches = [...code.matchAll(/robot\.(moveTo|walkForward|walkBackward|walkSidewaysLeft|walkSidewaysRight|turnLeft|turnRight|turn)\(([^)]*)\)/g)];
   if (!commandMatches.length) return [];
 
   let x = 0;
@@ -175,7 +175,13 @@ export function derivePlannerWaypointsFromCode(code = '') {
     const numeric = Number((argsRaw.match(/-?\d*\.?\d+/) || ['0'])[0]);
     const amount = Number.isFinite(numeric) ? numeric : 0;
 
-    if (methodName === 'walkForward' || methodName === 'walkBackward') {
+        if (methodName === 'moveTo') {
+          const [targetX, targetY] = argsRaw.split(',').map(Number);
+          if (Number.isFinite(targetX) && Number.isFinite(targetY)) {
+            x = targetX;
+            y = targetY;
+          }
+        } else if (methodName === 'walkForward' || methodName === 'walkBackward') {
       const stepDistance = methodName === 'walkBackward' ? -amount : amount;
       x += Math.cos((heading * Math.PI) / 180) * stepDistance;
       y += Math.sin((heading * Math.PI) / 180) * stepDistance;
@@ -213,26 +219,18 @@ export function buildPlannerMotionCommands(waypoints = []) {
   }
 
   const commands = ['robot.stand();', 'robot.wait(0.5);'];
-  let heading = 0;
+  let previous = G1_EDU_23_ENV.initialPose;
 
-  for (let i = 1; i < waypoints.length; i += 1) {
-    const from = waypoints[i - 1];
-    const to = waypoints[i];
-    const segment = normalizePlannerMotionSegment(from, to, heading);
+  waypoints.forEach((waypoint) => {
+    const x = Number(waypoint.x);
+    const y = Number(waypoint.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - previous.x, y - previous.y) <= 0.01) return;
+    commands.push(`robot.moveTo(${x.toFixed(2)}, ${y.toFixed(2)});`);
+    previous = { x, y };
+  });
 
-    if (segment.distanceMeters <= 0.05) continue;
-
-    if (Math.abs(segment.turnDelta) > 1) {
-      const direction = segment.turnDelta > 0 ? 'Left' : 'Right';
-      const angle = Math.min(180, Math.abs(Math.round(segment.turnDelta)));
-      commands.push(`robot.turn${direction}(${angle});`);
-      heading += segment.turnDelta;
-    }
-
-    if (segment.stepCount > 0) {
-      const action = segment.shouldWalkBackward ? 'robot.walkBackward' : 'robot.walkForward';
-      commands.push(`${action}(${segment.stepCount});`);
-    }
+  if (commands.length === 2) {
+    commands.push('robot.moveTo(0, 0);');
   }
 
   commands.push('robot.stand();');
@@ -439,10 +437,40 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       }, 'Stand up', 'Return to neutral standing stance.');
       return;
     }
-
     const methodName = match[1];
     const argsRaw = match[2] || '';
     const firstNumber = Number((argsRaw.match(/-?\d*\.?\d+/) || ['0'])[0]);
+
+    if (methodName === 'moveTo') {
+      const [targetX, targetY] = argsRaw.split(',').map(Number);
+      if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) return;
+
+      const deltaX = targetX - x;
+      const deltaY = targetY - y;
+      const distance = Math.hypot(deltaX, deltaY);
+      if (distance > 0.01) {
+        const startHeading = heading;
+        const targetHeading = (Math.atan2(deltaY, deltaX) * 180) / Math.PI;
+        const turnDelta = normalizeTurnDelta(targetHeading - startHeading);
+        if (Math.abs(turnDelta) > 0.05) {
+          animateAction(14, (progress) => {
+            heading = startHeading + turnDelta * progress;
+            torsoRoll = Math.sin(progress * Math.PI) * 8;
+          }, turnDelta > 0 ? 'Turn Left' : 'Turn Right', `${Math.abs(turnDelta).toFixed(1)}°`);
+          heading = startHeading + turnDelta;
+          torsoRoll = 0;
+        }
+
+        walkThrough(distance, 1, 'Follow waypoint path', `${distance.toFixed(2)} m`);
+      }
+
+      x = Number(targetX.toFixed(2));
+      y = Number(targetY.toFixed(2));
+      if (path.length) path[path.length - 1] = { x, y };
+      else path.push({ x, y });
+      addFrame();
+      return;
+    }
 
     if (methodName === 'walkForward' || methodName === 'walkForwardSteps') {
       const stepCount = Math.max(1, firstNumber || 1);

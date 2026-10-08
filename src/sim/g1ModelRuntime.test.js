@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { parseG1Urdf, G1_MODEL_INFO } from './g1ModelRuntime.js';
-import { buildPlannerMotionCommands, clampScenePoint, derivePlannerWaypointsFromCode, normalizePlannerMotionSegment } from './g1Edu23Env.js';
+import { buildG1SimulationFrames, buildPlannerMotionCommands, clampScenePoint, derivePlannerWaypointsFromCode, normalizePlannerMotionSegment } from './g1Edu23Env.js';
 
 test('G1 URDF defines the active robot structure used by the runtime', () => {
   const urdfText = readFileSync(new URL('../../g1_23dof.urdf.txt', import.meta.url), 'utf8');
@@ -31,17 +31,29 @@ test('G1 URDF defines the active robot structure used by the runtime', () => {
   assert.ok(!modelData.allJoints.includes('floating_base_joint'));
 });
 
-test('planner commands preserve waypoint order and heading direction', () => {
+test('planner commands preserve each waypoint from the robot origin', () => {
   const commands = buildPlannerMotionCommands([
     { id: 'start', x: 0, y: 0 },
     { id: 'diag', x: 10, y: 10 },
     { id: 'turn', x: 10, y: 0 },
   ]);
 
-  assert.ok(commands.includes('robot.turnLeft(45);'));
-  assert.ok(commands.includes('robot.turnRight(135);'));
-  assert.ok(commands.indexOf('robot.turnLeft(45);') < commands.indexOf('robot.turnRight(135);'));
-  assert.ok(commands.includes('robot.walkForward(4);'));
+  assert.ok(commands.includes('robot.moveTo(10.00, 10.00);'));
+  assert.ok(commands.includes('robot.moveTo(10.00, 0.00);'));
+  assert.ok(commands.indexOf('robot.moveTo(10.00, 10.00);') < commands.indexOf('robot.moveTo(10.00, 0.00);'));
+});
+
+test('planner simulation reaches fractional waypoint coordinates exactly', () => {
+  const waypoints = [
+    { id: 'first', x: 2.5, y: 1.25 },
+    { id: 'target', x: 4.75, y: 3.5 },
+  ];
+  const code = buildPlannerMotionCommands(waypoints).join('\n');
+  const finalFrame = buildG1SimulationFrames(code).at(-1);
+
+  assert.deepEqual({ x: finalFrame.x, y: finalFrame.y }, { x: 4.75, y: 3.5 });
+  assert.ok(finalFrame.path.some((point) => point.x === 2.5 && point.y === 1.25));
+  assert.ok(finalFrame.path.some((point) => point.x === 4.75 && point.y === 3.5));
 });
 
 test('planner motion normalization keeps forward segments forward and stable', () => {
@@ -79,4 +91,14 @@ test('planner waypoints derived from motion code preserve coordinates', () => {
 
   assert.deepEqual(waypoints[0], { id: 'planner-0', x: 0, y: 0 });
   assert.deepEqual(waypoints.at(-1), { id: 'planner-2', x: 0, y: 2 });
+});
+
+test('planner waypoints derived from moveTo commands stay absolute', () => {
+  const waypoints = derivePlannerWaypointsFromCode('robot.moveTo(2.5, 1.25);\nrobot.moveTo(4.75, 3.5);');
+
+  assert.deepEqual(waypoints.map(({ x, y }) => ({ x, y })), [
+    { x: 0, y: 0 },
+    { x: 2.5, y: 1.25 },
+    { x: 4.75, y: 3.5 },
+  ]);
 });

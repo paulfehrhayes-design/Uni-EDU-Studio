@@ -377,6 +377,9 @@ class Robot:
     def stand(self):
         print("Robot stand")
 
+    def moveTo(self, x, y):
+        print(f"Robot moveTo x={x} y={y}")
+
     def walkForward(self, speed=1.0):
         print(f"Robot walkForward speed={speed}")
 

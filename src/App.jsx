@@ -604,10 +604,13 @@ export default function App() {
   const codeEditorRef = useRef(null);
   const resizeObserverRef = useRef(null);
   const fileInputRef = useRef(null);
+  const compiledPlannerCodeRef = useRef(null);
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
-  const [generatedCode, setGeneratedCode] = useState("");
+  const compiledCode = commands.join('\n');
+  compiledPlannerCodeRef.current = compiledCode;
+  updateGeneratedCode(compiledCode);
   const generatedCodeRef = useRef('');
   const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_ROBOT_CONFIG_EN, null, 2));
   
@@ -639,11 +642,7 @@ export default function App() {
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [gridSize, setGridSize] = useState(20);
-  const [plannerWaypoints, setPlannerWaypoints] = useState([
-    { id: 'planner-1', x: -8, y: 0 },
-    { id: 'planner-2', x: 0, y: 10 },
-    { id: 'planner-3', x: 14, y: 8 },
-  ]);
+  const [plannerWaypoints, setPlannerWaypoints] = useState([]);
   const [simulatorState, setSimulatorState] = useState(createEmptyG1Edu23State());
   const [session, setSession] = useState(() => {
     try {
@@ -1480,14 +1479,10 @@ export default function App() {
   }, []);
 
   const derivePlannerWaypointsFromCode = useCallback((code = '') => {
-    if (!code || !code.trim()) {
-      return [{ id: 'planner-1', x: 0, y: 0 }];
-    }
+    if (!code || !code.trim()) return [];
 
     const commandMatches = [...code.matchAll(/robot\.(walkForward|walkBackward|walkSidewaysLeft|walkSidewaysRight|turnLeft|turnRight|turn)\(([^)]*)\)/g)];
-    if (!commandMatches.length) {
-      return [{ id: 'planner-1', x: 0, y: 0 }];
-    }
+    if (!commandMatches.length) return [];
 
     let x = 0;
     let y = 0;
@@ -1536,12 +1531,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const nextWaypoints = derivePlannerWaypointsFromCode(generatedCode);
-    setPlannerWaypoints((previousWaypoints) => {
-      const previousSnapshot = JSON.stringify(previousWaypoints);
-      const nextSnapshot = JSON.stringify(nextWaypoints);
-      return previousSnapshot === nextSnapshot ? previousWaypoints : nextWaypoints;
-    });
+    const isCompiledPlannerPath = compiledPlannerCodeRef.current === generatedCode;
+    compiledPlannerCodeRef.current = null;
+    if (!isCompiledPlannerPath) {
+      const nextWaypoints = derivePlannerWaypointsFromCode(generatedCode);
+      setPlannerWaypoints((previousWaypoints) => {
+        const previousSnapshot = JSON.stringify(previousWaypoints);
+        const nextSnapshot = JSON.stringify(nextWaypoints);
+        return previousSnapshot === nextSnapshot ? previousWaypoints : nextWaypoints;
+      });
+    }
     setPlaybackProgress(0);
     setIsPreviewPlaying(false);
   }, [generatedCode, derivePlannerWaypointsFromCode]);
@@ -1919,101 +1918,6 @@ export default function App() {
 
   if (!isBlocklyLoaded) return <div className="flex h-screen items-center justify-center bg-gray-50 flex-col gap-4"><Loader2 className="animate-spin text-blue-600" size={48} /><p className="text-gray-500 font-medium">{UI_TEXT.en.loading}</p></div>;
 
-  const robotAnchor = { x: sceneX(simulatorState.x), y: sceneY(simulatorState.y) };
-  const robotJoints = simulatorState.joints || {};
-  const toRadians = (degrees) => (degrees * Math.PI) / 180;
-  const armLen = 22;
-  const forearmLen = 20;
-  const legLen = 30;
-  const shinLen = 28;
-  const getJointAngle = (name, defaultValue = 0) => Number(robotJoints[name] ?? defaultValue);
-
-  const leftArm = (() => {
-    const shoulder = getJointAngle('left_shoulder_pitch', 12);
-    const elbow = getJointAngle('left_elbow_pitch', 8);
-    const shoulderRad = toRadians(shoulder + 180);
-    const elbowRad = toRadians(elbow + 110);
-    const shoulderX = 0;
-    const shoulderY = -28;
-    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
-    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
-    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
-  })();
-
-  const rightArm = (() => {
-    const shoulder = getJointAngle('right_shoulder_pitch', 12);
-    const elbow = getJointAngle('right_elbow_pitch', 8);
-    const shoulderRad = toRadians(shoulder + 180);
-    const elbowRad = toRadians(elbow + 110);
-    const shoulderX = 0;
-    const shoulderY = -28;
-    const elbowX = shoulderX + Math.cos(shoulderRad) * armLen;
-    const elbowY = shoulderY + Math.sin(shoulderRad) * armLen;
-    const wristX = elbowX + Math.cos(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    const wristY = elbowY + Math.sin(shoulderRad + elbowRad - Math.PI) * forearmLen;
-    return { shoulderX, shoulderY, elbowX, elbowY, wristX, wristY };
-  })();
-
-  const leftLeg = (() => {
-    const hip = getJointAngle('left_hip_pitch', 8);
-    const knee = getJointAngle('left_knee_pitch', 10);
-    const hipRad = toRadians(hip + 200);
-    const kneeRad = toRadians(knee + 80);
-    const hipX = 0;
-    const hipY = 28;
-    const kneeX = hipX + Math.cos(hipRad) * legLen;
-    const kneeY = hipY + Math.sin(hipRad) * legLen;
-    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
-    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
-    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
-  })();
-
-  const rightLeg = (() => {
-    const hip = getJointAngle('right_hip_pitch', 8);
-    const knee = getJointAngle('right_knee_pitch', 10);
-    const hipRad = toRadians(hip + 200);
-    const kneeRad = toRadians(knee + 80);
-    const hipX = 0;
-    const hipY = 28;
-    const kneeX = hipX + Math.cos(hipRad) * legLen;
-    const kneeY = hipY + Math.sin(hipRad) * legLen;
-    const ankleX = kneeX + Math.cos(hipRad + kneeRad - Math.PI) * shinLen;
-    const ankleY = kneeY + Math.sin(hipRad + kneeRad - Math.PI) * shinLen;
-    return { hipX, hipY, kneeX, kneeY, ankleX, ankleY };
-  })();
-
-  const robotBody = (
-    <g transform={`translate(${robotAnchor.x} ${robotAnchor.y}) rotate(${simulatorState.heading})`}>
-      <ellipse cx="0" cy="44" rx="38" ry="10" fill="rgba(15,23,42,0.18)" />
-      <g stroke="#dfe7f3" strokeWidth="2" strokeLinecap="round" fill="none">
-        <line x1="0" y1="-10" x2="0" y2="-42" stroke="#b4c4d8" strokeWidth="6" />
-        <line x1="0" y1="-42" x2="0" y2="-70" stroke="#b4c4d8" strokeWidth="8" />
-        <ellipse cx="0" cy="-70" rx="16" ry="18" fill="#e2e8f0" stroke="#475569" strokeWidth="2" />
-        <circle cx="0" cy="-74" r="5" fill="#94a3b8" />
-        <line x1="-8" y1="-66" x2="-18" y2="-58" stroke="#475569" strokeWidth="2" />
-        <line x1="8" y1="-66" x2="18" y2="-58" stroke="#475569" strokeWidth="2" />
-
-        <line x1="-10" y1="-40" x2={leftArm.shoulderX} y2={leftArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={leftArm.shoulderX} y1={leftArm.shoulderY} x2={leftArm.elbowX} y2={leftArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={leftArm.elbowX} y1={leftArm.elbowY} x2={leftArm.wristX} y2={leftArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="10" y1="-40" x2={rightArm.shoulderX} y2={rightArm.shoulderY - 8} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={rightArm.shoulderX} y1={rightArm.shoulderY} x2={rightArm.elbowX} y2={rightArm.elbowY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={rightArm.elbowX} y1={rightArm.elbowY} x2={rightArm.wristX} y2={rightArm.wristY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="-8" y1="8" x2={leftLeg.hipX} y2={leftLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={leftLeg.hipX} y1={leftLeg.hipY} x2={leftLeg.kneeX} y2={leftLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={leftLeg.kneeX} y1={leftLeg.kneeY} x2={leftLeg.ankleX} y2={leftLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
-
-        <line x1="8" y1="8" x2={rightLeg.hipX} y2={rightLeg.hipY - 2} stroke="#cbd5e1" strokeWidth="5" />
-        <line x1={rightLeg.hipX} y1={rightLeg.hipY} x2={rightLeg.kneeX} y2={rightLeg.kneeY} stroke="#dfe7f3" strokeWidth="4" />
-        <line x1={rightLeg.kneeX} y1={rightLeg.kneeY} x2={rightLeg.ankleX} y2={rightLeg.ankleY} stroke="#dfe7f3" strokeWidth="4" />
-      </g>
-    </g>
-  );
-
   return (
     <div className="flex flex-col h-screen bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
       
@@ -2249,7 +2153,6 @@ export default function App() {
               {[
                 { id: 'add-object', label: 'Add Object' },
                 { id: 'scene-objects', label: 'Scene Objects' },
-                { id: 'planner', label: 'Motion Planner' },
                 { id: 'settings', label: 'Settings' },
               ].map((tab) => (
                 <button
@@ -2315,41 +2218,6 @@ export default function App() {
               </div>
             )}
 
-            {simulatorSidebarTab === 'planner' && (
-              <div className="space-y-3">
-                <div className="flex gap-2">
-                  <button type="button" onClick={addPlannerWaypoint} className="flex-1 rounded-lg bg-blue-600 px-2 py-1.5 text-[10px] font-semibold text-white hover:bg-blue-700">Add waypoint</button>
-                  <button type="button" onClick={compilePlannerPath} className="flex-1 rounded-lg bg-emerald-600 px-2 py-1.5 text-[10px] font-semibold text-white hover:bg-emerald-700">Compile path</button>
-                </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[10px] text-slate-600">
-                  <p className="font-semibold uppercase tracking-wide text-slate-500">Planner instructions</p>
-                      <p className="mt-2">Each grid square is 1 m. Place and drag waypoints in the scene. Compile creates robot walk commands that update the IDE and block output.</p>
-                </div>
-                {plannerWaypoints.length === 0 ? (
-                  <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">No waypoints yet.</p>
-                ) : (
-                  plannerWaypoints.map((point, index) => (
-                    <div key={point.id} className="rounded-lg border border-slate-200 bg-white p-2">
-                      <div className="mb-2 flex items-center justify-between">
-                        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-600">Waypoint {index + 1}</span>
-                        <button type="button" onClick={() => removePlannerWaypoint(point.id)} className="text-[10px] text-red-600">Delete</button>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-600">
-                        <label>
-                          X
-                          <input type="number" value={point.x} step="0.5" onChange={(event) => updatePlannerWaypoint(point.id, { x: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-1 py-1" />
-                        </label>
-                        <label>
-                          Y
-                          <input type="number" value={point.y} step="0.5" onChange={(event) => updatePlannerWaypoint(point.id, { y: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-slate-50 px-1 py-1" />
-                        </label>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-
             {simulatorSidebarTab === 'settings' && (
               <div className="space-y-3">
                 <div className="rounded-lg border border-slate-200 bg-white p-2">
@@ -2391,7 +2259,7 @@ export default function App() {
             )}
 
             <div className="rounded-xl border border-slate-200 bg-slate-100 p-2">
-              <svg viewBox="0 0 220 220" className="block aspect-square w-full" onPointerMove={handleObstaclePointerMove} onPointerUp={handleObstaclePointerUp} onPointerLeave={handleObstaclePointerUp}>
+              <svg viewBox="0 0 220 220" className="block aspect-square w-full" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerLeave={handleScenePointerUp}>
                 <defs>
                   <pattern id="grid-pattern" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
                     <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
@@ -2401,13 +2269,15 @@ export default function App() {
                 {activeObstacles.map((obstacle) => {
                   const isStudentObstacle = String(obstacle.id).startsWith('student-');
                   const isEditable = currentUser.role !== 'teacher' && isStudentObstacle;
+                  const isDragging = activeDragItem?.kind === 'obstacle' && activeDragItem.id === obstacle.id;
                   const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
                   return (
-                    <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? 'grab' : 'default' }}>
+                    <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? (isDragging ? 'grabbing' : 'grab') : 'default' }}>
+                      {isDragging && <circle cx={sceneX(obstacle.x)} cy={sceneY(obstacle.y)} r={(obstacle.radius / 12) * sceneScale + 4} fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
                       <circle
                         cx={sceneX(obstacle.x)}
                         cy={sceneY(obstacle.y)}
-                        r={obstacle.radius * sceneScale}
+                        r={(obstacle.radius / 12) * sceneScale}
                         fill={color}
                         fillOpacity={isStudentObstacle ? 0.45 : 0.35}
                         stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
@@ -2429,7 +2299,8 @@ export default function App() {
                       opacity="0.9"
                     />
                     {plannerWaypoints.map((point, index) => (
-                      <g key={point.id} onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)} style={{ cursor: 'pointer' }}>
+                      <g key={point.id} onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)} style={{ cursor: activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id ? 'grabbing' : 'grab' }}>
+                        {activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id && <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="10" fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
                         <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
                         <text x={sceneX(point.x)} y={sceneY(point.y) + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
                       </g>
@@ -2511,73 +2382,14 @@ export default function App() {
       <div className="relative flex-1 overflow-hidden scene-shell">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(148,163,184,0.28),_rgba(15,23,42,0.04)_45%,_rgba(15,23,42,0.1))]" />
         <div className="scene-platform absolute left-[-8%] right-[-8%] top-[16%] bottom-[-8%] rounded-[28%]" />
-        <div className="absolute inset-0">
-          <svg viewBox="0 0 220 220" className="scene-svg h-full w-full block" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerLeave={handleScenePointerUp}>
-            <defs>
-              <pattern id="workspace-grid" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
-                <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
-              </pattern>
-            </defs>
-            <rect x="0" y="0" width="220" height="220" fill="url(#workspace-grid)" />
-            {activeObstacles.map((obstacle) => {
-              const isStudentObstacle = String(obstacle.id).startsWith('student-');
-              const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
-              return (
-                <g key={obstacle.id}>
-                  <circle
-                    cx={sceneX(obstacle.x)}
-                    cy={sceneY(obstacle.y)}
-                    r={obstacle.radius * sceneScale}
-                    fill={color}
-                    fillOpacity={isStudentObstacle ? 0.45 : 0.35}
-                    stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
-                    strokeWidth="2"
-                    strokeDasharray={isStudentObstacle ? '0' : '6 3'}
-                  />
-                </g>
-              );
-            })}
-            {plannerWaypoints.length > 0 && (
-              <g>
-                <polyline
-                  points={plannerWaypoints.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
-                  fill="none"
-                  stroke="#22c55e"
-                  strokeWidth="3"
-                  strokeDasharray="6 4"
-                  opacity="0.9"
-                />
-                {plannerWaypoints.map((point, index) => (
-                  <g key={point.id}>
-                    <circle cx={sceneX(point.x)} cy={sceneY(point.y)} r="6" fill="#22c55e" stroke="#14532d" strokeWidth="2" />
-                    <text x={sceneX(point.x)} y={sceneY(point.y) + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700">{index + 1}</text>
-                  </g>
-                ))}
-              </g>
-            )}
-            {simulatorState.goal && (
-              <g>
-                <circle cx={sceneX(simulatorState.goal.x)} cy={sceneY(simulatorState.goal.y)} r={simulatorState.goal.radius * sceneScale} fill={simulatorState.goalReached ? '#34d399' : '#a7f3d0'} fillOpacity="0.35" stroke="#22c55e" strokeWidth="2" />
-                <text x={sceneX(simulatorState.goal.x)} y={sceneY(simulatorState.goal.y) - 12} textAnchor="middle" fontSize="9" fill="#166534" fontWeight="700">GOAL</text>
-              </g>
-            )}
-            <polyline
-              points={simulatorState.path.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
-              fill="none"
-              stroke="#60a5fa"
-              strokeWidth="3"
-              strokeLinejoin="round"
-              strokeLinecap="round"
-              opacity="0.9"
-            />
-            {robotBody}
-          </svg>
-        </div>
-
         <G1Simulation3D
           code={generatedCode}
           simulatorState={simulatorState}
           obstacles={activeObstacles}
+          waypoints={plannerWaypoints}
+          isObstacleEditable={currentUser.role !== 'teacher'}
+          onObstacleChange={updateStudentObstacle}
+          onWaypointChange={updatePlannerWaypoint}
           isPlaying={isPreviewPlaying}
           playbackSpeed={playbackSpeed}
           playbackProgress={playbackProgress}
@@ -2587,68 +2399,6 @@ export default function App() {
           onPlaybackReset={resetSimulationPreview}
           onPlaybackSpeedChange={handlePlaybackSpeedChange}
         />
-
-        <div className="pointer-events-none absolute inset-0 z-10">
-          <svg viewBox="0 0 220 220" className="block h-full w-full" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerCancel={handleScenePointerUp}>
-            {activeObstacles.map((obstacle) => {
-              const isStudentObstacle = String(obstacle.id).startsWith('student-');
-              const isEditable = currentUser.role !== 'teacher' && isStudentObstacle;
-              const isDragging = activeDragItem?.kind === 'obstacle' && activeDragItem.id === obstacle.id;
-              const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
-              const x = sceneX(obstacle.x);
-              const y = sceneY(obstacle.y);
-              const radius = obstacle.radius * sceneScale;
-              return (
-                <g
-                  key={`interactive-${obstacle.id}`}
-                  className={isEditable ? 'pointer-events-auto touch-none' : 'pointer-events-none'}
-                  onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined}
-                  style={{ cursor: isEditable ? (isDragging ? 'grabbing' : 'grab') : 'default' }}
-                >
-                  {isDragging && <circle cx={x} cy={y} r={radius + 5} fill="none" stroke="#67e8f9" strokeWidth="3" strokeDasharray="5 3" />}
-                  <circle
-                    cx={x}
-                    cy={y}
-                    r={radius}
-                    fill={color}
-                    fillOpacity={isStudentObstacle ? 0.45 : 0.35}
-                    stroke={isDragging ? '#0891b2' : isStudentObstacle ? '#7c3aed' : '#f59e0b'}
-                    strokeWidth={isDragging ? 3 : 2}
-                    strokeDasharray={isStudentObstacle ? '0' : '6 3'}
-                  />
-                </g>
-              );
-            })}
-            {plannerWaypoints.length > 1 && (
-              <polyline
-                points={plannerWaypoints.map((point) => `${sceneX(point.x)},${sceneY(point.y)}`).join(' ')}
-                fill="none"
-                stroke="#22c55e"
-                strokeWidth="3"
-                strokeDasharray="6 4"
-                opacity="0.9"
-                className="pointer-events-none"
-              />
-            )}
-            {plannerWaypoints.map((point, index) => {
-              const isDragging = activeDragItem?.kind === 'waypoint' && activeDragItem.id === point.id;
-              const x = sceneX(point.x);
-              const y = sceneY(point.y);
-              return (
-                <g
-                  key={`interactive-${point.id}`}
-                  className="pointer-events-auto touch-none"
-                  onPointerDown={(event) => handlePlannerWaypointPointerDown(event, point.id)}
-                  style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
-                >
-                  {isDragging && <circle cx={x} cy={y} r="11" fill="none" stroke="#67e8f9" strokeWidth="3" strokeDasharray="4 2" />}
-                  <circle cx={x} cy={y} r="7" fill="#22c55e" stroke={isDragging ? '#0891b2' : '#14532d'} strokeWidth={isDragging ? 3 : 2} />
-                  <text x={x} y={y + 3} textAnchor="middle" fontSize="7" fill="#fff" fontWeight="700" className="pointer-events-none">{index + 1}</text>
-                </g>
-              );
-            })}
-          </svg>
-        </div>
 
         <div
           className="absolute z-20 flex flex-col overflow-visible rounded-xl border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm"

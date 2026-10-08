@@ -365,6 +365,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   const framesRef = useRef([]);
   const cameraRef = useRef(null);
   const robotRef = useRef(null);
+  const robotHeadingOffsetRef = useRef(-90);
   const jointRefs = useRef({});
   const obstacleGroupRef = useRef(null);
   const waypointGroupRef = useRef(null);
@@ -432,7 +433,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
     obstacles.forEach((obstacle) => {
       const mesh = new THREE.Mesh(
         new THREE.CylinderGeometry(Math.max(0.18, obstacle.radius / 12), Math.max(0.26, obstacle.radius / 10), 0.25, 24),
-        new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, transparent: true, opacity: 0.72 }),
+        new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, emissive: 0x000000, emissiveIntensity: 0.8, transparent: true, opacity: 0.72 }),
       );
       mesh.position.set(obstacle.x, 0.13, -obstacle.y);
       mesh.castShadow = true;
@@ -510,7 +511,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
     obstacles.forEach((obstacle) => {
       const mesh = new THREE.Mesh(
         new THREE.CylinderGeometry(Math.max(0.18, obstacle.radius / 12), Math.max(0.26, obstacle.radius / 10), 0.25, 24),
-        new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, transparent: true, opacity: 0.72 }),
+        new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, emissive: 0x000000, emissiveIntensity: 0.8, transparent: true, opacity: 0.72 }),
       );
       mesh.position.set(obstacle.x, 0.13, -obstacle.y);
       mesh.castShadow = true;
@@ -536,6 +537,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         if (object.material) object.material.dispose();
       });
       robotRef.current = loaded.robot;
+      robotHeadingOffsetRef.current = 90;
       jointRefs.current = loaded.joints;
       scene.add(loaded.robot);
     }).catch((error) => {
@@ -722,7 +724,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
       }
       if (robotRef.current && frame) {
         robotRef.current.position.set(frame.x || 0, 0, -(frame.y || 0));
-        robotRef.current.rotation.y = THREE.MathUtils.degToRad((frame.heading || 0) - 90);
+        robotRef.current.rotation.y = THREE.MathUtils.degToRad((frame.heading || 0) + robotHeadingOffsetRef.current);
         Object.entries(jointRefs.current).forEach(([name, group]) => {
           const normalizedName = name.replace('_joint', '');
           const stateName = normalizedName.endsWith('_knee') ? `${normalizedName}_pitch` : normalizedName;
