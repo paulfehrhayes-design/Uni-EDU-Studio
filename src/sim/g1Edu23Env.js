@@ -1,4 +1,5 @@
 import { G1_MODEL_INFO } from './g1ModelRuntime.js';
+import { flattenG1Commands, parseG1Program } from './g1Commands.js';
 
 export const G1_EDU_23_ENV = {
   robotType: G1_MODEL_INFO.robotType,
@@ -76,22 +77,22 @@ export const G1_MOTION_TEMPLATES = [
   {
     id: 'forward-2s',
     label: 'Forward 2s',
-    code: `sport_client.Move(0.4, 0.0, 0.0, False)\ntime.sleep(2)\nsport_client.StopMove()\n`,
+    code: `robot.walktime(2)\n`,
   },
   {
     id: 'turn-left-1s',
     label: 'Turn left 1s',
-    code: `sport_client.Move(0.0, 0.0, 0.6, False)\ntime.sleep(1)\nsport_client.StopMove()\n`,
+    code: `robot.turn("left", 90)\n`,
   },
   {
     id: 'square-path',
     label: 'Square path',
-    code: `sport_client.Move(0.4, 0.0, 0.0, False)\ntime.sleep(2)\nsport_client.StopMove()\n\nsport_client.Move(0.0, 0.0, 0.6, False)\ntime.sleep(1)\nsport_client.StopMove()\n\nsport_client.Move(0.4, 0.0, 0.0, False)\ntime.sleep(2)\nsport_client.StopMove()\n\nsport_client.Move(0.0, 0.0, 0.6, False)\ntime.sleep(1)\nsport_client.StopMove()\n`,
+    code: `for _ in range(4):\n    robot.walk(2)\n    robot.turn("left", 90)\n`,
   },
   {
     id: 'stand-up',
     label: 'Stand up',
-    code: `sport_client.Squat2StandUp()\n`,
+    code: `robot.stand()\n`,
   },
 ];
 
@@ -215,26 +216,38 @@ export function derivePlannerWaypointsFromCode(code = '') {
 
 export function buildPlannerMotionCommands(waypoints = []) {
   if (!Array.isArray(waypoints) || waypoints.length < 2) {
-    return ['robot.stand();', 'robot.wait(0.5);', 'robot.stand();', 'console.log("Program complete!");'];
+    return ['robot.stand()'];
   }
 
-  const commands = ['robot.stand();', 'robot.wait(0.5);'];
+  const commands = ['robot.stand()'];
   let previous = G1_EDU_23_ENV.initialPose;
+  let heading = previous.heading;
 
   waypoints.forEach((waypoint) => {
     const x = Number(waypoint.x);
     const y = Number(waypoint.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.hypot(x - previous.x, y - previous.y) <= 0.01) return;
-    commands.push(`robot.moveTo(${x.toFixed(2)}, ${y.toFixed(2)});`);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const deltaX = x - previous.x;
+    const deltaY = y - previous.y;
+    const distance = Math.hypot(deltaX, deltaY);
+    if (distance <= 0.01) return;
+
+    const targetHeading = (Math.atan2(deltaY, deltaX) * 180) / Math.PI;
+    const turnDelta = normalizeTurnDelta(targetHeading - heading);
+    if (Math.abs(turnDelta) >= 5) {
+      commands.push(`robot.turn("${turnDelta > 0 ? 'left' : 'right'}", ${Math.abs(turnDelta).toFixed(2)})`);
+    }
+    let remainingSeconds = distance / 0.4;
+    while (remainingSeconds > 0.001) {
+      const segmentSeconds = Math.min(10, remainingSeconds);
+      commands.push(`robot.walktime(${segmentSeconds.toFixed(3)})`);
+      remainingSeconds -= segmentSeconds;
+    }
+    heading = targetHeading;
     previous = { x, y };
   });
 
-  if (commands.length === 2) {
-    commands.push('robot.moveTo(0, 0);');
-  }
-
-  commands.push('robot.stand();');
-  commands.push('console.log("Program complete!");');
+  commands.push('robot.stand()');
   return commands;
 }
 
@@ -260,12 +273,20 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   }
 
   const normalized = pythonCode.replace(/\r/g, '');
-  const commandMatches = [
-    ...normalized.matchAll(/robot\.(\w+)\(([^)]*)\)/g),
-    ...normalized.matchAll(/sport_client\.Move\(([^)]*)\)/g),
-    ...normalized.matchAll(/sport_client\.StopMove\(\)/g),
-    ...normalized.matchAll(/sport_client\.Squat2StandUp\(\)/g),
-  ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  let commandMatches;
+  try {
+    commandMatches = flattenG1Commands(parseG1Program(normalized)).map((command) => {
+      const openingParenthesis = command.code.indexOf('(');
+      return [command.code, command.method, command.code.slice(openingParenthesis + 1, -1)];
+    });
+  } catch {
+    commandMatches = [
+      ...normalized.matchAll(/robot\.(\w+)\(([^)]*)\)/g),
+      ...normalized.matchAll(/sport_client\.Move\(([^)]*)\)/g),
+      ...normalized.matchAll(/sport_client\.StopMove\(\)/g),
+      ...normalized.matchAll(/sport_client\.Squat2StandUp\(\)/g),
+    ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  }
 
   if (!commandMatches.length) {
     return [{
@@ -348,11 +369,11 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     timeline.push({ label, summary });
 
     for (let index = 0; index < frameCount; index += 1) {
-      x = Number((x + stepX).toFixed(3));
-      y = Number((y + stepY).toFixed(3));
+      x += stepX;
+      y += stepY;
       gaitPhase += 0.18;
       torsoPitch = Math.sin(gaitPhase * Math.PI) * (normalizedDirection >= 0 ? 8 : -8);
-      path.push({ x, y });
+      path.push({ x: Number(x.toFixed(3)), y: Number(y.toFixed(3)) });
       addFrame();
     }
 
@@ -504,6 +525,35 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       addFrame();
     }
 
+    if (methodName === 'walk' || methodName === 'backward' || methodName === 'walktime' || methodName === 'backwardtime' ||
+      methodName === 'slowwalk' || methodName === 'slowwalktime' || methodName === 'fastwalk' || methodName === 'fastwalktime') {
+      const isTime = methodName.endsWith('time');
+      const isBackward = methodName === 'backward' || methodName === 'backwardtime';
+      const speed = methodName.startsWith('slow') ? 0.2 : methodName.startsWith('fast') ? 0.8 : 0.4;
+      const duration = isTime ? firstNumber : firstNumber;
+      const distance = isTime ? duration * speed : firstNumber * speed;
+      const summary = isTime ? `${duration.toFixed(2)} seconds` : `${firstNumber.toFixed(1)} steps`;
+      walkThrough(distance, isBackward ? -1 : 1, isBackward ? 'Walk backward' : methodName.startsWith('slow') ? 'Slow walk' : methodName.startsWith('fast') ? 'Fast walk' : 'Walk forward', summary);
+    }
+
+    if (methodName === 'sidestep') {
+      const side = /["']right["']/i.test(argsRaw) ? -90 : 90;
+      const previousHeading = heading;
+      heading += side;
+      walkThrough(0.3, 1, 'Sidestep', side > 0 ? 'Left' : 'Right');
+      heading = previousHeading;
+    }
+
+    if (methodName === 'turn') {
+      const directionMatch = argsRaw.match(/["'](left|right)["']/i);
+      const amountMatch = argsRaw.match(/,\s*(-?\d*\.?\d+)/);
+      const amount = amountMatch ? Number(amountMatch[1]) : 90;
+      const delta = directionMatch?.[1].toLowerCase() === 'right' ? -amount : amount;
+      heading += delta;
+      actions.push({ label: delta > 0 ? 'Turn Left' : 'Turn Right', summary: `${Math.abs(amount)}°` });
+      timeline.push({ label: delta > 0 ? 'Turn Left' : 'Turn Right', summary: `${Math.abs(amount)}°` });
+    }
+
     if (methodName === 'turnLeft') {
       const amount = firstNumber || 90;
       const startingHeading = heading;
@@ -600,6 +650,41 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
         poseTargets[`${side}_knee_pitch`] = 8 + 65 * progress;
         poseTargets[`${side}_ankle_pitch`] = -20 * progress;
       }, methodName === 'raiseLeftKnee' ? 'Raise left knee' : 'Raise right knee', 'leg pose');
+    }
+
+    if (methodName.startsWith('knee')) {
+      const side = methodName === 'kneeleft' ? 'left' : 'right';
+      animateAction(14, (progress) => {
+        poseTargets[`${side}_hip_pitch`] = -25 * progress;
+        poseTargets[`${side}_knee_pitch`] = 8 + 65 * progress;
+        poseTargets[`${side}_ankle_pitch`] = -20 * progress;
+      }, `Raise ${side} knee`, 'leg pose');
+    }
+
+    if (methodName.startsWith('wave') || methodName.startsWith('raise') || methodName.startsWith('kick')) {
+      const side = methodName.includes('right') ? 'right' : 'left';
+      const rawLevel = argsRaw.match(/["'](high|mid|low)["']/i)?.[1]?.toLowerCase();
+      const requestedDegrees = Number((argsRaw.match(/-?\d*\.?\d+/) || [90])[0]);
+      const amount = rawLevel ? ({ low: 30, mid: 60, high: 90 })[rawLevel] : requestedDegrees;
+      const isBoth = methodName.startsWith('raisebotharms');
+      const isKick = methodName.startsWith('kick');
+      animateAction(16, (progress) => {
+        const sides = isBoth ? ['left', 'right'] : [side];
+        sides.forEach((armSide) => {
+          if (isKick) {
+            poseTargets[`${armSide}_hip_pitch`] = amount * 0.45 * progress;
+            poseTargets[`${armSide}_knee_pitch`] = 10 + amount * progress;
+            poseTargets[`${armSide}_ankle_pitch`] = -amount * 0.35 * progress;
+          } else {
+            poseTargets[`${armSide}_shoulder_pitch`] = -amount * progress;
+            poseTargets[`${armSide}_shoulder_roll`] = (armSide === 'left' ? -1 : 1) * amount * 0.35 * progress;
+            poseTargets[`${armSide}_elbow`] = -amount * 0.45 * progress;
+            if (methodName.startsWith('wave')) {
+              poseTargets[`${armSide}_wrist_roll`] = Math.sin(progress * Math.PI * 4) * amount * 0.4;
+            }
+          }
+        });
+      }, methodName.replace(/Degrees$/, ''), `${amount}°`);
     }
 
     if (methodName === 'raiseLeftLeg' || methodName === 'raiseRightLeg' || methodName === 'kick') {

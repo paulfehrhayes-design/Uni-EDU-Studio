@@ -1,10 +1,15 @@
 import os
+import tempfile
 import unittest
 import uuid
+from unittest.mock import patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from server import app
+import server
+
+app = server.app
 
 
 class ServerClassroomTests(unittest.TestCase):
@@ -40,8 +45,10 @@ class ServerClassroomTests(unittest.TestCase):
 
         queue = client.get('/api/classroom/queue', headers={'Authorization': f'Bearer {teacher_token}'})
         self.assertEqual(queue.status_code, 200)
-        self.assertGreaterEqual(len(queue.json()['items']), 1)
-        self.assertEqual(queue.json()['items'][0]['status'], 'queued')
+        submitted_id = submitted.json()['item']['id']
+        matching_items = [item for item in queue.json()['items'] if item['id'] == submitted_id]
+        self.assertEqual(len(matching_items), 1)
+        self.assertEqual(matching_items[0]['status'], 'queued')
 
     def test_teacher_can_signup_student_and_view_roster(self):
         client = TestClient(app)
@@ -80,6 +87,119 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertNotEqual(selected, 5199)
         self.assertGreaterEqual(selected, 5199)
         busy_socket.close()
+
+    def test_teacher_clear_queue_removes_waiting_items_and_preserves_running_job(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            client = TestClient(app)
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1", "role": "student"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={"name": "waiting", "code": "robot.stand()"},
+            )
+            running = server.insert_queue_item("student1", "running", "robot.stand()")
+            server.set_queue_item_status(running["id"], "running")
+
+            cleared = client.post("/api/classroom/clear-queue", headers=teacher_headers)
+
+            self.assertEqual(cleared.status_code, 200)
+            self.assertEqual(cleared.json()["deleted"], 1)
+            self.assertEqual(
+                [item["id"] for item in cleared.json()["remaining"]],
+                [running["id"]],
+            )
+            forbidden = client.post("/api/classroom/clear-queue", headers=student_headers)
+            self.assertEqual(forbidden.status_code, 403)
+
+    def test_run_next_dispatches_queued_program_to_robot_executor(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            client = TestClient(app)
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1", "role": "student"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            code = "robot.walktime(0.5)"
+            client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={"name": "robot-motion", "code": code},
+            )
+
+            with patch.object(
+                server,
+                "execute_robot_program",
+                return_value={"status": "completed", "commandsExecuted": 1},
+            ) as execute:
+                response = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["item"]["status"], "completed")
+            self.assertEqual(response.json()["process"]["commandsExecuted"], 1)
+            execute.assert_called_once_with(code)
+
+    def test_run_next_keeps_program_queued_when_robot_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            client = TestClient(app)
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1", "role": "student"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            submission = client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={"name": "retry-after-connect", "code": "robot.walk(1)"},
+            ).json()["item"]
+
+            with patch.object(
+                server,
+                "execute_robot_program",
+                side_effect=HTTPException(status_code=409, detail="Connect the G1 SDK first."),
+            ):
+                response = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                )
+
+            self.assertEqual(response.status_code, 409)
+            items = client.get(
+                "/api/classroom/queue",
+                headers=teacher_headers,
+            ).json()["items"]
+            self.assertEqual(items[0]["id"], submission["id"])
+            self.assertEqual(items[0]["status"], "queued")
 
 
 if __name__ == '__main__':

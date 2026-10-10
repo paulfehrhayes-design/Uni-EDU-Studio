@@ -31,16 +31,16 @@ test('G1 URDF defines the active robot structure used by the runtime', () => {
   assert.ok(!modelData.allJoints.includes('floating_base_joint'));
 });
 
-test('planner commands preserve each waypoint from the robot origin', () => {
+test('planner compiles waypoints into physical walk and turn primitives, not simulator-only coordinates', () => {
   const commands = buildPlannerMotionCommands([
     { id: 'start', x: 0, y: 0 },
     { id: 'diag', x: 10, y: 10 },
     { id: 'turn', x: 10, y: 0 },
   ]);
 
-  assert.ok(commands.includes('robot.moveTo(10.00, 10.00);'));
-  assert.ok(commands.includes('robot.moveTo(10.00, 0.00);'));
-  assert.ok(commands.indexOf('robot.moveTo(10.00, 10.00);') < commands.indexOf('robot.moveTo(10.00, 0.00);'));
+  assert.ok(commands.some((command) => command.startsWith('robot.walktime(')));
+  assert.ok(commands.some((command) => command.startsWith('robot.turn(')));
+  assert.ok(commands.every((command) => !command.includes('moveTo')));
 });
 
 test('planner simulation reaches fractional waypoint coordinates exactly', () => {

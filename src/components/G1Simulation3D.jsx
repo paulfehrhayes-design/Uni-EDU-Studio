@@ -46,6 +46,7 @@ function addSegment(parent, start, end, width, color) {
 function createRobot() {
   const robot = new THREE.Group();
   robot.name = 'G1-23DoF';
+  robot.scale.setScalar(0.45);
   const dark = 0x263241;
   const light = 0xd7e0e8;
   const accent = 0x19b5fe;
@@ -189,6 +190,29 @@ function createWaypointLabelTexture(label) {
   return texture;
 }
 
+function createWaypointDistanceTexture(distance) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 80;
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.beginPath();
+  context.roundRect(8, 8, 240, 64, 24);
+  context.fillStyle = 'rgba(15, 23, 42, 0.88)';
+  context.fill();
+  context.lineWidth = 4;
+  context.strokeStyle = '#38bdf8';
+  context.stroke();
+  context.fillStyle = '#f8fafc';
+  context.font = 'bold 38px sans-serif';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText(`${distance.toFixed(2)} m`, 128, 42);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
 function createWaypointMarker(id, index) {
   const marker = new THREE.Group();
   marker.userData.waypointId = id;
@@ -247,7 +271,9 @@ function disposeWaypointMarker(marker) {
 
 function syncWaypointMarkers(group, pathLine, waypoints) {
   if (!group) return;
-  const existing = new Map(group.children.map((marker) => [marker.userData.waypointId, marker]));
+  const existing = new Map(group.children
+    .filter((marker) => marker.userData.waypointId !== undefined)
+    .map((marker) => [marker.userData.waypointId, marker]));
   const activeIds = new Set();
 
   waypoints.forEach((waypoint, index) => {
@@ -267,9 +293,35 @@ function syncWaypointMarkers(group, pathLine, waypoints) {
   });
 
   [...group.children].forEach((marker) => {
+    if (marker.userData.waypointId === undefined) {
+      group.remove(marker);
+      disposeWaypointMarker(marker);
+      return;
+    }
     if (activeIds.has(marker.userData.waypointId)) return;
     group.remove(marker);
     disposeWaypointMarker(marker);
+  });
+
+  waypoints.slice(1).forEach((waypoint, index) => {
+    const previous = waypoints[index];
+    const distance = Math.hypot(
+      (Number(waypoint.x) || 0) - (Number(previous.x) || 0),
+      (Number(waypoint.y) || 0) - (Number(previous.y) || 0),
+    );
+    const label = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: createWaypointDistanceTexture(distance),
+      transparent: true,
+      depthTest: false,
+    }));
+    label.scale.set(0.95, 0.3, 1);
+    label.position.set(
+      ((Number(previous.x) || 0) + (Number(waypoint.x) || 0)) / 2,
+      0.22,
+      -((Number(previous.y) || 0) + (Number(waypoint.y) || 0)) / 2,
+    );
+    label.renderOrder = 5;
+    group.add(label);
   });
 
   if (pathLine) {
@@ -359,9 +411,10 @@ async function loadG1MeshRig() {
   return { robot, joints };
 }
 
-export default function G1Simulation3D({ code, simulatorState, obstacles = [], waypoints = [], isObstacleEditable = false, onObstacleChange, onWaypointChange, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
+export default function G1Simulation3D({ code, simulatorState, obstacles = [], waypoints = [], isObstacleEditable = false, onObstacleChange, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
+  const rendererRef = useRef(null);
   const framesRef = useRef([]);
   const cameraRef = useRef(null);
   const robotRef = useRef(null);
@@ -373,6 +426,8 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   const waypointsRef = useRef(waypoints);
   const obstacleChangeCallbackRef = useRef(onObstacleChange);
   const waypointChangeCallbackRef = useRef(onWaypointChange);
+  const waypointPlaceCallbackRef = useRef(onWaypointPlace);
+  const waypointPlacementEnabledRef = useRef(isWaypointPlacementEnabled);
   const draggingMarkerRef = useRef(null);
   const simulatorStateRef = useRef(simulatorState);
   const viewRef = useRef({
@@ -391,6 +446,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   const playbackProgressCallbackRef = useRef(onPlaybackProgress);
   const playbackToggleCallbackRef = useRef(onPlaybackToggle);
   const [isPlaybackBarOpen, setIsPlaybackBarOpen] = useState(true);
+  const [renderError, setRenderError] = useState('');
 
   useEffect(() => {
     isPlayingRef.current = isPlaying;
@@ -417,7 +473,40 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
     waypointsRef.current = waypoints;
     obstacleChangeCallbackRef.current = onObstacleChange;
     waypointChangeCallbackRef.current = onWaypointChange;
-  }, [waypoints, onObstacleChange, onWaypointChange]);
+    waypointPlaceCallbackRef.current = onWaypointPlace;
+    waypointPlacementEnabledRef.current = isWaypointPlacementEnabled;
+    if (rendererRef.current) {
+      rendererRef.current.domElement.style.cursor = isWaypointPlacementEnabled ? 'crosshair' : '';
+    }
+  }, [waypoints, onObstacleChange, onWaypointChange, isWaypointPlacementEnabled, onWaypointPlace]);
+
+  useEffect(() => {
+    if (!isPlaying || !waypoints.length) return;
+
+    const points = [{ x: 0, y: 0 }, ...waypoints];
+    const bounds = points.reduce((current, point) => ({
+      minX: Math.min(current.minX, Number(point.x) || 0),
+      maxX: Math.max(current.maxX, Number(point.x) || 0),
+      minY: Math.min(current.minY, Number(point.y) || 0),
+      maxY: Math.max(current.maxY, Number(point.y) || 0),
+    }), { minX: 0, maxX: 0, minY: 0, maxY: 0 });
+    const view = viewRef.current;
+    const camera = cameraRef.current;
+    const radius = Math.hypot((bounds.maxX - bounds.minX) / 2, (bounds.maxY - bounds.minY) / 2);
+    const verticalFov = THREE.MathUtils.degToRad(camera?.fov ?? 42);
+    const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * (camera?.aspect ?? 1));
+    const requiredDistance = Math.max(
+      radius / Math.tan(horizontalFov / 2),
+      (radius * Math.sin(view.pitch) + 1.8) / Math.tan(verticalFov / 2),
+    ) * 1.15;
+
+    view.target.set(
+      (bounds.minX + bounds.maxX) / 2 + view.focusOffset.x,
+      1.05 + view.focusOffset.y,
+      -(bounds.minY + bounds.maxY) / 2 + view.focusOffset.z,
+    );
+    view.distance = Math.max(7, requiredDistance);
+  }, [isPlaying, waypoints]);
 
   useEffect(() => {
     framesRef.current = buildG1SimulationFrames(code, {
@@ -451,12 +540,23 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
     scene.fog = new THREE.Fog(0x08111d, 11, 28);
     const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
     cameraRef.current = camera;
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    } catch (error) {
+      console.error('G1 3D simulation could not initialize WebGL.', error);
+      window.setTimeout(() => {
+        setRenderError('The 3D simulator could not start because WebGL is unavailable or disabled in this browser. You can still use the programming tools, but 3D simulation is unavailable.');
+      }, 0);
+      return undefined;
+    }
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.domElement.style.touchAction = 'none';
+    renderer.domElement.style.cursor = waypointPlacementEnabledRef.current ? 'crosshair' : '';
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     mount.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
     sceneRef.current = scene;
 
     scene.add(new THREE.HemisphereLight(0x9fd8ff, 0x152234, 2.2));
@@ -557,10 +657,6 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
 
     const updateCamera = () => {
       const view = viewRef.current;
-      if (robotRef.current) {
-        view.target.x = robotRef.current.position.x + view.focusOffset.x;
-        view.target.z = robotRef.current.position.z + view.focusOffset.z;
-      }
       camera.position.set(
         view.target.x + Math.sin(view.yaw) * Math.cos(view.pitch) * view.distance,
         view.target.y + Math.sin(view.pitch) * view.distance,
@@ -594,6 +690,22 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         draggingMarkerRef.current = { kind: 'waypoint', id: waypointId, pointerId: event.pointerId };
         setWaypointMarkerDragging(marker, true);
         renderer.domElement.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+        return;
+      }
+      if (waypointPlacementEnabledRef.current) {
+        const worldPosition = raycaster.ray.intersectPlane(groundPlane, new THREE.Vector3());
+        const halfGrid = gridSize / 2;
+        if (
+          worldPosition
+          && Math.abs(worldPosition.x) <= halfGrid
+          && Math.abs(worldPosition.z) <= halfGrid
+        ) {
+          waypointPlaceCallbackRef.current?.({
+            x: Number(worldPosition.x.toFixed(2)),
+            y: Number((-worldPosition.z).toFixed(2)),
+          });
+        }
         event.preventDefault();
         return;
       }
@@ -664,6 +776,8 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
           const forward = new THREE.Vector3(Math.sin(view.yaw), 0, Math.cos(view.yaw));
           view.focusOffset.addScaledVector(right, -deltaX * panScale * 0.9);
           view.focusOffset.addScaledVector(forward, deltaY * panScale * 0.9);
+          view.target.addScaledVector(right, -deltaX * panScale * 0.9);
+          view.target.addScaledVector(forward, deltaY * panScale * 0.9);
         }
         view.pinchDistance = pinchDistance;
         view.pinchMidpoint = midpoint;
@@ -671,7 +785,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         const deltaX = event.clientX - previous.x;
         const deltaY = event.clientY - previous.y;
         view.yaw -= deltaX * 0.008;
-        view.pitch = Math.max(0.2, Math.min(1.35, view.pitch + deltaY * 0.006));
+        view.pitch = Math.max(0.2, Math.min(1.35, view.pitch - deltaY * 0.006));
       }
       updateCamera();
     };
@@ -707,7 +821,16 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
     renderer.domElement.addEventListener('wheel', onWheel, { passive: true });
 
     const clock = new THREE.Clock();
+    const onWebGLContextLost = (event) => {
+      event.preventDefault();
+      setRenderError('The browser lost its WebGL graphics context. Reload the page or enable hardware acceleration to restore the 3D simulator.');
+    };
+    renderer.domElement.addEventListener('webglcontextlost', onWebGLContextLost, false);
     const animate = () => {
+      if (renderer.getContext().isContextLost()) {
+        setRenderError('The browser lost its WebGL graphics context. Reload the page or enable hardware acceleration to restore the 3D simulator.');
+        return;
+      }
       const delta = Math.min(clock.getDelta(), 0.05);
       const frames = framesRef.current;
       let frame = frames[frames.length - 1] || simulatorStateRef.current;
@@ -723,7 +846,8 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         frame = interpolateSimulationFrame(frames[frameIndex], frames[nextIndex], framePosition - frameIndex);
       }
       if (robotRef.current && frame) {
-        robotRef.current.position.set(frame.x || 0, 0, -(frame.y || 0));
+        robotRef.current.position.x = frame.x || 0;
+        robotRef.current.position.z = -(frame.y || 0);
         robotRef.current.rotation.y = THREE.MathUtils.degToRad((frame.heading || 0) + robotHeadingOffsetRef.current);
         Object.entries(jointRefs.current).forEach(([name, group]) => {
           const normalizedName = name.replace('_joint', '');
@@ -742,7 +866,13 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         }
         updateCamera();
       }
-      renderer.render(scene, camera);
+      try {
+        renderer.render(scene, camera);
+      } catch (error) {
+        console.error('G1 3D simulation rendering failed.', error);
+        setRenderError('The 3D simulator encountered a graphics error. Reload the page or enable hardware acceleration to restore it.');
+        return;
+      }
       animationFrame = requestAnimationFrame(animate);
     };
     let animationFrame = requestAnimationFrame(animate);
@@ -757,8 +887,10 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
       renderer.domElement.removeEventListener('pointercancel', onPointerUp);
       renderer.domElement.removeEventListener('pointerleave', onPointerUp);
       renderer.domElement.removeEventListener('wheel', onWheel);
+      renderer.domElement.removeEventListener('webglcontextlost', onWebGLContextLost);
       renderer.dispose();
       mount.removeChild(renderer.domElement);
+      rendererRef.current = null;
       waypointGroup.children.forEach(disposeWaypointMarker);
       plannerLine.geometry.dispose();
       plannerLine.material.dispose();
@@ -774,6 +906,14 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
 
   return (
     <div ref={mountRef} className="absolute inset-0 overflow-hidden touch-none" aria-label={`Live ${G1_EDU_23_ENV.robotType} 3D simulation`}>
+      {renderError && (
+        <div role="alert" className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/95 p-6 text-center">
+          <div className="max-w-lg rounded-xl border border-amber-300/30 bg-slate-900 p-6 text-slate-100 shadow-xl">
+            <h2 className="text-lg font-semibold text-amber-200">3D simulation unavailable</h2>
+            <p className="mt-2 text-sm leading-relaxed text-slate-300">{renderError}</p>
+          </div>
+        </div>
+      )}
       <div className="pointer-events-none absolute left-4 top-4 rounded-lg border border-cyan-300/20 bg-slate-950/55 px-3 py-2 text-[10px] uppercase tracking-[0.16em] text-cyan-100 backdrop-blur-sm">
         Live G1 23-DoF simulation
       </div>

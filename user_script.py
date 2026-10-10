@@ -9,6 +9,9 @@ class Robot:
     def stand(self):
         print("Robot stand")
 
+    def moveTo(self, x, y):
+        print(f"Robot moveTo x={x} y={y}")
+
     def walkForward(self, speed=1.0):
         print(f"Robot walkForward speed={speed}")
 
@@ -73,3 +76,16 @@ class Robot:
         print(f"Robot sidestep direction={direction}")
 
 robot = Robot()
+robot.stand()
+robot.turn("left", 5)
+robot.walktime(4.736)
+robot.turn("left", 146.56)
+robot.walktime(9.997)
+robot.walktime(3.594)
+robot.turn("right", 25.91)
+robot.walktime(4.459)
+robot.turn("left", 95.11)
+robot.walktime(7.138)
+robot.turn("right", 88.33)
+robot.walktime(4.889)
+robot.stand()

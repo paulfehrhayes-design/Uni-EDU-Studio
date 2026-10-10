@@ -160,6 +160,25 @@ http://<host-ip>:5179
 
 > Use either of the two backend-start commands above, but do not start the Vite dev server and the Python backend together unless you intentionally want the two modes mixed.
 
+## Physical G1 control
+
+The robot-control backend must run on the G1 computer (or a host with the supported Unitree SDK2 Python and DDS network access). A Codespace or ordinary classroom server does not control a robot just because the browser can reach its IP address.
+
+Install the Unitree SDK2 Python package using the vendor-supported setup for the robot image, then start the backend with the correct DDS domain:
+
+```bash
+export UNITREE_DOMAIN_ID=0
+python backend/server.py
+```
+
+In the teacher G1 connection panel, enter the network interface name used by the robot computer (commonly `eth0`) and connect. A successful status means the SDK locomotion client initialized; it does not replace the robot's physical safety checks or enable unsupported actions.
+
+The backend accepts only the shared, bounded `robot.*` command language and bounded `for ... in range(...)` loops. Physical execution currently maps stand, forward/backward walking, timed/slow/fast walking, turns, and one-step sidesteps to the SDK locomotion client. Arm gestures, kicks, and knee actions remain simulation-only until a verified G1 SDK action or controller mapping is configured; those commands are rejected for physical runs rather than simulated as success.
+
+The teacher queue's **Clear queue** action removes waiting and finished entries, while leaving any currently running job visible. **Run next** sends the oldest queued program to the same physical G1 SDK executor; if the robot is not ready, that job remains queued so the teacher can reconnect and retry.
+
+Planner paths are converted to timed walking and turn commands. The G1 SDK interface used here is open-loop and does not read localization, so a physical route cannot stop exactly at its plotted waypoint coordinates. The simulation may show the intended waypoints; physical accuracy requires a localization/odometry feedback integration and real-robot calibration.
+
 ---
 
 ## Default login accounts

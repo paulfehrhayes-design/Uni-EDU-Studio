@@ -15,6 +15,7 @@ import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
 import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
 import G1Simulation3D from './components/G1Simulation3D';
 import { compileMotionPrompt } from './sim/textToMotion';
+import { flattenG1Commands, formatG1Program, G1_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -163,7 +164,7 @@ const UI_TEXT = {
     actUndo: "撤销", actRedo: "重做", actToggleCode: "切换代码预览", actAbout: "关于",
     actConfigImport: "导入配置", actConfigExport: "导出配置",
     configTitle: "机器人积木配置",
-    configDesc: "在此自定义机器人专属积木。系统积木和函数积木已内置，无需在此编辑。",
+    configDesc: "机器人命令由共享命令目录管理。旧配置仅供迁移参考，不能增加可执行命令。",
     applyBtn: "应用配置", closeBtn: "关闭", resetBtn: "恢复默认", confirmBtn: "确定", cancelBtn: "取消",
     codeTitle: "PYTHON 预览", loading: "正在加载引擎资源...",
     aboutContent: "Uni++ EDU Studio 是一个专为 Unitree 机器人设计的图形化编程环境。",
@@ -180,7 +181,7 @@ const UI_TEXT = {
     actUndo: "Undo", actRedo: "Redo", actToggleCode: "Toggle Code View", actAbout: "About",
     actConfigImport: "Import Config", actConfigExport: "Export Config",
     configTitle: "Robot Block Config",
-    configDesc: "Customize robot-specific blocks here. System blocks are built-in.",
+    configDesc: "Executable commands come from the shared G1 command catalog. Legacy configs are for migration only and cannot add robot commands.",
     applyBtn: "Apply Config", closeBtn: "Close", resetBtn: "Reset Default", confirmBtn: "OK", cancelBtn: "Cancel",
     codeTitle: "PYTHON PREVIEW", loading: "Loading Engine Resources...",
     aboutContent: "Uni++ EDU Studio is a graphical programming environment for Unitree Robots.",
@@ -608,9 +609,7 @@ export default function App() {
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
-  const compiledCode = commands.join('\n');
-  compiledPlannerCodeRef.current = compiledCode;
-  updateGeneratedCode(compiledCode);
+  const [generatedCode, setGeneratedCode] = useState('');
   const generatedCodeRef = useRef('');
   const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_ROBOT_CONFIG_EN, null, 2));
   
@@ -643,6 +642,7 @@ export default function App() {
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [gridSize, setGridSize] = useState(20);
   const [plannerWaypoints, setPlannerWaypoints] = useState([]);
+  const [isWaypointPlacementEnabled, setIsWaypointPlacementEnabled] = useState(false);
   const [simulatorState, setSimulatorState] = useState(createEmptyG1Edu23State());
   const [session, setSession] = useState(() => {
     try {
@@ -661,10 +661,12 @@ export default function App() {
   const [authMode, setAuthMode] = useState('login');
   const [loginError, setLoginError] = useState('');
   const [classroomStatus, setClassroomStatus] = useState('idle');
-  const [robotAddress, setRobotAddress] = useState('192.168.123.164');
+  const [robotAddress, setRobotAddress] = useState('eth0');
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
   const [isRobotConnected, setIsRobotConnected] = useState(false);
+  const [isRobotConnecting, setIsRobotConnecting] = useState(false);
   const [safetyNotice, setSafetyNotice] = useState('');
+  const [blockSyncError, setBlockSyncError] = useState('');
 
   const t = UI_TEXT[lang];
   const sceneObjectsKey = session?.user?.username ? `edu-scene-objects:${session.user.username}` : 'edu-scene-objects';
@@ -672,59 +674,6 @@ export default function App() {
   useEffect(() => {
     generatedCodeRef.current = generatedCode;
   }, [generatedCode]);
-  const insertRobotCommandWithValue = (commandType, defaultValue = 3, unitLabel = 'steps') => {
-    const valueText = window.prompt(`Enter ${unitLabel}:`, String(defaultValue));
-    if (valueText === null) return;
-
-    const numericValue = Number(valueText);
-    if (!Number.isFinite(numericValue)) {
-      alert(`Please enter a valid ${unitLabel}.`);
-      return;
-    }
-
-    const commandMap = {
-      walkForward: `robot.walkForward(${clampSafeValue('STEPS', numericValue)});`,
-      walkBackward: `robot.walkBackward(${clampSafeValue('STEPS', numericValue)});`,
-      walkSidewaysLeft: `robot.walkSidewaysLeft(${clampSafeValue('STEPS', numericValue)});`,
-      walkSidewaysRight: `robot.walkSidewaysRight(${clampSafeValue('STEPS', numericValue)});`,
-      wait: `robot.wait(${clampSafeValue('SECONDS', numericValue)});`,
-      repeat: `robot.repeatLoop(${clampSafeValue('STEPS', numericValue)});`,
-      raiseBothArms: 'robot.raiseBothArms();',
-      lowerBothArms: 'robot.lowerBothArms();',
-      stop: 'robot.stop();',
-      sit: 'robot.sit();',
-    };
-
-    const snippet = commandMap[commandType];
-    if (!snippet) return;
-
-    insertRobotCommand(snippet);
-  };
-
-  const quickRobotCommands = [
-    { label: 'robot.stand();', snippet: 'robot.stand();' },
-    { label: 'robot.stop();', snippet: 'robot.stop();' },
-    { label: 'robot.sit();', snippet: 'robot.sit();' },
-    { label: 'robot.walkForward();', snippet: 'robot.walkForward();' },
-    { label: 'Walk Forward (steps)', action: () => insertRobotCommandWithValue('walkForward', 3, 'steps') },
-    { label: 'robot.walkBackward();', snippet: 'robot.walkBackward();' },
-    { label: 'Walk Back (steps)', action: () => insertRobotCommandWithValue('walkBackward', 3, 'steps') },
-    { label: 'Walk Left (steps)', action: () => insertRobotCommandWithValue('walkSidewaysLeft', 2, 'steps') },
-    { label: 'Walk Right (steps)', action: () => insertRobotCommandWithValue('walkSidewaysRight', 2, 'steps') },
-    { label: 'robot.turnLeft(90);', snippet: 'robot.turnLeft(90);' },
-    { label: 'robot.turnRight(90);', snippet: 'robot.turnRight(90);' },
-    { label: 'robot.raiseBothArms();', snippet: 'robot.raiseBothArms();' },
-    { label: 'robot.lowerBothArms();', snippet: 'robot.lowerBothArms();' },
-    { label: 'robot.raiseLeftArm("high", 90);', snippet: 'robot.raiseLeftArm("high", 90);' },
-    { label: 'robot.raiseRightArm("mid", 90);', snippet: 'robot.raiseRightArm("mid", 90);' },
-    { label: 'robot.raiseLeftKnee();', snippet: 'robot.raiseLeftKnee();' },
-    { label: 'robot.raiseRightKnee();', snippet: 'robot.raiseRightKnee();' },
-    { label: 'Wait (seconds)', action: () => insertRobotCommandWithValue('wait', 1, 'seconds') },
-    { label: 'Repeat (times)', action: () => insertRobotCommandWithValue('repeat', 3, 'times') },
-    { label: 'robot.waveLeft();', snippet: 'robot.waveLeft();' },
-    { label: 'robot.waveRight();', snippet: 'robot.waveRight();' },
-  ];
-
   const overlayTabs = [
     { id: 'blocks', label: 'Blocks' },
     { id: 'ide', label: 'IDE' },
@@ -784,6 +733,19 @@ export default function App() {
         setSceneObjects([]);
       }
       refreshClassroomData();
+      if (session.user.role === 'teacher') {
+        apiFetch('/api/robot/status')
+          .then((status) => {
+            setIsRobotConnected(status.sdkAvailable);
+            setRobotConnectionStatus(status.sdkAvailable
+              ? `SDK connected on ${status.interface}`
+              : 'Disconnected • backend must run on the G1 computer');
+          })
+          .catch((error) => {
+            setIsRobotConnected(false);
+            setRobotConnectionStatus(`Robot status unavailable: ${error.message}`);
+          });
+      }
       apiFetch('/api/classroom/project?name=default')
         .then((response) => {
           if (response.project && Array.isArray(response.project.sceneObjects)) {
@@ -901,7 +863,7 @@ export default function App() {
       const response = await apiFetch('/api/classroom/run-next', { method: 'POST' });
       setClassroomStatus(response.status || 'running');
       await refreshClassroomData();
-      alert('Started the next queued student job.');
+      alert(`Completed ${response.item?.name || 'queued program'} on the robot.`);
     } catch (e) {
       alert('Could not start next queue item: ' + e.message);
     }
@@ -927,15 +889,17 @@ export default function App() {
   };
 
   const handleClearQueue = async () => {
+    if (!window.confirm('Clear all waiting and finished queue items? A currently running job will be kept.')) return;
     try {
-      await apiFetch('/api/classroom/clear-queue', { method: 'POST' });
-      await refreshClassroomData();
+      const result = await apiFetch('/api/classroom/clear-queue', { method: 'POST' });
+      setQueueItems(result.remaining || []);
+      alert(`Cleared ${result.deleted} queue item${result.deleted === 1 ? '' : 's'}.`);
     } catch (e) {
       alert('Clear queue failed: ' + e.message);
     }
   };
 
-  const handleConnectRobot = () => {
+  const handleConnectRobot = async () => {
     if (!session || session.user.role !== 'teacher') {
       alert('Teacher login is required to connect the robot.');
       return;
@@ -943,15 +907,29 @@ export default function App() {
 
     const cleanAddress = robotAddress.trim();
     if (!cleanAddress) {
-      alert('Please enter the G1 IP address first.');
+      alert('Enter the G1 computer network interface name, for example eth0.');
       return;
     }
 
-    setRobotConnectionStatus(`Connecting to ${cleanAddress}...`);
-    setTimeout(() => {
+    setIsRobotConnecting(true);
+    setRobotConnectionStatus(`Connecting through ${cleanAddress}...`);
+    try {
+      const connection = await apiFetch('/api/robot/connect', {
+        method: 'POST',
+        body: JSON.stringify({ interface: cleanAddress }),
+      });
+      if (connection.status !== 'connected') {
+        throw new Error('Backend did not confirm a connected robot.');
+      }
       setIsRobotConnected(true);
-      setRobotConnectionStatus(`Connected to ${cleanAddress} • ready for classroom queue`);
-    }, 400);
+      setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain}`);
+    } catch (error) {
+      setIsRobotConnected(false);
+      setRobotConnectionStatus(`Connection failed: ${error.message}`);
+      alert(`Robot connection failed: ${error.message}`);
+    } finally {
+      setIsRobotConnecting(false);
+    }
   };
 
   useEffect(() => {
@@ -1000,54 +978,25 @@ export default function App() {
     setRobotConfig(targetDefault);
   };
 
-  const generateToolboxXML = useCallback((robotCategories, language) => {
+  const generateToolboxXML = useCallback((language) => {
     const cats = UI_TEXT[language].toolbox;
-    const systemCategories = language === 'zh' ? SYSTEM_CONFIG_ZH : SYSTEM_CONFIG_EN;
-    const fullCategories = [...systemCategories, ...robotCategories];
-    const robotIdeCategory = `
-      <category name="Robot IDE" colour="210">
-        ${ROBOT_IDE_COMMAND_BLOCKS.map(block => `<block type="${block.type}"></block>`).join('')}
-      </category>
-    `;
-
-    const customCategoriesXml = fullCategories.map(cat => {
-      const blocksXml = cat.blocks.map(block => {
-        const inputs = block.args0?.filter(arg => arg.type === 'input_value') || [];
-        let innerXml = '';
-        inputs.forEach(input => {
-          if (input.check === 'Number') innerXml += `<value name="${input.name}"><shadow type="math_number"><field name="NUM">0</field></shadow></value>`;
-        });
-        return `<block type="${block.type}">${innerXml}</block>`;
-      }).join('');
-      return `<category name="${cat.category}" colour="${cat.colour}">${blocksXml}</category>`;
+    const categories = [...new Set(G1_COMMANDS.map((definition) => definition.category))];
+    const commandCategoriesXml = categories.map((category) => {
+      const blocks = getG1BlocklyCommandBlocks()
+        .filter((block) => G1_COMMANDS.find((definition) => definition.blockType === block.type)?.category === category)
+        .map((block) => `<block type="${block.type}"></block>`)
+        .join('');
+      return `<category name="${category}" colour="${category === 'Gestures' ? 280 : 160}">${blocks}</category>`;
     }).join('');
 
     return `
     <xml xmlns="https://developers.google.com/blockly/xml">
-      ${customCategoriesXml}
-      ${robotIdeCategory}
+      ${commandCategoriesXml}
       <category name="${cats.functions}" colour="290" custom="PROCEDURE"></category>
       <sep></sep>
-      <category name="${cats.logic}" colour="210">
-        <block type="controls_if"></block>
-        <block type="logic_compare"></block>
-        <block type="logic_operation"></block>
-        <block type="logic_boolean"></block>
-      </category>
       <category name="${cats.loops}" colour="120">
         <block type="controls_repeat_ext"><value name="TIMES"><shadow type="math_number"><field name="NUM">10</field></shadow></value></block>
-        <block type="controls_whileUntil"></block>
       </category>
-      <category name="${cats.math}" colour="230">
-        <block type="math_number"></block>
-        <block type="math_arithmetic"></block>
-        <block type="math_random_int"></block>
-      </category>
-      <category name="${cats.text}" colour="160">
-        <block type="text"></block>
-        <block type="text_print"></block>
-      </category>
-      <category name="${cats.variables}" colour="330" custom="VARIABLE"></category>
     </xml>
     `;
   }, []);
@@ -1082,11 +1031,20 @@ export default function App() {
 
     const systemCategories = lang === 'zh' ? SYSTEM_CONFIG_ZH : SYSTEM_CONFIG_EN;
     const allBlocks = [...systemCategories, ...robotCategories].flatMap(cat => cat.blocks);
-    const commandBlocks = ROBOT_IDE_COMMAND_BLOCKS.map(({ codeTemplate, ...rest }) => ({ ...rest }));
-    const definitions = [...allBlocks, ...commandBlocks].map(({ codeTemplate, extensions, ...rest }) => ({ ...rest, extensions: extensions || undefined }));
+    const commandBlocks = [
+      ...ROBOT_IDE_COMMAND_BLOCKS,
+      ...getG1BlocklyCommandBlocks(),
+    ];
+    const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
+      const definition = { ...blockDef };
+      delete definition.codeTemplate;
+      definition.extensions = definition.extensions || undefined;
+      return definition;
+    });
     Blockly.common.defineBlocksWithJsonArray(definitions);
     
     [...allBlocks, ...commandBlocks].forEach(blockDef => {
+      if (!blockDef.codeTemplate) return;
       pythonGenerator.forBlock[blockDef.type] = function(block, generator) {
         let code = blockDef.codeTemplate;
         
@@ -1129,19 +1087,22 @@ export default function App() {
   }, [lang]);
 
   useEffect(() => {
-    if (!isBlocklyLoaded || mainTab !== 'blocks' || !blocklyDiv.current) return;
+    if (!isBlocklyLoaded || !blocklyDiv.current) return;
     
     Blockly.dialog.setPrompt(function(message, defaultValue, callback) {
       setPromptState({ isOpen: true, message, defaultValue, inputValue: defaultValue, callback });
       setTimeout(() => promptInputRef.current?.focus(), 100);
     });
 
+    registerBlocks(robotConfig);
+    if (workspaceRef.current) {
+      workspaceRef.current.updateToolbox(generateToolboxXML(lang));
+      return undefined;
+    }
+
     const initTimer = setTimeout(() => {
-        registerBlocks(robotConfig);
-        if (workspaceRef.current) workspaceRef.current.dispose();
-        
         workspaceRef.current = Blockly.inject(blocklyDiv.current, {
-          toolbox: generateToolboxXML(robotConfig, lang),
+          toolbox: generateToolboxXML(lang),
           scrollbars: false,
           move: {
             scrollbars: false,
@@ -1164,9 +1125,6 @@ export default function App() {
         };
 
         const handleBlocklyEvents = (event) => {
-          if ([Blockly.Events.BLOCK_CHANGE, Blockly.Events.BLOCK_MOVE, Blockly.Events.BLOCK_DELETE, Blockly.Events.VAR_CREATE, Blockly.Events.VAR_DELETE, Blockly.Events.VAR_RENAME].includes(event.type)) {
-            try { applyGeneratedCode(pythonGenerator.workspaceToCode(workspaceRef.current), { syncBlocks: false }); } catch(e) {}
-          }
           if (event.type === Blockly.Events.UI || event.element === 'category') {
              setTimeout(forceResize, 50);
              setTimeout(forceResize, 200);
@@ -1186,7 +1144,11 @@ export default function App() {
           try {
             const code = pythonGenerator.workspaceToCode(workspaceRef.current);
             applyGeneratedCode(code, { syncBlocks: false });
-          } catch(e) {}
+            setBlockSyncError('');
+          } catch (error) {
+            setBlockSyncError(`Cannot read the Blocks workspace: ${error.message}`);
+            console.error('Failed to generate code from the Blockly workspace.', error);
+          }
         };
         workspaceRef.current.addChangeListener(updateCode);
         setTimeout(() => {
@@ -1197,9 +1159,11 @@ export default function App() {
     }, 100);
     
     return () => {
-      if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
+      clearTimeout(initTimer);
     };
-  }, [isBlocklyLoaded, mainTab, registerBlocks, generateToolboxXML, robotConfig, lang]);
+  }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang]);
+
+  useEffect(() => () => resizeObserverRef.current?.disconnect(), []);
 
   const handleApplyConfig = () => { try { setRobotConfig(JSON.parse(configText)); setShowConfigEditor(false); } catch (e) { alert("JSON Error: " + e.message); } };
   const handleImportConfig = (e) => { const r = new FileReader(); r.onload = (ev) => setConfigText(ev.target.result); if(e.target.files[0]) r.readAsText(e.target.files[0]); };
@@ -1231,6 +1195,7 @@ export default function App() {
       workspaceRef.current?.clear();
       setSceneObjects([]);
       setPlannerWaypoints([]);
+      setIsWaypointPlacementEnabled(false);
       applyGeneratedCode('', { syncBlocks: false });
       setIsPreviewPlaying(false);
       if (session?.user?.username) {
@@ -1244,24 +1209,22 @@ export default function App() {
     setProjectName(project.name || 'default');
     setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
     setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
+    setIsWaypointPlacementEnabled(false);
     const nextCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
     applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
   };
 
-  const addPlannerWaypoint = () => {
-    setPlannerWaypoints((prev) => {
-      const lastPoint = prev[prev.length - 1] || { x: 0, y: 0 };
-      const nextPoint = clampScenePoint(lastPoint.x + 4, lastPoint.y + 2, gridSize);
-      return [
-        ...prev,
-        {
-          id: `planner-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          x: nextPoint.x,
-          y: nextPoint.y,
-        },
-      ];
-    });
+  const placePlannerWaypoint = ({ x, y }) => {
+    const position = clampScenePoint(x, y, gridSize);
+    setPlannerWaypoints((prev) => [
+      ...prev,
+      {
+        id: `planner-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        ...position,
+      },
+    ]);
+    setIsWaypointPlacementEnabled(false);
   };
 
   const updatePlannerWaypoint = (id, patch) => {
@@ -1288,19 +1251,39 @@ export default function App() {
     if (generatedCode.trim() && !window.confirm('Compiling this path will replace the current Blocks and IDE code. Continue?')) return;
 
     const commands = buildPlannerMotionCommands(plannerWaypoints);
-    updateGeneratedCode(commands.join('\n'));
-    setMainTab('ide');
+    const plannerCode = commands.join('\n');
+    const safePlannerCode = sanitizeRobotCode(plannerCode).code || plannerCode;
+    if (safePlannerCode !== generatedCode) {
+      compiledPlannerCodeRef.current = safePlannerCode;
+    }
+    updateGeneratedCode(plannerCode);
+    setIsWaypointPlacementEnabled(false);
   };
 
   const handleRunCode = async () => {
     if (isRunning) {
-      try { await fetch('/api/stop', { method: 'POST' }); setIsRunning(false); } catch (e) { alert("Stop Failed: " + e.message); }
+      try {
+        const result = await apiFetch('/api/stop', { method: 'POST' });
+        setIsRunning(false);
+        setRobotConnectionStatus(result.status === 'stopping' ? 'Stopping robot...' : 'Robot is not connected');
+      } catch (error) {
+        alert(`Stop failed: ${error.message}`);
+      }
     } else {
       try {
+        if (!isRobotConnected) throw new Error('Connect the G1 SDK before sending a program.');
+        parseG1Program(generatedCode);
         setIsRunning(true);
-        const res = await fetch('/api/run', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ code: generatedCode }) });
-        if (!res.ok) throw new Error("Server Error");
-      } catch (e) { setIsRunning(false); alert("Run Failed: " + e.message); }
+        const result = await apiFetch('/api/run', {
+          method: 'POST',
+          body: JSON.stringify({ code: generatedCode }),
+        });
+        setRobotConnectionStatus(`Completed ${result.commandsExecuted} robot commands`);
+      } catch (error) {
+        alert(`Robot run failed: ${error.message}`);
+      } finally {
+        setIsRunning(false);
+      }
     }
   };
 
@@ -1340,6 +1323,7 @@ export default function App() {
     }
     setPlaybackProgress(0);
     setIsPreviewPlaying(true);
+    setIsWaypointPlacementEnabled(false);
   };
 
   const handlePlaybackSpeedChange = (value) => {
@@ -1349,177 +1333,106 @@ export default function App() {
   };
 
   const syncBlocksFromGeneratedCode = useCallback((code) => {
-    if (!workspaceRef.current || !window.Blockly) return;
+    if (!workspaceRef.current || !window.Blockly) return false;
     const workspace = workspaceRef.current;
-    workspace.clear();
-
-    const lines = (code || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
-    if (!lines.length) return;
-
-    let previousBlock = null;
-
-    lines.forEach((line) => {
-      const match = line.match(/^robot\.(\w+)\((.*)\);?$/);
-      const blockTypeMap = {
-        stand: 'robot_stand',
-        walk: 'robot_walk_forward',
-        walkForward: 'robot_walk_forward',
-        walkForwardSteps: 'robot_walk_forward_steps',
-        backward: 'robot_walk_back',
-        walkBackward: 'robot_walk_back',
-        walkBackwardSteps: 'robot_walk_back_steps',
-        sidestep: 'robot_walk_sideways_left',
-        walkSidewaysLeft: 'robot_walk_sideways_left',
-        walkSidewaysLeftSteps: 'robot_walk_sideways_left_steps',
-        walkSidewaysRight: 'robot_walk_sideways_right',
-        walkSidewaysRightSteps: 'robot_walk_sideways_right_steps',
-        turn: 'robot_turn_left',
-        turnLeft: 'robot_turn_left',
-        turnRight: 'robot_turn_right',
-        wait: 'robot_wait',
-        waitSeconds: 'robot_wait_seconds',
-        repeatLoop: 'robot_repeat_loop',
-        stop: 'robot_stop',
-        sit: 'robot_sit',
-        waveLeft: 'robot_wave_left',
-        waveRight: 'robot_wave_right',
-        raiseBothArms: 'robot_raise_both_arms',
-        lowerBothArms: 'robot_lower_both_arms',
-        raiseLeftArm: 'robot_raise_left_arm',
-        raiseRightArm: 'robot_raise_right_arm',
-        raiseLeftLeg: 'robot_left_leg_kick',
-        raiseRightLeg: 'robot_right_leg_kick',
-        raiseLeftKnee: 'robot_raise_left_knee',
-        raiseRightKnee: 'robot_raise_right_knee',
-        kick: 'robot_kick',
-      };
-
-      let blockType = 'raw_code';
-      let data = line;
-      let blockValues = {};
-
-      if (match) {
-        const methodName = match[1];
-        const argsRaw = match[2] || '';
-        blockType = blockTypeMap[methodName] || 'raw_code';
-
-        if (['walk', 'walkForward', 'walkBackward', 'walkSidewaysLeft', 'walkSidewaysRight', 'backward', 'sidestep'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          const safeSpeed = clampSafeValue('SPEED', numberMatch ? numberMatch[0] : 1);
-          blockValues = { SPEED: safeSpeed };
-        }
-        if (['walkForwardSteps', 'walkBackwardSteps', 'walkSidewaysLeftSteps', 'walkSidewaysRightSteps', 'repeatLoop'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          const safeSteps = clampSafeValue('STEPS', numberMatch ? numberMatch[0] : 3);
-          blockValues = { STEPS: safeSteps, TIMES: safeSteps };
-        }
-        if (['turn', 'turnLeft', 'turnRight'].includes(methodName)) {
-          if (methodName === 'turn') {
-            const turnArgs = argsRaw.match(/"(.*?)"\s*,\s*(\d+(?:\.\d+)?)/) || argsRaw.match(/'(.*?)'\s*,\s*(\d+(?:\.\d+)?)/);
-            if (turnArgs) {
-              const direction = (turnArgs[1] || 'left').toLowerCase();
-              const safeAngle = clampSafeValue('ANGLE', turnArgs[2]);
-              blockValues = { ANGLE: safeAngle, DIR: direction === 'right' ? 'right' : 'left' };
-              if (direction === 'right') {
-                blockType = 'robot_turn_right';
-              } else {
-                blockType = 'robot_turn_left';
-              }
-            }
+    let nodes;
+    try {
+      nodes = parseG1Program(code || '');
+    } catch (error) {
+      setBlockSyncError(`Cannot display this code as Blocks: ${error.message}`);
+      return false;
+    }
+    setBlockSyncError('');
+    Blockly.Events.disable();
+    try {
+      workspace.clear();
+      const createBlocks = (program, parentConnection = null) => {
+        let previousBlock = null;
+        program.forEach((node) => {
+          const block = node.type === 'repeat'
+            ? workspace.newBlock('controls_repeat_ext')
+            : workspace.newBlock(`g1_command_${node.method}`);
+          if (node.type === 'repeat') {
+            const repeatCount = workspace.newBlock('math_number');
+            repeatCount.setFieldValue(String(node.times), 'NUM');
+            repeatCount.initSvg();
+            repeatCount.render();
+            block.getInput('TIMES').connection.connect(repeatCount.outputConnection);
           } else {
-            const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-            blockValues = { ANGLE: clampSafeValue('ANGLE', numberMatch ? numberMatch[0] : 90) };
+            const definition = G1_COMMANDS.find((entry) => entry.method === node.method);
+            definition.args.forEach((argument, index) => {
+              block.setFieldValue(String(node.values[index]), argument.name);
+            });
           }
-        }
-        if (['raiseLeftArm', 'raiseRightArm', 'raiseLeftLeg', 'raiseRightLeg'].includes(methodName)) {
-          const quoted = argsRaw.match(/"(.*?)"/) || argsRaw.match(/'(.*?)'/);
-          const degreeMatch = argsRaw.match(/-?\d*\.?\d+/);
-          blockValues = {
-            POSITION: quoted ? quoted[1].toLowerCase() : 'mid',
-            DEGREES: clampSafeValue('DEGREES', degreeMatch ? degreeMatch[0] : 90),
-          };
-        }
-        if (['wait', 'waitSeconds'].includes(methodName)) {
-          const numberMatch = argsRaw.match(/-?\d*\.?\d+/);
-          blockValues = { SECONDS: clampSafeValue('SECONDS', numberMatch ? numberMatch[0] : 0.5) };
-        }
-        if (methodName === 'kick') {
-          const kickArgs = argsRaw.match(/"(.*?)"/) || argsRaw.match(/'(.*?)'/);
-          if (kickArgs) {
-            blockValues = { LEVEL: kickArgs[1].toLowerCase() };
-          }
-        }
+          block.initSvg();
+          block.render();
+          if (previousBlock) previousBlock.nextConnection.connect(block.previousConnection);
+          else if (parentConnection) parentConnection.connect(block.previousConnection);
+          if (node.type === 'repeat') createBlocks(node.body, block.getInput('DO').connection);
+          previousBlock = block;
+        });
+      };
+      createBlocks(nodes);
 
-        if (blockType !== 'raw_code') {
-          data = null;
-        }
+      if (workspace.getAllBlocks().length) {
+        workspace.zoomToFit(0.8);
       }
-
-      const block = workspace.newBlock(blockType);
-      if (data) {
-        block.data = data;
-      }
-      Object.entries(blockValues).forEach(([key, value]) => {
-        if (typeof value === 'string' || typeof value === 'number') {
-          block.setFieldValue(String(value), key);
-        }
-      });
-
-      if (previousBlock) {
-        previousBlock.nextConnection.connect(block.previousConnection);
-      }
-      block.initSvg();
-      block.render();
-      previousBlock = block;
-    });
-
-    if (workspace.getAllBlocks().length) {
-      workspace.zoomToFit(0.8);
+      return true;
+    } catch (error) {
+      setBlockSyncError(`Cannot display this code as Blocks: ${error.message}`);
+      console.error('Failed to synchronize IDE code to Blockly.', error);
+      return false;
+    } finally {
+      Blockly.Events.enable();
     }
   }, []);
 
+  useEffect(() => {
+    if (mainTab !== 'blocks' || !workspaceRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      if (!workspaceRef.current) return;
+      syncBlocksFromGeneratedCode(generatedCodeRef.current);
+      Blockly.svgResize(workspaceRef.current);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [mainTab, syncBlocksFromGeneratedCode]);
+
   const derivePlannerWaypointsFromCode = useCallback((code = '') => {
     if (!code || !code.trim()) return [];
-
-    const commandMatches = [...code.matchAll(/robot\.(walkForward|walkBackward|walkSidewaysLeft|walkSidewaysRight|turnLeft|turnRight|turn)\(([^)]*)\)/g)];
-    if (!commandMatches.length) return [];
-
+    let commands;
+    try {
+      commands = flattenG1Commands(parseG1Program(code));
+    } catch {
+      return [];
+    }
+    if (!commands.length) return [];
     let x = 0;
     let y = 0;
     let heading = 0;
     const points = [{ id: 'planner-0', x, y }];
-
-    commandMatches.forEach((match) => {
-      const [, methodName, argsRaw = ''] = match;
-      const numeric = Number((argsRaw.match(/-?\d*\.?\d+/) || ['0'])[0]);
-      const amount = Number.isFinite(numeric) ? numeric : 0;
-
-      if (methodName === 'walkForward' || methodName === 'walkBackward') {
-        const stepDistance = methodName === 'walkBackward' ? -amount : amount;
-        x += Math.cos((heading * Math.PI) / 180) * stepDistance;
-        y += Math.sin((heading * Math.PI) / 180) * stepDistance;
+    commands.forEach(({ method, values }) => {
+      const numberOfSteps = Number(values[0] || 0);
+      let forwardDistance = 0;
+      if (method === 'walk') forwardDistance = numberOfSteps * 0.4;
+      if (method === 'backward') forwardDistance = -numberOfSteps * 0.4;
+      if (method === 'walktime') forwardDistance = numberOfSteps * 0.4;
+      if (method === 'backwardtime') forwardDistance = -numberOfSteps * 0.4;
+      if (method === 'slowwalk') forwardDistance = numberOfSteps * 0.2;
+      if (method === 'slowwalktime') forwardDistance = numberOfSteps * 0.2;
+      if (method === 'fastwalk') forwardDistance = numberOfSteps * 0.8;
+      if (method === 'fastwalktime') forwardDistance = numberOfSteps * 0.8;
+      if (method === 'sidestep') {
+        const sideHeading = heading + (values[0] === 'left' ? 90 : -90);
+        x += Math.cos((sideHeading * Math.PI) / 180) * 0.3;
+        y += Math.sin((sideHeading * Math.PI) / 180) * 0.3;
+      } else if (method === 'turn') {
+        heading += values[0] === 'right' ? -Number(values[1]) : Number(values[1]);
+      } else if (forwardDistance) {
+        x += Math.cos((heading * Math.PI) / 180) * forwardDistance;
+        y += Math.sin((heading * Math.PI) / 180) * forwardDistance;
+      } else {
+        return;
       }
-
-      if (methodName === 'walkSidewaysLeft' || methodName === 'walkSidewaysRight') {
-        const direction = methodName === 'walkSidewaysLeft' ? 1 : -1;
-        const sidewaysHeading = heading + (direction > 0 ? 90 : -90);
-        x += Math.cos((sidewaysHeading * Math.PI) / 180) * amount;
-        y += Math.sin((sidewaysHeading * Math.PI) / 180) * amount;
-      }
-
-      if (methodName === 'turnLeft' || methodName === 'turnRight') {
-        heading += methodName === 'turnLeft' ? amount : -amount;
-      }
-
-      if (methodName === 'turn') {
-        const turnArgs = argsRaw.match(/"([^"]+)"\s*,\s*(\d+(?:\.\d+)?)/) || argsRaw.match(/'([^']+)'\s*,\s*(\d+(?:\.\d+)?)/);
-        if (turnArgs) {
-          const direction = (turnArgs[1] || 'left').toLowerCase();
-          const turnAmount = Number(turnArgs[2] || 0);
-          heading += direction === 'right' ? -turnAmount : turnAmount;
-        }
-      }
-
       points.push({ id: `planner-${points.length}`, x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
     });
 
@@ -1547,11 +1460,21 @@ export default function App() {
 
   const applyGeneratedCode = useCallback((nextCode, options = {}) => {
     const { syncBlocks = true } = options;
-    const result = sanitizeRobotCode(nextCode);
-    const safeCode = result.code || nextCode;
+    let boundedCode = nextCode;
+    let boundsChanged = false;
+    if (nextCode.trim()) {
+      try {
+        boundedCode = formatG1Program(parseG1Program(nextCode));
+        boundsChanged = boundedCode.trim() !== nextCode.trim();
+      } catch {
+        // Keep in-progress IDE edits intact; physical execution validates the complete program.
+      }
+    }
+    const result = sanitizeRobotCode(boundedCode);
+    const safeCode = result.code || boundedCode;
     generatedCodeRef.current = safeCode;
     setGeneratedCode(safeCode);
-    setSafetyNotice(result.changed ? 'One or more values were adjusted to the safe range.' : '');
+    setSafetyNotice(result.changed || boundsChanged ? 'Commands were normalized to the shared syntax and safe ranges.' : '');
     if (syncBlocks && workspaceRef.current && window.Blockly) {
       syncBlocksFromGeneratedCode(safeCode);
     }
@@ -1596,14 +1519,11 @@ export default function App() {
 
   const handleRecordMotionCapture = () => {
     const sampleScript = [
-      'robot.stand();',
-      'robot.wait(0.5);',
-      'robot.walkForward(3);',
-      'robot.wait(0.5);',
-      'robot.turnLeft(90);',
-      'robot.walkForward(2);',
-      'robot.stand();',
-      'console.log("Program complete!");',
+      'robot.stand()',
+      'robot.walk(3)',
+      'robot.turn("left", 90)',
+      'robot.walk(2)',
+      'robot.stand()',
     ].join('\n');
 
     if (generatedCode && generatedCode.trim()) {
@@ -2052,7 +1972,9 @@ export default function App() {
           <div className="border-b border-slate-200 p-3 bg-slate-50 flex items-center justify-between">
             <h3 className="font-semibold text-slate-800">{currentUser.role === 'teacher' ? 'Teacher Queue' : 'My Saved Code'}</h3>
             <div className="flex items-center gap-2">
-              <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1">{classroomStatus}</span>
+              <span className="text-xs rounded-full bg-blue-100 text-blue-700 px-2 py-1" aria-label={`Classroom queue: ${classroomStatus}`}>
+                Queue: {classroomStatus}
+              </span>
               <button type="button" onClick={() => setIsSimulatorOpen(false)} className="rounded-md p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-800" aria-label="Close simulator">
                 <X size={16} />
               </button>
@@ -2062,17 +1984,39 @@ export default function App() {
             {currentUser.role === 'teacher' && (
               <>
                 <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">G1 connection</p>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">Robot connection</p>
+                    <span
+                      role="status"
+                      aria-live="polite"
+                      className={`rounded-full px-2 py-1 text-[10px] font-bold ${
+                        isRobotConnected
+                          ? 'bg-green-100 text-green-800'
+                          : isRobotConnecting
+                            ? 'bg-amber-100 text-amber-800'
+                            : 'bg-slate-200 text-slate-700'
+                      }`}
+                    >
+                      {isRobotConnected ? 'CONNECTED' : isRobotConnecting ? 'CONNECTING' : 'DISCONNECTED'}
+                    </span>
+                  </div>
                   <div className="mt-2 flex gap-2">
                     <input
                       type="text"
                       value={robotAddress}
                       onChange={(e) => setRobotAddress(e.target.value)}
                       className="w-full border border-blue-200 rounded-lg px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="192.168.123.164"
+                      placeholder="eth0"
                     />
-                    <button onClick={handleConnectRobot} className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium">Connect</button>
+                    <button
+                      onClick={handleConnectRobot}
+                      disabled={isRobotConnecting}
+                      className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
+                    >
+                      {isRobotConnecting ? 'Connecting…' : isRobotConnected ? 'Reconnect' : 'Connect'}
+                    </button>
                   </div>
+                  <p className="mt-2 text-[10px] text-slate-600">Use the G1 computer&apos;s DDS network interface. Set UNITREE_DOMAIN_ID if it is not 0.</p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
                 </div>
 
@@ -2387,9 +2331,11 @@ export default function App() {
           simulatorState={simulatorState}
           obstacles={activeObstacles}
           waypoints={plannerWaypoints}
+          isWaypointPlacementEnabled={isWaypointPlacementEnabled}
           isObstacleEditable={currentUser.role !== 'teacher'}
           onObstacleChange={updateStudentObstacle}
           onWaypointChange={updatePlannerWaypoint}
+          onWaypointPlace={placePlannerWaypoint}
           isPlaying={isPreviewPlaying}
           playbackSpeed={playbackSpeed}
           playbackProgress={playbackProgress}
@@ -2510,31 +2456,66 @@ export default function App() {
               </div>
 
               <div className="min-h-0 flex-1 overflow-auto p-3">
-                {mainTab === 'blocks' && (
-                  <div className="space-y-3 text-slate-200">
+                <div className={`${mainTab === 'blocks' ? '' : 'hidden'} space-y-3 text-slate-200`}>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Workspace</p>
                       <div className="mt-3 flex gap-2">
                         <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run simulation</button>
+                        {currentUser.role === 'teacher' && (
+                          <button
+                            type="button"
+                            onClick={handleRunCode}
+                            disabled={!isRobotConnected && !isRunning}
+                            title={isRobotConnected ? 'Send this program to the connected G1' : 'Connect the G1 SDK before sending commands'}
+                            className="flex-1 rounded-md bg-amber-500 px-2 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {isRunning ? 'Stop robot' : 'Send to robot'}
+                          </button>
+                        )}
                         <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
                       </div>
+                      {currentUser.role === 'teacher' && (
+                        <p className="mt-2 text-[10px] text-slate-400" role="status" aria-live="polite">
+                          {isRunning ? 'Sending/running program on the G1…' : isRobotConnected ? 'G1 connected and ready for a program.' : 'Connect the G1 SDK before sending a physical run.'}
+                        </p>
+                      )}
                     </div>
                     <div ref={blocklyDiv} className="h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-950" />
+                    {blockSyncError && (
+                      <p role="alert" className="rounded-lg border border-amber-500/40 bg-amber-950/40 p-2 text-xs text-amber-200">
+                        {blockSyncError}
+                      </p>
+                    )}
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Generated code</p>
                       <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-slate-200">
                         {generatedCode || '# Python code will appear here'}
                       </pre>
                     </div>
-                  </div>
-                )}
+                </div>
 
                 {mainTab === 'planner' && (
                   <div className="space-y-3 text-slate-200">
+                    <p className="rounded-lg border border-amber-500/30 bg-amber-950/40 p-2 text-[10px] text-amber-200">
+                      Physical paths use timed walking primitives. Without robot localization feedback, waypoint stops are approximate.
+                    </p>
                     <div className="flex gap-2">
-                      <button type="button" onClick={addPlannerWaypoint} className="flex-1 rounded-md bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-500">Add waypoint</button>
+                      <button
+                        type="button"
+                        aria-label="Place waypoint"
+                        aria-pressed={isWaypointPlacementEnabled}
+                        onClick={() => setIsWaypointPlacementEnabled((enabled) => !enabled)}
+                        className={`flex-1 rounded-md px-2 py-2 text-[10px] font-semibold text-white ${isWaypointPlacementEnabled ? 'bg-cyan-600 hover:bg-cyan-500' : 'bg-blue-600 hover:bg-blue-500'}`}
+                      >
+                        {isWaypointPlacementEnabled ? 'Click grid to place' : 'Place waypoint'}
+                      </button>
                       <button type="button" onClick={compilePlannerPath} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-emerald-500">Compile</button>
                     </div>
+                    {isWaypointPlacementEnabled && (
+                      <p className="rounded-lg border border-cyan-500/30 bg-cyan-950/50 p-2 text-xs text-cyan-200">
+                        Click an open spot on the grid to place a waypoint, or click again to cancel.
+                      </p>
+                    )}
                     {plannerWaypoints.length === 0 ? (
                       <p className="rounded-lg border border-dashed border-slate-600 bg-slate-900 p-3 text-xs text-slate-400">No waypoints yet.</p>
                     ) : (
@@ -2544,6 +2525,11 @@ export default function App() {
                             <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">Waypoint {index + 1}</span>
                             <button type="button" onClick={() => removePlannerWaypoint(point.id)} className="text-[10px] text-red-400">Delete</button>
                           </div>
+                          {index > 0 && (
+                            <p data-testid="waypoint-distance" className="mb-2 text-[10px] font-semibold text-cyan-300">
+                              {Math.hypot(point.x - plannerWaypoints[index - 1].x, point.y - plannerWaypoints[index - 1].y).toFixed(2)} m from waypoint {index}
+                            </p>
+                          )}
                           <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-300">
                             <label>
                               X
@@ -2556,6 +2542,16 @@ export default function App() {
                           </div>
                         </div>
                       ))
+                    )}
+                    {plannerWaypoints.length > 1 && (
+                      <p data-testid="waypoint-total-distance" className="rounded-lg border border-slate-700 bg-slate-900 p-2 text-xs font-semibold text-slate-200">
+                        {plannerWaypoints.slice(1).reduce((total, point, index) => (
+                          total + Math.hypot(
+                            point.x - plannerWaypoints[index].x,
+                            point.y - plannerWaypoints[index].y,
+                          )
+                        ), 0).toFixed(2)} m total
+                      </p>
                     )}
                   </div>
                 )}
@@ -2575,7 +2571,7 @@ export default function App() {
                     <div className="flex flex-wrap gap-2">
                       {[
                         'Walk forward 3 steps, turn left 90 degrees, then wave',
-                        'Walk backward 2 steps and sit',
+                        'Walk backward 2 steps and turn right 90 degrees',
                         'Repeat a square path 2 times',
                       ].map((example) => (
                         <button key={example} type="button" onClick={() => setMotionPrompt(example)} className="rounded-md bg-slate-800 px-2 py-1.5 text-left text-[10px] text-slate-300 hover:bg-slate-700">
@@ -2626,10 +2622,10 @@ export default function App() {
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
                       <div className="mt-2 space-y-2 text-xs text-slate-200">
-                        <button type="button" onClick={() => insertRobotCommand('robot.stand();')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand</button>
-                        <button type="button" onClick={() => insertRobotCommandWithValue('walkForward', 3, 'steps')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Walk Forward (steps)</button>
-                        <button type="button" onClick={() => insertRobotCommandWithValue('wait', 1, 'seconds')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Wait (seconds)</button>
-                        <button type="button" onClick={() => insertRobotCommand('robot.raiseBothArms();')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Raise Both Arms</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.stand()')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.walk(3)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Walk Forward (3 steps)</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.turn("left", 90)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Turn Left (90°)</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.raisebotharms("mid")')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Raise Both Arms</button>
                       </div>
                     </div>
                   </div>
@@ -2638,18 +2634,25 @@ export default function App() {
                 {mainTab === 'ide' && (
                   <div className="space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick commands</p>
-                      <div className="mt-2 space-y-2 text-xs">
-                        {quickRobotCommands.slice(0, 8).map((command) => (
-                          <button
-                            key={command.label || command.snippet || 'quick-command'}
-                            type="button"
-                            onClick={() => { if (command.action) command.action(); else if (command.snippet) insertRobotCommand(command.snippet); }}
-                            className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left text-slate-200 hover:bg-slate-700"
-                          >
-                            {command.label || command.snippet}
-                          </button>
-                        ))}
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">G1 command reference</p>
+                      <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
+                        {G1_COMMANDS.map((command) => {
+                          const args = command.args.map((argument) => argument.kind === 'choice'
+                            ? `"${argument.value}"`
+                            : String(argument.value));
+                          return (
+                            <div key={command.method} className="rounded-md bg-slate-800 px-2 py-1.5">
+                              <code className="text-cyan-300">{`robot.${command.method}(${args.join(', ')})`}</code>
+                              <p className="mt-1 text-slate-400">{command.description}</p>
+                              {!command.physicalSupported && <p className="mt-1 text-amber-300">Simulation only until a verified G1 SDK action is configured.</p>}
+                            </div>
+                          );
+                        })}
+                        <div className="rounded-md bg-slate-800 px-2 py-1.5">
+                          <code className="text-cyan-300">for _ in range(3):</code>
+                          <code className="block pl-3 text-cyan-300">robot.walk(2)</code>
+                          <p className="mt-1 text-slate-400">Repeat an indented group of commands.</p>
+                        </div>
                       </div>
                     </div>
                     <textarea
@@ -2662,6 +2665,9 @@ export default function App() {
                       spellCheck={false}
                       className="h-64 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 font-mono text-[11px] leading-6 text-slate-100 outline-none"
                     />
+                    {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
+                    {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
+                    <p className="text-[10px] text-slate-400">Blocks, IDE, planner, prompt, and vision edits share this program. Use only commands from the reference.</p>
                   </div>
                 )}
               </div>
