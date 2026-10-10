@@ -1,4 +1,8 @@
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 try:
@@ -10,6 +14,23 @@ except ImportError:
 
 
 class G1RobotProgramTests(unittest.TestCase):
+    def test_connection_log_creates_private_session_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ,
+            {"G1_DATA_DIR": temp_dir},
+        ), patch.object(g1_robot, "_connection_log_path", None):
+            g1_robot._start_connection_log("eth0", 0)
+            log_path = g1_robot._connection_log_path
+            g1_robot._log_event("connected", interface="eth0", domain=0)
+
+            self.assertTrue(log_path.is_file())
+            self.assertEqual(log_path.parent, Path(temp_dir))
+            self.assertEqual(
+                [json.loads(line)["event"] for line in log_path.read_text().splitlines()],
+            ["connection_attempt", "connected"],
+            )
+            self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
+
     def test_loop_compiles_to_bounded_physical_commands(self):
         commands = parse_robot_program(
             'robot.stand()\n'
@@ -96,6 +117,30 @@ class G1RobotProgramTests(unittest.TestCase):
         self.assertEqual(moves[0][:3], (0.4, 0, 0))
         self.assertAlmostEqual(moves[0][3], 2.0)
         self.assertAlmostEqual(moves[1][2], -0.6)
+
+    def test_robot_program_logs_validated_command_outcomes(self):
+        class FakeLocoClient:
+            def Squat2StandUp(self):
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "session.jsonl"
+            log_path.touch(mode=0o600)
+            original_client = g1_robot._client
+            g1_robot._client = FakeLocoClient()
+            try:
+                with patch.object(g1_robot, "_connection_log_path", log_path):
+                    result = g1_robot.execute_robot_program("robot.stand()")
+            finally:
+                g1_robot._client = original_client
+
+            events = [json.loads(line) for line in log_path.read_text().splitlines()]
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["program_started", "command_started", "command_completed", "program_completed"],
+            )
+            self.assertEqual(events[1]["command"], {"method": "stand"})
 
 
 if __name__ == "__main__":

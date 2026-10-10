@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { flattenG1Commands, formatG1Program, getG1BlocklyCommandBlocks, parseG1Program } from './g1Commands.js';
+import { flattenG1Commands, formatG1Program, G1_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './g1Commands.js';
 import { compileMotionPrompt } from './textToMotion.js';
 import { buildG1SimulationFrames } from './g1Edu23Env.js';
 
@@ -10,6 +10,9 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.ok(blocks.some((block) => block.type === 'g1_command_backwardtime'));
   assert.ok(blocks.some((block) => block.type === 'g1_command_kickleftDegrees'));
   assert.ok(blocks.every((block) => block.codeTemplate.startsWith('robot.')));
+  assert.ok(G1_COMMANDS.every((entry) => entry.adapters.simulator));
+  assert.ok(G1_COMMANDS.every((entry) => entry.adapters.sdk === entry.physicalSupported));
+  assert.ok(G1_COMMANDS.every((entry) => entry.adapters.webRtc === false));
 });
 
 test('G1 program parser normalizes commands, clamps numbers, and expands loops', () => {

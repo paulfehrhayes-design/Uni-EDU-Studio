@@ -18,6 +18,25 @@ class ServerClassroomTests(unittest.TestCase):
         response = client.get('/api/github-proxy')
         self.assertEqual(response.status_code, 400)
 
+    def test_robot_connect_defaults_to_configured_unitree_interface(self):
+        client = TestClient(app)
+        teacher = client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        headers = {'Authorization': f"Bearer {teacher['token']}"}
+
+        with patch.dict(os.environ, {'UNITREE_INTERFACE': 'eth0'}), patch.object(
+            server,
+            'connect_robot',
+            return_value={'status': 'connected', 'interface': 'eth0', 'domain': 0},
+        ) as connect:
+            response = client.post('/api/robot/connect', headers=headers, json={})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['interface'], 'eth0')
+        connect.assert_called_once_with('eth0')
+
     def test_classroom_login_and_queue_flow(self):
         client = TestClient(app)
 

@@ -1,15 +1,21 @@
 import ast
+import json
 import math
 import os
 import re
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
 
 _client = None
 _connected_interface = None
+_connection_log_path: Path | None = None
+_log_lock = threading.Lock()
 _run_lock = threading.Lock()
 _stop_requested = threading.Event()
 _MAX_PROGRAM_SECONDS = 30.0
@@ -22,6 +28,40 @@ _TURN_RADIANS_PER_SECOND = 0.6
 
 class CommandValidationError(ValueError):
     pass
+
+
+def _log_event(event: str, **details: Any) -> None:
+    if _connection_log_path is None:
+        return
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **details,
+    }
+    with _log_lock:
+        with _connection_log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            log_file.flush()
+            os.fsync(log_file.fileno())
+
+
+def _start_connection_log(interface: str, domain: int) -> None:
+    global _connection_log_path
+    log_dir = Path(os.getenv("G1_DATA_DIR", "/home/unitree/harry_botter"))
+    try:
+        log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        log_path = log_dir / f"robot-session-{timestamp}-{uuid.uuid4().hex[:8]}.jsonl"
+        descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as log_file:
+            log_file.write("")
+        _connection_log_path = log_path
+    except OSError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not create the robot session log under {log_dir}: {error}",
+        ) from error
+    _log_event("connection_attempt", interface=interface, domain=domain)
 
 
 def _number(value: ast.AST, name: str, minimum: float, maximum: float) -> float:
@@ -177,15 +217,21 @@ def connect_robot(interface: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Cannot reconnect while a robot program is running.")
 
     try:
+        domain = int(os.getenv("UNITREE_DOMAIN_ID", "0"))
+    except ValueError as error:
+        raise HTTPException(status_code=500, detail="UNITREE_DOMAIN_ID must be an integer.") from error
+
+    _start_connection_log(interface, domain)
+    try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
     except ImportError as error:
+        _log_event("connection_failed", error=str(error))
         raise HTTPException(
             status_code=503,
             detail="Unitree SDK2 Python is not installed on this backend host. Deploy this backend on the G1 computer and install the supported SDK.",
         ) from error
 
-    domain = int(os.getenv("UNITREE_DOMAIN_ID", "0"))
     try:
         ChannelFactoryInitialize(domain, interface)
         client = LocoClient()
@@ -200,11 +246,18 @@ def connect_robot(interface: str) -> dict[str, Any]:
     except Exception as error:
         _client = None
         _connected_interface = None
+        _log_event("connection_failed", error=str(error))
         raise HTTPException(status_code=502, detail=f"Could not initialize the G1 locomotion SDK: {error}") from error
 
+    _log_event("connected", interface=interface, domain=domain)
     _client = client
     _connected_interface = interface
-    return {"status": "connected", "interface": interface, "domain": domain}
+    return {
+        "status": "connected",
+        "interface": interface,
+        "domain": domain,
+        "logFile": str(_connection_log_path),
+    }
 
 
 def robot_status() -> dict[str, Any]:
@@ -252,29 +305,36 @@ def execute_robot_program(code: str) -> dict[str, Any]:
 
     _stop_requested.clear()
     try:
-        for command in commands:
+        _log_event("program_started", command_count=len(commands), commands=commands)
+        for index, command in enumerate(commands, start=1):
             method = command["method"]
-            if method == "stand":
-                _sdk_result(_client.Squat2StandUp(), "Squat2StandUp")
-                continue
-            if method == "turn":
-                yaw = _TURN_RADIANS_PER_SECOND * (1 if command["direction"] == "left" else -1)
-                _move(0, 0, yaw, math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND)
-                continue
-            if method == "sidestep":
-                lateral_speed = 0.2 * (1 if command["direction"] == "left" else -1)
-                _move(0, lateral_speed, 0, _STEP_METERS / abs(lateral_speed))
-                continue
-
-            speed = 0.2 if method.startswith("slow") else 0.8 if method.startswith("fast") else _FORWARD_METERS_PER_SECOND
-            if method in {"backward", "backwardtime"}:
-                speed *= -1
-            duration = command["seconds"] if method.endswith("time") else command["steps"] * _STEP_METERS / abs(speed)
-            _move(speed, 0, 0, duration)
+            _log_event("command_started", index=index, command=command)
+            try:
+                if method == "stand":
+                    _sdk_result(_client.Squat2StandUp(), "Squat2StandUp")
+                elif method == "turn":
+                    yaw = _TURN_RADIANS_PER_SECOND * (1 if command["direction"] == "left" else -1)
+                    _move(0, 0, yaw, math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND)
+                elif method == "sidestep":
+                    lateral_speed = 0.2 * (1 if command["direction"] == "left" else -1)
+                    _move(0, lateral_speed, 0, _STEP_METERS / abs(lateral_speed))
+                else:
+                    speed = 0.2 if method.startswith("slow") else 0.8 if method.startswith("fast") else _FORWARD_METERS_PER_SECOND
+                    if method in {"backward", "backwardtime"}:
+                        speed *= -1
+                    duration = command["seconds"] if method.endswith("time") else command["steps"] * _STEP_METERS / abs(speed)
+                    _move(speed, 0, 0, duration)
+            except Exception as error:
+                _log_event("command_failed", index=index, command=command, error=str(error))
+                raise
+            _log_event("command_completed", index=index, command=command)
+        _log_event("program_completed", command_count=len(commands))
         return {"status": "completed", "commandsExecuted": len(commands)}
-    except HTTPException:
+    except HTTPException as error:
+        _log_event("program_failed", error=str(error.detail))
         raise
     except Exception as error:
+        _log_event("program_failed", error=str(error))
         raise HTTPException(status_code=502, detail=f"G1 command failed: {error}") from error
     finally:
         _stop_requested.clear()
@@ -284,9 +344,12 @@ def execute_robot_program(code: str) -> dict[str, Any]:
 def stop_robot() -> dict[str, str]:
     _stop_requested.set()
     if _client is None:
+        _log_event("stop_requested", status="not_connected")
         return {"status": "not_connected"}
     try:
         _sdk_result(_client.StopMove(), "StopMove")
     except Exception as error:
+        _log_event("stop_failed", error=str(error))
         raise HTTPException(status_code=502, detail=f"Failed to stop the G1: {error}") from error
+    _log_event("stop_requested", status="stopping")
     return {"status": "stopping"}
