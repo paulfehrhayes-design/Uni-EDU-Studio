@@ -24,3 +24,12 @@ dist-ssr
 *.sw?
 
 unitree_sdk2_python
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated test artifacts
+test-results/
+playwright-report/
