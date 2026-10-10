@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from fastapi import HTTPException
 
 try:
     from . import g1_robot
@@ -94,10 +95,10 @@ class G1RobotProgramTests(unittest.TestCase):
     def test_robot_program_dispatches_stand_and_locomotion_commands(self):
         class FakeLocoClient:
             def __init__(self):
-                self.stand_calls = 0
+                self.fsm_requests = []
 
-            def Squat2StandUp(self):
-                self.stand_calls += 1
+            def SetFsmId(self, fsm_id):
+                self.fsm_requests.append(fsm_id)
                 return 0
 
         client = FakeLocoClient()
@@ -112,15 +113,18 @@ class G1RobotProgramTests(unittest.TestCase):
         finally:
             g1_robot._client = original_client
 
-        self.assertEqual(result, {"status": "completed", "commandsExecuted": 3})
-        self.assertEqual(client.stand_calls, 1)
+        self.assertEqual(
+            result,
+            {"status": "completed", "commandsExecuted": 3, "physicalMotionVerified": False},
+        )
+        self.assertEqual(client.fsm_requests, [706])
         self.assertEqual(moves[0][:3], (0.4, 0, 0))
         self.assertAlmostEqual(moves[0][3], 2.0)
         self.assertAlmostEqual(moves[1][2], -0.6)
 
     def test_robot_program_logs_validated_command_outcomes(self):
         class FakeLocoClient:
-            def Squat2StandUp(self):
+            def SetFsmId(self, fsm_id):
                 return 0
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -141,6 +145,21 @@ class G1RobotProgramTests(unittest.TestCase):
                 ["program_started", "command_started", "command_completed", "program_completed"],
             )
             self.assertEqual(events[1]["command"], {"method": "stand"})
+
+    def test_stand_reports_sdk_transition_error(self):
+        class FakeLocoClient:
+            def SetFsmId(self, fsm_id):
+                return 3102
+
+        original_client = g1_robot._client
+        g1_robot._client = FakeLocoClient()
+        try:
+            with self.assertRaises(HTTPException) as raised:
+                g1_robot.execute_robot_program("robot.stand()")
+            self.assertEqual(raised.exception.status_code, 502)
+            self.assertIn("Squat2StandUp failed with code 3102", raised.exception.detail)
+        finally:
+            g1_robot._client = original_client
 
 
 if __name__ == "__main__":

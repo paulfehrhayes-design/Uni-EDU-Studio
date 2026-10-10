@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ast
 import json
 import math
@@ -311,7 +313,7 @@ def execute_robot_program(code: str) -> dict[str, Any]:
             _log_event("command_started", index=index, command=command)
             try:
                 if method == "stand":
-                    _sdk_result(_client.Squat2StandUp(), "Squat2StandUp")
+                    _sdk_result(_client.SetFsmId(706), "Squat2StandUp")
                 elif method == "turn":
                     yaw = _TURN_RADIANS_PER_SECOND * (1 if command["direction"] == "left" else -1)
                     _move(0, 0, yaw, math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND)
@@ -329,7 +331,11 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                 raise
             _log_event("command_completed", index=index, command=command)
         _log_event("program_completed", command_count=len(commands))
-        return {"status": "completed", "commandsExecuted": len(commands)}
+        return {
+            "status": "completed",
+            "commandsExecuted": len(commands),
+            "physicalMotionVerified": False,
+        }
     except HTTPException as error:
         _log_event("program_failed", error=str(error.detail))
         raise

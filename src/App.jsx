@@ -868,7 +868,7 @@ export default function App() {
       const response = await apiFetch('/api/classroom/run-next', { method: 'POST' });
       setClassroomStatus(response.status || 'running');
       await refreshClassroomData();
-      alert(`Completed ${response.item?.name || 'queued program'} on the robot.`);
+      alert(`SDK finished sending ${response.process?.commandsExecuted ?? 0} command(s) from ${response.item?.name || 'the queued program'}. Physical movement is not verified by the SDK.`);
     } catch (e) {
       alert('Could not start next queue item: ' + e.message);
     }
@@ -1271,7 +1271,7 @@ export default function App() {
         parseG1Program(generatedCode);
         setIsRunning(true);
         const result = await robotConnection.run(generatedCode);
-        setRobotConnectionStatus(`Completed ${result.commandsExecuted} robot commands`);
+        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.`);
       } catch (error) {
         alert(`Robot run failed: ${error.message}`);
       } finally {
