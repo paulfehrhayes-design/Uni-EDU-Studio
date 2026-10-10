@@ -122,6 +122,23 @@ class G1RobotProgramTests(unittest.TestCase):
         self.assertAlmostEqual(moves[0][3], 2.0)
         self.assertAlmostEqual(moves[1][2], -0.6)
 
+    def test_slow_motion_test_command_is_bounded_and_uses_slow_speed(self):
+        class FakeLocoClient:
+            def SetVelocity(self, vx, vy, vyaw, duration):
+                return 0
+
+        original_client = g1_robot._client
+        g1_robot._client = FakeLocoClient()
+        moves = []
+        try:
+            with patch.object(g1_robot, "_move", side_effect=lambda *args: moves.append(args)):
+                result = g1_robot.execute_robot_program("robot.slowwalktime(0.5)")
+        finally:
+            g1_robot._client = original_client
+
+        self.assertEqual(result["commandsExecuted"], 1)
+        self.assertEqual(moves, [(0.2, 0, 0, 0.5)])
+
     def test_robot_program_logs_validated_command_outcomes(self):
         class FakeLocoClient:
             def SetFsmId(self, fsm_id):

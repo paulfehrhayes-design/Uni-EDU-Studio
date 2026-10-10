@@ -928,6 +928,26 @@ export default function App() {
     }
   };
 
+  const handleTestRobotMotion = async () => {
+    if (!isRobotConnected) {
+      alert('Connect the G1 SDK before testing motion.');
+      return;
+    }
+    if (!window.confirm('Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a 0.5-second slow forward movement (about 10 cm). The app cannot verify physical movement. Continue?')) return;
+
+    setIsRunning(true);
+    setRobotConnectionStatus('Sending a brief slow-motion test...');
+    try {
+      const result = await robotConnection.run('robot.slowwalktime(0.5)');
+      setRobotConnectionStatus(`SDK finished sending the motion test (${result.commandsExecuted} command). Physical movement is not verified.`);
+    } catch (error) {
+      setRobotConnectionStatus(`Motion test failed: ${error.message}`);
+      alert(`Motion test failed: ${error.message}`);
+    } finally {
+      setIsRunning(false);
+    }
+  };
+
   useEffect(() => {
     const handleClickOutside = () => setActiveMenu(null);
     window.addEventListener('click', handleClickOutside);
@@ -1996,11 +2016,21 @@ export default function App() {
                   <div className="mt-2 flex gap-2">
                     <button
                       onClick={handleConnectRobot}
-                      disabled={isRobotConnecting}
-                      className="w-full rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
+                      disabled={isRobotConnecting || isRunning}
+                      className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
                     >
                       {isRobotConnecting ? 'Connecting…' : isRobotConnected ? 'Reconnect' : 'Connect'}
                     </button>
+                    {isRobotConnected && (
+                      <button
+                        type="button"
+                        onClick={handleTestRobotMotion}
+                        disabled={isRunning || isRobotConnecting}
+                        className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
+                      >
+                        {isRunning ? 'Motion test running…' : 'Test motion'}
+                      </button>
+                    )}
                   </div>
                   <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Simulation works while disconnected.</p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>

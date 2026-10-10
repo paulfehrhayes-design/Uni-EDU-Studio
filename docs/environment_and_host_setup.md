@@ -197,6 +197,8 @@ The backend accepts only the shared, bounded `robot.*` command language and boun
 
 The teacher queue's **Clear queue** action removes waiting and finished entries, while leaving any currently running job visible. **Run next** sends the oldest queued program to the same physical G1 SDK executor; if the robot is not ready, that job remains queued so the teacher can reconnect and retry.
 
+After connecting, teachers can use **Test motion** for one confirmed 0.5-second slow forward command (about 10 cm at the configured SDK speed). It does not run automatically on connection and does not verify physical movement. Use it only when the robot is upright and stable, the area is clear, and someone is ready at the emergency stop.
+
 Planner paths are converted to timed walking and turn commands. The G1 SDK interface used here is open-loop and does not read localization, so a physical route cannot stop exactly at its plotted waypoint coordinates. The simulation may show the intended waypoints; physical accuracy requires a localization/odometry feedback integration and real-robot calibration.
 
 The browser uses a connection adapter interface (`src/robot/RobotConnection.js`) for status, connect, run, and stop. The SDK adapter wraps the existing authenticated backend routes; a mock adapter exercises the same bounded command catalog in tests. The WebRTC adapter requires an explicitly supplied transport and command encoders, and no WebRTC command is marked supported until its G1 protocol mapping is verified. It parses the shared command language and sends structured encoded commands, never arbitrary Python source.
