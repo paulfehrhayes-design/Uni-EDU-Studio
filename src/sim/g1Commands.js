@@ -21,7 +21,12 @@ const command = (method, label, category, description, args = []) => ({
   label,
   category,
   description,
-  physicalSupported: ['stand', 'walk', 'walktime', 'backward', 'backwardtime', 'sidestep', 'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn'].includes(method),
+  adapters: {
+    simulator: true,
+    sdk: SDK_SUPPORTED_COMMANDS.has(method),
+    webRtc: false,
+  },
+  physicalSupported: SDK_SUPPORTED_COMMANDS.has(method),
   args,
   blockType: `g1_command_${method}`,
   blockMessage: `${label}${args.map((_, index) => ` %${index + 1}`).join('')}`,
@@ -33,6 +38,11 @@ const seconds = (value = 1) => numberArgument('SECONDS', 'seconds', value, 0.1, 
 const degrees = (value = 90) => numberArgument('DEGREES', 'degrees', value, 0, 120);
 const direction = (value = 'left') => choiceArgument('DIRECTION', 'direction', [['Left', 'left'], ['Right', 'right']], value);
 const level = (value = 'mid') => choiceArgument('LEVEL', 'level', [['High', 'high'], ['Mid', 'mid'], ['Low', 'low']], value);
+
+const SDK_SUPPORTED_COMMANDS = new Set([
+  'stand', 'walk', 'walktime', 'backward', 'backwardtime', 'sidestep',
+  'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn',
+]);
 
 const commandGroups = [
   [

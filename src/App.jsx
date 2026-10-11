@@ -16,6 +16,7 @@ import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, buildPlannerMotion
 import G1Simulation3D from './components/G1Simulation3D';
 import { compileMotionPrompt } from './sim/textToMotion';
 import { flattenG1Commands, formatG1Program, G1_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
+import { createRobotConnection } from './robot/RobotConnection';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -661,7 +662,6 @@ export default function App() {
   const [authMode, setAuthMode] = useState('login');
   const [loginError, setLoginError] = useState('');
   const [classroomStatus, setClassroomStatus] = useState('idle');
-  const [robotAddress, setRobotAddress] = useState('eth0');
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [isRobotConnecting, setIsRobotConnecting] = useState(false);
@@ -682,7 +682,7 @@ export default function App() {
     { id: 'camera', label: 'Vision to Motion' },
   ];
 
-  const apiFetch = async (url, options = {}) => {
+  const apiFetch = useCallback(async (url, options = {}) => {
     const headers = {
       'Content-Type': 'application/json',
       ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
@@ -697,7 +697,12 @@ export default function App() {
       throw new Error(data.detail || data.message || 'Request failed');
     }
     return data;
-  };
+  }, [session?.token]);
+
+  const robotConnection = useMemo(
+    () => createRobotConnection('sdk', { request: apiFetch }),
+    [apiFetch],
+  );
 
   const refreshClassroomData = useCallback(async () => {
     if (!session?.token) return;
@@ -717,7 +722,7 @@ export default function App() {
     } catch (err) {
       console.error('Failed to refresh classroom data:', err);
     }
-  }, [session]);
+  }, [session, apiFetch]);
 
   useEffect(() => {
     if (session) {
@@ -734,7 +739,7 @@ export default function App() {
       }
       refreshClassroomData();
       if (session.user.role === 'teacher') {
-        apiFetch('/api/robot/status')
+        robotConnection.status()
           .then((status) => {
             setIsRobotConnected(status.sdkAvailable);
             setRobotConnectionStatus(status.sdkAvailable
@@ -764,7 +769,7 @@ export default function App() {
     } else {
       localStorage.removeItem('edu-classroom-session');
     }
-  }, [session, refreshClassroomData, sceneObjectsKey]);
+  }, [session, refreshClassroomData, sceneObjectsKey, robotConnection, apiFetch]);
 
   useEffect(() => {
     if (session?.user?.username) {
@@ -863,7 +868,7 @@ export default function App() {
       const response = await apiFetch('/api/classroom/run-next', { method: 'POST' });
       setClassroomStatus(response.status || 'running');
       await refreshClassroomData();
-      alert(`Completed ${response.item?.name || 'queued program'} on the robot.`);
+      alert(`SDK finished sending ${response.process?.commandsExecuted ?? 0} command(s) from ${response.item?.name || 'the queued program'}. Physical movement is not verified by the SDK.`);
     } catch (e) {
       alert('Could not start next queue item: ' + e.message);
     }
@@ -905,30 +910,41 @@ export default function App() {
       return;
     }
 
-    const cleanAddress = robotAddress.trim();
-    if (!cleanAddress) {
-      alert('Enter the G1 computer network interface name, for example eth0.');
-      return;
-    }
-
     setIsRobotConnecting(true);
-    setRobotConnectionStatus(`Connecting through ${cleanAddress}...`);
+    setRobotConnectionStatus('Connecting through the G1 host network interface...');
     try {
-      const connection = await apiFetch('/api/robot/connect', {
-        method: 'POST',
-        body: JSON.stringify({ interface: cleanAddress }),
-      });
+      const connection = await robotConnection.connect();
       if (connection.status !== 'connected') {
         throw new Error('Backend did not confirm a connected robot.');
       }
       setIsRobotConnected(true);
-      setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain}`);
+      setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
     } catch (error) {
       setIsRobotConnected(false);
       setRobotConnectionStatus(`Connection failed: ${error.message}`);
       alert(`Robot connection failed: ${error.message}`);
     } finally {
       setIsRobotConnecting(false);
+    }
+  };
+
+  const handleTestRobotMotion = async () => {
+    if (!isRobotConnected) {
+      alert('Connect the G1 SDK before testing motion.');
+      return;
+    }
+    if (!window.confirm('Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a 0.5-second slow forward movement (about 10 cm). The app cannot verify physical movement. Continue?')) return;
+
+    setIsRunning(true);
+    setRobotConnectionStatus('Sending a brief slow-motion test...');
+    try {
+      const result = await robotConnection.run('robot.slowwalktime(0.5)');
+      setRobotConnectionStatus(`SDK finished sending the motion test (${result.commandsExecuted} command). Physical movement is not verified.`);
+    } catch (error) {
+      setRobotConnectionStatus(`Motion test failed: ${error.message}`);
+      alert(`Motion test failed: ${error.message}`);
+    } finally {
+      setIsRunning(false);
     }
   };
 
@@ -1263,7 +1279,7 @@ export default function App() {
   const handleRunCode = async () => {
     if (isRunning) {
       try {
-        const result = await apiFetch('/api/stop', { method: 'POST' });
+        const result = await robotConnection.stop();
         setIsRunning(false);
         setRobotConnectionStatus(result.status === 'stopping' ? 'Stopping robot...' : 'Robot is not connected');
       } catch (error) {
@@ -1274,11 +1290,8 @@ export default function App() {
         if (!isRobotConnected) throw new Error('Connect the G1 SDK before sending a program.');
         parseG1Program(generatedCode);
         setIsRunning(true);
-        const result = await apiFetch('/api/run', {
-          method: 'POST',
-          body: JSON.stringify({ code: generatedCode }),
-        });
-        setRobotConnectionStatus(`Completed ${result.commandsExecuted} robot commands`);
+        const result = await robotConnection.run(generatedCode);
+        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.`);
       } catch (error) {
         alert(`Robot run failed: ${error.message}`);
       } finally {
@@ -2001,22 +2014,25 @@ export default function App() {
                     </span>
                   </div>
                   <div className="mt-2 flex gap-2">
-                    <input
-                      type="text"
-                      value={robotAddress}
-                      onChange={(e) => setRobotAddress(e.target.value)}
-                      className="w-full border border-blue-200 rounded-lg px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="eth0"
-                    />
                     <button
                       onClick={handleConnectRobot}
-                      disabled={isRobotConnecting}
-                      className="rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
+                      disabled={isRobotConnecting || isRunning}
+                      className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
                     >
                       {isRobotConnecting ? 'Connecting…' : isRobotConnected ? 'Reconnect' : 'Connect'}
                     </button>
+                    {isRobotConnected && (
+                      <button
+                        type="button"
+                        onClick={handleTestRobotMotion}
+                        disabled={isRunning || isRobotConnecting}
+                        className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
+                      >
+                        {isRunning ? 'Motion test running…' : 'Test motion'}
+                      </button>
+                    )}
                   </div>
-                  <p className="mt-2 text-[10px] text-slate-600">Use the G1 computer&apos;s DDS network interface. Set UNITREE_DOMAIN_ID if it is not 0.</p>
+                  <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Simulation works while disconnected.</p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
                 </div>
 
@@ -2644,7 +2660,9 @@ export default function App() {
                             <div key={command.method} className="rounded-md bg-slate-800 px-2 py-1.5">
                               <code className="text-cyan-300">{`robot.${command.method}(${args.join(', ')})`}</code>
                               <p className="mt-1 text-slate-400">{command.description}</p>
-                              {!command.physicalSupported && <p className="mt-1 text-amber-300">Simulation only until a verified G1 SDK action is configured.</p>}
+                              {command.adapters.sdk
+                                ? <p className="mt-1 text-emerald-300">Supported by the G1 SDK adapter; WebRTC support is unverified.</p>
+                                : <p className="mt-1 text-amber-300">Simulation only; no physical adapter has a verified mapping.</p>}
                             </div>
                           );
                         })}

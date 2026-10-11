@@ -46,7 +46,7 @@ class CodeRequest(BaseModel):
     code: str
 
 class ConnectRobotRequest(BaseModel):
-    interface: str
+    interface: Optional[str] = None
 
 class HFTextMotionRequest(BaseModel):
     prompt: str
@@ -690,7 +690,7 @@ def run_code(request: CodeRequest, user: dict = Depends(auth_required)):
 def robot_connect(request: ConnectRobotRequest, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    return connect_robot(request.interface)
+    return connect_robot(request.interface or os.getenv("UNITREE_INTERFACE", "eth0"))
 
 @app.get("/api/robot/status")
 def get_robot_status(user: dict = Depends(auth_required)):
