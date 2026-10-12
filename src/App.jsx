@@ -15,7 +15,7 @@ import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
 import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
 import G1Simulation3D from './components/G1Simulation3D';
 import { compileMotionPrompt } from './sim/textToMotion';
-import { flattenG1Commands, formatG1Program, G1_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
+import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
 import { createRobotConnection } from './robot/RobotConnection';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
@@ -878,7 +878,7 @@ export default function App() {
     try {
       await apiFetch('/api/classroom/stop-current', { method: 'POST' });
       await refreshClassroomData();
-      alert('Robot run paused.');
+      alert('Locomotion stop requested and queue paused. An active arm preset may continue until its motion ends.');
     } catch (e) {
       alert('Pause failed: ' + e.message);
     }
@@ -996,10 +996,10 @@ export default function App() {
 
   const generateToolboxXML = useCallback((language) => {
     const cats = UI_TEXT[language].toolbox;
-    const categories = [...new Set(G1_COMMANDS.map((definition) => definition.category))];
+    const categories = [...new Set(G1_EXECUTABLE_COMMANDS.map((definition) => definition.category))];
     const commandCategoriesXml = categories.map((category) => {
-      const blocks = getG1BlocklyCommandBlocks()
-        .filter((block) => G1_COMMANDS.find((definition) => definition.blockType === block.type)?.category === category)
+      const blocks = getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS)
+        .filter((block) => block.category === category)
         .map((block) => `<block type="${block.type}"></block>`)
         .join('');
       return `<category name="${category}" colour="${category === 'Gestures' ? 280 : 160}">${blocks}</category>`;
@@ -1008,7 +1008,6 @@ export default function App() {
     return `
     <xml xmlns="https://developers.google.com/blockly/xml">
       ${commandCategoriesXml}
-      <category name="${cats.functions}" colour="290" custom="PROCEDURE"></category>
       <sep></sep>
       <category name="${cats.loops}" colour="120">
         <block type="controls_repeat_ext"><value name="TIMES"><shadow type="math_number"><field name="NUM">10</field></shadow></value></block>
@@ -1049,11 +1048,14 @@ export default function App() {
     const allBlocks = [...systemCategories, ...robotCategories].flatMap(cat => cat.blocks);
     const commandBlocks = [
       ...ROBOT_IDE_COMMAND_BLOCKS,
-      ...getG1BlocklyCommandBlocks(),
+      ...getG1BlocklyCommandBlocks(G1_COMMANDS),
     ];
     const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
       const definition = { ...blockDef };
       delete definition.codeTemplate;
+      delete definition.stringFields;
+      delete definition.category;
+      delete definition.armPreset;
       definition.extensions = definition.extensions || undefined;
       return definition;
     });
@@ -1085,6 +1087,10 @@ export default function App() {
             if (arg.type === "input_value") value = generator.valueToCode(block, name, pythonGenerator.ORDER_ATOMIC) || '0';
             else if (arg.type.startsWith("field_")) value = block.getFieldValue(name);
 
+            if (blockDef.stringFields?.includes(name)) {
+              value = JSON.stringify(value);
+            }
+
             if (arg.type === 'field_number' && name) {
               const safeValue = clampSafeValue(name, value);
               value = String(safeValue);
@@ -1094,7 +1100,7 @@ export default function App() {
           });
         }
 
-        code = sanitizeRobotCode(code);
+        code = sanitizeRobotCode(code).code;
         
         if (blockDef.output !== undefined) return [code, pythonGenerator.ORDER_ATOMIC];
         return code;
@@ -1116,66 +1122,55 @@ export default function App() {
       return undefined;
     }
 
-    const initTimer = setTimeout(() => {
-        workspaceRef.current = Blockly.inject(blocklyDiv.current, {
-          toolbox: generateToolboxXML(lang),
+    const initFrame = requestAnimationFrame(() => {
+      if (!blocklyDiv.current) return;
+      workspaceRef.current = Blockly.inject(blocklyDiv.current, {
+        toolbox: generateToolboxXML(lang),
+        scrollbars: false,
+        move: {
           scrollbars: false,
-          move: {
-            scrollbars: false,
-            drag: true,
-            wheel: true
-          },
-          grid: { spacing: 20, length: 3, colour: '#ccc', snap: true },
-          zoom: { controls: true, wheel: true, startScale: 1.0, maxScale: 3, minScale: 0.3, scaleSpeed: 1.2 },
-          trashcan: true,
+          drag: true,
+          wheel: true
+        },
+        grid: { spacing: 20, length: 3, colour: '#ccc', snap: true },
+        zoom: { controls: true, wheel: true, startScale: 0.75, maxScale: 3, minScale: 0.3, scaleSpeed: 1.2 },
+        trashcan: true,
+      });
+
+      const scheduleResize = () => {
+        requestAnimationFrame(() => {
+          if (workspaceRef.current) Blockly.svgResize(workspaceRef.current);
         });
+      };
 
-        if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
-        resizeObserverRef.current = new ResizeObserver(() => {
-          Blockly.svgResize(workspaceRef.current);
-        });
-        resizeObserverRef.current.observe(blocklyDiv.current);
+      if (resizeObserverRef.current) resizeObserverRef.current.disconnect();
+      resizeObserverRef.current = new ResizeObserver(scheduleResize);
+      resizeObserverRef.current.observe(blocklyDiv.current);
 
-        const forceResize = () => {
-          if(workspaceRef.current) Blockly.svgResize(workspaceRef.current);
-        };
+      const handleBlocklyEvents = (event) => {
+        if (event.type === Blockly.Events.UI || event.element === 'category') {
+          scheduleResize();
+        }
+      };
+      workspaceRef.current.addChangeListener(handleBlocklyEvents);
 
-        const handleBlocklyEvents = (event) => {
-          if (event.type === Blockly.Events.UI || event.element === 'category') {
-             setTimeout(forceResize, 50);
-             setTimeout(forceResize, 200);
-             setTimeout(forceResize, 400);
-          }
-        };
-        workspaceRef.current.addChangeListener(handleBlocklyEvents);
-
-        const onDivClick = () => {
-           setTimeout(forceResize, 50);
-           setTimeout(forceResize, 350);
-        };
-        blocklyDiv.current.addEventListener('click', onDivClick);
-        blocklyDiv.current.addEventListener('touchstart', onDivClick);
-
-        const updateCode = () => {
-          try {
-            const code = pythonGenerator.workspaceToCode(workspaceRef.current);
-            applyGeneratedCode(code, { syncBlocks: false });
-            setBlockSyncError('');
-          } catch (error) {
-            setBlockSyncError(`Cannot read the Blocks workspace: ${error.message}`);
-            console.error('Failed to generate code from the Blockly workspace.', error);
-          }
-        };
-        workspaceRef.current.addChangeListener(updateCode);
-        setTimeout(() => {
-          if (workspaceRef.current && generatedCodeRef.current.trim()) {
-            syncBlocksFromGeneratedCode(generatedCodeRef.current);
-          }
-        }, 150);
-    }, 100);
+      const updateCode = () => {
+        try {
+          const code = pythonGenerator.workspaceToCode(workspaceRef.current);
+          applyGeneratedCode(code, { syncBlocks: false });
+          setBlockSyncError('');
+        } catch (error) {
+          setBlockSyncError(`Cannot read the Blocks workspace: ${error.message}`);
+          console.error('Failed to generate code from the Blockly workspace.', error);
+        }
+      };
+      workspaceRef.current.addChangeListener(updateCode);
+      scheduleResize();
+      syncBlocksFromGeneratedCode(generatedCodeRef.current);
+    });
     
     return () => {
-      clearTimeout(initTimer);
+      cancelAnimationFrame(initFrame);
     };
   }, [isBlocklyLoaded, registerBlocks, generateToolboxXML, robotConfig, lang]);
 
@@ -1281,7 +1276,9 @@ export default function App() {
       try {
         const result = await robotConnection.stop();
         setIsRunning(false);
-        setRobotConnectionStatus(result.status === 'stopping' ? 'Stopping robot...' : 'Robot is not connected');
+        setRobotConnectionStatus(result.status === 'stopping'
+          ? 'Stop requested; locomotion will stop, but an active arm preset may continue.'
+          : 'Robot is not connected');
       } catch (error) {
         alert(`Stop failed: ${error.message}`);
       }
@@ -1291,7 +1288,8 @@ export default function App() {
         parseG1Program(generatedCode);
         setIsRunning(true);
         const result = await robotConnection.run(generatedCode);
-        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.`);
+        const output = result.results?.length ? ` SDK output: ${JSON.stringify(result.results)}` : '';
+        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.${output}`);
       } catch (error) {
         alert(`Robot run failed: ${error.message}`);
       } finally {
@@ -1364,7 +1362,9 @@ export default function App() {
         program.forEach((node) => {
           const block = node.type === 'repeat'
             ? workspace.newBlock('controls_repeat_ext')
-            : workspace.newBlock(`g1_command_${node.method}`);
+            : workspace.newBlock(node.method === 'arm_action'
+              ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
+              : `g1_command_${node.method}`);
           if (node.type === 'repeat') {
             const repeatCount = workspace.newBlock('math_number');
             repeatCount.setFieldValue(String(node.times), 'NUM');
@@ -1374,7 +1374,9 @@ export default function App() {
           } else {
             const definition = G1_COMMANDS.find((entry) => entry.method === node.method);
             definition.args.forEach((argument, index) => {
-              block.setFieldValue(String(node.values[index]), argument.name);
+              if (block.getField(argument.name)) {
+                block.setFieldValue(String(node.values[index]), argument.name);
+              }
             });
           }
           block.initSvg();
@@ -1388,7 +1390,9 @@ export default function App() {
       createBlocks(nodes);
 
       if (workspace.getAllBlocks().length) {
-        workspace.zoomToFit(0.8);
+        workspace.zoomToFit();
+        workspace.setScale(Math.min(workspace.getScale(), 0.8));
+        workspace.scrollCenter();
       }
       return true;
     } catch (error) {
@@ -1402,12 +1406,20 @@ export default function App() {
 
   useEffect(() => {
     if (mainTab !== 'blocks' || !workspaceRef.current) return;
+    let fitFrame = 0;
     const frame = requestAnimationFrame(() => {
       if (!workspaceRef.current) return;
-      syncBlocksFromGeneratedCode(generatedCodeRef.current);
       Blockly.svgResize(workspaceRef.current);
+      fitFrame = requestAnimationFrame(() => {
+        if (!workspaceRef.current) return;
+        syncBlocksFromGeneratedCode(generatedCodeRef.current);
+        Blockly.svgResize(workspaceRef.current);
+      });
     });
-    return () => cancelAnimationFrame(frame);
+    return () => {
+      cancelAnimationFrame(frame);
+      cancelAnimationFrame(fitFrame);
+    };
   }, [mainTab, syncBlocksFromGeneratedCode]);
 
   const derivePlannerWaypointsFromCode = useCallback((code = '') => {
@@ -1430,14 +1442,14 @@ export default function App() {
       if (method === 'backward') forwardDistance = -numberOfSteps * 0.4;
       if (method === 'walktime') forwardDistance = numberOfSteps * 0.4;
       if (method === 'backwardtime') forwardDistance = -numberOfSteps * 0.4;
-      if (method === 'slowwalk') forwardDistance = numberOfSteps * 0.2;
+      if (method === 'slowwalk') forwardDistance = numberOfSteps * 0.4;
       if (method === 'slowwalktime') forwardDistance = numberOfSteps * 0.2;
-      if (method === 'fastwalk') forwardDistance = numberOfSteps * 0.8;
+      if (method === 'fastwalk') forwardDistance = numberOfSteps * 0.4;
       if (method === 'fastwalktime') forwardDistance = numberOfSteps * 0.8;
       if (method === 'sidestep') {
         const sideHeading = heading + (values[0] === 'left' ? 90 : -90);
-        x += Math.cos((sideHeading * Math.PI) / 180) * 0.3;
-        y += Math.sin((sideHeading * Math.PI) / 180) * 0.3;
+        x += Math.cos((sideHeading * Math.PI) / 180) * 0.4;
+        y += Math.sin((sideHeading * Math.PI) / 180) * 0.4;
       } else if (method === 'turn') {
         heading += values[0] === 'right' ? -Number(values[1]) : Number(values[1]);
       } else if (forwardDistance) {
@@ -1472,10 +1484,10 @@ export default function App() {
   }, [generatedCode, derivePlannerWaypointsFromCode]);
 
   const applyGeneratedCode = useCallback((nextCode, options = {}) => {
-    const { syncBlocks = true } = options;
+    const { syncBlocks = true, preserveFormatting = false } = options;
     let boundedCode = nextCode;
     let boundsChanged = false;
-    if (nextCode.trim()) {
+    if (!preserveFormatting && nextCode.trim()) {
       try {
         boundedCode = formatG1Program(parseG1Program(nextCode));
         boundsChanged = boundedCode.trim() !== nextCode.trim();
@@ -2425,7 +2437,7 @@ export default function App() {
                     <button type="button" onClick={() => setIsSimulatorOpen(true)} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
                       Open queue
                     </button>
-                    <button type="button" onClick={handleRunCode} className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400" title="Run code on connected robot">
+                    <button type="button" onClick={handleRunCode} className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400" title={isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}>
                       {isRunning ? 'Stop robot' : 'Robot run'}
                     </button>
                   </>
@@ -2482,7 +2494,7 @@ export default function App() {
                             type="button"
                             onClick={handleRunCode}
                             disabled={!isRobotConnected && !isRunning}
-                            title={isRobotConnected ? 'Send this program to the connected G1' : 'Connect the G1 SDK before sending commands'}
+                            title={isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : isRobotConnected ? 'Send this program to the connected G1' : 'Connect the G1 SDK before sending commands'}
                             className="flex-1 rounded-md bg-amber-500 px-2 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {isRunning ? 'Stop robot' : 'Send to robot'}
@@ -2496,12 +2508,44 @@ export default function App() {
                         </p>
                       )}
                     </div>
-                    <div ref={blocklyDiv} className="h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-950" />
-                    {blockSyncError && (
-                      <p role="alert" className="rounded-lg border border-amber-500/40 bg-amber-950/40 p-2 text-xs text-amber-200">
-                        {blockSyncError}
-                      </p>
-                    )}
+                    <div className="relative h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-900">
+                      <div ref={blocklyDiv} className="h-full w-full" />
+                      {blockSyncError && (
+                        <div className="pointer-events-auto absolute inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-800 p-4" role="alert">
+                          <div className="max-w-lg rounded-xl border border-amber-500/60 bg-amber-950 p-5 text-center shadow-xl">
+                            <p className="text-sm font-semibold text-amber-200">This code cannot be represented with Blocks</p>
+                            <p className="mt-2 text-xs leading-5 text-slate-200">{blockSyncError}</p>
+                            <p className="mt-2 text-[10px] text-slate-400">Your IDE code is preserved. Edit the unsupported line in the IDE to restore block editing.</p>
+                            <div className="mt-3 flex flex-wrap justify-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setMainTab('ide')}
+                                className="rounded-md bg-amber-500 px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-amber-400"
+                              >
+                                Edit in IDE
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (window.confirm('Clear the unsupported code from the IDE and Blocks workspace?')) {
+                                    applyGeneratedCode('', { syncBlocks: true });
+                                    setBlockSyncError('');
+                                  }
+                                }}
+                                className="rounded-md border border-amber-300/50 px-3 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-900"
+                              >
+                                Clear unsupported code
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      {!blockSyncError && !generatedCode.trim() && (
+                        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-900/90 p-4 text-center">
+                          <p className="max-w-sm text-xs leading-5 text-slate-300">Choose a command from the toolbox to get started. Your blocks will appear here.</p>
+                        </div>
+                      )}
+                    </div>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Generated code</p>
                       <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-slate-200">
@@ -2638,10 +2682,10 @@ export default function App() {
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
                       <div className="mt-2 space-y-2 text-xs text-slate-200">
-                        <button type="button" onClick={() => insertRobotCommand('robot.stand()')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.stand()')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand / Ready</button>
                         <button type="button" onClick={() => insertRobotCommand('robot.walk(3)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Walk Forward (3 steps)</button>
                         <button type="button" onClick={() => insertRobotCommand('robot.turn("left", 90)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Turn Left (90°)</button>
-                        <button type="button" onClick={() => insertRobotCommand('robot.raisebotharms("mid")')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Raise Both Arms</button>
+                        <button type="button" onClick={() => insertRobotCommand('robot.arm_action("hands up")')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Hands Up arm preset</button>
                       </div>
                     </div>
                   </div>
@@ -2650,22 +2694,37 @@ export default function App() {
                 {mainTab === 'ide' && (
                   <div className="space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">G1 command reference</p>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Executable G1 SDK commands</p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
-                        {G1_COMMANDS.map((command) => {
+                        {G1_EXECUTABLE_COMMANDS.flatMap((command) => {
+                          if (command.method === 'arm_action') {
+                            return command.args[0].choices.map(([presetLabel, preset]) => ({
+                              ...command,
+                              key: `arm_action_${preset}`,
+                              script: `robot.arm_action(${JSON.stringify(preset)})`,
+                              label: `Arm preset: ${presetLabel.replace(/ \(\d+\)$/, '')}`,
+                            }));
+                          }
                           const args = command.args.map((argument) => argument.kind === 'choice'
                             ? `"${argument.value}"`
-                            : String(argument.value));
-                          return (
-                            <div key={command.method} className="rounded-md bg-slate-800 px-2 py-1.5">
-                              <code className="text-cyan-300">{`robot.${command.method}(${args.join(', ')})`}</code>
-                              <p className="mt-1 text-slate-400">{command.description}</p>
-                              {command.adapters.sdk
-                                ? <p className="mt-1 text-emerald-300">Supported by the G1 SDK adapter; WebRTC support is unverified.</p>
-                                : <p className="mt-1 text-amber-300">Simulation only; no physical adapter has a verified mapping.</p>}
-                            </div>
-                          );
-                        })}
+                            : argument.kind === 'text'
+                              ? JSON.stringify(argument.value)
+                              : String(argument.value));
+                          return [{
+                            ...command,
+                            key: command.method,
+                            script: `robot.${command.method}(${args.join(', ')})`,
+                            label: command.label,
+                          }];
+                        }).map((command) => (
+                          <div key={command.key} className="rounded-md bg-slate-800 px-2 py-1.5">
+                            <span className="block text-slate-200">{command.label}</span>
+                            <code className="text-cyan-300">{command.script}</code>
+                            <p className="mt-1 text-slate-400">{command.description}</p>
+                            <p className="mt-1 text-emerald-300">Unitree SDK: {command.sdkMethod}</p>
+                            {!command.adapters.simulator && <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>}
+                          </div>
+                        ))}
                         <div className="rounded-md bg-slate-800 px-2 py-1.5">
                           <code className="text-cyan-300">for _ in range(3):</code>
                           <code className="block pl-3 text-cyan-300">robot.walk(2)</code>
@@ -2677,7 +2736,8 @@ export default function App() {
                       value={generatedCode || ''}
                       onChange={(event) => {
                         const nextCode = event.target.value;
-                        applyGeneratedCode(nextCode, { syncBlocks: true });
+                        applyGeneratedCode(nextCode, { syncBlocks: false, preserveFormatting: true });
+                        setBlockSyncError('');
                       }}
                       onBlur={() => syncBlocksFromGeneratedCode(generatedCodeRef.current)}
                       spellCheck={false}
@@ -2685,7 +2745,8 @@ export default function App() {
                     />
                     {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
                     {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
-                    <p className="text-[10px] text-slate-400">Blocks, IDE, planner, prompt, and vision edits share this program. Use only commands from the reference.</p>
+                    <p className="text-[10px] text-slate-400">IDE text is synchronized to Blocks when you leave the editor. Incomplete or unsupported lines remain editable here but cannot be shown as Blocks.</p>
+                    <p className="text-[10px] text-slate-400">The IDE reference and Blocks toolbox list only commands mapped by the G1 SDK adapter. Unsupported code is rejected for physical runs; simulation-only actions are not offered here.</p>
                   </div>
                 )}
               </div>

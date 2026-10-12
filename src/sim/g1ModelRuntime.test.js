@@ -1,8 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { flattenG1Commands, G1_COMMANDS, parseG1Program } from './g1Commands.js';
 import { parseG1Urdf, G1_MODEL_INFO } from './g1ModelRuntime.js';
-import { buildG1SimulationFrames, buildPlannerMotionCommands, clampScenePoint, derivePlannerWaypointsFromCode, normalizePlannerMotionSegment } from './g1Edu23Env.js';
+import { buildG1SimulationFrames, buildPlannerMotionCommands, clampScenePoint, derivePlannerWaypointsFromCode, G1_MOTION_TEMPLATES, normalizePlannerMotionSegment } from './g1Edu23Env.js';
+
+test('motion templates use only commands supported by the physical SDK adapter', () => {
+  const commandsByMethod = new Map(G1_COMMANDS.map((command) => [command.method, command]));
+
+  for (const template of G1_MOTION_TEMPLATES) {
+    const commands = flattenG1Commands(parseG1Program(template.code));
+    assert.ok(commands.length > 0, `${template.id} should contain a robot command`);
+    for (const command of commands) {
+      assert.equal(
+        commandsByMethod.get(command.method)?.adapters.sdk,
+        true,
+        `${template.id} uses unsupported command ${command.method}`,
+      );
+    }
+  }
+});
 
 test('G1 URDF defines the active robot structure used by the runtime', () => {
   const urdfText = readFileSync(new URL('../../g1_23dof.urdf.txt', import.meta.url), 'utf8');
@@ -54,6 +71,33 @@ test('planner simulation reaches fractional waypoint coordinates exactly', () =>
   assert.deepEqual({ x: finalFrame.x, y: finalFrame.y }, { x: 4.75, y: 3.5 });
   assert.ok(finalFrame.path.some((point) => point.x === 2.5 && point.y === 1.25));
   assert.ok(finalFrame.path.some((point) => point.x === 4.75 && point.y === 3.5));
+});
+
+test('simulation movement distance and timing match SDK velocity command estimates', () => {
+  const scenarios = [
+    { code: 'robot.walk(2)', distance: 0.69, seconds: 1.725 },
+    { code: 'robot.slowwalk(2)', distance: 0.69, seconds: 3.45 },
+    { code: 'robot.fastwalk(2)', distance: 0.69, seconds: 0.8625 },
+    { code: 'robot.walktime(2)', distance: 0.8, seconds: 2 },
+    { code: 'robot.slowwalktime(2)', distance: 0.4, seconds: 2 },
+    { code: 'robot.fastwalktime(2)', distance: 1.6, seconds: 2 },
+  ];
+
+  scenarios.forEach(({ code, distance, seconds }) => {
+    const finalFrame = buildG1SimulationFrames(code).at(-1);
+    assert.ok(Math.abs(finalFrame.x - distance) < 1e-9, `${code} distance should match the SDK estimate`);
+    assert.ok(Math.abs(finalFrame.time - seconds) < 1e-9, `${code} duration should match the SDK estimate`);
+  });
+});
+
+test('turn and sidestep simulation timing match SDK velocity command estimates', () => {
+  const turnFrame = buildG1SimulationFrames('robot.turn("left", 90)').at(-1);
+  assert.ok(Math.abs(turnFrame.heading - 90) < 1e-9);
+  assert.ok(Math.abs(turnFrame.time - (Math.PI / 2) / 0.6) < 1e-9);
+
+  const sidestepFrame = buildG1SimulationFrames('robot.sidestep("left")').at(-1);
+  assert.ok(Math.abs(sidestepFrame.y - 0.4) < 1e-9);
+  assert.ok(Math.abs(sidestepFrame.time - 2) < 1e-9);
 });
 
 test('planner motion normalization keeps forward segments forward and stable', () => {

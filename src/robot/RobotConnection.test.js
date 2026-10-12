@@ -26,7 +26,7 @@ test('SDK adapter wraps the existing API and rejects unsupported commands before
 
   await connection.connect('eth0');
   await connection.status();
-  await connection.run('robot.walk(1)');
+  await connection.run('robot.walk(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()');
   await connection.stop();
   await assert.rejects(connection.run('robot.kickleft("mid")'), /not supported by the SDK connection/);
 
@@ -37,7 +37,9 @@ test('SDK adapter wraps the existing API and rejects unsupported commands before
     '/api/stop',
   ]);
   assert.deepEqual(JSON.parse(requests[0][1].body), { interface: 'eth0' });
-  assert.deepEqual(JSON.parse(requests[2][1].body), { code: 'robot.walk(1)' });
+  assert.deepEqual(JSON.parse(requests[2][1].body), {
+    code: 'robot.walk(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()',
+  });
 });
 
 test('WebRTC adapter does not infer command support from an encoder alone', async () => {

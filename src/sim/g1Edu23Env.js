@@ -1,5 +1,5 @@
 import { G1_MODEL_INFO } from './g1ModelRuntime.js';
-import { flattenG1Commands, parseG1Program } from './g1Commands.js';
+import { flattenG1Commands, G1_NOMINAL_STEP_METERS, parseG1Program } from './g1Commands.js';
 
 export const G1_EDU_23_ENV = {
   robotType: G1_MODEL_INFO.robotType,
@@ -75,14 +75,39 @@ export const SIMULATOR_MODES = {
 
 export const G1_MOTION_TEMPLATES = [
   {
+    id: 'slow-forward-1s',
+    label: 'Slow forward 1s',
+    code: `robot.slowwalktime(1)\n`,
+  },
+  {
     id: 'forward-2s',
     label: 'Forward 2s',
     code: `robot.walktime(2)\n`,
   },
   {
-    id: 'turn-left-1s',
-    label: 'Turn left 1s',
+    id: 'backward-1s',
+    label: 'Backward 1s',
+    code: `robot.backwardtime(1)\n`,
+  },
+  {
+    id: 'sidestep-left',
+    label: 'Sidestep left',
+    code: `robot.sidestep("left")\n`,
+  },
+  {
+    id: 'sidestep-right',
+    label: 'Sidestep right',
+    code: `robot.sidestep("right")\n`,
+  },
+  {
+    id: 'turn-left-90',
+    label: 'Turn left 90 deg',
     code: `robot.turn("left", 90)\n`,
+  },
+  {
+    id: 'turn-around',
+    label: 'Turn around',
+    code: `robot.turn("left", 180)\n`,
   },
   {
     id: 'square-path',
@@ -311,6 +336,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   const jointState = Object.fromEntries(G1_EDU_23_ENV.joints.map((joint) => [joint, 0]));
   let collisionCount = 0;
   let gaitPhase = 0;
+  let elapsedSeconds = 0;
   const poseTargets = {};
 
   const addFrame = (isInitial = false) => {
@@ -352,16 +378,18 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       timeline: [...timeline],
       joints: { ...jointState },
       mode,
+      time: elapsedSeconds,
     });
   };
 
   addFrame(true);
 
-  const walkThrough = (distance, direction, label, summary) => {
+  const walkThrough = (distance, direction, label, summary, durationSeconds) => {
     const normalizedDirection = direction === 0 ? 0 : (direction > 0 ? 1 : -1);
     const radians = (heading * Math.PI) / 180;
     const travelDistance = Math.abs(distance);
     const frameCount = Math.max(10, Math.ceil(travelDistance * 16));
+    const segmentDuration = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : frameCount / 30;
     const stepScale = travelDistance / frameCount;
     const stepX = Math.cos(radians) * stepScale * normalizedDirection;
     const stepY = Math.sin(radians) * stepScale * normalizedDirection;
@@ -369,9 +397,10 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     timeline.push({ label, summary });
 
     for (let index = 0; index < frameCount; index += 1) {
+      elapsedSeconds += segmentDuration / frameCount;
       x += stepX;
       y += stepY;
-      gaitPhase += 0.18;
+      gaitPhase += stepScale / (2 * G1_NOMINAL_STEP_METERS);
       torsoPitch = Math.sin(gaitPhase * Math.PI) * (normalizedDirection >= 0 ? 8 : -8);
       path.push({ x: Number(x.toFixed(3)), y: Number(y.toFixed(3)) });
       addFrame();
@@ -380,10 +409,11 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     torsoPitch = 0;
   };
 
-  const animateAction = (frameCount, update, label, summary) => {
+  const animateAction = (frameCount, update, label, summary, durationSeconds = frameCount / 30) => {
     actions.push({ label, summary });
     timeline.push({ label, summary });
     for (let index = 1; index <= frameCount; index += 1) {
+      elapsedSeconds += durationSeconds / frameCount;
       update(index / frameCount);
       addFrame();
     }
@@ -495,13 +525,13 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
 
     if (methodName === 'walkForward' || methodName === 'walkForwardSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount;
+      const stride = G1_NOMINAL_STEP_METERS * stepCount;
       walkThrough(stride, 1, 'Walk Forward', `${stepCount.toFixed(1)} steps`);
     }
 
     if (methodName === 'walkBackward' || methodName === 'walkBackwardSteps') {
       const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount;
+      const stride = G1_NOMINAL_STEP_METERS * stepCount;
       walkThrough(-stride, -1, 'Walk Back', `${stepCount.toFixed(1)} steps`);
     }
 
@@ -525,22 +555,67 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       addFrame();
     }
 
+    if (['squat_to_stand', 'lie_to_stand', 'stand_to_squat'].includes(methodName)) {
+      const isSquatting = methodName === 'stand_to_squat';
+      const isLying = methodName === 'lie_to_stand';
+      const startPose = isSquatting
+        ? { torso: 0, hip: 0, knee: 8, ankle: 0 }
+        : isLying
+        ? { torso: 70, hip: -20, knee: 8, ankle: -5 }
+          : { torso: 16, hip: 45, knee: 105, ankle: -50 };
+      const label = methodName === 'squat_to_stand'
+        ? 'Squat to stand'
+        : methodName === 'lie_to_stand' ? 'Lie to stand' : 'Stand to squat';
+      const target = isSquatting
+        ? { torso: 16, hip: 45, knee: 105, ankle: -50 }
+        : { torso: 0, hip: 0, knee: 8, ankle: 0 };
+
+      poseTargets.left_hip_pitch = startPose.hip;
+      poseTargets.right_hip_pitch = startPose.hip;
+      poseTargets.left_knee_pitch = startPose.knee;
+      poseTargets.right_knee_pitch = startPose.knee;
+      poseTargets.left_ankle_pitch = startPose.ankle;
+      poseTargets.right_ankle_pitch = startPose.ankle;
+      torsoPitch = startPose.torso;
+      animateAction(20, (progress) => {
+        torsoPitch = startPose.torso + (target.torso - startPose.torso) * progress;
+        poseTargets.left_hip_pitch = startPose.hip + (target.hip - startPose.hip) * progress;
+        poseTargets.right_hip_pitch = poseTargets.left_hip_pitch;
+        poseTargets.left_knee_pitch = startPose.knee + (target.knee - startPose.knee) * progress;
+        poseTargets.right_knee_pitch = poseTargets.left_knee_pitch;
+        poseTargets.left_ankle_pitch = startPose.ankle + (target.ankle - startPose.ankle) * progress;
+        poseTargets.right_ankle_pitch = poseTargets.left_ankle_pitch;
+      }, label, 'Approximate posture transition', 1);
+
+      if (!isSquatting) {
+        torsoPitch = 0;
+        ['left_hip_pitch', 'right_hip_pitch', 'left_knee_pitch', 'right_knee_pitch', 'left_ankle_pitch', 'right_ankle_pitch']
+          .forEach((joint) => delete poseTargets[joint]);
+      }
+    }
+
     if (methodName === 'walk' || methodName === 'backward' || methodName === 'walktime' || methodName === 'backwardtime' ||
       methodName === 'slowwalk' || methodName === 'slowwalktime' || methodName === 'fastwalk' || methodName === 'fastwalktime') {
       const isTime = methodName.endsWith('time');
       const isBackward = methodName === 'backward' || methodName === 'backwardtime';
       const speed = methodName.startsWith('slow') ? 0.2 : methodName.startsWith('fast') ? 0.8 : 0.4;
-      const duration = isTime ? firstNumber : firstNumber;
-      const distance = isTime ? duration * speed : firstNumber * speed;
+      const duration = isTime ? firstNumber : firstNumber * G1_NOMINAL_STEP_METERS / speed;
+      const distance = duration * speed;
       const summary = isTime ? `${duration.toFixed(2)} seconds` : `${firstNumber.toFixed(1)} steps`;
-      walkThrough(distance, isBackward ? -1 : 1, isBackward ? 'Walk backward' : methodName.startsWith('slow') ? 'Slow walk' : methodName.startsWith('fast') ? 'Fast walk' : 'Walk forward', summary);
+      walkThrough(
+        distance,
+        isBackward ? -1 : 1,
+        isBackward ? 'Walk backward' : methodName.startsWith('slow') ? 'Slow walk' : methodName.startsWith('fast') ? 'Fast walk' : 'Walk forward',
+        summary,
+        duration,
+      );
     }
 
     if (methodName === 'sidestep') {
       const side = /["']right["']/i.test(argsRaw) ? -90 : 90;
       const previousHeading = heading;
       heading += side;
-      walkThrough(0.3, 1, 'Sidestep', side > 0 ? 'Left' : 'Right');
+      walkThrough(0.4, 1, 'Sidestep', side > 0 ? 'Left' : 'Right', 2);
       heading = previousHeading;
     }
 
@@ -549,9 +624,18 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       const amountMatch = argsRaw.match(/,\s*(-?\d*\.?\d+)/);
       const amount = amountMatch ? Number(amountMatch[1]) : 90;
       const delta = directionMatch?.[1].toLowerCase() === 'right' ? -amount : amount;
-      heading += delta;
-      actions.push({ label: delta > 0 ? 'Turn Left' : 'Turn Right', summary: `${Math.abs(amount)}°` });
-      timeline.push({ label: delta > 0 ? 'Turn Left' : 'Turn Right', summary: `${Math.abs(amount)}°` });
+      const startingHeading = heading;
+      animateAction(
+        Math.max(10, Math.ceil(Math.abs(amount) / 6)),
+        (progress) => {
+          heading = startingHeading + delta * progress;
+          torsoRoll = Math.sin(progress * Math.PI) * (delta > 0 ? 8 : -8);
+        },
+        delta > 0 ? 'Turn Left' : 'Turn Right',
+        `${Math.abs(amount)}°`,
+        Math.abs((amount * Math.PI / 180) / 0.6),
+      );
+      torsoRoll = 0;
     }
 
     if (methodName === 'turnLeft') {
@@ -605,6 +689,43 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
         torsoPitch = startingPitch + (12 - startingPitch) * progress;
       }, 'Sit', 'Robot lowers into a seated pose.');
       torsoPitch = 12;
+    }
+
+    if (methodName === 'simulate_arm_action' || methodName === 'arm_action') {
+      const action = argsRaw.replace(/^["']|["']$/g, '').toLowerCase();
+      const armTargets = {
+        'release arm': {},
+        'two-hand kiss': { left_shoulder_pitch: -30, left_shoulder_roll: -12, left_elbow: -75, right_shoulder_pitch: -30, right_shoulder_roll: 12, right_elbow: -75 },
+        'left kiss': { left_shoulder_pitch: -30, left_shoulder_roll: -12, left_elbow: -75 },
+        'right kiss': { right_shoulder_pitch: -30, right_shoulder_roll: 12, right_elbow: -75 },
+        'hands up': { left_shoulder_pitch: -75, left_shoulder_roll: -15, left_elbow: -25, right_shoulder_pitch: -75, right_shoulder_roll: 15, right_elbow: -25 },
+        clap: { left_shoulder_pitch: -35, left_shoulder_roll: -8, left_elbow: -70, right_shoulder_pitch: -35, right_shoulder_roll: 8, right_elbow: -70 },
+        'high five': { right_shoulder_pitch: -70, right_shoulder_roll: 30, right_elbow: -35 },
+        hug: { left_shoulder_pitch: -15, left_shoulder_roll: -45, left_elbow: -30, right_shoulder_pitch: -15, right_shoulder_roll: 45, right_elbow: -30 },
+        heart: { left_shoulder_pitch: -35, left_shoulder_roll: -20, left_elbow: -75, right_shoulder_pitch: -35, right_shoulder_roll: 20, right_elbow: -75 },
+        'right heart': { right_shoulder_pitch: -35, right_shoulder_roll: 20, right_elbow: -75 },
+        reject: { right_shoulder_pitch: -15, right_shoulder_roll: 40, right_elbow: -90 },
+        'right hand up': { right_shoulder_pitch: -75, right_shoulder_roll: 20, right_elbow: -25 },
+        'x-ray': { left_shoulder_pitch: -20, left_shoulder_roll: -15, left_elbow: -90, right_shoulder_pitch: -20, right_shoulder_roll: 15, right_elbow: -90 },
+        'face wave': { left_shoulder_pitch: -55, left_shoulder_roll: -30, left_elbow: -75, left_wrist_roll: 25 },
+        'high wave': { left_shoulder_pitch: -75, left_shoulder_roll: -25, left_elbow: -65, left_wrist_roll: 25 },
+        'shake hand': { right_shoulder_pitch: -35, right_shoulder_roll: 25, right_elbow: -75 },
+      };
+      const targets = armTargets[action];
+      if (!targets) throw new Error(`Unknown simulated arm preset: ${action}`);
+      const armJoints = [
+        'left_shoulder_pitch', 'left_shoulder_roll', 'left_elbow', 'left_wrist_roll',
+        'right_shoulder_pitch', 'right_shoulder_roll', 'right_elbow', 'right_wrist_roll',
+      ];
+      const joints = new Set([...armJoints, ...Object.keys(targets)]);
+      const starts = Object.fromEntries([...joints].map((joint) => [joint, poseTargets[joint] || 0]));
+      const ends = Object.fromEntries([...joints].map((joint) => [joint, targets[joint] || 0]));
+      animateAction(24, (progress) => {
+        joints.forEach((joint) => {
+          poseTargets[joint] = starts[joint] + (ends[joint] - starts[joint]) * progress;
+        });
+      }, `Arm preset preview: ${action}`, 'Approximate simulator pose; not the real SDK trajectory.');
+      return;
     }
 
     if (methodName === 'stop') {

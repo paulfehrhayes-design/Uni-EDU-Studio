@@ -93,6 +93,13 @@ class ServerClassroomTests(unittest.TestCase):
         expected_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'static'))
         self.assertEqual(os.path.abspath(mounted_dir), expected_dir)
 
+    def test_frontend_index_is_not_cached(self):
+        response = TestClient(app).get('/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('no-store', response.headers['cache-control'])
+        self.assertIn('no-cache', response.headers['cache-control'])
+        self.assertRegex(response.text, r'assets/index-[A-Za-z0-9_-]+\.js')
+
     def test_find_available_port_skips_busy_port(self):
         import socket
 

@@ -15,6 +15,8 @@ from typing import Any
 from fastapi import HTTPException
 
 _client = None
+_arm_client = None
+_audio_client = None
 _connected_interface = None
 _connection_log_path: Path | None = None
 _log_lock = threading.Lock()
@@ -22,10 +24,34 @@ _run_lock = threading.Lock()
 _stop_requested = threading.Event()
 _MAX_PROGRAM_SECONDS = 30.0
 _MAX_EXPANDED_COMMANDS = 100
+_ARM_ACTION_REQUEST_SPACING_SECONDS = 2.0
 _CONTINUOUS_MOVE_DURATION = 864000.0
-_STEP_METERS = 0.4
+_STEP_METERS = 0.345
 _FORWARD_METERS_PER_SECOND = 0.4
 _TURN_RADIANS_PER_SECOND = 0.6
+_POSTURE_TRANSITION_FSM_IDS = {
+    "squat_to_stand": 706,
+    "lie_to_stand": 702,
+    "stand_to_squat": 706,
+}
+_ARM_ACTION_IDS = {
+    "release arm": 99,
+    "two-hand kiss": 11,
+    "left kiss": 12,
+    "right kiss": 13,
+    "hands up": 15,
+    "clap": 17,
+    "high five": 18,
+    "hug": 19,
+    "heart": 20,
+    "right heart": 21,
+    "reject": 22,
+    "right hand up": 23,
+    "x-ray": 24,
+    "face wave": 25,
+    "high wave": 26,
+    "shake hand": 27,
+}
 
 
 class CommandValidationError(ValueError):
@@ -84,6 +110,41 @@ def _choice(value: ast.AST, name: str, choices: tuple[str, ...]) -> str:
     return result
 
 
+def _integer_literal(value: ast.AST, name: str) -> int:
+    if isinstance(value, ast.Constant) and not isinstance(value.value, bool) and isinstance(value.value, int):
+        return value.value
+    if (
+        isinstance(value, ast.UnaryOp)
+        and isinstance(value.op, ast.USub)
+        and isinstance(value.operand, ast.Constant)
+        and not isinstance(value.operand.value, bool)
+        and isinstance(value.operand.value, int)
+    ):
+        return -value.operand.value
+    raise CommandValidationError(f"{name} must be an integer literal.")
+
+
+def _integer(value: ast.AST, name: str, minimum: int, maximum: int) -> int:
+    number = _integer_literal(value, name)
+    return min(maximum, max(minimum, number))
+
+
+def _integer_choice(value: ast.AST, name: str, choices: tuple[int, ...]) -> int:
+    number = _integer_literal(value, name)
+    if number not in choices:
+        raise CommandValidationError(f"{name} must be one of: {', '.join(map(str, choices))}.")
+    return number
+
+
+def _text(value: ast.AST, name: str, maximum: int = 120) -> str:
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+        raise CommandValidationError(f"{name} must be a quoted string.")
+    text = value.value
+    if not text.strip() or len(text) > maximum or any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise CommandValidationError(f"{name} must contain 1 to {maximum} printable characters.")
+    return text
+
+
 def _validate_call(node: ast.AST) -> dict[str, Any]:
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
         raise CommandValidationError("Only robot commands and bounded for/range loops are allowed.")
@@ -95,9 +156,9 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
     method = call.func.attr
     args = call.args
 
-    if method == "stand":
+    if method in {"stand", "sit", *_POSTURE_TRANSITION_FSM_IDS}:
         if args:
-            raise CommandValidationError("robot.stand() takes no arguments.")
+            raise CommandValidationError(f"robot.{method}() takes no arguments.")
         return {"method": method}
     if method in {"walk", "backward", "slowwalk", "fastwalk"}:
         if len(args) != 1:
@@ -117,7 +178,49 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
         if len(args) != 1:
             raise CommandValidationError('robot.sidestep() expects "left" or "right".')
         return {"method": method, "direction": _choice(args[0], "direction", ("left", "right"))}
+    if method in {"getfsm", "getactions", "getvolume"}:
+        if args:
+            raise CommandValidationError(f"robot.{method}() takes no arguments.")
+        return {"method": method}
+    if method == "say":
+        if len(args) != 2:
+            raise CommandValidationError('robot.say() expects text and a speaker ID (0 for Chinese or 1 for English).')
+        return {
+            "method": method,
+            "text": _text(args[0], "text"),
+            "speaker": _integer_choice(args[1], "speaker", (0, 1)),
+        }
+    if method == "setvolume":
+        if len(args) != 1:
+            raise CommandValidationError("robot.setvolume() expects a volume from 0 to 70.")
+        return {"method": method, "volume": _integer(args[0], "volume", 0, 70)}
+    if method == "led":
+        if len(args) != 3:
+            raise CommandValidationError("robot.led() expects red, green, and blue values from 0 to 255.")
+        return {
+            "method": method,
+            "red": _integer(args[0], "red", 0, 255),
+            "green": _integer(args[1], "green", 0, 255),
+            "blue": _integer(args[2], "blue", 0, 255),
+        }
+    if method == "playstop":
+        if len(args) != 1:
+            raise CommandValidationError('robot.playstop() expects an audio app name, e.g. robot.playstop("example").')
+        app_name = _text(args[0], "app name", maximum=32)
+        if not re.fullmatch(r"[A-Za-z0-9 _-]+", app_name):
+            raise CommandValidationError("Audio app name may contain only letters, numbers, spaces, underscores, or hyphens.")
+        return {"method": method, "app_name": app_name}
 
+    if method == "arm_action":
+        if len(args) != 1:
+            raise CommandValidationError("robot.arm_action() expects one preset name from the built-in G1 arm-action list.")
+        action = _choice(args[0], "arm preset", tuple(_ARM_ACTION_IDS))
+        return {"method": method, "action": action, "action_id": _ARM_ACTION_IDS[action]}
+
+    if method == "simulate_arm_action":
+        raise CommandValidationError(
+            "robot.simulate_arm_action is simulation-only: the G1 SDK arm preset has no verified stop/cancel path for physical execution."
+        )
     if method in {
         "waveleft", "waveleftDegrees", "waveright", "waverightDegrees",
         "raisebotharms", "raisebotharmsDegrees", "raiseleftarm", "raiseleftarmDegrees",
@@ -199,8 +302,12 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
 
 def _estimated_duration(command: dict[str, Any]) -> float:
     method = command["method"]
-    if method == "stand":
+    if method == "say":
+        return len(command["text"]) / 12
+    if method in {"stand", "sit", *_POSTURE_TRANSITION_FSM_IDS, "getfsm", "getactions", "getvolume", "setvolume", "led", "playstop"}:
         return 0
+    if method == "arm_action":
+        return _ARM_ACTION_REQUEST_SPACING_SECONDS
     if method == "turn":
         return math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND
     if method == "sidestep":
@@ -212,7 +319,7 @@ def _estimated_duration(command: dict[str, Any]) -> float:
 
 
 def connect_robot(interface: str) -> dict[str, Any]:
-    global _client, _connected_interface
+    global _client, _arm_client, _audio_client, _connected_interface
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,32}", interface):
         raise HTTPException(status_code=400, detail="Network interface name is invalid.")
     if _run_lock.locked():
@@ -227,6 +334,8 @@ def connect_robot(interface: str) -> dict[str, Any]:
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+        from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
+        from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
     except ImportError as error:
         _log_event("connection_failed", error=str(error))
         raise HTTPException(
@@ -245,19 +354,39 @@ def connect_robot(interface: str) -> dict[str, Any]:
         probe_code = probe[0] if isinstance(probe, tuple) else probe
         if probe_code not in (None, 0):
             raise RuntimeError(f"G1 locomotion RPC probe failed with code {probe_code}.")
+        arm_client = G1ArmActionClient()
+        arm_client.SetTimeout(10.0)
+        arm_result = arm_client.Init()
+        if arm_result not in (None, 0):
+            raise RuntimeError(f"G1 arm-action client initialization failed with code {arm_result}.")
+        audio_client = AudioClient()
+        audio_client.SetTimeout(10.0)
+        audio_result = audio_client.Init()
+        if audio_result not in (None, 0):
+            raise RuntimeError(f"G1 audio client initialization failed with code {audio_result}.")
     except Exception as error:
         _client = None
+        _arm_client = None
+        _audio_client = None
         _connected_interface = None
         _log_event("connection_failed", error=str(error))
         raise HTTPException(status_code=502, detail=f"Could not initialize the G1 locomotion SDK: {error}") from error
 
     _log_event("connected", interface=interface, domain=domain)
     _client = client
+    _arm_client = arm_client
+    _audio_client = audio_client
     _connected_interface = interface
     return {
         "status": "connected",
         "interface": interface,
         "domain": domain,
+        "capabilities": {
+            "locomotion": True,
+            "armActions": True,
+            "armActionsReadOnly": False,
+            "audio": True,
+        },
         "logFile": str(_connection_log_path),
     }
 
@@ -267,6 +396,12 @@ def robot_status() -> dict[str, Any]:
         "status": "connected" if _client is not None else "disconnected",
         "interface": _connected_interface,
         "sdkAvailable": _client is not None,
+        "capabilities": {
+            "locomotion": _client is not None,
+            "armActions": _arm_client is not None,
+            "armActionsReadOnly": False,
+            "audio": _audio_client is not None,
+        },
         "running": _run_lock.locked(),
     }
 
@@ -306,6 +441,7 @@ def execute_robot_program(code: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="A robot program is already running.")
 
     _stop_requested.clear()
+    results = []
     try:
         _log_event("program_started", command_count=len(commands), commands=commands)
         for index, command in enumerate(commands, start=1):
@@ -313,7 +449,62 @@ def execute_robot_program(code: str) -> dict[str, Any]:
             _log_event("command_started", index=index, command=command)
             try:
                 if method == "stand":
-                    _sdk_result(_client.SetFsmId(706), "Squat2StandUp")
+                    _sdk_result(_client.SetFsmId(500), "Start")
+                elif method == "sit":
+                    _sdk_result(_client.SetFsmId(3), "Sit")
+                elif method in _POSTURE_TRANSITION_FSM_IDS:
+                    _sdk_result(
+                        _client.SetFsmId(_POSTURE_TRANSITION_FSM_IDS[method]),
+                        method,
+                    )
+                elif method == "getfsm":
+                    _sdk_result_if_available(_client.GetFsmId(), "GetFsmId", results, method)
+                elif method == "getactions":
+                    if _arm_client is None:
+                        raise HTTPException(status_code=409, detail="Connect the G1 arm-action SDK before listing arm actions.")
+                    _sdk_result_if_available(_arm_client.GetActionList(), "GetActionList", results, method)
+                elif method == "arm_action":
+                    if _arm_client is None:
+                        raise HTTPException(status_code=409, detail="Connect the G1 arm-action SDK before running an arm preset.")
+                    _sdk_result(
+                        _arm_client.ExecuteAction(command["action_id"]),
+                        "ExecuteAction",
+                    )
+                    _log_event(
+                        "arm_action_accepted",
+                        index=index,
+                        action=command["action"],
+                        action_id=command["action_id"],
+                        note="SDK acceptance does not confirm completion; the preset has no verified cancel API.",
+                    )
+                    if _stop_requested.wait(_ARM_ACTION_REQUEST_SPACING_SECONDS):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Stop requested after the arm preset was accepted. The SDK has no verified way to cancel the active arm motion; it may continue until its preset ends.",
+                        )
+                elif method == "getvolume":
+                    if _audio_client is None:
+                        raise HTTPException(status_code=409, detail="Connect the G1 audio SDK before reading speaker volume.")
+                    _sdk_result_if_available(_audio_client.GetVolume(), "GetVolume", results, method)
+                elif method == "say":
+                    if _audio_client is None:
+                        raise HTTPException(status_code=409, detail="Connect the G1 audio SDK before using text-to-speech.")
+                    _sdk_result(_audio_client.TtsMaker(command["text"], command["speaker"]), "TtsMaker")
+                elif method == "setvolume":
+                    if _audio_client is None:
+                        raise HTTPException(status_code=409, detail="Connect the G1 audio SDK before setting speaker volume.")
+                    _sdk_result(_audio_client.SetVolume(command["volume"]), "SetVolume")
+                elif method == "led":
+                    if _audio_client is None:
+                        raise HTTPException(status_code=409, detail="Connect the G1 audio SDK before controlling the head LED.")
+                    _sdk_result(
+                        _audio_client.LedControl(command["red"], command["green"], command["blue"]),
+                        "LedControl",
+                    )
+                elif method == "playstop":
+                    if _audio_client is None:
+                        raise HTTPException(status_code=409, detail="Connect the G1 audio SDK before stopping audio playback.")
+                    _sdk_result(_audio_client.PlayStop(command["app_name"]), "PlayStop")
                 elif method == "turn":
                     yaw = _TURN_RADIANS_PER_SECOND * (1 if command["direction"] == "left" else -1)
                     _move(0, 0, yaw, math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND)
@@ -334,6 +525,7 @@ def execute_robot_program(code: str) -> dict[str, Any]:
         return {
             "status": "completed",
             "commandsExecuted": len(commands),
+            "results": results,
             "physicalMotionVerified": False,
         }
     except HTTPException as error:
@@ -359,3 +551,11 @@ def stop_robot() -> dict[str, str]:
         raise HTTPException(status_code=502, detail=f"Failed to stop the G1: {error}") from error
     _log_event("stop_requested", status="stopping")
     return {"status": "stopping"}
+
+
+def _sdk_result_if_available(result: Any, operation: str, outputs: list[dict[str, Any]], command: str) -> None:
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(f"G1 SDK operation {operation} returned an invalid response.")
+    code, value = result
+    _sdk_result(code, operation)
+    outputs.append({"command": command, "value": value})

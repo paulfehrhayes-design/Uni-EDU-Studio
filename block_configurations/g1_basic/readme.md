@@ -1,13 +1,15 @@
 ## Uni++ EDU Studio Configuration File: Unitree G1 Basic Program
 
-This configuration file includes:
+This legacy configuration file describes:
 
 * **Unitree G1 High-level Control** (only safe actions are accessible)
 * **Arm Motion Control**
   * Supports pre-recorded teaching actions
 * **Audio and Light Interface Control**
 
-This configuration is designed for K-12 programming and beginners, shielding all functions that could potentially be dangerous or cause damage to the robot.
+This configuration was originally intended for K-12 programming and beginners. It does not certify that its actions are safe for a particular robot.
+
+> The current web IDE and Blocks toolbox use the shared executable command catalog, not this legacy JSON. Physical runs expose bounded locomotion commands, the 16 fixed built-in arm presets, read-only arm-action diagnostics, and selected audio controls through the app's SDK adapter. Arbitrary recorded-action names, raw FSM controls, and binary audio streaming are not exposed. The G1 SDK does not provide an arm-action cancel API; the app's Stop control stops locomotion only.
 
 ---
 

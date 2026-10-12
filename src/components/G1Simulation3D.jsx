@@ -157,9 +157,10 @@ function interpolateSimulationFrame(from, to, amount) {
   });
   return {
     ...to,
-    x: THREE.MathUtils.lerp(from.x || 0, to.x || 0, eased),
-    y: THREE.MathUtils.lerp(from.y || 0, to.y || 0, eased),
-    heading: interpolateAngle(from.heading || 0, to.heading || 0, eased),
+    time: THREE.MathUtils.lerp(from.time || 0, to.time || 0, eased),
+    x: THREE.MathUtils.lerp(from.x || 0, to.x || 0, amount),
+    y: THREE.MathUtils.lerp(from.y || 0, to.y || 0, amount),
+    heading: interpolateAngle(from.heading || 0, to.heading || 0, amount),
     torsoPitch: THREE.MathUtils.lerp(from.torsoPitch || 0, to.torsoPitch || 0, eased),
     torsoRoll: THREE.MathUtils.lerp(from.torsoRoll || 0, to.torsoRoll || 0, eased),
     joints,
@@ -481,7 +482,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   }, [waypoints, onObstacleChange, onWaypointChange, isWaypointPlacementEnabled, onWaypointPlace]);
 
   useEffect(() => {
-    if (!isPlaying || !waypoints.length) return;
+    if (!waypoints.length) return;
 
     const points = [{ x: 0, y: 0 }, ...waypoints];
     const bounds = points.reduce((current, point) => ({
@@ -506,7 +507,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
       -(bounds.minY + bounds.maxY) / 2 + view.focusOffset.z,
     );
     view.distance = Math.max(7, requiredDistance);
-  }, [isPlaying, waypoints]);
+  }, [waypoints]);
 
   useEffect(() => {
     framesRef.current = buildG1SimulationFrames(code, {
@@ -831,19 +832,34 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         setRenderError('The browser lost its WebGL graphics context. Reload the page or enable hardware acceleration to restore the 3D simulator.');
         return;
       }
-      const delta = Math.min(clock.getDelta(), 0.05);
+      const delta = clock.getDelta();
       const frames = framesRef.current;
       let frame = frames[frames.length - 1] || simulatorStateRef.current;
       if (frames.length) {
-        if (frames.length > 1 && isPlayingRef.current) {
-          playbackProgressRef.current = Math.min(1, playbackProgressRef.current + (delta * playbackSpeedRef.current * 30) / (frames.length - 1));
+        const totalDuration = Math.max(0, frames[frames.length - 1].time || 0);
+        if (frames.length > 1 && totalDuration > 0 && isPlayingRef.current) {
+          playbackProgressRef.current = Math.min(
+            1,
+            playbackProgressRef.current + (delta * playbackSpeedRef.current) / totalDuration,
+          );
           playbackProgressCallbackRef.current?.(playbackProgressRef.current);
           if (playbackProgressRef.current >= 1) playbackToggleCallbackRef.current?.(false);
         }
-        const framePosition = playbackProgressRef.current * Math.max(0, frames.length - 1);
-        const frameIndex = Math.min(frames.length - 1, Math.floor(framePosition));
+        const targetTime = playbackProgressRef.current * totalDuration;
+        let first = 0;
+        let last = frames.length - 1;
+        while (first < last) {
+          const middle = Math.ceil((first + last) / 2);
+          if ((frames[middle].time || 0) <= targetTime) first = middle;
+          else last = middle - 1;
+        }
+        const frameIndex = first;
         const nextIndex = Math.min(frames.length - 1, frameIndex + 1);
-        frame = interpolateSimulationFrame(frames[frameIndex], frames[nextIndex], framePosition - frameIndex);
+        const frameStartTime = frames[frameIndex].time || 0;
+        const frameEndTime = frames[nextIndex].time || frameStartTime;
+        const frameDuration = frameEndTime - frameStartTime;
+        const frameProgress = frameDuration > 0 ? (targetTime - frameStartTime) / frameDuration : 0;
+        frame = interpolateSimulationFrame(frames[frameIndex], frames[nextIndex], frameProgress);
       }
       if (robotRef.current && frame) {
         robotRef.current.position.x = frame.x || 0;

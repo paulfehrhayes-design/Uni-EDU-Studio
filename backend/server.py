@@ -42,6 +42,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def prevent_stale_frontend_index(request, call_next):
+    response = await call_next(request)
+    if request.url.path in {"/", "/index.html"}:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 class CodeRequest(BaseModel):
     code: str
 
