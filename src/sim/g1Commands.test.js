@@ -13,7 +13,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     blocks.map((block) => block.type),
     [
       ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
-        .slice(0, 12).map((command) => command.blockType),
+        .slice(0, 13).map((command) => command.blockType),
       'g1_command_squat_to_stand',
       'g1_command_lie_to_stand',
       'g1_command_stand_to_squat',
@@ -34,7 +34,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
       'g1_command_arm_action_high_wave',
       'g1_command_arm_action_shake_hand',
       ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
-        .slice(12).map((command) => command.blockType),
+        .slice(16).map((command) => command.blockType),
     ],
   );
   assert.ok(blocks.every((block) => G1_EXECUTABLE_COMMANDS.some((command) => (
@@ -44,8 +44,8 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'arm_action' && command.category === 'Gestures'));
   assert.ok(getG1BlocklyCommandBlocks(G1_COMMANDS).some((block) => block.type === 'g1_command_kickleftDegrees'));
   assert.deepEqual(
-    G1_EXECUTABLE_COMMANDS.slice(0, 12).map((command) => command.method),
-    ['stand', 'sit', 'walk', 'walktime', 'backward', 'backwardtime', 'sidestep', 'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn'],
+    G1_EXECUTABLE_COMMANDS.slice(0, 13).map((command) => command.method),
+    ['stand', 'sit', 'wait', 'walk', 'walktime', 'backward', 'backwardtime', 'sidestep', 'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn'],
   );
   assert.deepEqual(
     G1_EXECUTABLE_COMMANDS.filter((command) => command.category === 'Postures').map(({ method }) => method),
@@ -56,11 +56,12 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.equal(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'stand_to_squat').sdkMethod, 'LocoClient.SetFsmId(706) / StandUp2Squat');
   assert.equal(G1_EXECUTABLE_COMMANDS[0].sdkMethod, 'LocoClient.Start() / SetFsmId(500)');
   assert.equal(G1_EXECUTABLE_COMMANDS[1].sdkMethod, 'LocoClient.Sit (SetFsmId(3))');
-  assert.ok(G1_EXECUTABLE_COMMANDS.slice(2, 12).every((command) => command.sdkMethod === 'LocoClient.SetVelocity'));
-  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'walk').description, /34.5 cm per count/);
-  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'walk').description, /0\.86 s/);
-  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'slowwalk').description, /1\.73 s/);
-  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'fastwalk').description, /0\.43 s/);
+  assert.equal(G1_EXECUTABLE_COMMANDS[2].sdkMethod, null);
+  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'wait').description, /Pause/);
+  assert.ok(G1_EXECUTABLE_COMMANDS.filter((command) => ['walk', 'walktime', 'backward', 'backwardtime', 'sidestep', 'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn'].includes(command.method))
+    .every((command) => command.sdkMethod === 'LocoClient.SetVelocity'));
+  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'walk').description, /Walk forward/);
+  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'walk').description, /may vary/);
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'getactions' && command.sdkMethod === 'G1ArmActionClient.GetActionList'));
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'say' && command.sdkMethod === 'AudioClient.TtsMaker'));
   const sayBlock = blocks.find((block) => block.type === 'g1_command_say');
@@ -84,7 +85,16 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     'robot.arm_action("hands up")\n',
   );
   assert.ok(!blocks.some((block) => block.type === G1_COMMANDS.find((entry) => entry.method === 'simulate_arm_action').blockType));
-  assert.match(armPreset.description, /cannot cancel an active arm preset/);
+  assert.match(armPreset.description, /Stop cannot cancel an arm preset/);
+  assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'playstop').description, /placeholder app name, not a sound/);
+  assert.equal(
+    blocks.find((block) => block.type === 'g1_command_arm_action_hands_up').tooltip.startsWith('Raise both hands.'),
+    true,
+  );
+  assert.equal(
+    getG1BlocklyCommandBlocks(G1_COMMANDS).find((block) => block.type === 'g1_command_waveleft').tooltip.endsWith('This action is only available in the simulator.'),
+    true,
+  );
 });
 
 test('G1 program parser normalizes commands, clamps numbers, and expands loops', () => {
@@ -93,6 +103,15 @@ test('G1 program parser normalizes commands, clamps numbers, and expands loops',
   assert.equal(nodes[1].times, 2);
   assert.equal(nodes[1].body[0].code, 'robot.turn("left", 90)');
   assert.equal(flattenG1Commands(nodes).length, 3);
+});
+
+test('wait command is bounded, included in the IDE catalog, and previews its full duration', () => {
+  assert.equal(parseG1Program('robot.wait(2)')[0].code, 'robot.wait(2)');
+  assert.equal(parseG1Program('robot.wait(99)')[0].code, 'robot.wait(10)');
+  const frames = buildG1SimulationFrames('robot.wait(2)');
+  assert.ok(Math.abs(frames.at(-1).time - 2) < 1e-9);
+  assert.equal(frames.at(-1).actions.length, 1);
+  assert.equal(frames.at(-1).actions[0].label, 'Wait');
 });
 
 test('G1 program formatter preserves executable loop structure', () => {

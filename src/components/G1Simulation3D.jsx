@@ -30,6 +30,92 @@ function addBox(parent, size, position, color, radius = 0.04) {
   return mesh;
 }
 
+function createObstacleMesh(obstacle) {
+  const group = new THREE.Group();
+  const size = Math.max(0.45, Number(obstacle.radius) / 10 || 1);
+  const color = obstacle.color || (String(obstacle.id).startsWith('student-') ? '#8b5cf6' : '#f59e0b');
+  const addMesh = (geometry, position) => {
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+      color,
+      emissive: 0x000000,
+      roughness: 0.72,
+      transparent: true,
+      opacity: 0.82,
+    }));
+    mesh.position.set(...position);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.userData.obstacleId = String(obstacle.id);
+    mesh.userData.obstacleType = obstacle.type || 'unknown';
+    group.add(mesh);
+    return mesh;
+  };
+
+  switch (obstacle.type) {
+    case 'box':
+      addMesh(new THREE.BoxGeometry(size * 1.35, size * 1.35, size * 1.35), [0, size * 0.675, 0]);
+      break;
+    case 'wall':
+      addMesh(new THREE.BoxGeometry(size * 2.4, size * 1.3, size * 0.48), [0, size * 0.65, 0]);
+      break;
+    case 'platform':
+      addMesh(new THREE.BoxGeometry(size * 1.9, size * 0.28, size * 1.9), [0, size * 0.14, 0]);
+      break;
+    case 'ramp': {
+      const ramp = new THREE.Shape();
+      ramp.moveTo(-size, 0);
+      ramp.lineTo(size, 0);
+      ramp.lineTo(size, size * 1.25);
+      ramp.closePath();
+      const geometry = new THREE.ExtrudeGeometry(ramp, { depth: size * 1.4, bevelEnabled: false });
+      geometry.translate(0, 0, -size * 0.7);
+      addMesh(geometry, [0, 0, 0]);
+      break;
+    }
+    case 'stairs':
+      for (let step = 0; step < 3; step += 1) {
+        const height = size * (step + 1) * 0.38;
+        addMesh(
+          new THREE.BoxGeometry(size * 0.72, height, size * 0.8),
+          [(step - 1) * size * 0.56, height / 2, 0],
+        );
+      }
+      break;
+    case 'sphere':
+      addMesh(new THREE.SphereGeometry(size * 0.7, 24, 16), [0, size * 0.7, 0]);
+      break;
+    case 'cylinder':
+      addMesh(new THREE.CylinderGeometry(size * 0.62, size * 0.62, size * 1.3, 24), [0, size * 0.65, 0]);
+      break;
+    case 'table':
+      addMesh(new THREE.BoxGeometry(size * 1.8, size * 0.18, size * 1.5), [0, size * 1.2, 0]);
+      for (const xSign of [-1, 1]) {
+        for (const zSign of [-1, 1]) {
+          addMesh(new THREE.BoxGeometry(size * 0.14, size * 1.15, size * 0.14), [xSign * size * 0.72, size * 0.575, zSign * size * 0.58]);
+        }
+      }
+      break;
+    case 'terrain':
+      addMesh(new THREE.IcosahedronGeometry(size, 1), [0, size * 0.28, 0]).scale.set(1.5, 0.55, 1.25);
+      break;
+    default:
+      addMesh(new THREE.CylinderGeometry(size * 0.65, size * 0.75, size * 0.5, 24), [0, size * 0.25, 0]);
+  }
+
+  group.position.set(obstacle.x, 0, -obstacle.y);
+  group.userData.obstacleId = String(obstacle.id);
+  group.userData.obstacleType = obstacle.type || 'unknown';
+  return group;
+}
+
+function disposeObstacleMeshes(group) {
+  group.traverse((object) => {
+    object.geometry?.dispose();
+    if (Array.isArray(object.material)) object.material.forEach((entry) => entry.dispose());
+    else object.material?.dispose();
+  });
+}
+
 function addSegment(parent, start, end, width, color) {
   const startVector = new THREE.Vector3(...start);
   const endVector = new THREE.Vector3(...end);
@@ -519,16 +605,10 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   useEffect(() => {
     const group = obstacleGroupRef.current;
     if (!group) return;
+    group.children.forEach(disposeObstacleMeshes);
     group.clear();
     obstacles.forEach((obstacle) => {
-      const mesh = new THREE.Mesh(
-        new THREE.CylinderGeometry(Math.max(0.18, obstacle.radius / 12), Math.max(0.26, obstacle.radius / 10), 0.25, 24),
-        new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, emissive: 0x000000, emissiveIntensity: 0.8, transparent: true, opacity: 0.72 }),
-      );
-      mesh.position.set(obstacle.x, 0.13, -obstacle.y);
-      mesh.castShadow = true;
-      mesh.userData.obstacleId = String(obstacle.id);
-      group.add(mesh);
+      group.add(createObstacleMesh(obstacle));
     });
   }, [obstacles]);
 
@@ -610,14 +690,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
     obstacleGroupRef.current = obstacleGroup;
     scene.add(obstacleGroup);
     obstacles.forEach((obstacle) => {
-      const mesh = new THREE.Mesh(
-        new THREE.CylinderGeometry(Math.max(0.18, obstacle.radius / 12), Math.max(0.26, obstacle.radius / 10), 0.25, 24),
-        new THREE.MeshStandardMaterial({ color: String(obstacle.id).startsWith('student-') ? 0x8b5cf6 : 0xf59e0b, emissive: 0x000000, emissiveIntensity: 0.8, transparent: true, opacity: 0.72 }),
-      );
-      mesh.position.set(obstacle.x, 0.13, -obstacle.y);
-      mesh.castShadow = true;
-      mesh.userData.obstacleId = String(obstacle.id);
-      obstacleGroup.add(mesh);
+      obstacleGroup.add(createObstacleMesh(obstacle));
     });
 
     const built = createRobot();
@@ -677,8 +750,10 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
       raycaster.setFromCamera(pointer, camera);
     };
     const setObstacleHighlight = (obstacleId, isDragging) => {
-      const mesh = obstacleGroup.children.find((obstacle) => obstacle.userData.obstacleId === obstacleId);
-      if (mesh?.material?.emissive) mesh.material.emissive.set(isDragging ? 0x22d3ee : 0x000000);
+      const group = obstacleGroup.children.find((obstacle) => obstacle.userData.obstacleId === obstacleId);
+      group?.traverse((object) => {
+        if (object.material?.emissive) object.material.emissive.set(isDragging ? 0x22d3ee : 0x000000);
+      });
     };
 
     const onPointerDown = (event) => {
@@ -711,7 +786,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         return;
       }
       if (isObstacleEditable) {
-        const obstacleHit = raycaster.intersectObjects(obstacleGroup.children, false)
+        const obstacleHit = raycaster.intersectObjects(obstacleGroup.children, true)
           .find((hit) => hit.object.userData.obstacleId !== undefined);
         if (obstacleHit) {
           const obstacleId = obstacleHit.object.userData.obstacleId;
@@ -749,7 +824,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
           waypointChangeCallbackRef.current?.(draggingMarker.id, { x, y });
         } else {
           const obstacle = obstacleGroup.children.find((item) => item.userData.obstacleId === draggingMarker.id);
-          if (obstacle) obstacle.position.set(x, 0.13, -y);
+          if (obstacle) obstacle.position.set(x, 0, -y);
           obstacleChangeCallbackRef.current?.(draggingMarker.id, { x, y });
         }
         return;

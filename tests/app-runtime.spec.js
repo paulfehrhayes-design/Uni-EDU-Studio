@@ -63,7 +63,47 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
   await expect(page.locator('code').filter({ hasText: 'robot.arm_action("hands up")' })).toBeVisible();
   await expect(page.locator('code').filter({ hasText: 'robot.arm_action("shake hand")' })).toBeVisible();
+  await expect(page.locator('code').filter({ hasText: 'robot.wait(1)' })).toBeVisible();
+  await expect(page.getByText('Unitree SDK: LocoClient.Start() / SetFsmId(500)')).toBeVisible();
+  await expect(page.getByText('Stand ready to move.')).toBeVisible();
+  await expect(page.getByText('Pause for the selected number of seconds.')).toBeVisible();
+  await expect(page.getByText('Raise both hands.')).toBeVisible();
+  await expect(page.getByText(/“example” is a placeholder app name, not a sound/)).toBeVisible();
   expect(pageErrors).toEqual([]);
+});
+
+test('object library items keep distinct shapes when added to the scene', async ({ page }) => {
+  test.setTimeout(90000);
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-object-library-test' },
+    }));
+  });
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Library', exact: true }).click();
+  await page.getByRole('button', { name: 'Add Object' }).click();
+
+  for (const objectType of ['Box', 'Wall', 'Platform', 'Ramp', 'Stairs', 'Sphere', 'Cylinder', 'Table', 'Terrain']) {
+    const objectLabel = page.getByText(objectType, { exact: true });
+    await objectLabel.click({ force: true });
+  }
+
+  const scene = page.locator('svg[viewBox="0 0 220 220"]');
+  for (const type of ['box', 'wall', 'platform', 'ramp', 'stairs', 'sphere', 'cylinder', 'table', 'terrain']) {
+    await expect(scene.locator(`g[data-obstacle-type="${type}"]`)).toHaveCount(1);
+  }
+  await expect(scene.locator('g[data-obstacle-type="box"] polygon')).toHaveCount(3);
+  await expect(scene.locator('g[data-obstacle-type="wall"] path')).toHaveCount(1);
+  await expect(scene.locator('g[data-obstacle-type="platform"] rect')).toHaveCount(2);
+  await expect(scene.locator('g[data-obstacle-type="ramp"] polygon')).toHaveCount(1);
+  await expect(scene.locator('g[data-obstacle-type="stairs"] path')).toHaveCount(1);
+  await expect(scene.locator('g[data-obstacle-type="sphere"] circle')).toHaveCount(2);
+  await expect(scene.locator('g[data-obstacle-type="cylinder"] ellipse')).toHaveCount(1);
+  await expect(scene.locator('g[data-obstacle-type="cylinder"] circle')).toHaveCount(1);
+  await expect(scene.locator('g[data-obstacle-type="table"] circle')).toHaveCount(4);
+  await expect(scene.locator('g[data-obstacle-type="terrain"] polygon')).toHaveCount(1);
 });
 
 test('unsupported saved code is preserved and explained in the Blocks view for both roles', async ({ browser }) => {

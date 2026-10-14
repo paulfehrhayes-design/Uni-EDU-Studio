@@ -15,7 +15,7 @@ import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
 import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
 import G1Simulation3D from './components/G1Simulation3D';
 import { compileMotionPrompt } from './sim/textToMotion';
-import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
+import { flattenG1Commands, formatG1Program, G1_ARM_PRESET_DESCRIPTIONS, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
 import { createRobotConnection } from './robot/RobotConnection';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
@@ -211,6 +211,76 @@ const OBJECT_LIBRARY = [
   { id: 'table', label: 'Table', icon: '◫', defaultRadius: 16, color: '#94a3b8' },
   { id: 'terrain', label: 'Terrain', icon: '◌', defaultRadius: 15, color: '#86efac' },
 ];
+
+function SceneObstacleShape({ obstacle, centerX, centerY, size, color, opacity, stroke, strokeWidth, strokeDasharray }) {
+  const common = { fill: color, fillOpacity: opacity, stroke, strokeWidth, strokeDasharray };
+  switch (obstacle.type) {
+    case 'box':
+      return (
+        <g>
+          <polygon {...common} points={`${centerX - size * 0.68},${centerY - size * 0.42} ${centerX},${centerY - size * 0.78} ${centerX + size * 0.68},${centerY - size * 0.42} ${centerX},${centerY - size * 0.06}`} />
+          <polygon {...common} points={`${centerX - size * 0.68},${centerY - size * 0.42} ${centerX},${centerY - size * 0.06} ${centerX},${centerY + size * 0.72} ${centerX - size * 0.68},${centerY + size * 0.36}`} />
+          <polygon {...common} points={`${centerX},${centerY - size * 0.06} ${centerX + size * 0.68},${centerY - size * 0.42} ${centerX + size * 0.68},${centerY + size * 0.36} ${centerX},${centerY + size * 0.72}`} />
+        </g>
+      );
+    case 'wall':
+      return (
+        <g>
+          <rect {...common} x={centerX - size * 1.2} y={centerY - size * 0.34} width={size * 2.4} height={size * 0.68} rx="2" />
+          <path d={`M ${centerX - size * 0.6} ${centerY - size * 0.3} v ${size * 0.6} M ${centerX} ${centerY - size * 0.3} v ${size * 0.6} M ${centerX + size * 0.6} ${centerY - size * 0.3} v ${size * 0.6}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.7)} />
+        </g>
+      );
+    case 'platform':
+      return (
+        <g>
+          <rect {...common} x={centerX - size * 0.88} y={centerY - size * 0.62} width={size * 1.76} height={size * 1.24} rx={size * 0.28} />
+          <rect x={centerX - size * 0.58} y={centerY - size * 0.34} width={size * 1.16} height={size * 0.68} rx={size * 0.18} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.65)} />
+        </g>
+      );
+    case 'ramp':
+      return (
+        <g>
+          <polygon {...common} points={`${centerX - size},${centerY + size * 0.7} ${centerX + size},${centerY + size * 0.7} ${centerX + size},${centerY - size * 0.7}`} />
+          <path d={`M ${centerX - size * 0.52} ${centerY + size * 0.38} L ${centerX + size * 0.48} ${centerY - size * 0.42}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.8)} strokeDasharray="3 2" />
+        </g>
+      );
+    case 'stairs':
+      return <path {...common} d={`M ${centerX - size} ${centerY + size * 0.65} v ${-size * 0.4} h ${size * 0.65} v ${-size * 0.4} h ${size * 0.7} v ${-size * 0.4} h ${size * 0.65} v ${size * 1.2} Z`} />;
+    case 'sphere':
+      return (
+        <g>
+          <circle {...common} cx={centerX} cy={centerY} r={size * 0.72} />
+          <circle cx={centerX - size * 0.2} cy={centerY - size * 0.2} r={size * 0.14} fill="white" fillOpacity="0.65" />
+        </g>
+      );
+    case 'cylinder':
+      return (
+        <g>
+          <circle {...common} cx={centerX} cy={centerY} r={size * 0.72} />
+          <ellipse cx={centerX} cy={centerY} rx={size * 0.42} ry={size * 0.2} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.75)} />
+          <path d={`M ${centerX - size * 0.5} ${centerY} h ${size}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.65)} />
+        </g>
+      );
+    case 'table':
+      return (
+        <g>
+          <rect {...common} x={centerX - size * 0.82} y={centerY - size * 0.62} width={size * 1.64} height={size * 1.24} rx="3" />
+          {[-1, 1].flatMap((xSign) => [-1, 1].map((ySign) => (
+            <circle key={`${xSign}-${ySign}`} cx={centerX + xSign * size * 0.58} cy={centerY + ySign * size * 0.43} r={size * 0.1} fill={stroke} />
+          )))}
+        </g>
+      );
+    case 'terrain':
+      return (
+        <g>
+          <polygon {...common} points={`${centerX - size},${centerY + size * 0.35} ${centerX - size * 0.65},${centerY - size * 0.35} ${centerX - size * 0.1},${centerY - size * 0.1} ${centerX + size * 0.25},${centerY - size * 0.7} ${centerX + size},${centerY + size * 0.35}`} />
+          <path d={`M ${centerX - size * 0.45} ${centerY + size * 0.1} Q ${centerX - size * 0.1} ${centerY - size * 0.35} ${centerX + size * 0.5} ${centerY - size * 0.05}`} fill="none" stroke={stroke} strokeWidth={Math.max(1, strokeWidth * 0.7)} />
+        </g>
+      );
+    default:
+      return <circle {...common} cx={centerX} cy={centerY} r={size} />;
+  }
+}
 
 const SAFE_COMMAND_LIMITS = {
   SPEED: { min: 0.5, max: 2 },
@@ -1570,10 +1640,29 @@ export default function App() {
 
   const addStudentObstacle = (type = 'box') => {
     const preset = OBJECT_LIBRARY.find((item) => item.id === type) || OBJECT_LIBRARY[0];
-    const defaultPosition = clampScenePoint(0, 0, gridSize);
-    setSceneObjects((prev) => [
-      ...prev,
-      {
+    setSceneObjects((prev) => {
+      const coordinateLimit = Math.max(0, gridSize / 2 - 1);
+      const coordinates = Array.from({ length: 5 }, (_, index) => (
+        -coordinateLimit + (coordinateLimit * 2 * index) / 4
+      ));
+      const candidates = coordinates.flatMap((x) => coordinates.map((y) => ({ x, y })))
+        .sort((left, right) => (
+          Math.hypot(left.x, left.y) - Math.hypot(right.x, right.y)
+        ));
+      const position = candidates
+        .map((candidate) => ({
+          ...candidate,
+          overlap: prev.reduce((score, obstacle) => {
+            const requiredSpace = (preset.defaultRadius + (Number(obstacle.radius) || 10)) / 12 + 0.5;
+            const distance = Math.hypot(candidate.x - obstacle.x, candidate.y - obstacle.y);
+            return score + Math.max(0, requiredSpace - distance);
+          }, 0),
+        }))
+        .sort((left, right) => left.overlap - right.overlap || Math.hypot(left.x, left.y) - Math.hypot(right.x, right.y))[0];
+      const defaultPosition = clampScenePoint(position.x, position.y, gridSize);
+      return [
+        ...prev,
+        {
         id: `student-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         type: preset.id,
         label: preset.label,
@@ -1581,8 +1670,9 @@ export default function App() {
         x: defaultPosition.x,
         y: defaultPosition.y,
         radius: preset.defaultRadius,
-      },
-    ]);
+        },
+      ];
+    });
   };
 
   const updateStudentObstacle = (id, patch) => {
@@ -2243,20 +2333,26 @@ export default function App() {
                   const isEditable = currentUser.role !== 'teacher' && isStudentObstacle;
                   const isDragging = activeDragItem?.kind === 'obstacle' && activeDragItem.id === obstacle.id;
                   const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
+                  const centerX = sceneX(obstacle.x);
+                  const centerY = sceneY(obstacle.y);
+                  const size = (obstacle.radius / 12) * sceneScale;
                   return (
                     <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? (isDragging ? 'grabbing' : 'grab') : 'default' }}>
-                      {isDragging && <circle cx={sceneX(obstacle.x)} cy={sceneY(obstacle.y)} r={(obstacle.radius / 12) * sceneScale + 4} fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
-                      <circle
-                        cx={sceneX(obstacle.x)}
-                        cy={sceneY(obstacle.y)}
-                        r={(obstacle.radius / 12) * sceneScale}
-                        fill={color}
-                        fillOpacity={isStudentObstacle ? 0.45 : 0.35}
+                      <g data-obstacle-type={obstacle.type || 'unknown'}>
+                      {isDragging && <circle cx={centerX} cy={centerY} r={size + 4} fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
+                      <SceneObstacleShape
+                        obstacle={obstacle}
+                        centerX={centerX}
+                        centerY={centerY}
+                        size={size}
+                        color={color}
+                        opacity={isStudentObstacle ? 0.45 : 0.35}
                         stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
                         strokeWidth={isEditable ? 2.5 : 2}
                         strokeDasharray={isEditable ? '0' : '6 3'}
                       />
-                      {isEditable && <text x={sceneX(obstacle.x)} y={sceneY(obstacle.y) + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
+                      {isEditable && <text x={centerX} y={centerY + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
+                      </g>
                     </g>
                   );
                 })}
@@ -2694,7 +2790,7 @@ export default function App() {
                 {mainTab === 'ide' && (
                   <div className="space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Executable G1 SDK commands</p>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Executable robot commands</p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
                         {G1_EXECUTABLE_COMMANDS.flatMap((command) => {
                           if (command.method === 'arm_action') {
@@ -2703,6 +2799,7 @@ export default function App() {
                               key: `arm_action_${preset}`,
                               script: `robot.arm_action(${JSON.stringify(preset)})`,
                               label: `Arm preset: ${presetLabel.replace(/ \(\d+\)$/, '')}`,
+                              description: G1_ARM_PRESET_DESCRIPTIONS[preset],
                             }));
                           }
                           const args = command.args.map((argument) => argument.kind === 'choice'
@@ -2721,7 +2818,12 @@ export default function App() {
                             <span className="block text-slate-200">{command.label}</span>
                             <code className="text-cyan-300">{command.script}</code>
                             <p className="mt-1 text-slate-400">{command.description}</p>
-                            <p className="mt-1 text-emerald-300">Unitree SDK: {command.sdkMethod}</p>
+                            {command.sdkMethod
+                              ? <p className="mt-1 text-emerald-300">Unitree SDK: {command.sdkMethod}</p>
+                              : command.method === 'wait'
+                                ? <p className="mt-1 text-emerald-300">Runs as a timed pause.</p>
+                                : null}
+                            {command.method === 'arm_action' && <p className="mt-1 text-amber-300">Stop cannot cancel an arm preset; keep the area clear.</p>}
                             {!command.adapters.simulator && <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>}
                           </div>
                         ))}

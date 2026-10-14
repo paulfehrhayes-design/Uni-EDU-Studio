@@ -39,6 +39,7 @@ The IDE reference and Blocks toolbox show the commands currently mapped by the G
 ```python
 robot.stand()
 robot.sit()
+robot.wait(2)
 robot.squat_to_stand()
 robot.lie_to_stand()
 robot.stand_to_squat()
@@ -49,9 +50,9 @@ robot.backwardtime(1)
 
 Programs can also use bounded `for` loops. The legacy G1 arm presets are available with `robot.arm_action("hands up")` and the other names listed below. Simulation shows approximate poses, not the SDK trajectories. The physical SDK reports whether it accepted a preset request, not when the motion finishes. The teacher's `Stop robot` button stops locomotion but cannot cancel an accepted arm preset, so keep the robot area clear and use direct teacher supervision.
 
-The `stand` command selects the SDK's normal locomotion-ready state (FSM 500). The separate `squat_to_stand()` and `stand_to_squat()` posture transitions both use FSM 706 in the Python SDK; `lie_to_stand()` uses FSM 702. These SDK transitions report request acceptance, not completion. Simulator poses are approximate, and `HighStand`, `LowStand`, and `Damp` remain unavailable because their effects are not verified for this robot setup.
+`stand()` sets the robot ready to move (SDK FSM 500). `squat_to_stand()` and `stand_to_squat()` use SDK FSM 706; `lie_to_stand()` uses FSM 702. The robot confirms each request, but the app does not know when the movement is finished. Simulator poses are approximate. `HighStand`, `LowStand`, and `Damp` are not included because their effects have not been confirmed for this setup.
 
-Step-count walking commands use an estimated 34.5 cm per count, based on observed steps of about 33–36 cm. The robot receives timed velocity commands; this is a nominal estimate, not measured odometry. `walktime` commands and planner paths remain velocity-based and are not snapped to individual footfalls, so actual hardware paths may differ.
+Step-count walking estimates about 34.5 cm per step from observed steps of 33–36 cm. The robot moves for a calculated amount of time rather than measuring each step, so the actual distance can differ. Time-based walks and planned paths can also vary on the real robot.
 
 For example, run a preset:
 
@@ -61,7 +62,23 @@ robot.arm_action("hands up")
 
 The available preset names are: `release arm`, `two-hand kiss`, `left kiss`, `right kiss`, `hands up`, `clap`, `high five`, `hug`, `heart`, `right heart`, `reject`, `right hand up`, `x-ray`, `face wave`, `high wave`, and `shake hand`.
 
-The SDK-backed audio blocks include text-to-speech, volume (capped at 70), head LED color, and stopping an audio app. Diagnostic blocks can read the current motion state, speaker volume, and the arm-action list reported by the robot. Reading the arm-action list does not execute an arm action. Raw FSM controls and arbitrary recorded-action names are not exposed as runnable blocks.
+`wait(seconds)` pauses the program for 0.1 to 10 seconds. The whole program is limited to 30 seconds.
+
+Arm presets:
+- Release arm: relax the arms.
+- Two-hand kiss, left kiss, and right kiss: bring the hand(s) to the face.
+- Hands up, right hand up, and high five: raise a hand or both hands.
+- Clap: bring both hands together.
+- Hug: open both arms.
+- Heart and right heart: make a heart gesture.
+- Reject: raise a hand to signal “no.”
+- X-ray: make the X-ray pose.
+- Face wave and high wave: wave near the face or overhead.
+- Shake hand: offer the right hand.
+
+Simulator poses are approximate; the real robot runs its built-in preset.
+
+The audio blocks include speech, volume, head light color, and stopping audio from an app. `robot.playstop("example")` stops audio for an app called `example`; `example` is not a sound name. Available sounds depend on the audio apps installed on the robot, and this command does not list them. Diagnostic blocks can read the current movement mode, speaker volume, and available arm actions.
 
 Example audio commands:
 

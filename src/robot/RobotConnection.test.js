@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRobotConnection, MockRobotConnection, SdkRobotConnection, WebRtcRobotConnection } from './RobotConnection.js';
 
-test('mock connection runs only catalog commands supported by the SDK and expands bounded loops', async () => {
+test('mock connection runs catalog robot commands and expands bounded loops', async () => {
   const connection = new MockRobotConnection();
   await assert.rejects(connection.run('robot.walk(1)'), /Connect the mock robot/);
   await connection.connect();
@@ -10,6 +10,8 @@ test('mock connection runs only catalog commands supported by the SDK and expand
 
   assert.deepEqual(result, { status: 'completed', commandsExecuted: 2, adapter: 'mock' });
   assert.equal(connection.executions[0].length, 2);
+  await connection.run('robot.wait(1)');
+  assert.equal(connection.executions[1][0].method, 'wait');
   await assert.rejects(connection.run('robot.waveleft("high")'), /not supported by the mock connection/);
   await assert.rejects(
     connection.run('for _ in range(20):\n    for _ in range(20):\n        robot.walk(1)'),
@@ -26,7 +28,7 @@ test('SDK adapter wraps the existing API and rejects unsupported commands before
 
   await connection.connect('eth0');
   await connection.status();
-  await connection.run('robot.walk(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()');
+  await connection.run('robot.walk(1)\nrobot.wait(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()');
   await connection.stop();
   await assert.rejects(connection.run('robot.kickleft("mid")'), /not supported by the SDK connection/);
 
@@ -38,7 +40,7 @@ test('SDK adapter wraps the existing API and rejects unsupported commands before
   ]);
   assert.deepEqual(JSON.parse(requests[0][1].body), { interface: 'eth0' });
   assert.deepEqual(JSON.parse(requests[2][1].body), {
-    code: 'robot.walk(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()',
+    code: 'robot.walk(1)\nrobot.wait(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()',
   });
 });
 

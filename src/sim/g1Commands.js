@@ -67,6 +67,25 @@ const SDK_COMMAND_METHODS = {
   playstop: 'AudioClient.PlayStop',
 };
 
+export const G1_ARM_PRESET_DESCRIPTIONS = Object.freeze({
+  'release arm': 'Relax the arms.',
+  'two-hand kiss': 'Bring both hands to the face for a kiss.',
+  'left kiss': 'Bring the left hand to the face for a kiss.',
+  'right kiss': 'Bring the right hand to the face for a kiss.',
+  'hands up': 'Raise both hands.',
+  clap: 'Clap both hands together.',
+  'high five': 'Raise the right hand for a high five.',
+  hug: 'Open both arms for a hug.',
+  heart: 'Make a heart shape with both hands.',
+  'right heart': 'Make a heart gesture with the right hand.',
+  reject: 'Raise the hand in a “no” gesture.',
+  'right hand up': 'Raise the right hand.',
+  'x-ray': 'Make the X-ray pose.',
+  'face wave': 'Wave near the face.',
+  'high wave': 'Wave overhead.',
+  'shake hand': 'Offer the right hand for a handshake.',
+});
+
 const command = (method, label, category, description, args = []) => ({
   method,
   label,
@@ -75,10 +94,10 @@ const command = (method, label, category, description, args = []) => ({
   sdkMethod: SDK_COMMAND_METHODS[method] || null,
   adapters: {
     simulator: !['Diagnostics', 'Audio'].includes(category),
-    sdk: Boolean(SDK_COMMAND_METHODS[method]),
+    sdk: Boolean(SDK_COMMAND_METHODS[method]) || method === 'wait',
     webRtc: false,
   },
-  physicalSupported: Boolean(SDK_COMMAND_METHODS[method]),
+  physicalSupported: Boolean(SDK_COMMAND_METHODS[method]) || method === 'wait',
   args,
   blockType: `g1_command_${method}`,
   blockMessage: `${label}${args.map((_, index) => ` %${index + 1}`).join('')}`,
@@ -115,79 +134,80 @@ const ARM_PRESETS = [
 
 const commandGroups = [
   [
-    command('stand', 'Stand / ready', 'Basics', 'Select the normal G1 locomotion-ready FSM (ID 500). This does not run the separate Squat2StandUp transition.'),
-    command('sit', 'Sit down', 'Basics', 'Request the G1 seated posture (LocoClient FSM 3). The simulator shows an approximate seated pose; transition completion is not monitored.'),
+    command('stand', 'Stand / ready', 'Basics', 'Stand ready to move.'),
+    command('sit', 'Sit down', 'Basics', 'Sit down.'),
+    command('wait', 'Wait for', 'Basics', 'Pause for the selected number of seconds.', [seconds()]),
   ],
   [
-    command('walk', 'Walk forward', 'Walking', 'Estimate 34.5 cm per count from observed 33–36 cm steps; requests about 0.86 s of 0.4 m/s velocity per count, then stops. Real distance varies.', [steps()]),
-    command('walktime', 'Walk forward for', 'Walking', 'Request forward velocity for this many seconds, then stop. Actual distance varies with the robot and surface.', [seconds()]),
-    command('backward', 'Walk backward', 'Walking', 'Estimate 34.5 cm per count from observed 33–36 cm steps; requests about 0.86 s of 0.4 m/s backward velocity per count, then stops. Real distance varies.', [steps()]),
-    command('backwardtime', 'Walk backward for', 'Walking', 'Request backward velocity for this many seconds, then stop. Actual distance varies with the robot and surface.', [seconds()]),
-    command('sidestep', 'Sidestep', 'Walking', 'Request sideways motion for about 2 seconds at 0.2 m/s, then stop. This is timed velocity, not a measured footstep.', [direction()]),
-    command('slowwalk', 'Slow walk', 'Walking', 'Estimate 34.5 cm per count from observed 33–36 cm steps; requests about 1.73 s of 0.2 m/s velocity per count, then stops. Real distance varies.', [steps()]),
-    command('slowwalktime', 'Slow walk for', 'Walking', 'Request forward velocity at 0.2 m/s for this many seconds, then stop. Actual distance varies with the robot and surface.', [seconds()]),
-    command('fastwalk', 'Fast walk', 'Walking', 'Estimate 34.5 cm per count from observed 33–36 cm steps; requests about 0.43 s of 0.8 m/s velocity per count, then stops. Real distance varies.', [steps()]),
-    command('fastwalktime', 'Fast walk for', 'Walking', 'Request forward velocity at 0.8 m/s for this many seconds, then stop. Actual distance varies with the robot and surface.', [seconds()]),
-    command('turn', 'Turn', 'Walking', 'Request a timed turn at about 0.6 radians/second for the selected angle, then stop. The angle is a target estimate, not feedback-controlled positioning.', [direction(), numberArgument('ANGLE', 'degrees', 90, 5, 180)]),
+    command('walk', 'Walk forward', 'Walking', 'Walk forward the selected number of steps. Distance may vary.', [steps()]),
+    command('walktime', 'Walk forward for', 'Walking', 'Walk forward for the selected time.', [seconds()]),
+    command('backward', 'Walk backward', 'Walking', 'Walk backward the selected number of steps. Distance may vary.', [steps()]),
+    command('backwardtime', 'Walk backward for', 'Walking', 'Walk backward for the selected time.', [seconds()]),
+    command('sidestep', 'Sidestep', 'Walking', 'Step sideways in the selected direction.', [direction()]),
+    command('slowwalk', 'Slow walk', 'Walking', 'Walk forward slowly for the selected steps. Distance may vary.', [steps()]),
+    command('slowwalktime', 'Slow walk for', 'Walking', 'Walk forward slowly for the selected time.', [seconds()]),
+    command('fastwalk', 'Fast walk', 'Walking', 'Walk forward quickly for the selected steps. Distance may vary.', [steps()]),
+    command('fastwalktime', 'Fast walk for', 'Walking', 'Walk forward quickly for the selected time.', [seconds()]),
+    command('turn', 'Turn', 'Walking', 'Turn in the selected direction by about this angle.', [direction(), numberArgument('ANGLE', 'degrees', 90, 5, 180)]),
   ],
   [
-    command('squat_to_stand', 'Squat to stand', 'Postures', 'Request the SDK squat-to-stand transition (FSM 706). The SDK only confirms the request, not completion.'),
-    command('lie_to_stand', 'Lie to stand', 'Postures', 'Request the SDK lie-to-stand transition (FSM 702). The SDK only confirms the request, not completion.'),
-    command('stand_to_squat', 'Stand to squat', 'Postures', 'Request the SDK stand-to-squat transition (FSM 706). The SDK only confirms the request, not completion.'),
+    command('squat_to_stand', 'Squat to stand', 'Postures', 'Rise from a squat.'),
+    command('lie_to_stand', 'Lie to stand', 'Postures', 'Get up from lying down.'),
+    command('stand_to_squat', 'Stand to squat', 'Postures', 'Lower into a squat.'),
   ],
   [
     command(
       'arm_action',
       'Run arm preset',
       'Gestures',
-      'Request a named built-in G1 arm action. The SDK reports whether the request was accepted, not when the motion finishes. Teacher Stop stops locomotion but cannot cancel an active arm preset; use only with the robot area clear and direct supervision.',
+      'Run the selected arm preset. Stop cannot cancel an arm preset; keep the area clear.',
       [choiceArgument('ACTION', 'arm preset', ARM_PRESETS, 'hands up')],
     ),
     command(
       'simulate_arm_action',
       'Preview arm preset',
       'Gestures',
-      'Preview an approximate arm pose for a legacy G1 preset. Simulator-only; the motion does not match the SDK trajectory.',
+      'Preview this arm pose in the simulator. It is not exact.',
       [choiceArgument('ACTION', 'arm preset', ARM_PRESETS, 'hands up')],
     ),
-    command('waveleft', 'Wave left hand', 'Gestures', 'Wave the left hand at a preset height.', [level()]),
-    command('waveleftDegrees', 'Wave left hand by', 'Gestures', 'Set the left arm gesture angle in degrees.', [degrees()]),
-    command('waveright', 'Wave right hand', 'Gestures', 'Wave the right hand at a preset height.', [level()]),
-    command('waverightDegrees', 'Wave right hand by', 'Gestures', 'Set the right arm gesture angle in degrees.', [degrees()]),
-    command('raisebotharms', 'Raise both arms', 'Gestures', 'Raise both arms to a preset height.', [level()]),
-    command('raisebotharmsDegrees', 'Raise both arms by', 'Gestures', 'Set both arm gesture angles in degrees.', [degrees()]),
-    command('raiseleftarm', 'Raise left arm', 'Gestures', 'Raise the left arm to a preset height.', [level()]),
-    command('raiseleftarmDegrees', 'Raise left arm by', 'Gestures', 'Set the left arm angle in degrees.', [degrees()]),
-    command('raiserightarm', 'Raise right arm', 'Gestures', 'Raise the right arm to a preset height.', [level()]),
-    command('raiserightarmDegrees', 'Raise right arm by', 'Gestures', 'Set the right arm angle in degrees.', [degrees()]),
-    command('kickleft', 'Kick with left leg', 'Gestures', 'Perform a left-leg kick at a preset level.', [level()]),
-    command('kickleftDegrees', 'Kick with left leg by', 'Gestures', 'Set the left-leg kick angle in degrees.', [degrees()]),
-    command('kickright', 'Kick with right leg', 'Gestures', 'Perform a right-leg kick at a preset level.', [level()]),
-    command('kickrightDegrees', 'Kick with right leg by', 'Gestures', 'Set the right-leg kick angle in degrees.', [degrees()]),
-    command('kneeleft', 'Raise left knee', 'Gestures', 'Raise the left knee.'),
-    command('kneeright', 'Raise right knee', 'Gestures', 'Raise the right knee.'),
+    command('waveleft', 'Wave left hand', 'Gestures', 'Preview a left-hand wave.', [level()]),
+    command('waveleftDegrees', 'Wave left hand by', 'Gestures', 'Preview a left-hand wave.', [degrees()]),
+    command('waveright', 'Wave right hand', 'Gestures', 'Preview a right-hand wave.', [level()]),
+    command('waverightDegrees', 'Wave right hand by', 'Gestures', 'Preview a right-hand wave.', [degrees()]),
+    command('raisebotharms', 'Raise both arms', 'Gestures', 'Preview raising both arms.', [level()]),
+    command('raisebotharmsDegrees', 'Raise both arms by', 'Gestures', 'Preview raising both arms.', [degrees()]),
+    command('raiseleftarm', 'Raise left arm', 'Gestures', 'Preview raising the left arm.', [level()]),
+    command('raiseleftarmDegrees', 'Raise left arm by', 'Gestures', 'Preview raising the left arm.', [degrees()]),
+    command('raiserightarm', 'Raise right arm', 'Gestures', 'Preview raising the right arm.', [level()]),
+    command('raiserightarmDegrees', 'Raise right arm by', 'Gestures', 'Preview raising the right arm.', [degrees()]),
+    command('kickleft', 'Kick with left leg', 'Gestures', 'Preview a left-leg kick.', [level()]),
+    command('kickleftDegrees', 'Kick with left leg by', 'Gestures', 'Preview a left-leg kick.', [degrees()]),
+    command('kickright', 'Kick with right leg', 'Gestures', 'Preview a right-leg kick.', [level()]),
+    command('kickrightDegrees', 'Kick with right leg by', 'Gestures', 'Preview a right-leg kick.', [degrees()]),
+    command('kneeleft', 'Raise left knee', 'Gestures', 'Preview lifting the left knee.'),
+    command('kneeright', 'Raise right knee', 'Gestures', 'Preview lifting the right knee.'),
   ],
   [
-    command('getfsm', 'Read current motion state', 'Diagnostics', 'Read the current locomotion FSM ID without changing robot state.'),
-    command('getactions', 'List available arm actions', 'Diagnostics', 'Read the preset arm actions reported by the robot; does not execute an action.'),
+    command('getfsm', 'Read current motion state', 'Diagnostics', 'Check the current movement mode.'),
+    command('getactions', 'List available arm actions', 'Diagnostics', 'List the robot’s available arm actions.'),
   ],
   [
-    command('say', 'Speak %1 with voice %2', 'Audio', 'Speak a short text phrase.', [textArgument('TEXT', 'text', 'Hello'), integerChoiceArgument('SPEAKER', 'speaker', [['Chinese', '0'], ['English', '1']], '1')]),
-    command('getvolume', 'Read speaker volume', 'Audio', 'Read the current speaker volume.'),
-    command('setvolume', 'Set speaker volume to %1', 'Audio', 'Set speaker volume from 0 to 70.', [integerArgument('VOLUME', 'volume', 50, 0, 70)]),
-    command('led', 'Set head LED R %1 G %2 B %3', 'Audio', 'Set the head LED RGB color.', [
+    command('say', 'Speak %1 with voice %2', 'Audio', 'Speak the entered words.', [textArgument('TEXT', 'text', 'Hello'), integerChoiceArgument('SPEAKER', 'speaker', [['Chinese', '0'], ['English', '1']], '1')]),
+    command('getvolume', 'Read speaker volume', 'Audio', 'Check the speaker volume.'),
+    command('setvolume', 'Set speaker volume to %1', 'Audio', 'Set speaker volume (0–70).', [integerArgument('VOLUME', 'volume', 50, 0, 70)]),
+    command('led', 'Set head LED R %1 G %2 B %3', 'Audio', 'Set the head light color.', [
       integerArgument('RED', 'red', 0, 0, 255),
       integerArgument('GREEN', 'green', 160, 0, 255),
       integerArgument('BLUE', 'blue', 255, 0, 255),
     ]),
-    command('playstop', 'Stop audio app %1', 'Audio', 'Stop playback for the named audio app.', [textArgument('APP', 'app name', 'example')]),
+    command('playstop', 'Stop audio app %1', 'Audio', 'Stop audio from a named app. “example” is a placeholder app name, not a sound; available audio depends on apps installed on the robot.', [textArgument('APP', 'app name', 'example')]),
   ],
 ];
 
 export const G1_NOMINAL_STEP_METERS = 0.345;
 export const G1_COMMANDS = Object.freeze(commandGroups.flat());
 export const G1_EXECUTABLE_COMMANDS = Object.freeze(
-  G1_COMMANDS.filter((entry) => entry.adapters.sdk),
+  G1_COMMANDS.filter((entry) => entry.physicalSupported),
 );
 
 const COMMAND_BY_METHOD = new Map(G1_COMMANDS.map((entry) => [entry.method, entry]));
@@ -351,6 +371,7 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
     const variants = definition.method === 'arm_action'
       ? definition.args[0].choices.map(([presetLabel, preset]) => ({
         ...definition,
+        description: G1_ARM_PRESET_DESCRIPTIONS[preset],
         type: armPresetBlockType(preset),
         message: `Arm preset: ${presetLabel.replace(/ \(\d+\)$/, '')}`,
         args: [],
@@ -379,10 +400,12 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
       nextStatement: null,
       colour: definition.category === 'Gestures' ? 280 : definition.category === 'Audio' ? 210 : definition.category === 'Diagnostics' ? 230 : 160,
       tooltip: !definition.physicalSupported
-        ? `${definition.description} Physical robot execution is not configured for this action yet.`
+        ? `${definition.description} This action is only available in the simulator.`
         : !definition.adapters.simulator
-          ? `${definition.description} Executes on G1 hardware; not simulated.`
-          : definition.description,
+          ? `${variant.description} This action runs on the robot and has no simulator preview.`
+          : definition.method === 'arm_action'
+            ? `${variant.description} Stop cannot cancel an arm preset; keep the area clear.`
+            : variant.description,
       codeTemplate: variant.codeTemplate,
       stringFields: variant.stringFields,
     }));

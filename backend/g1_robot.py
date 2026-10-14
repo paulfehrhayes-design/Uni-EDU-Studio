@@ -168,6 +168,10 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
         if len(args) != 1:
             raise CommandValidationError(f"robot.{method}() expects a duration in seconds.")
         return {"method": method, "seconds": _number(args[0], "seconds", 0.1, 10)}
+    if method == "wait":
+        if len(args) != 1:
+            raise CommandValidationError("robot.wait() expects a duration in seconds.")
+        return {"method": method, "seconds": _number(args[0], "seconds", 0.1, 10)}
     if method == "turn":
         if len(args) not in {1, 2}:
             raise CommandValidationError('robot.turn() expects a direction and optional angle, e.g. robot.turn("left", 90).')
@@ -302,6 +306,8 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
 
 def _estimated_duration(command: dict[str, Any]) -> float:
     method = command["method"]
+    if method == "wait":
+        return command["seconds"]
     if method == "say":
         return len(command["text"]) / 12
     if method in {"stand", "sit", *_POSTURE_TRANSITION_FSM_IDS, "getfsm", "getactions", "getvolume", "setvolume", "led", "playstop"}:
@@ -457,6 +463,9 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                         _client.SetFsmId(_POSTURE_TRANSITION_FSM_IDS[method]),
                         method,
                     )
+                elif method == "wait":
+                    if _stop_requested.wait(command["seconds"]):
+                        raise HTTPException(status_code=409, detail="Robot program stopped by teacher.")
                 elif method == "getfsm":
                     _sdk_result_if_available(_client.GetFsmId(), "GetFsmId", results, method)
                 elif method == "getactions":

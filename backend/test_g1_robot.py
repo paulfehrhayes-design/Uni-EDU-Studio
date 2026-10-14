@@ -50,6 +50,20 @@ class G1RobotProgramTests(unittest.TestCase):
         commands = parse_robot_program('robot.walktime(99)')
         self.assertEqual(commands[0]["seconds"], 10)
 
+    def test_wait_is_bounded_and_counts_toward_program_duration(self):
+        self.assertEqual(
+            parse_robot_program("robot.wait(2)"),
+            [{"method": "wait", "seconds": 2}],
+        )
+        self.assertEqual(
+            parse_robot_program("robot.wait(99)"),
+            [{"method": "wait", "seconds": 10}],
+        )
+        with self.assertRaisesRegex(CommandValidationError, "duration"):
+            parse_robot_program("robot.wait(10)\nrobot.wait(10)\nrobot.wait(10)\nrobot.wait(1)")
+        with self.assertRaisesRegex(CommandValidationError, "duration in seconds"):
+            parse_robot_program("robot.wait()")
+
     def test_sit_command_is_a_bounded_no_argument_posture_command(self):
         self.assertEqual(parse_robot_program("robot.sit()"), [{"method": "sit"}])
         with self.assertRaisesRegex(CommandValidationError, "takes no arguments"):
@@ -261,6 +275,23 @@ class G1RobotProgramTests(unittest.TestCase):
 
         self.assertEqual(client.fsm_requests, [706, 702, 706])
         self.assertEqual(result["commandsExecuted"], 3)
+
+    def test_wait_uses_interruptible_backend_delay(self):
+        class FakeLocoClient:
+            pass
+
+        original_client = g1_robot._client
+        g1_robot._client = FakeLocoClient()
+        try:
+            with patch.object(g1_robot._stop_requested, "wait", return_value=False) as wait:
+                result = g1_robot.execute_robot_program("robot.wait(2)")
+            wait.assert_called_once_with(2.0)
+            self.assertEqual(result["commandsExecuted"], 1)
+            with patch.object(g1_robot._stop_requested, "wait", return_value=True):
+                with self.assertRaisesRegex(HTTPException, "stopped by teacher"):
+                    g1_robot.execute_robot_program("robot.wait(2)")
+        finally:
+            g1_robot._client = original_client
 
     def test_slow_motion_test_command_is_bounded_and_uses_slow_speed(self):
         class FakeLocoClient:

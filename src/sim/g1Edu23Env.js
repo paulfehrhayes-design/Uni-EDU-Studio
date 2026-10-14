@@ -30,16 +30,16 @@ export const G1_EDU_23_ENV = {
     standUp: { label: 'Stand up', description: 'Return to neutral standing pose' },
   },
   defaultObstacles: [
-    { id: 'block-1', x: 26, y: 18, radius: 12 },
-    { id: 'block-2', x: -18, y: -10, radius: 14 },
-    { id: 'block-3', x: 8, y: -26, radius: 10 },
+    { id: 'block-1', type: 'box', label: 'Box', color: '#60a5fa', x: 26, y: 18, radius: 12 },
+    { id: 'block-2', type: 'sphere', label: 'Sphere', color: '#cbd5e1', x: -18, y: -10, radius: 14 },
+    { id: 'block-3', type: 'terrain', label: 'Terrain', color: '#86efac', x: 8, y: -26, radius: 10 },
   ],
   challengeLayouts: {
     'simple-path': {
       label: 'Simple path',
       goal: { x: 30, y: 28, radius: 10 },
       obstacles: [
-        { id: 'wall-1', x: 12, y: -12, radius: 9 },
+        { id: 'wall-1', type: 'wall', label: 'Wall', color: '#f59e0b', x: 12, y: -12, radius: 9 },
       ],
     },
     'avoid-blocks': {
@@ -667,9 +667,14 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     }
 
     if (methodName === 'wait' || methodName === 'waitSeconds') {
-      actions.push({ label: 'Wait', summary: `${firstNumber || 0.5}s` });
-      timeline.push({ label: 'Wait', summary: `${firstNumber || 0.5}s` });
-      animateAction(8, () => {}, 'Wait', `${firstNumber || 0.5}s`);
+      const duration = firstNumber || 0.5;
+      animateAction(
+        Math.max(1, Math.ceil(duration * 30)),
+        () => {},
+        'Wait',
+        `${duration}s`,
+        duration,
+      );
     }
 
     if (methodName === 'stand') {
