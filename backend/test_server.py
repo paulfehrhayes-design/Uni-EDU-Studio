@@ -13,6 +13,318 @@ app = server.app
 
 
 class ServerClassroomTests(unittest.TestCase):
+    def test_teacher_can_capture_publish_and_share_validated_lidar_map(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            job_id = "12345678-1234-1234-1234-123456789abc"
+            map_snapshot = {
+                "ready": True,
+                "map": {
+                    "map_id": "classroom",
+                    "version": "v-room-1",
+                    "frame_id": "map",
+                    "resolution_m": 0.05,
+                    "width": 2,
+                    "height": 2,
+                    "origin": {"x": -0.05, "y": -0.05, "yaw_rad": 0.0},
+                    "updated_at": "2026-10-14T17:00:00+00:00",
+                },
+                "data": [0, 100, -1, 50],
+            }
+            pointcloud = {
+                "job_id": job_id,
+                "frame_id": "map",
+                "captured_at": "2026-10-14T17:00:00+00:00",
+                "point_count": 1000,
+                "points": [{"x": 1.0, "y": 2.0, "z": 0.5}] * 1000,
+            }
+            with patch.object(
+                server, "robot_status", return_value={"running": False}
+            ), patch.object(
+                server, "navigation_start_scan",
+                return_value={"job_id": job_id, "status": "scanning"},
+            ), patch.object(
+                server, "navigation_scan_status",
+                return_value={"job_id": job_id, "status": "scanning", "point_count": 1000},
+            ), patch.object(
+                server, "navigation_complete_scan",
+                return_value={
+                    "job_id": job_id, "status": "completed",
+                    "map_id": "classroom", "map_version": "v-room-1",
+                    "frame_id": "map",
+                },
+            ), patch.object(
+                server, "navigation_scan_map_snapshot", return_value=map_snapshot
+            ), patch.object(
+                server, "navigation_scan_pointcloud", return_value=pointcloud
+            ):
+                started = client.post("/api/lidar/scan", headers=teacher_headers)
+                status = client.get(f"/api/lidar/scan/{job_id}", headers=teacher_headers)
+                blocked_sdk = client.post(
+                    "/api/run",
+                    headers=teacher_headers,
+                    json={"code": "robot.walk(1)"},
+                )
+                completed = client.post(
+                    f"/api/lidar/scan/{job_id}/complete", headers=teacher_headers
+                )
+
+            published = client.post(
+                "/api/lidar/map/publish",
+                headers=teacher_headers,
+                json={"job_id": job_id},
+            )
+            hidden_student_map = client.get("/api/lidar/map", headers=student_headers)
+            forbidden_toggle = client.put(
+                "/api/lidar/settings",
+                headers=student_headers,
+                json={"show_shared_overlay": True},
+            )
+            enabled = client.put(
+                "/api/lidar/settings",
+                headers=teacher_headers,
+                json={"show_shared_overlay": True},
+            )
+            shared_student_map = client.get("/api/lidar/map", headers=student_headers)
+
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(status.json()["point_count"], 1000)
+        self.assertEqual(blocked_sdk.status_code, 409)
+        self.assertIn("LiDAR scan", blocked_sdk.json()["detail"])
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(published.json()["status"], "published")
+        self.assertFalse(hidden_student_map.json()["enabled"])
+        self.assertEqual(forbidden_toggle.status_code, 403)
+        self.assertTrue(enabled.json()["show_shared_overlay"])
+        self.assertEqual(shared_student_map.json()["map"]["map"]["version"], "v-room-1")
+        self.assertEqual(shared_student_map.json()["pointcloud"]["point_count"], 1000)
+
+    def test_authenticated_lidar_websocket_streams_live_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            client = TestClient(app)
+            session = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            bridge_status = {
+                "ready": False,
+                "status": "unavailable",
+                "map": None,
+                "localization": {"ready": False},
+                "error": "bridge unavailable",
+            }
+            with patch.object(server, "navigation_bridge_status", return_value=bridge_status):
+                with client.websocket_connect(
+                    "/api/lidar/live",
+                    subprotocols=[f"edu-auth.{session['token']}"],
+                ) as websocket:
+                    update = websocket.receive_json()
+
+        self.assertEqual(update["type"], "live_update")
+        self.assertFalse(update["navigation"]["ready"])
+        self.assertFalse(update["shared_overlay_enabled"])
+
+    def test_navigation_status_is_teacher_only_and_records_map_versions(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            bridge_status = {
+                "status": "ready",
+                "ready": True,
+                "bridgeReady": True,
+                "localization": {
+                    "ready": True,
+                    "frame_id": "map",
+                    "pose": {"x": 1.0, "y": 2.0, "yaw_rad": 0.2},
+                    "timestamp": "2026-10-14T17:00:00+00:00",
+                    "age_ms": 50,
+                },
+                "plannerReady": True,
+                "map": {
+                    "map_id": "classroom",
+                    "version": "v1",
+                    "frame_id": "map",
+                    "resolution_m": 0.05,
+                    "width": 100,
+                    "height": 80,
+                    "origin": {"x": -2.5, "y": -2.0},
+                    "updated_at": "2026-10-13T17:00:00+00:00",
+                },
+                "error": None,
+            }
+
+            with patch.object(server, "navigation_bridge_status", return_value=bridge_status):
+                response = client.get("/api/navigation/status", headers=teacher_headers)
+                denied = client.get("/api/navigation/status", headers=student_headers)
+                anonymous = client.get("/api/navigation/status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ready")
+        self.assertEqual(response.json()["knownMapVersions"][0]["version"], "v1")
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(anonymous.status_code, 401)
+
+    def test_navigation_map_endpoint_is_teacher_only_and_read_only(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            snapshot = {
+                "ready": True,
+                "map": {
+                    "map_id": "classroom",
+                    "version": "v2",
+                    "frame_id": "map",
+                    "resolution_m": 0.05,
+                    "width": 2,
+                    "height": 2,
+                    "origin": {"x": -0.05, "y": -0.05, "yaw_rad": 0.0},
+                    "updated_at": "2026-10-14T17:00:00+00:00",
+                },
+                "data": [0, 100, -1, 50],
+            }
+            with patch.object(server, "navigation_map_snapshot", return_value=snapshot):
+                response = client.get("/api/navigation/map", headers=teacher_headers)
+                denied = client.get("/api/navigation/map", headers=student_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"], [0, 100, -1, 50])
+        self.assertEqual(response.json()["knownMapVersions"][0]["version"], "v2")
+        self.assertEqual(denied.status_code, 403)
+
+    def test_navigation_start_is_teacher_only_persists_operation_and_locks_sdk(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            route_request = {
+                "map_id": "classroom",
+                "version": "v4",
+                "frame_id": "map",
+                "waypoints": [{"x": 1.0, "y": 2.0}],
+            }
+            operation = {
+                "operation_id": "12345678-1234-1234-1234-123456789abc",
+                "status": "accepted",
+            }
+            with patch.object(server, "robot_status", return_value={"running": False}), patch.object(
+                server, "navigation_start_route", return_value=operation
+            ):
+                response = client.post(
+                    "/api/navigation/start",
+                    headers=teacher_headers,
+                    json=route_request,
+                )
+                denied = client.post(
+                    "/api/navigation/start",
+                    headers=student_headers,
+                    json=route_request,
+                )
+
+            blocked_sdk = client.post(
+                "/api/run",
+                headers=teacher_headers,
+                json={"code": "robot.walk(1)"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["operation_id"], operation["operation_id"])
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(blocked_sdk.status_code, 409)
+        self.assertIn("owns locomotion", blocked_sdk.json()["detail"])
+
+    def test_navigation_terminal_status_releases_sdk_lock_and_stop_requires_active_operation(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            headers = {"Authorization": f"Bearer {teacher['token']}"}
+            operation_id = "12345678-1234-1234-1234-123456789abc"
+            server.save_navigation_operation(
+                {"operation_id": operation_id, "status": "accepted"},
+                "teacher",
+                {"map_id": "classroom", "version": "v4", "frame_id": "map", "waypoints": []},
+            )
+            with patch.object(
+                server,
+                "navigation_operation_status",
+                return_value={"operation_id": operation_id, "status": "succeeded"},
+            ):
+                response = client.get(
+                    f"/api/navigation/operation/{operation_id}",
+                    headers=headers,
+                )
+            stop_response = client.post(
+                f"/api/navigation/operation/{operation_id}/stop",
+                headers=headers,
+            )
+            with patch.object(server, "execute_robot_program", return_value={"status": "completed"}):
+                sdk_response = client.post(
+                    "/api/run",
+                    headers=headers,
+                    json={"code": "robot.walk(1)"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertEqual(stop_response.status_code, 409)
+        self.assertEqual(sdk_response.status_code, 200)
+
     def test_github_proxy_requires_url(self):
         client = TestClient(app)
         response = client.get('/api/github-proxy')
@@ -36,6 +348,35 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['interface'], 'eth0')
         connect.assert_called_once_with('eth0')
+
+    def test_robot_status_reports_distance_provider_only_to_teacher(self):
+        client = TestClient(app)
+        teacher = client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        student = client.post(
+            '/api/classroom/login',
+            json={'username': 'student1', 'password': 'student1'},
+        ).json()
+        teacher_headers = {'Authorization': f"Bearer {teacher['token']}"}
+        student_headers = {'Authorization': f"Bearer {student['token']}"}
+        sensor_status = {
+            'status': 'ready',
+            'ready': True,
+            'distance_m': 0.8,
+            'age_ms': 40,
+        }
+
+        with patch.object(server, 'distance_sensor_status', return_value=sensor_status):
+            response = client.get('/api/robot/status', headers=teacher_headers)
+            denied = client.get('/api/robot/status', headers=student_headers)
+            anonymous = client.get('/api/robot/status')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['distanceSensor'], sensor_status)
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(anonymous.status_code, 401)
 
     def test_classroom_login_and_queue_flow(self):
         client = TestClient(app)

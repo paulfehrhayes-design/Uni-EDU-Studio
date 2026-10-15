@@ -1,5 +1,5 @@
 import { G1_MODEL_INFO } from './g1ModelRuntime.js';
-import { flattenG1Commands, G1_NOMINAL_STEP_METERS, parseG1Program } from './g1Commands.js';
+import { G1_NOMINAL_STEP_METERS, parseG1Program } from './g1Commands.js';
 
 export const G1_EDU_23_ENV = {
   robotType: G1_MODEL_INFO.robotType,
@@ -298,13 +298,21 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   }
 
   const normalized = pythonCode.replace(/\r/g, '');
-  let commandMatches;
+  let programNodes;
+  let commandMatches = [];
   try {
-    commandMatches = flattenG1Commands(parseG1Program(normalized)).map((command) => {
-      const openingParenthesis = command.code.indexOf('(');
-      return [command.code, command.method, command.code.slice(openingParenthesis + 1, -1)];
-    });
-  } catch {
+    programNodes = parseG1Program(normalized);
+  } catch (error) {
+    if (/^\s*(?:if|elif|else)\b/m.test(normalized)) {
+      return [{
+        ...createEmptyG1Edu23State(),
+        status: 'Invalid distance condition',
+        actions: [{ label: 'Condition not simulated', summary: error.message }],
+        blocked: false,
+        collisions: 0,
+        goal: challenge?.goal || null,
+      }];
+    }
     commandMatches = [
       ...normalized.matchAll(/robot\.(\w+)\(([^)]*)\)/g),
       ...normalized.matchAll(/sport_client\.Move\(([^)]*)\)/g),
@@ -313,7 +321,12 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
   }
 
-  if (!commandMatches.length) {
+  const countProgramCommands = (nodes) => nodes.reduce((total, node) => {
+    if (node.type === 'command') return total + 1;
+    if (node.type === 'repeat') return total + node.times * countProgramCommands(node.body);
+    return total + Math.max(countProgramCommands(node.then), countProgramCommands(node.else));
+  }, 0);
+  if (programNodes ? countProgramCommands(programNodes) === 0 : !commandMatches.length) {
     return [{
       ...createEmptyG1Edu23State(),
       status: 'Idle',
@@ -419,7 +432,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     }
   };
 
-  commandMatches.forEach((match) => {
+  const executeCommand = (match) => {
     const rawCommand = match[0];
     if (rawCommand.startsWith('sport_client.Move')) {
       const rawArgs = (match[1] || '').split(',').map((part) => part.trim());
@@ -688,14 +701,6 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       Object.keys(poseTargets).forEach((joint) => { poseTargets[joint] = 0; });
     }
 
-    if (methodName === 'sit') {
-      const startingPitch = torsoPitch;
-      animateAction(14, (progress) => {
-        torsoPitch = startingPitch + (12 - startingPitch) * progress;
-      }, 'Sit', 'Robot lowers into a seated pose.');
-      torsoPitch = 12;
-    }
-
     if (methodName === 'simulate_arm_action' || methodName === 'arm_action') {
       const action = argsRaw.replace(/^["']|["']$/g, '').toLowerCase();
       const armTargets = {
@@ -825,253 +830,59 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
 
     path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
     addFrame();
-  });
+  };
 
-  if (!frames.length) {
-    addFrame();
-  }
+  const closestObstacleDistance = (sector) => {
+    const radians = (heading * Math.PI) / 180;
+    const maxRangeMeters = 20;
+    const direction = sector === 'rear' ? -1 : 1;
+    let closestDistance = maxRangeMeters;
+    obstacles.forEach((obstacle) => {
+      const dx = Number(obstacle.x) - x;
+      const dy = Number(obstacle.y) - y;
+      const forward = direction * (dx * Math.cos(radians) + dy * Math.sin(radians));
+      const lateral = direction * (-dx * Math.sin(radians) + dy * Math.cos(radians));
+      if (forward <= 0 || Math.abs(Math.atan2(lateral, forward)) > Math.PI / 6) return;
+      const radius = Number.isFinite(Number(obstacle.radius)) ? Math.max(0, Number(obstacle.radius)) : 0;
+      closestDistance = Math.min(closestDistance, Math.max(0, Math.hypot(forward, lateral) - radius));
+    });
+    return closestDistance;
+  };
 
-  return frames;
-}
-
-function buildUnusedDuplicateG1SimulationFrames(pythonCode, options = {}) {
-  const { mode = 'kid-preview', obstacles = G1_EDU_23_ENV.defaultObstacles, challenge = null } = options;
-
-  if (!pythonCode || !pythonCode.trim()) {
-    return [{
-      ...createEmptyG1Edu23State(),
-      blocked: false,
-      collisions: 0,
-      goal: challenge?.goal || null,
-    }];
-  }
-
-  const normalized = pythonCode.replace(/\r/g, '');
-  const commandMatches = [
-    ...normalized.matchAll(/robot\.(\w+)\(([^)]*)\)/g),
-    ...normalized.matchAll(/sport_client\.Move\(([^)]*)\)/g),
-    ...normalized.matchAll(/sport_client\.StopMove\(\)/g),
-    ...normalized.matchAll(/sport_client\.Squat2StandUp\(\)/g),
-  ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
-
-  if (!commandMatches.length) {
-    return [{
-      ...createEmptyG1Edu23State(),
-      status: 'Idle',
-      actions: [{ label: 'No G1 motion blocks', summary: 'Add a move, turn, or stand-up block to preview the robot.' }],
-      blocked: false,
-      collisions: 0,
-      goal: challenge?.goal || null,
-    }];
-  }
-
-  const frames = [];
-  let x = 0;
-  let y = 0;
-  let heading = 0;
-  let torsoPitch = 0;
-  let torsoRoll = 0;
-  const path = [{ x, y }];
-  const actions = [];
-  const timeline = [];
-  const jointState = Object.fromEntries(G1_EDU_23_ENV.joints.map((joint) => [joint, 0]));
-  let collisionCount = 0;
-
-  const addFrame = (isInitial = false) => {
-    const finalGoal = challenge?.goal || null;
-    const goalReached = !!finalGoal && Math.hypot(x - finalGoal.x, y - finalGoal.y) <= (finalGoal.radius || 8);
-    const blocked = mode === 'advanced-physics' && collisionCount > 0;
-    const walkPhase = isInitial ? 0 : Math.min(path.length, 30) / 30;
-    const leftSwing = Math.sin(walkPhase * Math.PI * 2) * 26;
-    const rightSwing = Math.sin(walkPhase * Math.PI * 2 + Math.PI) * 26;
-
-    jointState.left_hip_pitch = Number((leftSwing * 0.8 + torsoPitch * 0.4).toFixed(2));
-    jointState.right_hip_pitch = Number((rightSwing * 0.8 + torsoPitch * 0.4).toFixed(2));
-    jointState.left_knee_pitch = Number((Math.abs(leftSwing) * 0.9 + 8).toFixed(2));
-    jointState.right_knee_pitch = Number((Math.abs(rightSwing) * 0.9 + 8).toFixed(2));
-    jointState.left_ankle_pitch = Number((-Math.abs(leftSwing) * 0.4).toFixed(2));
-    jointState.right_ankle_pitch = Number((-Math.abs(rightSwing) * 0.4).toFixed(2));
-    jointState.left_shoulder_pitch = Number((Math.sin(walkPhase * Math.PI) * 18 + torsoPitch * 0.3).toFixed(2));
-    jointState.right_shoulder_pitch = Number((Math.sin(walkPhase * Math.PI + Math.PI) * 18 + torsoPitch * 0.3).toFixed(2));
-    jointState.left_shoulder_yaw = Number((Math.sin(walkPhase * Math.PI / 2) * 12 + torsoRoll * 0.6).toFixed(2));
-    jointState.right_shoulder_yaw = Number((Math.sin(walkPhase * Math.PI / 2 + Math.PI) * 12 + torsoRoll * 0.6).toFixed(2));
-    jointState.waist_yaw = Number((heading * 0.28).toFixed(2));
-    jointState.waist_pitch = Number((torsoPitch * 0.6).toFixed(2));
-    jointState.waist_roll = Number((torsoRoll * 0.8).toFixed(2));
-
-    frames.push({
-      x: Number(x.toFixed(2)),
-      y: Number(y.toFixed(2)),
-      heading: Number(normalizeAngle(heading).toFixed(2)),
-      torsoPitch: Number(torsoPitch.toFixed(2)),
-      torsoRoll: Number(torsoRoll.toFixed(2)),
-      status: goalReached ? 'Goal reached' : blocked ? 'Blocked' : 'Preview',
-      path: [...path],
-      actions: actions.length ? [...actions] : [{ label: 'Idle', summary: 'Ready for a motion block.' }],
-      collisions: collisionCount,
-      blocked,
-      goalReached,
-      goal: finalGoal,
-      timeline: [...timeline],
-      joints: { ...jointState },
-      mode,
+  const executeNodes = (nodes) => {
+    nodes.forEach((node) => {
+      if (node.type === 'command') {
+        const openingParenthesis = node.code.indexOf('(');
+        executeCommand([node.code, node.method, node.code.slice(openingParenthesis + 1, -1)]);
+        return;
+      }
+      if (node.type === 'repeat') {
+        for (let iteration = 0; iteration < node.times; iteration += 1) executeNodes(node.body);
+        return;
+      }
+      const sector = node.sensor === 'rear_distance_m' ? 'rear' : 'forward';
+      const distance = closestObstacleDistance(sector);
+      const operators = {
+        '<': (left, right) => left < right,
+        '<=': (left, right) => left <= right,
+        '>': (left, right) => left > right,
+        '>=': (left, right) => left >= right,
+        '==': (left, right) => left === right,
+        '!=': (left, right) => left !== right,
+      };
+      const selectedThen = operators[node.operator](distance, node.threshold);
+      const selectedBranch = selectedThen ? 'then' : 'else';
+      const side = sector === 'rear' ? 'rear' : 'forward';
+      const summary = `Nearest ${side} obstacle: ${distance.toFixed(2)} m ${node.operator} ${node.threshold} m → ${selectedBranch}`;
+      actions.push({ label: 'Distance condition', summary });
+      timeline.push({ label: 'Distance condition', summary });
+      addFrame();
+      executeNodes(selectedThen ? node.then : node.else);
     });
   };
 
-  addFrame(true);
-
-  commandMatches.forEach((match) => {
-    const rawCommand = match[0];
-    if (rawCommand.startsWith('sport_client.Move')) {
-      const rawArgs = (match[1] || '').split(',').map((part) => part.trim());
-      const vx = Number(rawArgs[0] ?? 0);
-      const vz = Number(rawArgs[2] ?? 0);
-      const distance = Math.hypot(vx, vz) * 2;
-      const radians = (heading * Math.PI) / 180;
-      const nextX = x + Math.cos(radians) * (vx * 12);
-      const nextY = y + Math.sin(radians) * (vx * 12);
-
-      if (mode === 'advanced-physics' && isBlockedByObstacle(nextX, nextY, obstacles)) {
-        collisionCount += 1;
-        actions.push({ label: 'Obstacle detected', summary: `Blocked before reaching ${nextX.toFixed(1)}, ${nextY.toFixed(1)}` });
-        timeline.push({ label: 'Block hit', summary: 'Robot avoided a barrier' });
-        x = Number(nextX.toFixed(2));
-        y = Number(nextY.toFixed(2));
-        path.push({ x, y });
-        addFrame();
-        return;
-      }
-
-      if (Math.abs(vx) > 0.001) {
-        x = Number(nextX.toFixed(2));
-        y = Number(nextY.toFixed(2));
-        torsoPitch = Math.min(20, Math.max(-20, vx * 28));
-        actions.push({ label: vx > 0 ? 'Walk forward' : 'Walk backward', summary: `${Math.abs(vx).toFixed(2)} speed` });
-        timeline.push({ label: vx > 0 ? 'Walk forward' : 'Walk backward', summary: `${Math.abs(vx).toFixed(2)} speed` });
-      }
-
-      if (Math.abs(vz) > 0.001) {
-        const turnDegrees = distance * 0.7;
-        heading += turnDegrees;
-        torsoRoll = Math.min(18, Math.max(-18, vz * 18));
-        actions.push({ label: vz > 0 ? 'Turn left' : 'Turn right', summary: `${Math.abs(vz).toFixed(2)} turn` });
-        timeline.push({ label: vz > 0 ? 'Turn left' : 'Turn right', summary: `${Math.abs(turnDegrees).toFixed(0)}°` });
-      }
-
-      path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
-      addFrame();
-      return;
-    }
-
-    if (rawCommand === 'sport_client.StopMove()') {
-      actions.push({ label: 'Stop', summary: 'Robot stops movement.' });
-      timeline.push({ label: 'Stop', summary: 'Movement stopped' });
-      path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
-      addFrame();
-      return;
-    }
-
-    if (rawCommand === 'sport_client.Squat2StandUp()') {
-      torsoPitch = 0;
-      torsoRoll = 0;
-      actions.push({ label: 'Stand up', summary: 'Return to neutral standing stance.' });
-      timeline.push({ label: 'Stand up', summary: 'Ready again' });
-      path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
-      addFrame();
-      return;
-    }
-
-    const methodName = match[1];
-    const argsRaw = match[2] || '';
-    const firstNumber = Number((argsRaw.match(/-?\d*\.?\d+/) || ['0'])[0]);
-
-    if (methodName === 'walkForward' || methodName === 'walkForwardSteps') {
-      const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount;
-      const nextX = x + Math.cos((heading * Math.PI) / 180) * stride;
-      const nextY = y + Math.sin((heading * Math.PI) / 180) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Forward', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Forward', summary: `${stepCount.toFixed(1)} steps` });
-    }
-
-    if (methodName === 'walkBackward' || methodName === 'walkBackwardSteps') {
-      const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.4 * stepCount;
-      const nextX = x - Math.cos((heading * Math.PI) / 180) * stride;
-      const nextY = y - Math.sin((heading * Math.PI) / 180) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Back', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Back', summary: `${stepCount.toFixed(1)} steps` });
-    }
-
-    if (methodName === 'walkSidewaysLeft' || methodName === 'walkSidewaysLeftSteps') {
-      const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.3 * stepCount;
-      const nextX = x + Math.cos((heading * Math.PI / 180 + Math.PI / 2)) * stride;
-      const nextY = y + Math.sin((heading * Math.PI / 180 + Math.PI / 2)) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Sideways Left', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Sideways Left', summary: `${stepCount.toFixed(1)} steps` });
-    }
-
-    if (methodName === 'walkSidewaysRight' || methodName === 'walkSidewaysRightSteps') {
-      const stepCount = Math.max(1, firstNumber || 1);
-      const stride = 0.3 * stepCount;
-      const nextX = x + Math.cos((heading * Math.PI / 180 - Math.PI / 2)) * stride;
-      const nextY = y + Math.sin((heading * Math.PI / 180 - Math.PI / 2)) * stride;
-      x = Number(nextX.toFixed(2));
-      y = Number(nextY.toFixed(2));
-      actions.push({ label: 'Walk Sideways Right', summary: `${stepCount.toFixed(1)} steps` });
-      timeline.push({ label: 'Walk Sideways Right', summary: `${stepCount.toFixed(1)} steps` });
-    }
-
-    if (methodName === 'turnLeft') {
-      heading += firstNumber || 90;
-      actions.push({ label: 'Turn Left', summary: `${firstNumber || 90}°` });
-      timeline.push({ label: 'Turn Left', summary: `${firstNumber || 90}°` });
-    }
-
-    if (methodName === 'turnRight') {
-      heading -= firstNumber || 90;
-      actions.push({ label: 'Turn Right', summary: `${firstNumber || 90}°` });
-      timeline.push({ label: 'Turn Right', summary: `${firstNumber || 90}°` });
-    }
-
-    if (methodName === 'wait' || methodName === 'waitSeconds') {
-      actions.push({ label: 'Wait', summary: `${firstNumber || 0.5}s` });
-      timeline.push({ label: 'Wait', summary: `${firstNumber || 0.5}s` });
-    }
-
-    if (methodName === 'stand') {
-      torsoPitch = 0;
-      torsoRoll = 0;
-      actions.push({ label: 'Stand', summary: 'Robot stands upright.' });
-      timeline.push({ label: 'Stand', summary: 'Ready again' });
-    }
-
-    if (methodName === 'sit') {
-      torsoPitch = 12;
-      actions.push({ label: 'Sit', summary: 'Robot lowers into a seated pose.' });
-      timeline.push({ label: 'Sit', summary: 'Seated pose' });
-    }
-
-    if (methodName === 'stop') {
-      actions.push({ label: 'Stop', summary: 'Robot stops movement.' });
-      timeline.push({ label: 'Stop', summary: 'Movement stopped' });
-    }
-
-    if (methodName === 'raiseBothArms' || methodName === 'lowerBothArms') {
-      actions.push({ label: methodName === 'raiseBothArms' ? 'Raise Both Arms' : 'Lower Both Arms', summary: 'Arm pose adjusted.' });
-      timeline.push({ label: methodName === 'raiseBothArms' ? 'Raise Both Arms' : 'Lower Both Arms', summary: 'Arm pose adjusted.' });
-    }
-
-    path.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
-    addFrame();
-  });
+  if (programNodes) executeNodes(programNodes);
+  else commandMatches.forEach(executeCommand);
 
   if (!frames.length) {
     addFrame();

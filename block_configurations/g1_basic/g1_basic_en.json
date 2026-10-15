@@ -154,7 +154,6 @@
       { "type": "g1_loco_start", "message0": "Start", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Start()\n" },
       { "type": "g1_loco_squat2stand", "message0": "Squat2StandUp", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Squat2StandUp()\n" },
       { "type": "g1_loco_lie2stand", "message0": "Lie2StandUp", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Lie2StandUp()\n" },
-      { "type": "g1_loco_sit", "message0": "Sit", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.Sit()\n" },
       { "type": "g1_loco_zero_torque", "message0": "ZeroTorque", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.ZeroTorque()\n" },
       { "type": "g1_loco_high_stand", "message0": "HighStand", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.HighStand()\n" },
       { "type": "g1_loco_low_stand", "message0": "LowStand", "args0": [], "previousStatement": null, "nextStatement": null, "colour": 160, "codeTemplate": "sport_client.LowStand()\n" },
