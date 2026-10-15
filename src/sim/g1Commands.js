@@ -59,6 +59,7 @@ const SDK_COMMAND_METHODS = {
   getfsm: 'LocoClient.GetFsmId',
   getactions: 'G1ArmActionClient.GetActionList',
   arm_action: 'G1ArmActionClient.ExecuteAction',
+  hold_arm: 'G1ArmActionClient.ExecuteAction + timed hold',
   say: 'AudioClient.TtsMaker',
   getvolume: 'AudioClient.GetVolume',
   setvolume: 'AudioClient.SetVolume',
@@ -132,6 +133,9 @@ const ARM_PRESETS = [
   ['High Wave (26)', 'high wave'],
   ['Shake Hand (27)', 'shake hand'],
 ];
+const ARM_HOLD_PRESETS = ARM_PRESETS.filter(([, preset]) => (
+  !['release arm', 'clap', 'face wave', 'high wave', 'shake hand'].includes(preset)
+));
 
 const commandGroups = [
   [
@@ -162,6 +166,13 @@ const commandGroups = [
       'Gestures',
       'Run the selected arm preset. Stop cannot cancel an arm preset; keep the area clear.',
       [choiceArgument('ACTION', 'arm preset', ARM_PRESETS, 'hands up')],
+    ),
+    command(
+      'hold_arm',
+      'Hold arm pose %1 for %2 seconds',
+      'Gestures',
+      'Run a static arm preset and keep the program on that pose for the selected time. The SDK does not confirm pose completion or actively maintain joint targets.',
+      [choiceArgument('ACTION', 'static arm pose', ARM_HOLD_PRESETS, 'hands up'), seconds(3)],
     ),
     command(
       'simulate_arm_action',
@@ -393,28 +404,7 @@ export function parseG1Program(code = '') {
   if (endIndex < lines.length && lines.slice(endIndex).some(({ text }) => text && !text.startsWith('#'))) {
     throw new Error(`Invalid indentation on line ${lines[endIndex].lineNumber}.`);
   }
-  const addArmReleases = (programNodes) => {
-    const normalizedNodes = programNodes.map((node) => {
-      if (node.type === 'repeat') return { ...node, body: addArmReleases(node.body) };
-      if (node.type === 'condition') {
-        return { ...node, then: addArmReleases(node.then), else: addArmReleases(node.else) };
-      }
-      return node;
-    });
-    return normalizedNodes.flatMap((node, index) => {
-      if (node.type !== 'command' || node.method !== 'arm_action' || node.values[0] === 'release arm') {
-        return [node];
-      }
-      const nextNode = normalizedNodes[index + 1];
-      const releaseFollows = nextNode?.type === 'command'
-        && nextNode.method === 'arm_action'
-        && nextNode.values[0] === 'release arm';
-      return releaseFollows
-        ? [node]
-        : [node, { type: 'command', ...normalizeCommand('arm_action', '"release arm"') }];
-    });
-  };
-  const normalized = addArmReleases(nodes);
+  const normalized = nodes;
   const commandCount = (programNodes) => programNodes.reduce((total, node) => {
     if (node.type === 'command') return total + 1;
     if (node.type === 'repeat') return total + node.times * commandCount(node.body);

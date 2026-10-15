@@ -701,8 +701,9 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       Object.keys(poseTargets).forEach((joint) => { poseTargets[joint] = 0; });
     }
 
-    if (methodName === 'simulate_arm_action' || methodName === 'arm_action') {
-      const action = argsRaw.replace(/^["']|["']$/g, '').toLowerCase();
+    if (methodName === 'simulate_arm_action' || methodName === 'arm_action' || methodName === 'hold_arm') {
+      const actionArgument = methodName === 'hold_arm' ? argsRaw.split(',')[0].trim() : argsRaw;
+      const action = actionArgument.replace(/^["']|["']$/g, '').toLowerCase();
       const armTargets = {
         'release arm': {},
         'two-hand kiss': { left_shoulder_pitch: -30, left_shoulder_roll: -12, left_elbow: -75, right_shoulder_pitch: -30, right_shoulder_roll: 12, right_elbow: -75 },
@@ -735,6 +736,16 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
           poseTargets[joint] = starts[joint] + (ends[joint] - starts[joint]) * progress;
         });
       }, `Arm preset preview: ${action}`, 'Approximate simulator pose; not the real SDK trajectory.');
+      if (methodName === 'hold_arm') {
+        const holdSeconds = Number(argsRaw.split(',')[1]);
+        animateAction(
+          Math.max(1, Math.ceil(holdSeconds * 30)),
+          () => {},
+          'Hold arm pose',
+          `${action} • timed preview only; robot SDK does not actively hold joint targets.`,
+          holdSeconds,
+        );
+      }
       return;
     }
 

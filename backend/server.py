@@ -31,6 +31,7 @@ try:
         navigation_complete_scan,
         navigation_map_snapshot,
         navigation_operation_status,
+        navigation_plan_route,
         navigation_scan_pointcloud,
         navigation_scan_map_snapshot,
         navigation_scan_status,
@@ -48,6 +49,7 @@ except ImportError:
         navigation_complete_scan,
         navigation_map_snapshot,
         navigation_operation_status,
+        navigation_plan_route,
         navigation_scan_pointcloud,
         navigation_scan_map_snapshot,
         navigation_scan_status,
@@ -114,6 +116,10 @@ class NavigationStartRequest(BaseModel):
     version: str
     frame_id: str
     waypoints: List[dict]
+
+
+class LidarScanStartRequest(BaseModel):
+    confirm_rotation: bool
 
 
 class SharedLidarSettingsRequest(BaseModel):
@@ -243,6 +249,9 @@ def save_lidar_scan(
     username: str,
     map_snapshot: Optional[dict] = None,
     pointcloud: Optional[dict] = None,
+    rotation_status: Optional[str] = None,
+    rotation_radians: Optional[float] = None,
+    error: Optional[str] = None,
 ) -> None:
     map_json = json.dumps(map_snapshot, separators=(",", ":")) if map_snapshot else None
     points_blob = (
@@ -252,16 +261,23 @@ def save_lidar_scan(
     conn = get_db_connection()
     conn.execute(
         """
-        INSERT INTO lidar_scans (job_id, status, username, map_snapshot, pointcloud, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO lidar_scans (
+            job_id, status, username, map_snapshot, pointcloud,
+            rotation_status, rotation_radians, error, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(job_id) DO UPDATE SET
             status = excluded.status,
             map_snapshot = COALESCE(excluded.map_snapshot, lidar_scans.map_snapshot),
             pointcloud = COALESCE(excluded.pointcloud, lidar_scans.pointcloud),
+            rotation_status = COALESCE(excluded.rotation_status, lidar_scans.rotation_status),
+            rotation_radians = COALESCE(excluded.rotation_radians, lidar_scans.rotation_radians),
+            error = COALESCE(excluded.error, lidar_scans.error),
             updated_at = excluded.updated_at
         """,
         (
             job_id, status, username, map_json, points_blob,
+            rotation_status, rotation_radians, error,
             datetime.now(timezone.utc).isoformat(),
         ),
     )
@@ -284,7 +300,8 @@ def save_lidar_scan(
 def get_lidar_scan(job_id: str):
     conn = get_db_connection()
     row = conn.execute(
-        "SELECT job_id, status, username, map_snapshot, pointcloud, updated_at FROM lidar_scans WHERE job_id = ?",
+        "SELECT job_id, status, username, map_snapshot, pointcloud, updated_at, rotation_status, rotation_radians, error "
+        "FROM lidar_scans WHERE job_id = ?",
         (job_id,),
     ).fetchone()
     conn.close()
@@ -300,6 +317,9 @@ def get_lidar_scan(job_id: str):
         "map_snapshot": json.loads(row["map_snapshot"]) if row["map_snapshot"] else None,
         "pointcloud": pointcloud,
         "updated_at": row["updated_at"],
+        "rotation_status": row["rotation_status"],
+        "rotation_radians": row["rotation_radians"] or 0.0,
+        "error": row["error"],
     }
 
 
@@ -458,10 +478,23 @@ def init_db():
             username TEXT NOT NULL,
             map_snapshot TEXT,
             pointcloud BLOB,
+            rotation_status TEXT,
+            rotation_radians REAL,
+            error TEXT,
             updated_at TEXT NOT NULL
         )
         """
     )
+    lidar_scan_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(lidar_scans)").fetchall()
+    }
+    for column, sql_type in (
+        ("rotation_status", "TEXT"),
+        ("rotation_radians", "REAL"),
+        ("error", "TEXT"),
+    ):
+        if column not in lidar_scan_columns:
+            conn.execute(f"ALTER TABLE lidar_scans ADD COLUMN {column} {sql_type}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS shared_lidar_map (
@@ -1116,9 +1149,17 @@ def get_navigation_map(user: dict = Depends(auth_required)):
 
 
 @app.post("/api/lidar/scan")
-def start_lidar_scan(user: dict = Depends(auth_required)):
+def start_lidar_scan(
+    request: LidarScanStartRequest,
+    user: dict = Depends(auth_required),
+):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
+    if request.confirm_rotation is not True:
+        raise HTTPException(
+            status_code=400,
+            detail="Teacher confirmation is required before the robot begins an in-place 360-degree scan.",
+        )
     if not _MOTION_START_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
     try:
@@ -1132,7 +1173,14 @@ def start_lidar_scan(user: dict = Depends(auth_required)):
             scan = navigation_start_scan()
         except NavigationBridgeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
-        save_lidar_scan(scan["job_id"], scan["status"], user["username"])
+        save_lidar_scan(
+            scan["job_id"],
+            scan["status"],
+            user["username"],
+            rotation_status=scan["rotation_status"],
+            rotation_radians=scan["rotation_radians"],
+            error=scan.get("error"),
+        )
         return scan
     finally:
         _MOTION_START_LOCK.release()
@@ -1151,7 +1199,14 @@ def get_lidar_scan_status(job_id: str, user: dict = Depends(auth_required)):
         except NavigationBridgeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         if scan["status"] in {"failed", "canceled"}:
-            save_lidar_scan(job_id, scan["status"], stored["username"])
+            save_lidar_scan(
+                job_id,
+                scan["status"],
+                stored["username"],
+                rotation_status=scan["rotation_status"],
+                rotation_radians=scan["rotation_radians"],
+                error=scan.get("error"),
+            )
         return scan
     return {
         "job_id": stored["job_id"],
@@ -1159,7 +1214,10 @@ def get_lidar_scan_status(job_id: str, user: dict = Depends(auth_required)):
         "point_count": stored["pointcloud"]["point_count"] if stored["pointcloud"] else 0,
         "map_version": stored["map_snapshot"]["map"]["version"] if stored["map_snapshot"] else None,
         "updated_at": stored["updated_at"],
-        "error": None,
+        "rotation_status": stored["rotation_status"],
+        "rotation_radians": stored["rotation_radians"],
+        "error": stored["error"],
+        "preview_points": [],
     }
 
 
@@ -1173,9 +1231,45 @@ def complete_lidar_scan(job_id: str, user: dict = Depends(auth_required)):
     if stored["status"] not in {"scanning", "completed"}:
         raise HTTPException(status_code=409, detail="Only an active LiDAR scan can be completed.")
     try:
+        current_scan = navigation_scan_status(job_id)
+        if current_scan["status"] in {"failed", "canceled"}:
+            save_lidar_scan(
+                job_id,
+                current_scan["status"],
+                stored["username"],
+                rotation_status=current_scan["rotation_status"],
+                rotation_radians=current_scan["rotation_radians"],
+                error=current_scan.get("error"),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=current_scan.get("error") or "The 360-degree scan did not complete successfully.",
+            )
+        if current_scan.get("rotation_status") == "uncertain":
+            raise HTTPException(
+                status_code=503,
+                detail=current_scan.get("error") or "Nav2 could not confirm the scan rotation state.",
+            )
+        if current_scan.get("rotation_status") == "cancel_requested":
+            raise HTTPException(
+                status_code=409,
+                detail=current_scan.get("error") or "Nav2 has not confirmed that scan rotation stopped.",
+            )
+        if current_scan.get("rotation_status") != "completed":
+            raise HTTPException(
+                status_code=409,
+                detail="Wait for the supervised 360-degree rotation to complete before validating the map.",
+            )
         scan = navigation_complete_scan(job_id)
         if scan["status"] != "completed":
-            save_lidar_scan(job_id, "failed", stored["username"])
+            save_lidar_scan(
+                job_id,
+                "failed",
+                stored["username"],
+                rotation_status=scan.get("rotation_status"),
+                rotation_radians=scan.get("rotation_radians"),
+                error=scan.get("error"),
+            )
             raise HTTPException(status_code=409, detail=scan.get("error") or "LiDAR scan did not complete.")
         map_snapshot = navigation_scan_map_snapshot(job_id)
         if not map_snapshot["ready"]:
@@ -1193,16 +1287,22 @@ def complete_lidar_scan(job_id: str, user: dict = Depends(auth_required)):
             raise NavigationBridgeError("3D point cloud frame does not match the SLAM occupancy map.")
         if pointcloud["point_count"] < 1_000:
             raise NavigationBridgeError("The completed room scan contains too few unique 3D points.")
+    except HTTPException:
+        raise
     except NavigationBridgeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     save_lidar_scan(
         job_id, "completed", stored["username"],
         map_snapshot=map_snapshot, pointcloud=pointcloud,
+        rotation_status=current_scan.get("rotation_status"),
+        rotation_radians=current_scan.get("rotation_radians"),
     )
     return {
         "job_id": job_id,
         "status": "completed",
         "point_count": pointcloud["point_count"],
+        "rotation_status": current_scan["rotation_status"],
+        "rotation_radians": current_scan["rotation_radians"],
         "map": map_snapshot["map"],
     }
 
@@ -1218,7 +1318,14 @@ def cancel_lidar_scan(job_id: str, user: dict = Depends(auth_required)):
         scan = navigation_cancel_scan(job_id)
     except NavigationBridgeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    save_lidar_scan(job_id, scan["status"], stored["username"])
+    save_lidar_scan(
+        job_id,
+        scan["status"],
+        stored["username"],
+        rotation_status=scan["rotation_status"],
+        rotation_radians=scan["rotation_radians"],
+        error=scan.get("error"),
+    )
     return scan
 
 
@@ -1313,6 +1420,8 @@ async def lidar_live_updates(websocket: WebSocket):
                     "status": bridge_status["status"],
                     "map": bridge_status.get("map"),
                     "localization": bridge_status.get("localization"),
+                    "pointcloud_ready": bridge_status.get("pointcloudReady"),
+                    "pointcloud_age_ms": bridge_status.get("pointcloudAgeMs"),
                     "error": bridge_status.get("error"),
                 },
                 "scan": scan_status,
@@ -1377,6 +1486,27 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
         return {**operation, "status": operation_status}
     finally:
         _MOTION_START_LOCK.release()
+
+
+@app.post("/api/navigation/plan")
+def preview_navigation_route(request: NavigationStartRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    ensure_sdk_motion_available()
+    if robot_status()["running"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the active SDK robot program before requesting a route preview.",
+        )
+    try:
+        return navigation_plan_route(
+            request.map_id,
+            request.version,
+            request.frame_id,
+            request.waypoints,
+        )
+    except NavigationBridgeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @app.get("/api/navigation/operation/{operation_id}")

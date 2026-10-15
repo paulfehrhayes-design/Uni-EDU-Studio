@@ -32,7 +32,9 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
-  await page.locator('textarea').first().fill('robot.walk(2)\nrobot.stand()\nrobot.arm_action("hands up")');
+  await page.locator('textarea').first().fill(
+    'robot.walk(2)\nrobot.stand()\nrobot.arm_action("hands up")\nrobot.hold_arm("hands up", 3)',
+  );
   await page.getByRole('button', { name: 'Blocks', exact: true }).click();
 
   await expect(page.locator('.blocklySvg')).toBeVisible();
@@ -58,8 +60,13 @@ test('student IDE multiline commands render as Blocks and generate code', async 
     if (!blocks.find((block) => block.type === 'g1_command_arm_action_hands_up')) {
       throw new Error('Arm preset did not map to its dedicated Blocks command.');
     }
+    if (!blocks.find((block) => block.type === 'g1_command_hold_arm')) {
+      throw new Error('Timed arm pose did not map to its Blockly command.');
+    }
   });
   await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).toContainText('robot.arm_action("hands up")');
+  await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).toContainText('robot.hold_arm("hands up", 3)');
+  await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).not.toContainText('robot.arm_action("release arm")');
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
   await expect(page.locator('code').filter({ hasText: 'robot.arm_action("hands up")' })).toBeVisible();
   await expect(page.locator('code').filter({ hasText: 'robot.arm_action("shake hand")' })).toBeVisible();
@@ -148,6 +155,7 @@ test('teacher can check ROS navigation readiness without starting motion', async
           pose: { x: 1.2, y: -0.4, yaw_rad: 0.3 },
           age_ms: 80,
         },
+        pointcloudAgeMs: 50,
         map: { map_id: 'classroom', version: 'v4', frame_id: 'map' },
       }),
     });
@@ -157,7 +165,7 @@ test('teacher can check ROS navigation readiness without starting motion', async
   await page.getByRole('button', { name: 'Path Planner' }).click();
   await page.getByRole('button', { name: 'Check status' }).click();
   await expect(page.getByRole('status').filter({
-    hasText: 'Ready • map classroom • version v4 • map • pose 1.20, -0.40 m (80 ms old)',
+    hasText: 'Ready • map classroom • version v4 • map • pose 1.20, -0.40 m (80 ms old) • MID-360 50 ms old',
   })).toBeVisible();
 });
 
@@ -168,6 +176,9 @@ test('teacher can load and hide the ROS occupancy map', async ({ page }) => {
       user: { role: 'teacher', username: 'teacher-map-preview-test' },
     }));
   });
+  let mapVersion = 'v2';
+  let occupancy = [0, 100, -1, 75];
+  let liveSocket;
   await page.route('**/api/navigation/map', async (route) => {
     await route.fulfill({
       status: 200,
@@ -176,16 +187,19 @@ test('teacher can load and hide the ROS occupancy map', async ({ page }) => {
         ready: true,
         map: {
           map_id: 'classroom',
-          version: 'v2',
+          version: mapVersion,
           frame_id: 'map',
           resolution_m: 1,
           width: 2,
           height: 2,
           origin: { x: -1, y: -1, yaw_rad: 0 },
         },
-        data: [0, 100, -1, 75],
+        data: occupancy,
       }),
     });
+  });
+  await page.routeWebSocket('**/api/lidar/live', (socket) => {
+    liveSocket = socket;
   });
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
@@ -195,6 +209,45 @@ test('teacher can load and hide the ROS occupancy map', async ({ page }) => {
   const overlay = page.getByTestId('ros-occupancy-overlay');
   await expect(overlay).toBeVisible();
   await expect(overlay.locator('path')).toHaveAttribute('d', /M1 0h1v1h-1zM1 1h1v1h-1z/);
+  await page.getByRole('button', { name: 'Add map goals' }).click();
+  const mapClick = await page.evaluate(() => {
+    const layer = document.querySelector('[data-testid="navigation-map-coordinate-layer"]');
+    const svg = layer.ownerSVGElement;
+    const target = svg.createSVGPoint();
+    target.x = 0.5;
+    target.y = 0.5;
+    const screenPoint = target.matrixTransform(layer.getScreenCTM());
+    const bounds = svg.getBoundingClientRect();
+    return { x: screenPoint.x - bounds.left, y: screenPoint.y - bounds.top };
+  });
+  await page.getByRole('img', { name: 'ROS occupancy map and navigation destinations' }).click({
+    position: mapClick,
+  });
+  await expect(page.getByText('Goal 1: -0.50, -0.50 m (map)')).toBeVisible();
+  await expect.poll(() => Boolean(liveSocket)).toBeTruthy();
+  mapVersion = 'v3';
+  occupancy = [0, 0, -1, 75];
+  liveSocket.send(JSON.stringify({
+    type: 'live_update',
+    navigation: { ready: true, map: { map_id: 'classroom', version: mapVersion } },
+    scan: null,
+    shared_overlay_enabled: false,
+    shared_map_version: null,
+  }));
+  await expect(overlay.locator('path')).toHaveAttribute('d', 'M1 1h1v1h-1z');
+  await expect(page.getByText(/Live map updated • 2 × 2 cells • version v3/)).toBeVisible();
+  await expect(page.getByText('Goal 1: -0.50, -0.50 m (map)')).toBeVisible();
+  mapVersion = 'v4';
+  occupancy = [100, 0, -1, 75];
+  liveSocket.send(JSON.stringify({
+    type: 'live_update',
+    navigation: { ready: true, map: { map_id: 'classroom', version: mapVersion } },
+    scan: null,
+    shared_overlay_enabled: false,
+    shared_map_version: null,
+  }));
+  await expect(page.getByText('Goal 1: -0.50, -0.50 m (map)')).toHaveCount(0);
+  await expect(page.getByText(/1 destination\(s\) removed because they are no longer in known free space/)).toBeVisible();
   await page.getByRole('button', { name: 'Hide overlay' }).click();
   await expect(overlay).toHaveCount(0);
 });
@@ -245,11 +298,18 @@ test('students receive the centrally published metric map and 3D cloud overlay',
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'Path Planner' }).click();
   await expect(page.getByText('Published room map • 3D points projected to grid')).toBeVisible();
+  await expect(page.getByRole('img', {
+    name: 'Published shared occupancy map with 3D LiDAR points colored by height',
+  })).toHaveAttribute('viewBox', '0 0 1 1');
   await page.getByRole('button', { name: 'Library' }).click();
-  await expect(page.getByTestId('shared-lidar-grid-overlay')).toBeVisible();
-  await expect(page.getByTestId('shared-lidar-grid-overlay')).toHaveAttribute('d', /M/);
-  await expect(page.getByTestId('shared-lidar-pointcloud-overlay').locator('circle')).toHaveCount(1);
-  await page.getByRole('button', { name: 'Settings', exact: true }).last().click();
+  const gridOverlay = page.getByTestId('shared-lidar-grid-overlay');
+  await expect(gridOverlay).toBeVisible();
+  await expect(gridOverlay).toHaveAttribute('d', 'M104.5 115.5L110 115.5L110 110L104.5 110z');
+  const pointOverlay = page.getByTestId('shared-lidar-pointcloud-overlay').locator('circle');
+  await expect(pointOverlay).toHaveCount(1);
+  await expect(pointOverlay).toHaveAttribute('cx', '107.25');
+  await expect(pointOverlay).toHaveAttribute('cy', '112.75');
+  await page.getByRole('button', { name: 'Settings', exact: true }).first().click();
   await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toBeChecked();
   await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toBeDisabled();
 });
@@ -263,10 +323,18 @@ test('teacher scan workflow requires explicit capture completion and map publica
   });
   const jobId = '12345678-1234-1234-1234-123456789abc';
   await page.route('**/api/lidar/scan', async (route) => {
+    expect(route.request().postDataJSON()).toEqual({ confirm_rotation: true });
     await route.fulfill({
       status: 202,
       contentType: 'application/json',
-      body: JSON.stringify({ job_id: jobId, status: 'scanning' }),
+      body: JSON.stringify({
+        job_id: jobId,
+        status: 'scanning',
+        rotation_status: 'submitted',
+        rotation_radians: 0,
+        point_count: 0,
+        preview_points: [],
+      }),
     });
   });
   await page.route(`**/api/lidar/scan/${jobId}`, async (route) => {
@@ -276,6 +344,8 @@ test('teacher scan workflow requires explicit capture completion and map publica
       body: JSON.stringify({
         job_id: jobId,
         status: 'scanning',
+        rotation_status: 'completed',
+        rotation_radians: 6.283185307179586,
         point_count: 1200,
         preview_points: [{ x: 0.2, y: 0.3, z: 1.1 }],
       }),
@@ -289,6 +359,8 @@ test('teacher scan workflow requires explicit capture completion and map publica
         job_id: jobId,
         status: 'completed',
         point_count: 1200,
+        rotation_status: 'completed',
+        rotation_radians: 6.283185307179586,
         map: {
           map_id: 'classroom',
           version: 'scan-v1',
@@ -319,18 +391,20 @@ test('teacher scan workflow requires explicit capture completion and map publica
     });
   });
 
+  page.on('dialog', (dialog) => dialog.accept());
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'Path Planner' }).click();
-  await page.getByRole('button', { name: 'Start room scan' }).click();
-  await expect(page.getByText(/Capturing 3D room scan • 1200 unique points/)).toBeVisible();
-  await page.getByRole('button', { name: 'Finish and validate scan' }).click();
+  await page.getByRole('button', { name: 'Start supervised 360° scan' }).click();
+  await expect(page.getByRole('button', { name: 'Validate 360° scan' })).toBeEnabled();
+  await expect(page.getByText(/360° rotation confirmed \(6\.28 rad\)/)).toBeVisible();
+  await page.getByRole('button', { name: 'Validate 360° scan' }).click();
   await expect(page.getByRole('button', { name: 'Publish shared map' })).toBeVisible();
   await page.getByRole('button', { name: 'Publish shared map' }).click();
   await expect(page.getByText('Published shared room map • 2 m × 1.5 m')).toBeVisible();
 });
 
-test('teacher can submit map-frame destinations to Nav2 and observe terminal status', async ({ page }) => {
+test('teacher can preview a route without motion before starting Nav2', async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'test-token',
@@ -356,7 +430,24 @@ test('teacher can submit map-frame destinations to Nav2 and observe terminal sta
       }),
     });
   });
+  let navigationStartCalls = 0;
   await page.route('**/api/navigation/start', async (route) => {
+    navigationStartCalls += 1;
+    const request = route.request().postDataJSON();
+    expect(request.map_id).toBe('classroom');
+    expect(request.version).toBe('v2');
+    expect(request.frame_id).toBe('map');
+    expect(request.waypoints).toEqual([{ x: -0.5, y: -0.5 }]);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        operation_id: '12345678-1234-1234-1234-123456789abc',
+        status: 'accepted',
+      }),
+    });
+  });
+  await page.route('**/api/navigation/plan', async (route) => {
     const request = route.request().postDataJSON();
     expect(request.map_id).toBe('classroom');
     expect(request.version).toBe('v2');
@@ -366,8 +457,11 @@ test('teacher can submit map-frame destinations to Nav2 and observe terminal sta
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
-        operation_id: '12345678-1234-1234-1234-123456789abc',
-        status: 'accepted',
+        map_id: 'classroom',
+        version: 'v2',
+        frame_id: 'map',
+        planner_id: 'GridBased',
+        path: [{ x: 0, y: 0 }, { x: 0.5, y: 0.5 }],
       }),
     });
   });
@@ -389,10 +483,27 @@ test('teacher can submit map-frame destinations to Nav2 and observe terminal sta
   await page.getByRole('button', { name: 'Load occupancy map' }).click();
   await expect(page.getByText('Loaded • 2 × 2 cells • map classroom • version v2')).toBeVisible();
   await page.getByRole('button', { name: 'Add map goals' }).click();
-  await page.getByRole('img', { name: 'ROS occupancy map and navigation destinations' }).click({
-    position: { x: 100, y: 100 },
+  const mapClick = await page.evaluate(() => {
+    const layer = document.querySelector('[data-testid="navigation-map-coordinate-layer"]');
+    const svg = layer.ownerSVGElement;
+    const target = svg.createSVGPoint();
+    target.x = 0.5;
+    target.y = 0.5;
+    const screenPoint = target.matrixTransform(layer.getScreenCTM());
+    const bounds = svg.getBoundingClientRect();
+    return { x: screenPoint.x - bounds.left, y: screenPoint.y - bounds.top };
   });
-  await expect(page.getByText(/Goal 1: .*map\)/)).toBeVisible();
+  await page.getByRole('img', { name: 'ROS occupancy map and navigation destinations' }).click({
+    position: mapClick,
+  });
+  await expect(page.getByText('Goal 1: -0.50, -0.50 m (map)')).toBeVisible();
+  const startNavigation = page.getByRole('button', { name: 'Start Nav2' });
+  await expect(startNavigation).toBeDisabled();
+  expect(navigationStartCalls).toBe(0);
+  await page.getByRole('button', { name: 'Preview route • no motion' }).click();
+  await expect(page.getByTestId('navigation-preview-status')).toContainText('no motion sent');
+  await expect(page.getByTestId('navigation-route-preview')).toHaveAttribute('points', '1,1 1.5,1.5');
+  await expect(startNavigation).toBeEnabled();
   await page.getByRole('button', { name: 'Start Nav2' }).click();
   await expect(page.getByTestId('navigation-execution-status')).toContainText('Navigation completed');
 });

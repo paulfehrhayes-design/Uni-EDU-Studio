@@ -15,6 +15,12 @@ import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
 import { G1_EDU_23_ENV, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
 import { getSceneObjectBaseDimensions, getSceneObjectDimensions } from './sim/sceneObjects';
 import G1Simulation3D from './components/G1Simulation3D';
+import {
+  isWorldPointInKnownFreeSpace,
+  mapLocalToWorld,
+  occupancyAtMapLocalPoint,
+  worldToMapLocal,
+} from './navigation/mapCoordinates.js';
 import { compileMotionPrompt } from './sim/textToMotion';
 import { flattenG1Commands, formatG1Program, G1_ARM_PRESET_DESCRIPTIONS, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './sim/g1Commands';
 import { createRobotConnection } from './robot/RobotConnection';
@@ -281,6 +287,24 @@ function SceneObstacleShape({ obstacle, centerX, centerY, size, color, opacity, 
     default:
       return <circle {...common} cx={centerX} cy={centerY} r={size} />;
   }
+}
+
+function hasSameNavigationMapGeometry(previous, next) {
+  if (!previous?.map || !next?.map) return false;
+  const previousMap = previous.map;
+  const nextMap = next.map;
+  return previousMap.map_id === nextMap.map_id
+    && previousMap.frame_id === nextMap.frame_id
+    && previousMap.width === nextMap.width
+    && previousMap.height === nextMap.height
+    && previousMap.resolution_m === nextMap.resolution_m
+    && previousMap.origin.x === nextMap.origin.x
+    && previousMap.origin.y === nextMap.origin.y
+    && previousMap.origin.yaw_rad === nextMap.origin.yaw_rad;
+}
+
+function isNavigationWaypointInFreeSpace(waypoint, snapshot) {
+  return isWorldPointInKnownFreeSpace(waypoint.x, waypoint.y, snapshot);
 }
 
 const SAFE_COMMAND_LIMITS = {
@@ -734,6 +758,11 @@ export default function App() {
   const [isNavigationMapLoading, setIsNavigationMapLoading] = useState(false);
   const [isNavigationMapVisible, setIsNavigationMapVisible] = useState(false);
   const [navigationRouteWaypoints, setNavigationRouteWaypoints] = useState([]);
+  const navigationRouteWaypointsRef = useRef(navigationRouteWaypoints);
+  navigationRouteWaypointsRef.current = navigationRouteWaypoints;
+  const [navigationRoutePreview, setNavigationRoutePreview] = useState(null);
+  const [isNavigationPreviewing, setIsNavigationPreviewing] = useState(false);
+  const [navigationPreviewStatus, setNavigationPreviewStatus] = useState('No route preview');
   const [isNavigationGoalPlacementEnabled, setIsNavigationGoalPlacementEnabled] = useState(false);
   const [navigationOperation, setNavigationOperation] = useState(null);
   const [navigationExecutionStatus, setNavigationExecutionStatus] = useState('No navigation operation');
@@ -750,6 +779,9 @@ export default function App() {
   const sharedMapVersionRef = useRef(null);
   const sharedMapLoadedRef = useRef(false);
   const liveNavigationMapVersionRef = useRef(null);
+  const navigationMapSnapshotRef = useRef(null);
+  const navigationMapRefreshPendingRef = useRef(false);
+  const navigationMapRefreshStartedRef = useRef(0);
   const navigationMapCoordinatesRef = useRef(null);
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [isRobotConnecting, setIsRobotConnecting] = useState(false);
@@ -896,10 +928,16 @@ export default function App() {
       sharedMapVersionRef.current = null;
       sharedMapLoadedRef.current = false;
       liveNavigationMapVersionRef.current = null;
+      navigationMapSnapshotRef.current = null;
+      setNavigationRoutePreview(null);
+      setNavigationPreviewStatus('No route preview');
       return undefined;
     }
 
     let active = true;
+    let socket = null;
+    let reconnectTimer = null;
+    let reconnectDelayMs = 1000;
     Promise.all([
       apiFetch('/api/lidar/settings'),
       apiFetch('/api/lidar/map'),
@@ -913,15 +951,7 @@ export default function App() {
       if (active) setNavigationLiveStatus(`Live map unavailable • ${error.message}`);
     });
 
-    const socketScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(
-      `${socketScheme}//${window.location.host}/api/lidar/live`,
-      [`edu-auth.${session.token}`],
-    );
-    socket.onopen = () => {
-      if (active) setNavigationLiveStatus('Live LiDAR and navigation updates connected');
-    };
-    socket.onmessage = (event) => {
+    const handleLiveMessage = (event) => {
       if (!active) return;
       try {
         const update = JSON.parse(event.data);
@@ -938,7 +968,7 @@ export default function App() {
         setSharedLidarOverlayEnabled(update.shared_overlay_enabled === true);
         setNavigationLiveStatus(
           update.navigation?.ready
-            ? `Live • ${update.navigation.map?.map_id} ${update.navigation.map?.version} • ${update.navigation.localization?.age_ms ?? '—'} ms localization`
+            ? `Live • ${update.navigation.map?.map_id} ${update.navigation.map?.version} • ${update.navigation.localization?.age_ms ?? '—'} ms localization • MID-360 ${update.navigation.pointcloud_age_ms ?? '—'} ms old`
             : `Live • navigation unavailable${update.navigation?.error ? ` • ${update.navigation.error}` : ''}`,
         );
         const sharedVersion = update.shared_map_version || null;
@@ -973,39 +1003,80 @@ export default function App() {
           && liveNavigationMapVersionRef.current
           && liveMapVersion
           && liveMapVersion !== liveNavigationMapVersionRef.current
+          && !navigationMapRefreshPendingRef.current
+          && Date.now() - navigationMapRefreshStartedRef.current >= 1000
         ) {
-          const previousVersion = liveNavigationMapVersionRef.current;
-          liveNavigationMapVersionRef.current = liveMapVersion;
+          navigationMapRefreshPendingRef.current = true;
+          navigationMapRefreshStartedRef.current = Date.now();
           apiFetch('/api/navigation/map')
             .then((result) => {
               if (!active) return;
-              if (result.map.version !== previousVersion) {
+              const previousSnapshot = navigationMapSnapshotRef.current;
+              const previousWaypointCount = navigationRouteWaypointsRef.current.length;
+              const sameGeometry = hasSameNavigationMapGeometry(previousSnapshot, result);
+              if (!sameGeometry) {
+                navigationRouteWaypointsRef.current = [];
                 setNavigationRouteWaypoints([]);
                 setIsNavigationGoalPlacementEnabled(false);
+              } else {
+                const retained = navigationRouteWaypointsRef.current.filter((waypoint) => (
+                  isNavigationWaypointInFreeSpace(waypoint, result)
+                ));
+                navigationRouteWaypointsRef.current = retained;
+                setNavigationRouteWaypoints(retained);
               }
+              navigationMapSnapshotRef.current = result;
               setNavigationMapSnapshot(result);
-              setNavigationMapStatus(
-                `Live map update • ${result.map.width} × ${result.map.height} cells • version ${result.map.version}`,
-              );
+              liveNavigationMapVersionRef.current = result.map.version;
+              setNavigationRoutePreview(null);
+              setNavigationPreviewStatus('Map changed • preview the route again');
+              const removedWaypointCount = previousWaypointCount - navigationRouteWaypointsRef.current.length;
+              setNavigationMapStatus(!sameGeometry
+                ? `Live map geometry changed • destinations cleared • version ${result.map.version}`
+                : removedWaypointCount > 0
+                  ? `Live map updated • ${removedWaypointCount} destination(s) removed because they are no longer in known free space`
+                  : `Live map updated • ${result.map.width} × ${result.map.height} cells • version ${result.map.version}`);
             })
             .catch((error) => {
               if (active) setNavigationMapStatus(`Live map refresh failed • ${error.message}`);
+            })
+            .finally(() => {
+              navigationMapRefreshPendingRef.current = false;
             });
         }
       } catch (error) {
         setNavigationLiveStatus(`Invalid live update • ${error.message}`);
       }
     };
-    socket.onerror = () => {
-      if (active) setNavigationLiveStatus('Live updates unavailable • check the authenticated backend connection');
+
+    const connectLiveSocket = () => {
+      if (!active) return;
+      const socketScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      socket = new WebSocket(
+        `${socketScheme}//${window.location.host}/api/lidar/live`,
+        [`edu-auth.${session.token}`],
+      );
+      socket.onopen = () => {
+        reconnectDelayMs = 1000;
+        if (active) setNavigationLiveStatus('Live LiDAR and navigation updates connected');
+      };
+      socket.onmessage = handleLiveMessage;
+      socket.onerror = () => {
+        if (active) setNavigationLiveStatus('Live updates unavailable • checking the authenticated backend connection');
+      };
+      socket.onclose = () => {
+        if (!active) return;
+        setNavigationLiveStatus('Live updates disconnected • reconnecting');
+        reconnectTimer = window.setTimeout(connectLiveSocket, reconnectDelayMs);
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 15000);
+      };
     };
-    socket.onclose = () => {
-      if (active) setNavigationLiveStatus('Live updates disconnected');
-    };
+    connectLiveSocket();
 
     return () => {
       active = false;
-      socket.close();
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      socket?.close();
     };
   }, [session?.token, session?.user?.role, apiFetch]);
 
@@ -1203,7 +1274,7 @@ export default function App() {
       return;
     }
     setIsNavigationBridgeChecking(true);
-    setNavigationBridgeStatus('Checking bridge, localization, and map metadata…');
+    setNavigationBridgeStatus('Checking bridge, fresh MID-360 data, localization, and map metadata…');
     try {
       const result = await apiFetch('/api/navigation/status');
       if (result.activeOperation) {
@@ -1222,7 +1293,7 @@ export default function App() {
       setNavigationBridgeStatus(
         `Ready • map ${map.map_id} • version ${map.version} • ${map.frame_id} • `
         + `pose ${localization.pose.x.toFixed(2)}, ${localization.pose.y.toFixed(2)} m `
-        + `(${localization.age_ms} ms old)`,
+        + `(${localization.age_ms} ms old) • MID-360 ${result.pointcloudAgeMs} ms old`,
       );
     } catch (error) {
       setNavigationBridgeStatus(`Check failed • ${error.message}`);
@@ -1240,20 +1311,35 @@ export default function App() {
     setNavigationMapStatus('Loading occupancy map…');
     try {
       const result = await apiFetch('/api/navigation/map');
-      setNavigationMapSnapshot(result);
-      liveNavigationMapVersionRef.current = result.map.version;
-      setIsNavigationMapVisible(true);
+      const sameGeometry = hasSameNavigationMapGeometry(navigationMapSnapshotRef.current, result);
       if (
-        navigationMapSnapshot?.map?.map_id !== result.map.map_id
-        || navigationMapSnapshot?.map?.version !== result.map.version
+        navigationMapSnapshotRef.current?.map?.version !== result.map.version
+        || navigationMapSnapshotRef.current?.map?.frame_id !== result.map.frame_id
       ) {
+        setNavigationRoutePreview(null);
+        setNavigationPreviewStatus('Map changed • preview the route again');
+      }
+      if (sameGeometry) {
+        const retained = navigationRouteWaypointsRef.current.filter((waypoint) => (
+          isNavigationWaypointInFreeSpace(waypoint, result)
+        ));
+        navigationRouteWaypointsRef.current = retained;
+        setNavigationRouteWaypoints(retained);
+      } else {
+        navigationRouteWaypointsRef.current = [];
         setNavigationRouteWaypoints([]);
         setIsNavigationGoalPlacementEnabled(false);
       }
+      navigationMapSnapshotRef.current = result;
+      setNavigationMapSnapshot(result);
+      liveNavigationMapVersionRef.current = result.map.version;
+      setIsNavigationMapVisible(true);
       setNavigationMapStatus(
         `Loaded • ${result.map.width} × ${result.map.height} cells • map ${result.map.map_id} • version ${result.map.version}`,
       );
     } catch (error) {
+      navigationMapSnapshotRef.current = null;
+      liveNavigationMapVersionRef.current = null;
       setNavigationMapSnapshot(null);
       setIsNavigationMapVisible(false);
       setNavigationMapStatus(`Unavailable • ${error.message}`);
@@ -1264,13 +1350,20 @@ export default function App() {
 
   const handleStartLidarScan = async () => {
     if (session?.user?.role !== 'teacher') return;
+    const confirmed = window.confirm(
+      'The G1 will rotate in place through 360° while the LiDAR captures the room. Continue only after confirming the robot is stable, the rotation area is clear, a teacher is supervising, and the independent emergency stop is immediately available.',
+    );
+    if (!confirmed) return;
     setIsLidarScanStarting(true);
-    setLidarScanStatus('Starting read-only LiDAR capture…');
+    setLidarScanStatus('Checking localization, LiDAR, map, and Nav2 Spin readiness…');
     try {
-      const scan = await apiFetch('/api/lidar/scan', { method: 'POST' });
+      const scan = await apiFetch('/api/lidar/scan', {
+        method: 'POST',
+        body: JSON.stringify({ confirm_rotation: true }),
+      });
       setLidarScanJob(scan);
       setLiveLidarScanPoints([]);
-      setLidarScanStatus('Capturing 3D LiDAR points in the SLAM map frame • robot movement is not commanded');
+      setLidarScanStatus('G1 is rotating in place • capturing LiDAR in the SLAM map frame');
     } catch (error) {
       setLidarScanStatus(`Scan could not start • ${error.message}`);
     } finally {
@@ -1288,7 +1381,7 @@ export default function App() {
       });
       setLidarScanJob(result);
       setLidarScanStatus(
-        `Scan complete • ${result.point_count} 3D points • ${result.map.width} × ${result.map.height} cells at ${result.map.resolution_m} m/cell`,
+        `360° scan complete • ${result.point_count} 3D points • ${result.map.width} × ${result.map.height} cells at ${result.map.resolution_m} m/cell`,
       );
     } catch (error) {
       setLidarScanStatus(`Scan finalization failed • ${error.message}`);
@@ -1306,7 +1399,9 @@ export default function App() {
       });
       setLidarScanJob(result);
       setLiveLidarScanPoints([]);
-      setLidarScanStatus('Room scan canceled • no map was published');
+      setLidarScanStatus(result.status === 'scanning'
+        ? 'Nav2 rotation cancellation requested • waiting for confirmed stop'
+        : 'Room scan canceled • no map was published');
     } catch (error) {
       setLidarScanStatus(`Scan cancellation failed • ${error.message}`);
     } finally {
@@ -1372,8 +1467,15 @@ export default function App() {
         if (!active) return;
         setLidarScanJob(result);
         setLiveLidarScanPoints(Array.isArray(result.preview_points) ? result.preview_points : []);
+        const rotationStatus = result.rotation_status === 'completed'
+          ? `360° rotation confirmed (${result.rotation_radians.toFixed(2)} rad) • ready to validate`
+          : result.rotation_status === 'cancel_requested' || result.rotation_status === 'uncertain'
+            ? `Rotation stopping • ${result.error || 'waiting for Nav2 terminal confirmation'}`
+            : `G1 rotating in place • ${result.rotation_radians.toFixed(2)} rad captured`;
         setLidarScanStatus(
-          `Capturing 3D room scan • ${result.point_count || 0} unique points • move/sweep only under teacher supervision`,
+          `${result.rotation_status === 'submitted'
+            ? 'Waiting for Nav2 to accept the in-place rotation'
+            : rotationStatus} • ${result.point_count || 0} unique 3D points${result.error ? ` • ${result.error}` : ''}`,
         );
       } catch (error) {
         if (active) setLidarScanStatus(`Scan status unavailable • ${error.message}`);
@@ -1400,16 +1502,62 @@ export default function App() {
     const mapWidth = map.width * map.resolution_m;
     const mapHeight = map.height * map.resolution_m;
     if (localPoint.x < 0 || localPoint.y < 0 || localPoint.x >= mapWidth || localPoint.y >= mapHeight) return;
-    const localY = mapHeight - localPoint.y;
-    const cosine = Math.cos(map.origin.yaw_rad);
-    const sine = Math.sin(map.origin.yaw_rad);
-    const x = map.origin.x + cosine * localPoint.x - sine * localY;
-    const y = map.origin.y + sine * localPoint.x + cosine * localY;
+    const mapLocalY = localPoint.y;
+    const occupancy = occupancyAtMapLocalPoint(
+      localPoint.x, mapLocalY, map, navigationMapSnapshot.data,
+    );
+    if (!Number.isInteger(occupancy) || occupancy < 0 || occupancy >= 65) {
+      setNavigationExecutionStatus('Destination rejected • choose a known free map cell.');
+      return;
+    }
+    const { x, y } = mapLocalToWorld(localPoint.x, mapLocalY, map);
     setNavigationRouteWaypoints((points) => [
       ...points,
       { id: `nav-${Date.now()}-${points.length}`, x, y },
     ]);
+    setNavigationRoutePreview(null);
+    setNavigationPreviewStatus('Destinations changed • preview the route again');
     setNavigationExecutionStatus('Destination added • route will be checked against the current map before start.');
+  };
+
+  const handlePreviewNavigationRoute = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationPreviewStatus('Teacher login is required to preview a route.');
+      return;
+    }
+    if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
+      setNavigationPreviewStatus('Load the map and add at least one destination before previewing.');
+      return;
+    }
+    setIsNavigationPreviewing(true);
+    setNavigationRoutePreview(null);
+    setNavigationPreviewStatus('Requesting a non-motion path preview from Nav2…');
+    try {
+      const result = await apiFetch('/api/navigation/plan', {
+        method: 'POST',
+        body: JSON.stringify({
+          map_id: navigationMapSnapshot.map.map_id,
+          version: navigationMapSnapshot.map.version,
+          frame_id: navigationMapSnapshot.map.frame_id,
+          waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
+        }),
+      });
+      if (
+        result.map_id !== navigationMapSnapshot.map.map_id
+        || result.version !== navigationMapSnapshot.map.version
+        || result.frame_id !== navigationMapSnapshot.map.frame_id
+      ) {
+        throw new Error('The map changed while Nav2 was planning. Reload it and preview again.');
+      }
+      setNavigationRoutePreview(result);
+      setNavigationPreviewStatus(
+        `Preview ready • ${result.path.length} path points • ${result.planner_id} • no motion sent`,
+      );
+    } catch (error) {
+      setNavigationPreviewStatus(`Route preview unavailable • ${error.message}`);
+    } finally {
+      setIsNavigationPreviewing(false);
+    }
   };
 
   const handleStartNavigation = async () => {
@@ -1419,6 +1567,15 @@ export default function App() {
     }
     if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
       setNavigationExecutionStatus('Load the map and add at least one destination before starting.');
+      return;
+    }
+    if (
+      !navigationRoutePreview
+      || navigationRoutePreview.map_id !== navigationMapSnapshot.map.map_id
+      || navigationRoutePreview.version !== navigationMapSnapshot.map.version
+      || navigationRoutePreview.frame_id !== navigationMapSnapshot.map.frame_id
+    ) {
+      setNavigationExecutionStatus('Preview the current route on the latest map before starting Nav2.');
       return;
     }
     if (navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status)) {
@@ -2166,13 +2323,17 @@ export default function App() {
   const addStudentObstacle = (type = 'box') => {
     const preset = OBJECT_LIBRARY.find((item) => item.id === type) || OBJECT_LIBRARY[0];
     setSceneObjects((prev) => {
-      const coordinateLimit = Math.max(0, gridSize / 2 - 1);
+      const coordinateLimit = Math.max(0, sceneExtent / 2 - 1);
       const coordinates = Array.from({ length: 5 }, (_, index) => (
         -coordinateLimit + (coordinateLimit * 2 * index) / 4
       ));
-      const candidates = coordinates.flatMap((x) => coordinates.map((y) => ({ x, y })))
+      const candidates = coordinates.flatMap((x) => coordinates.map((y) => ({
+        x: x + sceneCenterX,
+        y: y + sceneCenterY,
+      })))
         .sort((left, right) => (
-          Math.hypot(left.x, left.y) - Math.hypot(right.x, right.y)
+          Math.hypot(left.x - sceneCenterX, left.y - sceneCenterY)
+          - Math.hypot(right.x - sceneCenterX, right.y - sceneCenterY)
         ));
       const position = candidates
         .map((candidate) => ({
@@ -2183,8 +2344,12 @@ export default function App() {
             return score + Math.max(0, requiredSpace - distance);
           }, 0),
         }))
-        .sort((left, right) => left.overlap - right.overlap || Math.hypot(left.x, left.y) - Math.hypot(right.x, right.y))[0];
-      const defaultPosition = clampScenePoint(position.x, position.y, gridSize);
+        .sort((left, right) => (
+          left.overlap - right.overlap
+          || Math.hypot(left.x - sceneCenterX, left.y - sceneCenterY)
+            - Math.hypot(right.x - sceneCenterX, right.y - sceneCenterY)
+        ))[0];
+      const defaultPosition = clampGridPoint(position.x, position.y);
       return [
         ...prev,
         {
@@ -2209,10 +2374,9 @@ export default function App() {
   const updateStudentObstacle = (id, patch) => {
     setSceneObjects((prev) => prev.map((obstacle) => {
       if (obstacle.id !== id) return obstacle;
-      const nextPosition = clampScenePoint(
+      const nextPosition = clampGridPoint(
         patch.x !== undefined ? patch.x : obstacle.x,
         patch.y !== undefined ? patch.y : obstacle.y,
-        gridSize,
       );
       return { ...obstacle, ...patch, x: nextPosition.x, y: nextPosition.y };
     }));
@@ -2227,8 +2391,10 @@ export default function App() {
   const plannerDragRef = useRef(null);
   const sceneOrigin = 110;
   const sharedMapMetadata = sharedLidarMap?.map?.map;
-  const mapCenterLocalX = sharedMapMetadata ? sharedMapMetadata.width * sharedMapMetadata.resolution_m / 2 : 0;
-  const mapCenterLocalY = sharedMapMetadata ? sharedMapMetadata.height * sharedMapMetadata.resolution_m / 2 : 0;
+  const mapWidthMeters = sharedMapMetadata ? sharedMapMetadata.width * sharedMapMetadata.resolution_m : 0;
+  const mapHeightMeters = sharedMapMetadata ? sharedMapMetadata.height * sharedMapMetadata.resolution_m : 0;
+  const mapCenterLocalX = mapWidthMeters / 2;
+  const mapCenterLocalY = mapHeightMeters / 2;
   const mapCenterCosine = Math.cos(sharedMapMetadata?.origin?.yaw_rad || 0);
   const mapCenterSine = Math.sin(sharedMapMetadata?.origin?.yaw_rad || 0);
   const sceneCenterX = sharedLidarOverlayEnabled && sharedMapMetadata
@@ -2237,16 +2403,18 @@ export default function App() {
   const sceneCenterY = sharedLidarOverlayEnabled && sharedMapMetadata
     ? sharedMapMetadata.origin.y + mapCenterSine * mapCenterLocalX + mapCenterCosine * mapCenterLocalY
     : 0;
+  const rotatedMapWidth = Math.abs(mapCenterCosine) * mapWidthMeters + Math.abs(mapCenterSine) * mapHeightMeters;
+  const rotatedMapHeight = Math.abs(mapCenterSine) * mapWidthMeters + Math.abs(mapCenterCosine) * mapHeightMeters;
   const sceneExtent = sharedLidarOverlayEnabled && sharedMapMetadata
-    ? Math.max(
-      gridSize,
-      sharedMapMetadata.width * sharedMapMetadata.resolution_m,
-      sharedMapMetadata.height * sharedMapMetadata.resolution_m,
-    )
+    ? Math.max(gridSize, rotatedMapWidth, rotatedMapHeight)
     : gridSize;
   const sceneScale = 220 / sceneExtent;
   const sceneX = (meters) => sceneOrigin + (meters - sceneCenterX) * sceneScale;
   const sceneY = (meters) => sceneOrigin - (meters - sceneCenterY) * sceneScale;
+  const clampGridPoint = (x, y) => ({
+    x: Math.max(sceneCenterX - sceneExtent / 2, Math.min(sceneCenterX + sceneExtent / 2, x)),
+    y: Math.max(sceneCenterY - sceneExtent / 2, Math.min(sceneCenterY + sceneExtent / 2, y)),
+  });
   const navigationOccupiedCellsPath = useMemo(() => {
     if (!navigationMapSnapshot?.data?.length || !navigationMapSnapshot.map) return '';
     const { data, map } = navigationMapSnapshot;
@@ -2262,6 +2430,20 @@ export default function App() {
     }
     return commands.join('');
   }, [navigationMapSnapshot]);
+  const navigationRoutePreviewPoints = useMemo(() => {
+    if (
+      !navigationRoutePreview
+      || !navigationMapSnapshot?.map
+      || navigationRoutePreview.map_id !== navigationMapSnapshot.map.map_id
+      || navigationRoutePreview.version !== navigationMapSnapshot.map.version
+      || navigationRoutePreview.frame_id !== navigationMapSnapshot.map.frame_id
+    ) return '';
+    const { map } = navigationMapSnapshot;
+    return navigationRoutePreview.path.map((point) => {
+      const local = worldToMapLocal(point.x, point.y, map);
+      return `${local.x},${local.y}`;
+    }).join(' ');
+  }, [navigationMapSnapshot, navigationRoutePreview]);
   const sharedOccupiedCellsPath = useMemo(() => {
     const snapshot = sharedLidarMap?.map;
     if (!snapshot?.data?.length || !snapshot.map) return '';
@@ -2313,8 +2495,8 @@ export default function App() {
       const centerX = map.origin.x + cosine * localX - sine * localY;
       const centerY = map.origin.y + sine * localX + cosine * localY;
       if (
-        centerX < -halfGrid - resolution || centerX > halfGrid + resolution
-        || centerY < -halfGrid - resolution || centerY > halfGrid + resolution
+        centerX < sceneCenterX - halfGrid - resolution || centerX > sceneCenterX + halfGrid + resolution
+        || centerY < sceneCenterY - halfGrid - resolution || centerY > sceneCenterY + halfGrid + resolution
       ) continue;
       const corners = [
         [column * resolution, row * resolution],
@@ -2324,7 +2506,7 @@ export default function App() {
       ].map(([x, y]) => {
         const worldX = map.origin.x + cosine * x - sine * y;
         const worldY = map.origin.y + sine * x + cosine * y;
-        return `${sceneX(worldX)} ${sceneY(worldY)}`;
+        return `${sceneOrigin + (worldX - sceneCenterX) * sceneScale} ${sceneOrigin - (worldY - sceneCenterY) * sceneScale}`;
       });
       commands.push(`M${corners.join('L')}z`);
     }
@@ -2337,12 +2519,9 @@ export default function App() {
     screenPoint.x = event.clientX;
     screenPoint.y = event.clientY;
     const svgPoint = screenPoint.matrixTransform(svg.getScreenCTM().inverse());
-    const localX = (svgPoint.x - sceneOrigin) / sceneScale;
-    const localY = (sceneOrigin - svgPoint.y) / sceneScale;
-    return {
-      x: Math.max(-gridSize / 2, Math.min(gridSize / 2, localX)),
-      y: Math.max(-gridSize / 2, Math.min(gridSize / 2, localY)),
-    };
+    const worldX = (svgPoint.x - sceneOrigin) / sceneScale + sceneCenterX;
+    const worldY = (sceneOrigin - svgPoint.y) / sceneScale + sceneCenterY;
+    return clampGridPoint(worldX, worldY);
   };
 
   const handleObstaclePointerDown = (event, obstacleId) => {
@@ -2362,13 +2541,13 @@ export default function App() {
 
   const handleObstaclePointerMove = (event) => {
     if (!obstacleDragRef.current || currentUser.role === 'teacher') return;
-    const { x, y } = clampScenePoint(...Object.values(getSvgCoords(event)), gridSize);
+    const { x, y } = getSvgCoords(event);
     updateStudentObstacle(obstacleDragRef.current.obstacleId, { x, y });
   };
 
   const handlePlannerWaypointPointerMove = (event) => {
     if (!plannerDragRef.current) return;
-    const { x, y } = clampScenePoint(...Object.values(getSvgCoords(event)), gridSize);
+    const { x, y } = getSvgCoords(event);
     updatePlannerWaypoint(plannerDragRef.current.waypointId, { x, y });
   };
 
@@ -3018,7 +3197,7 @@ export default function App() {
               <svg viewBox="0 0 220 220" className="block aspect-square w-full" onPointerMove={handleScenePointerMove} onPointerUp={handleScenePointerUp} onPointerLeave={handleScenePointerUp}>
                 <defs>
                   <pattern id="grid-pattern" width={sceneScale} height={sceneScale} patternUnits="userSpaceOnUse">
-                    <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#dfe7f3" strokeWidth="1"/>
+                      <path d={`M ${sceneScale} 0 L 0 0 0 ${sceneScale}`} fill="none" stroke="#dfe7f3" strokeWidth="0.25"/>
                   </pattern>
                 </defs>
                 <rect x="0" y="0" width="220" height="220" fill="url(#grid-pattern)" rx="12"/>
@@ -3166,7 +3345,7 @@ export default function App() {
         />
 
         <div
-          className="absolute z-20 flex flex-col overflow-visible rounded-xl border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm"
+          className="absolute z-40 flex flex-col overflow-visible rounded-xl border border-slate-700 bg-slate-950/90 shadow-[0_0_30px_rgba(15,23,42,0.5)] backdrop-blur-sm"
           style={{
             top: toolPanelRect.top,
             right: toolPanelCollapsed ? 16 : toolPanelRect.right,
@@ -3413,17 +3592,17 @@ export default function App() {
                                 disabled={isLidarScanStarting}
                                 className="rounded-md bg-cyan-700 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
                               >
-                                {isLidarScanStarting ? 'Starting…' : 'Start room scan'}
+                                {isLidarScanStarting ? 'Starting…' : 'Start supervised 360° scan'}
                               </button>
                             ) : (
                               <>
                                 <button
                                   type="button"
                                   onClick={handleCompleteLidarScan}
-                                  disabled={isLidarScanFinalizing}
+                                  disabled={isLidarScanFinalizing || lidarScanJob?.rotation_status !== 'completed'}
                                   className="rounded-md bg-amber-500 px-2 py-1 text-[10px] font-semibold text-slate-950 disabled:opacity-50"
                                 >
-                                  {isLidarScanFinalizing ? 'Validating…' : 'Finish and validate scan'}
+                                  {isLidarScanFinalizing ? 'Validating…' : lidarScanJob?.rotation_status === 'completed' ? 'Validate 360° scan' : 'Waiting for 360° rotation'}
                                 </button>
                                 <button
                                   type="button"
@@ -3449,7 +3628,7 @@ export default function App() {
                       </div>
                       <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-300">{lidarScanStatus}</p>
                       <p className="text-[10px] leading-4 text-amber-200">
-                        Capture is read-only: it does not move the robot. For a full room, a teacher must manually sweep the LiDAR through the room while the commissioned SLAM system publishes a correctly registered map. Keep people clear and maintain supervised control.
+                        The teacher-started scan uses Nav2’s commissioned Spin behavior and the existing G1 velocity bridge. It requires fresh LiDAR, localization, and SLAM map data. Keep the rotation area clear, supervise continuously, and keep the independent emergency stop ready. A failed or incomplete rotation cannot be published.
                       </p>
                       <p className="text-[10px] text-slate-400">{navigationLiveStatus}</p>
                     </div>
@@ -3517,6 +3696,7 @@ export default function App() {
                           />
                           <g
                             ref={navigationMapCoordinatesRef}
+                            data-testid="navigation-map-coordinate-layer"
                             transform={`translate(0 ${navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}) scale(1 -1)`}
                             style={{ cursor: isNavigationGoalPlacementEnabled ? 'crosshair' : 'default' }}
                           >
@@ -3526,26 +3706,35 @@ export default function App() {
                             >
                               <path d={navigationOccupiedCellsPath} fill="#ef4444" fillOpacity="0.72" />
                             </g>
+                            {navigationRoutePreviewPoints && (
+                              <polyline
+                                data-testid="navigation-route-preview"
+                                points={navigationRoutePreviewPoints}
+                                fill="none"
+                                stroke="#059669"
+                                strokeWidth={navigationMapSnapshot.map.resolution_m * 0.8}
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                pointerEvents="none"
+                              />
+                            )}
                             {navigationRouteWaypoints.map((point, index) => {
-                              const dx = point.x - navigationMapSnapshot.map.origin.x;
-                              const dy = point.y - navigationMapSnapshot.map.origin.y;
-                              const cosine = Math.cos(navigationMapSnapshot.map.origin.yaw_rad);
-                              const sine = Math.sin(navigationMapSnapshot.map.origin.yaw_rad);
-                              const localX = cosine * dx + sine * dy;
-                              const localY = -sine * dx + cosine * dy;
+                              const local = worldToMapLocal(
+                                point.x, point.y, navigationMapSnapshot.map,
+                              );
                               return (
                                 <g key={point.id} pointerEvents="none">
                                   <circle
-                                    cx={localX}
-                                    cy={localY}
+                                    cx={local.x}
+                                    cy={local.y}
                                     r={navigationMapSnapshot.map.resolution_m * 2}
                                     fill="#2563eb"
                                     stroke="#fff"
                                     strokeWidth={navigationMapSnapshot.map.resolution_m * 0.15}
                                   />
                                   <text
-                                    x={localX}
-                                    y={localY}
+                                    x={local.x}
+                                    y={local.y}
                                     textAnchor="middle"
                                     dominantBaseline="central"
                                     fontSize={navigationMapSnapshot.map.resolution_m * 1.3}
@@ -3576,7 +3765,12 @@ export default function App() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => setNavigationRouteWaypoints([])}
+                            onClick={() => {
+                              navigationRouteWaypointsRef.current = [];
+                              setNavigationRouteWaypoints([]);
+                              setNavigationRoutePreview(null);
+                              setNavigationPreviewStatus('Destinations cleared');
+                            }}
                             disabled={!navigationRouteWaypoints.length || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
                             className="rounded-md border border-slate-600 px-2 py-1 text-[10px] text-slate-200 disabled:opacity-50"
                           >
@@ -3584,8 +3778,16 @@ export default function App() {
                           </button>
                           <button
                             type="button"
+                            onClick={handlePreviewNavigationRoute}
+                            disabled={isNavigationPreviewing || !navigationRouteWaypoints.length || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            className="rounded-md border border-emerald-700 px-2 py-1 text-[10px] font-semibold text-emerald-200 disabled:opacity-50"
+                          >
+                            {isNavigationPreviewing ? 'Planning…' : 'Preview route • no motion'}
+                          </button>
+                          <button
+                            type="button"
                             onClick={handleStartNavigation}
-                            disabled={isNavigationStarting || !navigationRouteWaypoints.length || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            disabled={isNavigationStarting || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
                             className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
                           >
                             {isNavigationStarting ? 'Starting…' : 'Start Nav2'}
@@ -3603,12 +3805,21 @@ export default function App() {
                         <p role="status" aria-live="polite" data-testid="navigation-execution-status" className="break-words text-[10px] text-cyan-200">
                           {navigationExecutionStatus}
                         </p>
+                        <p role="status" aria-live="polite" data-testid="navigation-preview-status" className="break-words text-[10px] text-emerald-200">
+                          {navigationPreviewStatus}
+                        </p>
                         {navigationRouteWaypoints.map((point, index) => (
                           <div key={point.id} className="flex items-center justify-between text-[10px] text-slate-400">
                             <span>Goal {index + 1}: {point.x.toFixed(2)}, {point.y.toFixed(2)} m ({navigationMapSnapshot.map.frame_id})</span>
                             <button
                               type="button"
-                              onClick={() => setNavigationRouteWaypoints((points) => points.filter((item) => item.id !== point.id))}
+                              onClick={() => {
+                                const remaining = navigationRouteWaypointsRef.current.filter((item) => item.id !== point.id);
+                                navigationRouteWaypointsRef.current = remaining;
+                                setNavigationRouteWaypoints(remaining);
+                                setNavigationRoutePreview(null);
+                                setNavigationPreviewStatus('Destinations changed • preview the route again');
+                              }}
                               disabled={Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
                               className="text-red-300 disabled:opacity-50"
                             >

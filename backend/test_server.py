@@ -55,10 +55,24 @@ class ServerClassroomTests(unittest.TestCase):
                 server, "robot_status", return_value={"running": False}
             ), patch.object(
                 server, "navigation_start_scan",
-                return_value={"job_id": job_id, "status": "scanning"},
+                return_value={
+                    "job_id": job_id,
+                    "status": "scanning",
+                    "rotation_status": "submitted",
+                    "rotation_radians": 0.0,
+                    "point_count": 0,
+                    "preview_points": [],
+                },
             ), patch.object(
                 server, "navigation_scan_status",
-                return_value={"job_id": job_id, "status": "scanning", "point_count": 1000},
+                return_value={
+                    "job_id": job_id,
+                    "status": "scanning",
+                    "rotation_status": "completed",
+                    "rotation_radians": 6.283185307179586,
+                    "point_count": 1000,
+                    "preview_points": [],
+                },
             ), patch.object(
                 server, "navigation_complete_scan",
                 return_value={
@@ -71,7 +85,16 @@ class ServerClassroomTests(unittest.TestCase):
             ), patch.object(
                 server, "navigation_scan_pointcloud", return_value=pointcloud
             ):
-                started = client.post("/api/lidar/scan", headers=teacher_headers)
+                unconfirmed = client.post(
+                    "/api/lidar/scan",
+                    headers=teacher_headers,
+                    json={"confirm_rotation": False},
+                )
+                started = client.post(
+                    "/api/lidar/scan",
+                    headers=teacher_headers,
+                    json={"confirm_rotation": True},
+                )
                 status = client.get(f"/api/lidar/scan/{job_id}", headers=teacher_headers)
                 blocked_sdk = client.post(
                     "/api/run",
@@ -101,6 +124,8 @@ class ServerClassroomTests(unittest.TestCase):
             shared_student_map = client.get("/api/lidar/map", headers=student_headers)
 
         self.assertEqual(started.status_code, 200)
+        self.assertEqual(unconfirmed.status_code, 400)
+        self.assertEqual(started.json()["rotation_status"], "submitted")
         self.assertEqual(status.json()["point_count"], 1000)
         self.assertEqual(blocked_sdk.status_code, 409)
         self.assertIn("LiDAR scan", blocked_sdk.json()["detail"])
@@ -229,6 +254,59 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"], [0, 100, -1, 50])
         self.assertEqual(response.json()["knownMapVersions"][0]["version"], "v2")
+        self.assertEqual(denied.status_code, 403)
+
+    def test_route_preview_is_teacher_only_and_does_not_start_navigation(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            preview = {
+                "map_id": "classroom",
+                "version": "v4",
+                "frame_id": "map",
+                "planner_id": "GridBased",
+                "path": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}],
+            }
+            with patch.object(server, "robot_status", return_value={"running": False}), patch.object(
+                server, "navigation_plan_route", return_value=preview
+            ) as plan_route, patch.object(server, "navigation_start_route") as start_route:
+                response = client.post(
+                    "/api/navigation/plan",
+                    headers=teacher_headers,
+                    json={
+                        "map_id": "classroom",
+                        "version": "v4",
+                        "frame_id": "map",
+                        "waypoints": [{"x": 1.0, "y": 0.0}],
+                    },
+                )
+                denied = client.post(
+                    "/api/navigation/plan",
+                    headers=student_headers,
+                    json={
+                        "map_id": "classroom",
+                        "version": "v4",
+                        "frame_id": "map",
+                        "waypoints": [{"x": 1.0, "y": 0.0}],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), preview)
+        plan_route.assert_called_once()
+        start_route.assert_not_called()
         self.assertEqual(denied.status_code, 403)
 
     def test_navigation_start_is_teacher_only_persists_operation_and_locks_sdk(self):

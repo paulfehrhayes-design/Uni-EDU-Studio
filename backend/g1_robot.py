@@ -57,6 +57,22 @@ _ARM_ACTION_IDS = {
     "high wave": 26,
     "shake hand": 27,
 }
+_ARM_HOLD_ACTION_IDS = {
+    action: _ARM_ACTION_IDS[action]
+    for action in (
+        "two-hand kiss",
+        "left kiss",
+        "right kiss",
+        "hands up",
+        "high five",
+        "hug",
+        "heart",
+        "right heart",
+        "reject",
+        "right hand up",
+        "x-ray",
+    )
+}
 
 
 class CommandValidationError(ValueError):
@@ -225,6 +241,16 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
             raise CommandValidationError("robot.arm_action() expects one preset name from the built-in G1 arm-action list.")
         action = _choice(args[0], "arm preset", tuple(_ARM_ACTION_IDS))
         return {"method": method, "action": action, "action_id": _ARM_ACTION_IDS[action]}
+    if method == "hold_arm":
+        if len(args) != 2:
+            raise CommandValidationError('robot.hold_arm() expects a static pose name and hold duration in seconds.')
+        action = _choice(args[0], "static arm pose", tuple(_ARM_HOLD_ACTION_IDS))
+        return {
+            "method": method,
+            "action": action,
+            "action_id": _ARM_HOLD_ACTION_IDS[action],
+            "seconds": _number(args[1], "hold duration", 0.1, 10),
+        }
 
     if method == "simulate_arm_action":
         raise CommandValidationError(
@@ -362,35 +388,7 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
                 nodes.append(_validate_call(statement))
         return nodes
 
-    def add_arm_releases(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        normalized = []
-        for node in nodes:
-            if node.get("type") == "repeat":
-                normalized.append({**node, "body": add_arm_releases(node["body"])})
-            elif node.get("type") == "condition":
-                normalized.append({
-                    **node,
-                    "then": add_arm_releases(node["then"]),
-                    "else": add_arm_releases(node["else"]),
-                })
-            else:
-                normalized.append(node)
-        result = []
-        for index, node in enumerate(normalized):
-            result.append(node)
-            if node.get("type") in {"condition", "repeat"} or node["method"] != "arm_action" or node["action"] == "release arm":
-                continue
-            next_node = normalized[index + 1] if index + 1 < len(normalized) else None
-            if next_node and next_node.get("type") not in {"condition", "repeat"} and next_node["method"] == "arm_action" and next_node["action"] == "release arm":
-                continue
-            result.append({
-                "method": "arm_action",
-                "action": "release arm",
-                "action_id": _ARM_ACTION_IDS["release arm"],
-            })
-        return result
-
-    nodes = add_arm_releases(visit(tree.body))
+    nodes = visit(tree.body)
     if not nodes:
         raise CommandValidationError("Program contains no robot commands.")
 
@@ -430,6 +428,8 @@ def _estimated_duration(command: dict[str, Any]) -> float:
         return 0
     if method == "arm_action":
         return _ARM_ACTION_REQUEST_SPACING_SECONDS
+    if method == "hold_arm":
+        return max(_ARM_ACTION_REQUEST_SPACING_SECONDS, command["seconds"])
     if method == "turn":
         return math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND
     if method == "sidestep":
@@ -553,6 +553,29 @@ def _move(vx: float, vy: float, vyaw: float, seconds: float) -> None:
         raise HTTPException(status_code=409, detail="Robot program stopped by teacher.")
 
 
+def _require_locomotion_ready() -> None:
+    if _client is None:
+        raise HTTPException(status_code=409, detail="Connect the G1 SDK before running a robot program.")
+    try:
+        response = _client.GetFsmId()
+    except Exception as error:
+        raise RuntimeError(f"Could not verify G1 locomotion mode before walking: {error}") from error
+    if not isinstance(response, tuple) or len(response) != 2:
+        raise RuntimeError("G1 GetFsmId returned an invalid response; locomotion command was not sent.")
+    result, fsm_id = response
+    _sdk_result(result, "GetFsmId")
+    if isinstance(fsm_id, bool) or not isinstance(fsm_id, int):
+        raise RuntimeError("G1 GetFsmId returned an invalid FSM ID; locomotion command was not sent.")
+    if fsm_id != 500:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Locomotion command was not sent because the G1 is in FSM {fsm_id}, not walking-ready FSM 500. "
+                "Use robot.stand() and wait for that transition to finish before walking."
+            ),
+        )
+
+
 def execute_robot_program(code: str) -> dict[str, Any]:
     try:
         commands = parse_robot_program(code)
@@ -569,6 +592,27 @@ def execute_robot_program(code: str) -> dict[str, Any]:
     executed_count = 0
     try:
         _log_event("program_started", command_count=len(commands), commands=commands)
+
+        def execute_arm_action(command: dict[str, Any], index: int, hold_seconds: float) -> None:
+            if _arm_client is None:
+                raise HTTPException(status_code=409, detail="Connect the G1 arm-action SDK before running an arm preset.")
+            _sdk_result(
+                _arm_client.ExecuteAction(command["action_id"]),
+                "ExecuteAction",
+            )
+            _log_event(
+                "arm_action_accepted",
+                index=index,
+                action=command["action"],
+                action_id=command["action_id"],
+                hold_seconds=hold_seconds,
+                note="SDK acceptance does not confirm pose completion; the hold is a timed delay, not active joint control.",
+            )
+            if _stop_requested.wait(max(_ARM_ACTION_REQUEST_SPACING_SECONDS, hold_seconds)):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Stop requested after the arm preset was accepted. The SDK has no verified way to cancel the active arm motion.",
+                )
 
         def execute_command(command: dict[str, Any]) -> None:
             nonlocal executed_count
@@ -594,24 +638,9 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                         raise HTTPException(status_code=409, detail="Connect the G1 arm-action SDK before listing arm actions.")
                     _sdk_result_if_available(_arm_client.GetActionList(), "GetActionList", results, method)
                 elif method == "arm_action":
-                    if _arm_client is None:
-                        raise HTTPException(status_code=409, detail="Connect the G1 arm-action SDK before running an arm preset.")
-                    _sdk_result(
-                        _arm_client.ExecuteAction(command["action_id"]),
-                        "ExecuteAction",
-                    )
-                    _log_event(
-                        "arm_action_accepted",
-                        index=index,
-                        action=command["action"],
-                        action_id=command["action_id"],
-                        note="SDK acceptance does not confirm completion; the preset has no verified cancel API.",
-                    )
-                    if _stop_requested.wait(_ARM_ACTION_REQUEST_SPACING_SECONDS):
-                        raise HTTPException(
-                            status_code=409,
-                            detail="Stop requested after the arm preset was accepted. The SDK has no verified way to cancel the active arm motion; it may continue until its preset ends.",
-                        )
+                    execute_arm_action(command, index, _ARM_ACTION_REQUEST_SPACING_SECONDS)
+                elif method == "hold_arm":
+                    execute_arm_action(command, index, command["seconds"])
                 elif method == "getvolume":
                     if _audio_client is None:
                         raise HTTPException(status_code=409, detail="Connect the G1 audio SDK before reading speaker volume.")
@@ -637,15 +666,18 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                     _sdk_result(_audio_client.PlayStop(command["app_name"]), "PlayStop")
                 elif method == "turn":
                     yaw = _TURN_RADIANS_PER_SECOND * (1 if command["direction"] == "left" else -1)
+                    _require_locomotion_ready()
                     _move(0, 0, yaw, math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND)
                 elif method == "sidestep":
                     lateral_speed = 0.2 * (1 if command["direction"] == "left" else -1)
+                    _require_locomotion_ready()
                     _move(0, lateral_speed, 0, _STEP_METERS / abs(lateral_speed))
                 else:
                     speed = 0.2 if method.startswith("slow") else 0.8 if method.startswith("fast") else _FORWARD_METERS_PER_SECOND
                     if method in {"backward", "backwardtime"}:
                         speed *= -1
                     duration = command["seconds"] if method.endswith("time") else command["steps"] * _STEP_METERS / abs(speed)
+                    _require_locomotion_ready()
                     _move(speed, 0, 0, duration)
             except Exception as error:
                 _log_event("command_failed", index=index, command=command, error=str(error))

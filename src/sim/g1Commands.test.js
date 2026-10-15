@@ -35,6 +35,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
       'g1_command_arm_action_face_wave',
       'g1_command_arm_action_high_wave',
       'g1_command_arm_action_shake_hand',
+      'g1_command_hold_arm',
       'g1_command_getfsm',
       'g1_command_getactions',
       'g1_command_say',
@@ -350,25 +351,22 @@ test('simulation expands the same bounded IDE loop syntax', () => {
   assert.ok(Math.abs(finalFrame.x - 2 * G1_NOMINAL_STEP_METERS) < 1e-9);
 });
 
-test('legacy arm presets share the same approximate simulation and executable command', () => {
+test('legacy arm presets preserve their selected pose in simulation and executable code', () => {
   const frames = buildG1SimulationFrames('robot.arm_action("hands up")');
   const finalFrame = frames.at(-1);
 
-  assert.equal(finalFrame.actions.at(-1).label, 'Arm preset preview: release arm');
-  assert.equal(Number(finalFrame.joints.left_shoulder_pitch), 0);
-  assert.equal(Number(finalFrame.joints.right_shoulder_pitch), 0);
+  assert.equal(finalFrame.actions.at(-1).label, 'Arm preset preview: hands up');
+  assert.equal(Number(finalFrame.joints.left_shoulder_pitch), -75);
+  assert.equal(Number(finalFrame.joints.right_shoulder_pitch), -75);
 
   const presets = G1_COMMANDS.find((entry) => entry.method === 'arm_action').args[0].choices;
   presets.forEach(([, preset]) => {
     const presetProgram = parseG1Program(`robot.arm_action(${JSON.stringify(preset)})`);
-    assert.deepEqual(
-      presetProgram.map(({ values }) => values[0]),
-      preset === 'release arm' ? ['release arm'] : [preset, 'release arm'],
-    );
+    assert.deepEqual(presetProgram.map(({ values }) => values[0]), [preset]);
   });
 });
 
-test('arm preset parsing adds one release after gestures and preserves explicit releases', () => {
+test('arm preset parsing preserves only explicitly requested releases', () => {
   const nodes = parseG1Program(
     'robot.arm_action("hands up")\n'
     + 'robot.arm_action("release arm")\n'
@@ -378,13 +376,31 @@ test('arm preset parsing adds one release after gestures and preserves explicit 
     'hands up',
     'release arm',
     'right heart',
-    'release arm',
   ]);
   assert.equal(
     formatG1Program(nodes),
     'robot.arm_action("hands up")\n'
       + 'robot.arm_action("release arm")\n'
-      + 'robot.arm_action("right heart")\n'
-      + 'robot.arm_action("release arm")',
+      + 'robot.arm_action("right heart")',
   );
+});
+
+test('timed arm pose block uses supported static presets and previews the requested hold time', () => {
+  const program = parseG1Program('robot.hold_arm("hands up", 3)');
+  assert.deepEqual(program[0].values, ['hands up', 3]);
+  assert.equal(program[0].code, 'robot.hold_arm("hands up", 3)');
+
+  const frames = buildG1SimulationFrames(program[0].code);
+  assert.ok(Math.abs(frames.at(-1).time - 3.8) < 1e-9);
+  assert.equal(Number(frames.at(-1).joints.left_shoulder_pitch), -75);
+  assert.equal(Number(frames.at(-1).joints.right_shoulder_pitch), -75);
+  assert.equal(frames.at(-1).actions.at(-1).label, 'Hold arm pose');
+
+  for (const code of [
+    'robot.hold_arm("release arm", 3)',
+    'robot.hold_arm("clap", 3)',
+    'robot.hold_arm("hands up")',
+  ]) {
+    assert.throws(() => parseG1Program(code));
+  }
 });

@@ -30,6 +30,10 @@ Humble and the SLAM/Nav2 workspace. The host must provide:
 
 - a Nav2 `NavigateThroughPoses` action server (default
   `/navigate_through_poses`);
+- a Nav2 `ComputePathThroughPoses` action server (default
+  `/compute_path_through_poses`) for path previews that do not move the robot;
+- a Nav2 `Spin` behavior action server (default `/spin`) that uses the same
+  Nav2 velocity-output path and commissioned G1 `/cmd_vel` bridge;
 - a live, correctly registered `OccupancyGrid` on `/map`, in the configured
   `map` frame;
 - a `PointCloud2` stream from the MID-360, default topic
@@ -43,9 +47,11 @@ expose it only behind a trusted network and TLS reverse proxy, then set the
 backend URL to that proxy's HTTPS URL. Set `G1_NAV_GATEWAY_TOKEN` to a
 cryptographically strong secret (at least 24 characters). Optional gateway
 environment variables are `G1_NAV_GATEWAY_HOST`, `G1_NAV_GATEWAY_PORT`,
-`G1_NAV_ACTION_NAME`, `G1_NAV_MAP_TOPIC`, `G1_NAV_POINTCLOUD_TOPIC`, `G1_NAV_MAP_FRAME`,
-`G1_NAV_BASE_FRAME`, `G1_NAV_MAP_ID`, and
-`G1_NAV_OCCUPIED_THRESHOLD`.
+`G1_NAV_ACTION_NAME`, `G1_NAV_PLAN_ACTION_NAME`, `G1_NAV_PLANNER_ID`,
+`G1_NAV_PLAN_TIMEOUT_SECONDS`, `G1_NAV_SPIN_ACTION_NAME`,
+`G1_NAV_SCAN_ROTATION_TIMEOUT_SECONDS` (30–300 seconds, default 180),
+`G1_NAV_MAP_TOPIC`, `G1_NAV_POINTCLOUD_TOPIC`, `G1_NAV_MAP_FRAME`,
+`G1_NAV_BASE_FRAME`, `G1_NAV_MAP_ID`, and `G1_NAV_OCCUPIED_THRESHOLD`.
 The ROS host also needs the Python ROS packages used by the gateway:
 `rclpy`, `nav2_msgs`, `nav_msgs`, `geometry_msgs`, `action_msgs`, `tf2_ros`,
 `sensor_msgs`, and `sensor_msgs_py`.
@@ -54,12 +60,29 @@ This gateway is not a replacement for SLAM, Nav2, or the Unitree velocity
 bridge. It does not publish `/cmd_vel`, install sensor drivers, build a 2D
 occupancy map, or configure the G1 bridge. The occupancy map must come from a
 commissioned mapping system; the point cloud is transformed into that map
-frame, voxel-downsampled at 5 cm, and capped at 300,000 points. Scan capture
-does not start robot movement. The teacher/operator must manually sweep the
-sensor while SLAM publishes valid map-frame transforms. A minimum of 1,000
-unique points is required to finish capture. The app stores the resulting
-point cloud and matching occupancy snapshot in its classroom SQLite database
-when a teacher completes and publishes the scan.
+frame, voxel-downsampled at 5 cm, and capped at 300,000 points.
+
+A teacher-started 360° scan sends a `Spin` action goal to Nav2, which must use
+the same commissioned G1 velocity bridge as navigation. Before motion, the
+gateway requires a fresh map, fresh point-cloud stream, valid sensor-to-map
+transform, fresh `map -> base_link` localization, and a ready Spin action
+server. It monitors those inputs during the turn, measures accumulated yaw,
+and requests Nav2 cancellation if localization, map, or LiDAR data becomes
+stale. The scan cannot be finalized unless Nav2 reports success and measured
+rotation is within 0.15 radians of a full turn. Unknown action/cancel outcomes
+keep the scan's locomotion lock reserved; operators must verify the robot is
+stopped before restarting the gateway.
+
+The teacher must confirm a clear rotation area, stable robot, continuous
+supervision, and immediate access to the independent emergency stop. First
+commission the Nav2 Spin behavior's angular speed/acceleration limits and
+collision checking in a controlled, unoccupied area. Do not enable or test
+Spin until the Nav2 action and G1 bridge have been verified together on the
+actual hardware. This workspace cannot establish physical safety or prove
+that the robot turned. A minimum of 1,000 unique points is also required to
+finish capture. The app stores the resulting point cloud and matching metric
+occupancy snapshot in its classroom SQLite database when a teacher completes
+and publishes the scan.
 
 The published overlay uses the ROS map resolution, width/height, origin and
 origin rotation; grid coordinates are meters in the map frame. It overlays
@@ -73,11 +96,11 @@ Authenticated `/api/lidar/live` WebSocket updates report navigation readiness,
 scan progress, and shared-map version changes; map content is fetched through
 the authenticated API.
 
-The app's existing SDK executor is blocked while a Nav2
-operation is active, but that application lock cannot arbitrate against
-independent ROS publishers, terminals, or other controllers. Ensure Nav2 is
-the only active ROS locomotion publisher and do not start SDK motion from
-another process during navigation.
+The app's existing SDK executor is blocked while a Nav2 operation or LiDAR
+scan is active. That application lock cannot arbitrate against independent ROS
+publishers, terminals, or other controllers. Ensure the commissioned Nav2
+stack is the only active ROS locomotion owner, and do not start SDK motion
+from another process during navigation or scanning.
 
 ## Bridge API
 
@@ -92,19 +115,28 @@ another process during navigation.
   1,000 unique points.
 - `POST /api/v1/scans/{job_id}/cancel` discards the active capture.
 
-In the application, teachers start a scan, manually sweep the sensor, finish
-and validate it, then explicitly publish it. Publishing stores the associated
+In the application, a teacher explicitly confirms and starts a scan, waits for
+the supervised 360° turn to complete, validates the map, then explicitly
+publishes it. Publishing stores the associated
 2D occupancy grid and 3D scan centrally; it does not enable the student
 overlay automatically. The API is teacher-authenticated for capture and
 publishing; students can read the approved shared map only while the shared
 overlay setting is on.
 
+The teacher's planner refreshes its loaded occupancy map when the live map
+version changes and reconnects its live status stream after a dropped
+connection. Destinations are retained only while they remain inside known
+free cells; they are cleared when map geometry changes and removed when their
+cells become occupied or unknown. This live planner preview is separate from
+the approved shared student overlay: students continue to see only the
+centrally published map controlled by the teacher setting.
+
 The classroom API exposes the workflow as:
 
 | Route | Access | Purpose |
 | --- | --- | --- |
-| `POST /api/lidar/scan` | Teacher | Start a non-moving scan capture. |
-| `GET /api/lidar/scan/{job_id}` | Teacher | Read capture progress and the bounded point preview. |
+| `POST /api/lidar/scan` | Teacher | Start a supervised 360° scan with `{"confirm_rotation":true}`. |
+| `GET /api/lidar/scan/{job_id}` | Teacher | Read rotation progress, measured yaw, and bounded point preview. |
 | `POST /api/lidar/scan/{job_id}/complete` | Teacher | Validate the 3D cloud against the current metric map and persist the scan. |
 | `POST /api/lidar/scan/{job_id}/cancel` | Teacher | Discard an active scan. |
 | `POST /api/lidar/map/publish` | Teacher | Publish a completed scan (`{"job_id":"…"}`) as the shared map. |
@@ -193,10 +225,20 @@ between -1 and 100. The app limits read-only map previews to 250,000 cells.
 Occupied cells at 65% or above are shown on the map. Teachers can add ordered
 destination goals by clicking the map. The map origin/yaw transform converts
 those clicks into the map frame; the app and gateway both reject targets
-outside the map, unknown, or occupied. Nav2 plans between the goals and
-executes through its `NavigateThroughPoses` action. The gateway caps a route at
-20 goals and accepts it only when the submitted map ID, version, and frame
-match the current map.
+outside the map, unknown, or occupied. **Preview route • no motion** calls
+the planner's `ComputePathThroughPoses` action and displays the returned
+map-frame path; it does not send a movement action or velocity command. The
+preview is invalidated if the map or selected goals change. Starting
+navigation requires a current successful preview and an explicit teacher
+confirmation, then executes through `NavigateThroughPoses`. The gateway caps
+a route at 20 goals and accepts it only when the submitted map ID, version,
+and frame match the current map.
+
+Route preview and execution both fail closed when localization, the occupancy
+map, or the MID-360 point-cloud stream is stale. The application cannot
+electronically verify an independent hardware emergency stop unless the
+deployed robot integration provides a verified E-stop state; keep the
+physical stop reachable and prove it works during commissioning.
 
 The teacher must explicitly confirm **Start Nav2**. The backend records the
 operation and blocks this app's Unitree SDK connect/run/queue paths until Nav2

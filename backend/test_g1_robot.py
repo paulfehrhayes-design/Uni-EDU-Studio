@@ -282,19 +282,12 @@ class G1RobotProgramTests(unittest.TestCase):
 
         for action, action_id in expected.items():
             with self.subTest(action=action):
-                expected_commands = [{"method": "arm_action", "action": action, "action_id": action_id}]
-                if action != "release arm":
-                    expected_commands.append({
-                        "method": "arm_action",
-                        "action": "release arm",
-                        "action_id": 99,
-                    })
                 self.assertEqual(
                     parse_robot_program(f'robot.arm_action("{action}")'),
-                    expected_commands,
+                    [{"method": "arm_action", "action": action, "action_id": action_id}],
                 )
 
-    def test_arm_presets_release_between_gestures_without_duplicate_release(self):
+    def test_arm_presets_only_release_when_the_program_explicitly_requests_it(self):
         self.assertEqual(
             parse_robot_program(
                 'for _ in range(2):\n'
@@ -306,11 +299,9 @@ class G1RobotProgramTests(unittest.TestCase):
                 {"method": "arm_action", "action": "hands up", "action_id": 15},
                 {"method": "arm_action", "action": "release arm", "action_id": 99},
                 {"method": "arm_action", "action": "right heart", "action_id": 21},
-                {"method": "arm_action", "action": "release arm", "action_id": 99},
                 {"method": "arm_action", "action": "hands up", "action_id": 15},
                 {"method": "arm_action", "action": "release arm", "action_id": 99},
                 {"method": "arm_action", "action": "right heart", "action_id": 21},
-                {"method": "arm_action", "action": "release arm", "action_id": 99},
             ],
         )
 
@@ -321,6 +312,53 @@ class G1RobotProgramTests(unittest.TestCase):
         ):
             with self.subTest(code=code), self.assertRaises(CommandValidationError):
                 parse_robot_program(code)
+
+    def test_timed_arm_pose_uses_only_static_presets_and_is_bounded(self):
+        self.assertEqual(
+            parse_robot_program('robot.hold_arm("hands up", 3)'),
+            [{
+                "method": "hold_arm",
+                "action": "hands up",
+                "action_id": 15,
+                "seconds": 3.0,
+            }],
+        )
+        self.assertEqual(
+            parse_robot_program('robot.hold_arm("hands up", 99)')[0]["seconds"],
+            10,
+        )
+        for code in (
+            'robot.hold_arm("release arm", 3)',
+            'robot.hold_arm("clap", 3)',
+            'robot.hold_arm("hands up")',
+            'robot.hold_arm("hands up", 3, 4)',
+        ):
+            with self.subTest(code=code), self.assertRaises(CommandValidationError):
+                parse_robot_program(code)
+
+    def test_timed_arm_pose_executes_preset_then_waits_without_releasing(self):
+        class FakeLocoClient:
+            pass
+
+        class FakeArmClient:
+            def __init__(self):
+                self.actions = []
+
+            def ExecuteAction(self, action_id):
+                self.actions.append(action_id)
+                return 0
+
+        original_clients = g1_robot._client, g1_robot._arm_client
+        arm_client = FakeArmClient()
+        g1_robot._client, g1_robot._arm_client = FakeLocoClient(), arm_client
+        try:
+            with patch.object(g1_robot._stop_requested, "wait", return_value=False) as wait:
+                result = g1_robot.execute_robot_program('robot.hold_arm("hands up", 3)')
+            wait.assert_called_once_with(3.0)
+            self.assertEqual(arm_client.actions, [15])
+            self.assertEqual(result["commandsExecuted"], 1)
+        finally:
+            g1_robot._client, g1_robot._arm_client = original_clients
 
     def test_sdk_diagnostics_and_audio_arguments_are_bounded(self):
         commands = parse_robot_program(
@@ -414,9 +452,14 @@ class G1RobotProgramTests(unittest.TestCase):
         class FakeLocoClient:
             def __init__(self):
                 self.fsm_requests = []
+                self.fsm_id = 706
+
+            def GetFsmId(self):
+                return 0, self.fsm_id
 
             def SetFsmId(self, fsm_id):
                 self.fsm_requests.append(fsm_id)
+                self.fsm_id = fsm_id
                 return 0
 
         client = FakeLocoClient()
@@ -513,6 +556,9 @@ class G1RobotProgramTests(unittest.TestCase):
 
     def test_slow_motion_test_command_is_bounded_and_uses_slow_speed(self):
         class FakeLocoClient:
+            def GetFsmId(self):
+                return 0, 500
+
             def SetVelocity(self, vx, vy, vyaw, duration):
                 return 0
 
@@ -607,8 +653,46 @@ class G1RobotProgramTests(unittest.TestCase):
                 ("PlayStop", "example"),
             ],
         )
-        self.assertEqual(arm_client.actions, [15, 99])
-        self.assertEqual(result["commandsExecuted"], 9)
+        self.assertEqual(arm_client.actions, [15])
+        self.assertEqual(result["commandsExecuted"], 8)
+
+    def test_locomotion_is_not_sent_until_g1_is_in_ready_fsm(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.velocity_calls = []
+                self.fsm_checks = 0
+
+            def GetFsmId(self):
+                self.fsm_checks += 1
+                return 0, 706
+
+            def SetVelocity(self, vx, vy, vyaw, duration):
+                self.velocity_calls.append((vx, vy, vyaw, duration))
+                return 0
+
+        class FakeArmClient:
+            def __init__(self):
+                self.actions = []
+
+            def ExecuteAction(self, action_id):
+                self.actions.append(action_id)
+                return 0
+
+        original_clients = g1_robot._client, g1_robot._arm_client
+        client, arm_client = FakeLocoClient(), FakeArmClient()
+        g1_robot._client, g1_robot._arm_client = client, arm_client
+        try:
+            with patch.object(g1_robot._stop_requested, "wait", return_value=False), patch.object(
+                g1_robot, "_move"
+            ) as move:
+                with self.assertRaisesRegex(HTTPException, "FSM 706, not walking-ready FSM 500"):
+                    g1_robot.execute_robot_program('robot.arm_action("hands up")\nrobot.walk(1)')
+            self.assertEqual(arm_client.actions, [15])
+            self.assertEqual(client.fsm_checks, 1)
+            move.assert_not_called()
+            self.assertEqual(client.velocity_calls, [])
+        finally:
+            g1_robot._client, g1_robot._arm_client = original_clients
 
     def test_stop_during_arm_action_spacing_does_not_claim_to_cancel_arm(self):
         class FakeLocoClient:

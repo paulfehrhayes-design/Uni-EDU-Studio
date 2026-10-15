@@ -14,10 +14,13 @@ import httpx
 BRIDGE_TIMEOUT_SECONDS = 0.5
 SCAN_STATUS_TIMEOUT_SECONDS = 3.0
 SCAN_POINTCLOUD_TIMEOUT_SECONDS = 15.0
+NAVIGATION_PLAN_TIMEOUT_SECONDS = 65.0
 MAX_LOCALIZATION_AGE_SECONDS = 1.0
+MAX_POINTCLOUD_AGE_SECONDS = 1.5
 MAX_MAP_CELLS = 100_000_000
 MAX_PREVIEW_MAP_CELLS = 250_000
 MAX_NAVIGATION_WAYPOINTS = 20
+MAX_NAVIGATION_PREVIEW_POINTS = 50_000
 MAX_SCAN_POINTS = 300_000
 
 
@@ -73,13 +76,19 @@ def _get_json(
     return payload
 
 
-def _post_json(base_url: str, token: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _post_json(
+    base_url: str,
+    token: str,
+    path: str,
+    payload: dict[str, Any],
+    timeout: float = BRIDGE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     try:
         response = httpx.post(
             f"{base_url}{path}",
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
             json=payload,
-            timeout=BRIDGE_TIMEOUT_SECONDS,
+            timeout=timeout,
             follow_redirects=False,
         )
     except httpx.HTTPError as error:
@@ -152,11 +161,23 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             f"Navigation bridge localization is stale ({age_seconds * 1000:.0f} ms old; maximum is {MAX_LOCALIZATION_AGE_SECONDS * 1000:.0f} ms)."
         )
     localization_ready = localization.get("ready") is True
+    pointcloud_age_ms = payload.get("pointcloud_age_ms")
+    if (
+        isinstance(pointcloud_age_ms, bool)
+        or not isinstance(pointcloud_age_ms, (int, float))
+        or not math.isfinite(float(pointcloud_age_ms))
+        or pointcloud_age_ms < 0
+        or pointcloud_age_ms > MAX_POINTCLOUD_AGE_SECONDS * 1000
+    ):
+        raise NavigationBridgeError("Navigation bridge MID-360 point-cloud stream is missing or stale.")
+    pointcloud_ready = payload.get("pointcloud_ready") is True
     planner_ready = payload.get("planner_ready") is True
     bridge_ready = payload.get("ready") is True
     return {
-        "ready": bridge_ready and localization_ready and planner_ready,
+        "ready": bridge_ready and localization_ready and planner_ready and pointcloud_ready,
         "bridgeReady": bridge_ready,
+        "pointcloudReady": pointcloud_ready,
+        "pointcloudAgeMs": round(float(pointcloud_age_ms)),
         "localization": {
             "ready": localization_ready,
             "frame_id": frame_id,
@@ -317,6 +338,62 @@ def navigation_start_route(
     return {"operation_id": operation_id, "status": status}
 
 
+def navigation_plan_route(
+    map_id: str,
+    version: str,
+    frame_id: str,
+    waypoints: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    snapshot = navigation_map_snapshot(now=now)
+    if not snapshot.get("ready"):
+        raise NavigationBridgeError(snapshot.get("error") or "Navigation map is not ready.")
+    route = _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
+    base_url, token = _bridge_configuration()
+    result = _post_json(
+        base_url,
+        token,
+        "/api/v1/navigation/plan",
+        {
+            "map_id": map_id,
+            "version": version,
+            "frame_id": frame_id,
+            "goals": [
+                {"x": waypoint["x"], "y": waypoint["y"], "yaw_rad": 0.0}
+                for waypoint in route
+            ],
+        },
+        timeout=NAVIGATION_PLAN_TIMEOUT_SECONDS,
+    )
+    if (
+        result.get("map_id") != map_id
+        or result.get("version") != version
+        or result.get("frame_id") != frame_id
+    ):
+        raise NavigationBridgeError("Navigation gateway planned a route against a different map or frame.")
+    planner_id = result.get("planner_id")
+    if not isinstance(planner_id, str) or not planner_id.strip() or len(planner_id) > 128:
+        raise NavigationBridgeError("Navigation gateway returned an invalid planner ID.")
+    raw_path = result.get("path")
+    if not isinstance(raw_path, list) or not 1 <= len(raw_path) <= MAX_NAVIGATION_PREVIEW_POINTS:
+        raise NavigationBridgeError("Navigation gateway returned an empty or oversized route preview.")
+    path = []
+    for index, point in enumerate(raw_path):
+        if not isinstance(point, dict):
+            raise NavigationBridgeError(f"Navigation gateway route preview point {index + 1} is invalid.")
+        path.append({
+            axis: _finite_number(point.get(axis), f"route preview point {index + 1} {axis}")
+            for axis in ("x", "y")
+        })
+    return {
+        "map_id": map_id,
+        "version": version,
+        "frame_id": frame_id,
+        "planner_id": planner_id,
+        "path": path,
+    }
+
+
 def navigation_operation_status(operation_id: str) -> dict[str, Any]:
     safe_id = _navigation_operation_id(operation_id)
     base_url, token = _bridge_configuration()
@@ -353,7 +430,55 @@ def navigation_start_scan() -> dict[str, Any]:
     job_id = _scan_job_id(result.get("job_id"))
     if result.get("status") != "scanning":
         raise NavigationBridgeError("LiDAR gateway did not confirm that scan capture started.")
-    return {"job_id": job_id, "status": "scanning"}
+    return _validated_scan_status(result, job_id)
+
+
+def _validated_scan_status(result: dict[str, Any], job_id: str) -> dict[str, Any]:
+    if result.get("job_id") != job_id or result.get("status") not in {
+        "scanning", "completed", "failed", "canceled",
+    }:
+        raise NavigationBridgeError("LiDAR gateway returned an invalid scan job status.")
+    rotation_status = result.get("rotation_status")
+    if rotation_status not in {
+        "submitted", "rotating", "completed", "failed", "canceled",
+        "cancel_requested", "uncertain",
+    }:
+        raise NavigationBridgeError("LiDAR gateway returned an invalid scan rotation status.")
+    rotation_radians = result.get("rotation_radians", 0.0)
+    if (
+        isinstance(rotation_radians, bool)
+        or not isinstance(rotation_radians, (int, float))
+        or not math.isfinite(float(rotation_radians))
+        or not 0 <= float(rotation_radians) <= 100
+    ):
+        raise NavigationBridgeError("LiDAR gateway returned an invalid scan rotation measurement.")
+    point_count = result.get("point_count", 0)
+    if isinstance(point_count, bool) or not isinstance(point_count, int) or not 0 <= point_count <= MAX_SCAN_POINTS:
+        raise NavigationBridgeError("LiDAR gateway returned an invalid scan point count.")
+    preview_points = result.get("preview_points", [])
+    if not isinstance(preview_points, list) or len(preview_points) > 1_000:
+        raise NavigationBridgeError("LiDAR gateway returned an invalid scan preview.")
+    normalized_preview = []
+    for index, point in enumerate(preview_points):
+        if not isinstance(point, dict):
+            raise NavigationBridgeError(f"LiDAR gateway returned an invalid scan preview point {index + 1}.")
+        normalized_preview.append({
+            axis: _finite_number(point.get(axis), f"scan preview point {index + 1} {axis}")
+            for axis in ("x", "y", "z")
+        })
+    return {
+        "job_id": job_id,
+        "status": result["status"],
+        "rotation_status": rotation_status,
+        "rotation_radians": float(rotation_radians),
+        "point_count": point_count,
+        "preview_points": normalized_preview,
+        "error": result.get("error"),
+        "frame_id": result.get("frame_id"),
+        "map_id": result.get("map_id"),
+        "map_version": result.get("map_version"),
+        "updated_at": result.get("updated_at"),
+    }
 
 
 def navigation_scan_status(job_id: str) -> dict[str, Any]:
@@ -365,28 +490,7 @@ def navigation_scan_status(job_id: str) -> dict[str, Any]:
         f"/api/v1/scans/{safe_id}",
         timeout=SCAN_STATUS_TIMEOUT_SECONDS,
     )
-    if result.get("job_id") != safe_id or result.get("status") not in {
-        "scanning", "completed", "failed", "canceled",
-    }:
-        raise NavigationBridgeError("LiDAR gateway returned an invalid scan job status.")
-    point_count = result.get("point_count", 0)
-    if isinstance(point_count, bool) or not isinstance(point_count, int) or not 0 <= point_count <= MAX_SCAN_POINTS:
-        raise NavigationBridgeError("LiDAR gateway returned an invalid scan point count.")
-    result["point_count"] = point_count
-    preview_points = result.get("preview_points", [])
-    if not isinstance(preview_points, list) or len(preview_points) > 1_000:
-        raise NavigationBridgeError("LiDAR gateway returned an invalid scan preview.")
-    result["preview_points"] = [
-        {
-            axis: _finite_number(point.get(axis), f"scan preview point {index + 1} {axis}")
-            for axis in ("x", "y", "z")
-        }
-        for index, point in enumerate(preview_points)
-        if isinstance(point, dict)
-    ]
-    if len(result["preview_points"]) != len(preview_points):
-        raise NavigationBridgeError("LiDAR gateway returned an invalid scan preview point.")
-    return result
+    return _validated_scan_status(result, safe_id)
 
 
 def navigation_scan_pointcloud(job_id: str) -> dict[str, Any]:
@@ -452,11 +556,7 @@ def navigation_cancel_scan(job_id: str) -> dict[str, Any]:
     safe_id = _scan_job_id(job_id)
     base_url, token = _bridge_configuration()
     result = _post_json(base_url, token, f"/api/v1/scans/{safe_id}/cancel", {})
-    if result.get("job_id") != safe_id or result.get("status") not in {
-        "canceled", "completed", "failed",
-    }:
-        raise NavigationBridgeError("LiDAR gateway did not confirm scan cancellation.")
-    return result
+    return _validated_scan_status(result, safe_id)
 
 
 def navigation_bridge_status(now: datetime | None = None) -> dict[str, Any]:
@@ -473,7 +573,11 @@ def navigation_bridge_status(now: datetime | None = None) -> dict[str, Any]:
             "status": "ready" if status["ready"] else "unavailable",
             **status,
             "map": map_metadata,
-            "error": None if status["ready"] else "Bridge, localization, or planner is not ready.",
+            "error": None if status["ready"] else (
+                "MID-360 point-cloud stream is not fresh."
+                if not status["pointcloudReady"]
+                else "Bridge, localization, or planner is not ready."
+            ),
         }
     except NavigationBridgeError as error:
         return {

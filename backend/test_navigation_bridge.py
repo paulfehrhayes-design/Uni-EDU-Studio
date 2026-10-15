@@ -6,7 +6,14 @@ from unittest.mock import patch
 
 try:
     from . import navigation_bridge
-    from .navigation_bridge import navigation_bridge_status, navigation_map_snapshot
+    from .navigation_bridge import (
+        NavigationBridgeError,
+        navigation_bridge_status,
+        navigation_cancel_route,
+        navigation_map_snapshot,
+        navigation_plan_route,
+        navigation_start_route,
+    )
 except ImportError:
     import navigation_bridge
     from navigation_bridge import (
@@ -14,6 +21,7 @@ except ImportError:
         navigation_bridge_status,
         navigation_cancel_route,
         navigation_map_snapshot,
+        navigation_plan_route,
         navigation_start_route,
     )
 
@@ -24,6 +32,8 @@ class NavigationBridgeTests(unittest.TestCase):
         self.status = {
             "ready": True,
             "planner_ready": True,
+            "pointcloud_ready": True,
+            "pointcloud_age_ms": 80,
             "localization": {
                 "ready": True,
                 "frame_id": "map",
@@ -38,7 +48,7 @@ class NavigationBridgeTests(unittest.TestCase):
             "resolution_m": 0.05,
             "width": 200,
             "height": 150,
-            "origin": {"x": -5.0, "y": -3.75},
+            "origin": {"x": -5.0, "y": -3.75, "yaw_rad": 0.0},
             "updated_at": (self.now - timedelta(days=1)).isoformat(),
         }
         self.map_snapshot = {
@@ -118,6 +128,15 @@ class NavigationBridgeTests(unittest.TestCase):
             frame_result = navigation_bridge_status(now=self.now)
         self.assertFalse(frame_result["ready"])
         self.assertIn("does not match", frame_result["error"])
+
+    def test_missing_or_stale_pointcloud_fails_navigation_readiness(self):
+        for sensor_status in (
+            {**self.status, "pointcloud_ready": False},
+            {**self.status, "pointcloud_age_ms": 1_501},
+        ):
+            with self.mock_bridge(status=sensor_status):
+                result = navigation_bridge_status(now=self.now)
+            self.assertFalse(result["ready"])
 
     def test_map_dimensions_are_bounded(self):
         too_large = {**self.map_metadata, "width": 100_000, "height": 100_000}
@@ -227,9 +246,8 @@ class NavigationBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(NavigationBridgeError, "outside the current map"):
                 navigation_start_route(
                     "classroom", "v4", "map", [{"x": 100, "y": 100}],
-                    operation_id, now=self.now,
+                    operation_id,                     now=self.now,
                 )
-
         occupied_map = {
             **self.map_metadata,
             "width": 2,
@@ -247,6 +265,49 @@ class NavigationBridgeTests(unittest.TestCase):
                     "classroom", "v4", "map", [{"x": 0.025, "y": 0.025}],
                     operation_id, now=self.now,
                 )
+
+    def test_route_preview_validates_targets_and_returns_bounded_map_frame_path(self):
+        plan = {
+            "map_id": "classroom",
+            "version": "v4",
+            "frame_id": "map",
+            "planner_id": "GridBased",
+            "path": [{"x": -0.5, "y": 0.25}, {"x": 0.0, "y": 0.5}],
+        }
+        with patch.object(navigation_bridge, "navigation_map_snapshot", return_value={
+            "ready": True,
+            "map": self.map_metadata,
+            "data": self.map_snapshot["data"],
+        }), patch.object(navigation_bridge, "_bridge_configuration", return_value=(
+            "http://127.0.0.1:8282", "test-bridge-token"
+        )), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "0"}), patch.object(
+            navigation_bridge, "_post_json", return_value=plan
+        ) as post:
+            result = navigation_plan_route(
+                "classroom", "v4", "map", [{"x": 0.0, "y": 0.0}], now=self.now
+            )
+
+        self.assertEqual(result["path"], plan["path"])
+        self.assertEqual(result["planner_id"], "GridBased")
+        self.assertEqual(post.call_args.args[2], "/api/v1/navigation/plan")
+        self.assertEqual(post.call_args.args[3]["goals"], [
+            {"x": 0.0, "y": 0.0, "yaw_rad": 0.0},
+        ])
+        self.assertEqual(post.call_args.kwargs["timeout"], navigation_bridge.NAVIGATION_PLAN_TIMEOUT_SECONDS)
+
+    def test_route_preview_rejects_unmapped_targets_before_contacting_gateway(self):
+        with patch.object(navigation_bridge, "navigation_map_snapshot", return_value={
+            "ready": True,
+            "map": self.map_metadata,
+            "data": self.map_snapshot["data"],
+        }), patch.object(navigation_bridge, "_bridge_configuration"), patch.object(
+            navigation_bridge, "_post_json"
+        ) as post:
+            with self.assertRaisesRegex(NavigationBridgeError, "outside the current map"):
+                navigation_plan_route(
+                    "classroom", "v4", "map", [{"x": 100.0, "y": 100.0}], now=self.now
+                )
+        post.assert_not_called()
 
     def test_route_cancellation_requires_valid_operation_and_terminal_contract(self):
         operation_id = "12345678-1234-1234-1234-123456789abc"
@@ -266,26 +327,74 @@ class NavigationBridgeTests(unittest.TestCase):
         with patch.object(
             navigation_bridge,
             "_post_json",
-            return_value={"job_id": job_id, "status": "scanning"},
+            return_value={
+                "job_id": job_id,
+                "status": "scanning",
+                "rotation_status": "submitted",
+                "rotation_radians": 0.0,
+                "point_count": 0,
+                "preview_points": [],
+            },
         ) as start:
             result = navigation_bridge.navigation_start_scan()
-        self.assertEqual(result, {"job_id": job_id, "status": "scanning"})
+        self.assertEqual(result["status"], "scanning")
+        self.assertEqual(result["rotation_status"], "submitted")
         start.assert_called_once()
 
         with patch.object(
             navigation_bridge,
             "_get_json",
-            return_value={"job_id": job_id, "status": "scanning", "point_count": 1250},
+            return_value={
+                "job_id": job_id,
+                "status": "scanning",
+                "rotation_status": "rotating",
+                "rotation_radians": 3.14,
+                "point_count": 1250,
+            },
         ):
             status = navigation_bridge.navigation_scan_status(job_id)
         self.assertEqual(status["point_count"], 1250)
+        self.assertEqual(status["rotation_status"], "rotating")
         with patch.object(
             navigation_bridge,
             "_get_json",
-            return_value={"job_id": job_id, "status": "scanning", "point_count": -1},
+            return_value={
+                "job_id": job_id,
+                "status": "scanning",
+                "rotation_status": "rotating",
+                "point_count": -1,
+            },
         ):
             with self.assertRaisesRegex(NavigationBridgeError, "point count"):
                 navigation_bridge.navigation_scan_status(job_id)
+
+        with patch.object(
+            navigation_bridge,
+            "_get_json",
+            return_value={
+                "job_id": job_id,
+                "status": "scanning",
+                "rotation_status": "rotating",
+                "rotation_radians": float("nan"),
+            },
+        ):
+            with self.assertRaisesRegex(NavigationBridgeError, "rotation measurement"):
+                navigation_bridge.navigation_scan_status(job_id)
+
+    def test_scan_cancel_can_report_pending_until_nav2_confirms_terminal_stop(self):
+        job_id = "12345678-1234-1234-1234-123456789abc"
+        response = {
+            "job_id": job_id,
+            "status": "scanning",
+            "rotation_status": "cancel_requested",
+            "rotation_radians": 1.2,
+            "point_count": 30,
+            "preview_points": [],
+        }
+        with patch.object(navigation_bridge, "_post_json", return_value=response):
+            result = navigation_bridge.navigation_cancel_scan(job_id)
+        self.assertEqual(result["status"], "scanning")
+        self.assertEqual(result["rotation_status"], "cancel_requested")
 
     def test_scan_pointcloud_requires_finite_map_frame_points_and_timestamp(self):
         job_id = "12345678-1234-1234-1234-123456789abc"

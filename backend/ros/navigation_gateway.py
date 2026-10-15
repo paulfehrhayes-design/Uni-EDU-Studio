@@ -2,8 +2,10 @@
 
 Deployment: run this module on the navigation host after sourcing the ROS 2
 Humble and workspace setup files, with Nav2 publishing ``/map``, a TF
-``map -> base_link`` transform, and a NavigateThroughPoses action server
-(default ``/navigate_through_poses``). Install the ROS 2 Python packages
+``map -> base_link`` transform, a ComputePathThroughPoses action server
+(default ``/compute_path_through_poses``), a NavigateThroughPoses action
+server (default ``/navigate_through_poses``), and the Nav2 Spin behavior
+server (default ``/spin``). Install the ROS 2 Python packages
 ``rclpy``, ``nav2_msgs``, ``nav_msgs``, ``geometry_msgs``, ``action_msgs``,
 ``tf2_ros``, ``sensor_msgs``, and ``sensor_msgs_py`` from the supported ROS
 installation. Set
@@ -13,11 +15,16 @@ The HTTP listener binds to 127.0.0.1 by default. Set
 ``G1_NAV_GATEWAY_HOST``/``G1_NAV_GATEWAY_PORT`` only for a deliberately
 configured deployment; non-loopback HTTP should be protected by a trusted
 network and TLS reverse proxy. The gateway sends goals only to Nav2; it does
-not publish ``cmd_vel`` or call a G1 bridge/stop service. A cancel request
+not publish ``cmd_vel`` or call a G1 bridge/stop service. A full LiDAR scan
+uses Nav2's Spin action and its existing velocity path; it does not create a
+second command publisher. A cancel request
 remains pending until Nav2 reports a terminal action result.
 
 Configuration overrides are ``G1_NAV_ACTION_NAME`` (default
-``/navigate_through_poses``), ``G1_NAV_MAP_TOPIC`` (``/map``),
+``/navigate_through_poses``), ``G1_NAV_PLAN_ACTION_NAME`` (default
+``/compute_path_through_poses``), ``G1_NAV_PLANNER_ID`` (default
+``GridBased``), ``G1_NAV_PLAN_TIMEOUT_SECONDS`` (1–60, default 15),
+``G1_NAV_SPIN_ACTION_NAME`` (default ``/spin``), ``G1_NAV_MAP_TOPIC`` (``/map``),
 ``G1_NAV_POINTCLOUD_TOPIC`` (``/mid360/livox/lidar``),
 ``G1_NAV_MAP_FRAME`` (``map``), ``G1_NAV_BASE_FRAME`` (``base_link``),
 ``G1_NAV_MAP_ID`` (``nav2-map``), and
@@ -27,9 +34,11 @@ threshold are occupied. Map versions are SHA-256 identities of the current
 map metadata and all occupancy cells.
 
 All routes require ``Authorization: Bearer <G1_NAV_GATEWAY_TOKEN>``.
-``GET /api/v1/status`` reports action-server, map, and TF readiness;
+``GET /api/v1/status`` reports action-server, map, fresh point-cloud, and TF readiness;
 ``GET /api/v1/map/metadata`` and ``GET /api/v1/map`` return the current
-map and identity. Submit with
+map and identity. Route previews use
+``POST /api/v1/navigation/plan`` and Nav2's ComputePathThroughPoses action;
+this endpoint never sends a movement goal. Submit for motion with
 ``POST /api/v1/navigation/goal`` using JSON
 ``{"map_id":"…","version":"…","frame_id":"map","goals":[{"x":1.0,"y":2.0,"yaw_rad":0.0}]}``.
 Each goal must be a finite map-frame x/y/yaw pose in a known, unoccupied map
@@ -63,12 +72,17 @@ from urllib.parse import unquote, urlsplit
 MAX_GOALS = 20
 MAX_MAP_CELLS = 4_000_000
 MAX_MAP_PREVIEW_CELLS = 250_000
+MAX_PREVIEW_PATH_POSES = 50_000
 MAX_SCAN_POINTS = 300_000
 MIN_COMPLETED_SCAN_POINTS = 1_000
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_OPERATIONS = 500
 DEFAULT_OCCUPIED_THRESHOLD = 65
 TERMINAL_STATES = {"succeeded", "failed", "canceled", "rejected"}
+SCAN_ROTATION_RADIANS = 2 * math.pi
+SCAN_ROTATION_TOLERANCE_RADIANS = 0.15
+SCAN_SENSOR_MAX_AGE_SECONDS = 1.5
+SCAN_MAP_MAX_AGE_SECONDS = 2.0
 
 
 class GatewayConfigurationError(ValueError):
@@ -96,12 +110,19 @@ def _configuration() -> dict[str, Any]:
     if not host:
         raise GatewayConfigurationError("G1_NAV_GATEWAY_HOST cannot be empty.")
     action_name = os.getenv("G1_NAV_ACTION_NAME", "/navigate_through_poses").strip()
+    spin_action_name = os.getenv("G1_NAV_SPIN_ACTION_NAME", "/spin").strip()
+    plan_action_name = os.getenv(
+        "G1_NAV_PLAN_ACTION_NAME", "/compute_path_through_poses"
+    ).strip()
     map_topic = os.getenv("G1_NAV_MAP_TOPIC", "/map").strip()
     pointcloud_topic = os.getenv("G1_NAV_POINTCLOUD_TOPIC", "/mid360/livox/lidar").strip()
     map_frame = os.getenv("G1_NAV_MAP_FRAME", "map").strip()
     base_frame = os.getenv("G1_NAV_BASE_FRAME", "base_link").strip()
     map_id = os.getenv("G1_NAV_MAP_ID", "nav2-map").strip()
-    if not all((action_name, map_topic, pointcloud_topic, map_frame, base_frame, map_id)):
+    if not all((
+        action_name, spin_action_name, plan_action_name, map_topic,
+        pointcloud_topic, map_frame, base_frame, map_id,
+    )):
         raise GatewayConfigurationError("Action, map, frame, and map ID settings cannot be empty.")
     try:
         threshold = float(os.getenv("G1_NAV_OCCUPIED_THRESHOLD", str(DEFAULT_OCCUPIED_THRESHOLD)))
@@ -114,6 +135,13 @@ def _configuration() -> dict[str, Any]:
         "host": host,
         "port": _env_int("G1_NAV_GATEWAY_PORT", 8282, 1, 65535),
         "action_name": action_name,
+        "spin_action_name": spin_action_name,
+        "plan_action_name": plan_action_name,
+        "planner_id": os.getenv("G1_NAV_PLANNER_ID", "GridBased").strip() or "GridBased",
+        "plan_timeout_seconds": _env_int("G1_NAV_PLAN_TIMEOUT_SECONDS", 15, 1, 60),
+        "scan_rotation_timeout_seconds": _env_int(
+            "G1_NAV_SCAN_ROTATION_TIMEOUT_SECONDS", 180, 30, 300
+        ),
         "map_topic": map_topic,
         "pointcloud_topic": pointcloud_topic,
         "map_frame": map_frame,
@@ -142,12 +170,27 @@ def _yaw_from_quaternion(quaternion: Any) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def accumulate_scan_rotation(rotation_radians: float, previous_yaw: float, current_yaw: float) -> float:
+    delta = math.atan2(
+        math.sin(current_yaw - previous_yaw),
+        math.cos(current_yaw - previous_yaw),
+    )
+    return rotation_radians + delta
+
+
+def scan_rotation_complete(rotation_radians: float) -> bool:
+    return (
+        math.isfinite(rotation_radians)
+        and abs(rotation_radians) >= SCAN_ROTATION_RADIANS - SCAN_ROTATION_TOLERANCE_RADIANS
+    )
+
+
 def _make_ros_node(config: dict[str, Any]):
     """Import ROS only on launch, allowing syntax inspection without ROS."""
     import rclpy
     from action_msgs.msg import GoalStatus
     from geometry_msgs.msg import PoseStamped
-    from nav2_msgs.action import NavigateThroughPoses
+    from nav2_msgs.action import ComputePathThroughPoses, NavigateThroughPoses, Spin
     from nav_msgs.msg import OccupancyGrid
     from rclpy.action import ActionClient
     from rclpy.node import Node
@@ -164,6 +207,8 @@ def _make_ros_node(config: dict[str, Any]):
             self._goal_status = GoalStatus
             self._pose_stamped = PoseStamped
             self._navigate_action = NavigateThroughPoses
+            self._spin_action = Spin
+            self._plan_action = ComputePathThroughPoses
             self._transform_exception = TransformException
             self.config = config
             self.lock = threading.RLock()
@@ -174,7 +219,14 @@ def _make_ros_node(config: dict[str, Any]):
             self.active_operation_id: str | None = None
             self.scans: dict[str, dict[str, Any]] = {}
             self.active_scan_id: str | None = None
+            self.pointcloud_received_monotonic: float | None = None
+            self.pointcloud_frame_id: str | None = None
             self.action_client = ActionClient(self, NavigateThroughPoses, config["action_name"])
+            self.spin_action_client = ActionClient(self, Spin, config["spin_action_name"])
+            self.plan_action_client = ActionClient(
+                self, ComputePathThroughPoses, config["plan_action_name"]
+            )
+            self.plan_lock = threading.Lock()
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
             self.map_subscription = self.create_subscription(
@@ -183,6 +235,7 @@ def _make_ros_node(config: dict[str, Any]):
             self.pointcloud_subscription = self.create_subscription(
                 PointCloud2, config["pointcloud_topic"], self._pointcloud_callback, 10
             )
+            self.scan_health_timer = self.create_timer(0.05, self._scan_health_tick)
 
         @staticmethod
         def _rotate_point(point: tuple[float, float, float], rotation: Any) -> tuple[float, float, float]:
@@ -201,13 +254,28 @@ def _make_ros_node(config: dict[str, Any]):
             )
 
         def _pointcloud_callback(self, message):
+            source_frame = str(message.header.frame_id).strip()
+            if not source_frame:
+                return
             with self.lock:
                 scan_id = self.active_scan_id
                 scan = self.scans.get(scan_id) if scan_id else None
             if not scan or scan["state"] != "scanning":
-                return
-            source_frame = str(message.header.frame_id).strip()
-            if not source_frame:
+                try:
+                    if source_frame != self.config["map_frame"]:
+                        self.tf_buffer.lookup_transform(
+                            self.config["map_frame"],
+                            source_frame,
+                            Time.from_msg(message.header.stamp),
+                            timeout=Duration(seconds=0.1),
+                        )
+                except (self._transform_exception, TypeError, ValueError) as error:
+                    self.get_logger().warning(
+                        f"Skipping LiDAR readiness sample without a valid map transform: {error}"
+                    )
+                    return
+                self.pointcloud_received_monotonic = time.monotonic()
+                self.pointcloud_frame_id = source_frame
                 return
             try:
                 if source_frame == self.config["map_frame"]:
@@ -254,13 +322,195 @@ def _make_ros_node(config: dict[str, Any]):
                 scan = self.scans.get(scan_id)
                 if not scan or scan["state"] != "scanning":
                     return
+                self.pointcloud_received_monotonic = time.monotonic()
+                self.pointcloud_frame_id = source_frame
                 voxels = scan["voxels"]
                 for x, y, z in points:
                     key = (math.floor(x / 0.05), math.floor(y / 0.05), math.floor(z / 0.05))
                     if key in voxels or len(voxels) >= MAX_SCAN_POINTS:
                         continue
                     voxels[key] = (x, y, z)
+                scan["last_cloud_monotonic"] = time.monotonic()
                 scan["updated_at"] = _utc_now()
+
+        def _scan_health_tick(self):
+            with self.lock:
+                scan_id = self.active_scan_id
+                scan = self.scans.get(scan_id) if scan_id else None
+                if not scan or scan["state"] != "scanning":
+                    return
+                if scan.get("rotation_status") in {
+                    "completed", "cancel_requested", "uncertain",
+                }:
+                    return
+                last_cloud_monotonic = scan.get("last_cloud_monotonic", scan["created_monotonic"])
+            now = time.monotonic()
+            if now - last_cloud_monotonic > SCAN_SENSOR_MAX_AGE_SECONDS:
+                self._abort_scan(scan_id, "LiDAR point-cloud data became stale during the rotation.")
+                return
+            if self.grid_received_monotonic is None or now - self.grid_received_monotonic > SCAN_MAP_MAX_AGE_SECONDS:
+                self._abort_scan(scan_id, "The SLAM occupancy map became stale during the rotation.")
+                return
+            localization = self._localization_snapshot()
+            if not localization.get("ready"):
+                self._abort_scan(
+                    scan_id,
+                    localization.get("error") or "Robot localization became unavailable during the rotation.",
+                )
+                return
+            yaw = localization["pose"]["yaw_rad"]
+            with self.lock:
+                scan = self.scans.get(scan_id)
+                if not scan or scan["state"] != "scanning" or scan.get("rotation_status") == "completed":
+                    return
+                previous_yaw = scan.get("last_yaw")
+                if previous_yaw is not None:
+                    scan["rotation_radians"] = accumulate_scan_rotation(
+                        scan["rotation_radians"], previous_yaw, yaw
+                    )
+                scan["last_yaw"] = yaw
+                scan["updated_at"] = _utc_now()
+
+        def _abort_scan(self, job_id: str, reason: str) -> None:
+            with self.lock:
+                scan = self.scans.get(job_id)
+                if not scan or scan["state"] != "scanning":
+                    return
+                scan["failure_reason"] = reason
+                scan["rotation_status"] = "cancel_requested"
+                scan["error"] = reason
+                scan["updated_at"] = _utc_now()
+                handle = scan.get("_goal_handle")
+                if handle is None:
+                    scan["rotation_status"] = "uncertain"
+                    scan["error"] = f"{reason} Nav2 has not confirmed the rotation goal state."
+                    return
+            try:
+                future = handle.cancel_goal_async()
+                future.add_done_callback(lambda completed, scan_id=job_id: self._scan_cancel_response(scan_id, completed))
+            except Exception as error:
+                with self.lock:
+                    scan = self.scans.get(job_id)
+                    if scan and scan["state"] == "scanning":
+                        scan["rotation_status"] = "uncertain"
+                        scan["error"] = f"{reason} Nav2 cancellation could not be confirmed: {error}"
+                        scan["updated_at"] = _utc_now()
+
+        def _scan_goal_response(self, job_id: str, future: Any) -> None:
+            try:
+                handle = future.result()
+            except Exception as error:
+                with self.lock:
+                    scan = self.scans.get(job_id)
+                    if scan and scan["state"] == "scanning":
+                        scan["rotation_status"] = "uncertain"
+                        scan["error"] = f"Nav2 Spin goal response is unknown: {error}"
+                        scan["updated_at"] = _utc_now()
+                return
+            with self.lock:
+                scan = self.scans.get(job_id)
+                if scan is None:
+                    return
+                if not handle.accepted:
+                    self._finish_scan_locked(scan, "failed", "Nav2 rejected the in-place rotation.")
+                    return
+                scan["_goal_handle"] = handle
+                cancel_requested = scan["rotation_status"] in {"cancel_requested", "uncertain"}
+                if not cancel_requested:
+                    scan["rotation_status"] = "rotating"
+                    scan["updated_at"] = _utc_now()
+            result_future = handle.get_result_async()
+            result_future.add_done_callback(
+                lambda completed, scan_id=job_id: self._scan_result_callback(scan_id, completed)
+            )
+            if cancel_requested:
+                try:
+                    cancel_future = handle.cancel_goal_async()
+                    cancel_future.add_done_callback(
+                        lambda completed, scan_id=job_id: self._scan_cancel_response(scan_id, completed)
+                    )
+                except Exception as error:
+                    with self.lock:
+                        scan = self.scans.get(job_id)
+                        if scan and scan["state"] == "scanning":
+                            scan["rotation_status"] = "uncertain"
+                            scan["error"] = f"Nav2 cancellation could not be confirmed: {error}"
+
+        def _scan_cancel_response(self, job_id: str, future: Any) -> None:
+            try:
+                response = future.result()
+                accepted = bool(response.goals_canceling)
+            except Exception as error:
+                accepted = False
+                message = f"Nav2 cancellation acknowledgement failed: {error}"
+            else:
+                message = "Nav2 has not acknowledged cancellation."
+            if accepted:
+                return
+            with self.lock:
+                scan = self.scans.get(job_id)
+                if scan and scan["state"] == "scanning":
+                    scan["rotation_status"] = "uncertain"
+                    scan["error"] = f"{scan.get('failure_reason') or 'Scan cancellation requested.'} {message}"
+                    scan["updated_at"] = _utc_now()
+
+        def _scan_result_callback(self, job_id: str, future: Any) -> None:
+            try:
+                wrapped = future.result()
+                result = wrapped.result
+                status = int(wrapped.status)
+                if not hasattr(result, "error_code"):
+                    raise ValueError("Nav2 Spin result did not include its error code.")
+                error_code = int(result.error_code)
+                error_message = str(getattr(result, "error_msg", "") or "")
+            except Exception as error:
+                with self.lock:
+                    scan = self.scans.get(job_id)
+                    if scan and scan["state"] == "scanning":
+                        scan["rotation_status"] = "uncertain"
+                        scan["error"] = f"Nav2 Spin terminal result is unknown: {error}"
+                        scan["updated_at"] = _utc_now()
+                return
+            with self.lock:
+                scan = self.scans.get(job_id)
+                if not scan or scan["state"] != "scanning":
+                    return
+                if scan.get("failure_reason"):
+                    self._finish_scan_locked(scan, "failed", scan["failure_reason"])
+                elif scan.get("rotation_status") == "cancel_requested":
+                    self._finish_scan_locked(
+                        scan,
+                        "canceled",
+                        "The teacher canceled the 360-degree scan.",
+                    )
+                elif status == self._goal_status.STATUS_CANCELED:
+                    state = "failed" if scan.get("failure_reason") else "canceled"
+                    message = scan.get("failure_reason") or "The teacher canceled the 360-degree scan."
+                    self._finish_scan_locked(scan, state, message)
+                elif status != self._goal_status.STATUS_SUCCEEDED or error_code != 0:
+                    self._finish_scan_locked(
+                        scan,
+                        "failed",
+                        error_message or f"Nav2 Spin failed (status {status}, error {error_code}).",
+                    )
+                elif not scan_rotation_complete(scan["rotation_radians"]):
+                    self._finish_scan_locked(
+                        scan,
+                        "failed",
+                        f"Measured rotation was only {abs(scan['rotation_radians']):.2f} radians; a complete 360-degree turn was not confirmed.",
+                    )
+                else:
+                    scan["rotation_status"] = "completed"
+                    scan["updated_at"] = _utc_now()
+
+        def _finish_scan_locked(self, scan: dict[str, Any], state: str, error: str | None) -> None:
+            scan["state"] = state
+            scan["rotation_status"] = state
+            scan["error"] = error
+            scan["updated_at"] = _utc_now()
+            scan["completed_at"] = scan["updated_at"]
+            if self.active_scan_id == scan["job_id"]:
+                self.active_scan_id = None
 
         @staticmethod
         def _public_scan(scan: dict[str, Any]) -> dict[str, Any]:
@@ -280,6 +530,8 @@ def _make_ros_node(config: dict[str, Any]):
                 "point_count": voxel_count,
                 "map_id": scan.get("map_id"),
                 "map_version": scan.get("map_version"),
+                "rotation_status": scan.get("rotation_status"),
+                "rotation_radians": abs(scan.get("rotation_radians", 0.0)),
                 "error": scan.get("error"),
                 "preview_points": [
                     {"x": point[0], "y": point[1], "z": point[2]}
@@ -291,6 +543,37 @@ def _make_ros_node(config: dict[str, Any]):
             with self.lock:
                 if self.grid is None:
                     raise GatewayHTTPError(503, "A valid SLAM OccupancyGrid is required before scanning.")
+                if (
+                    self.grid_received_monotonic is None
+                    or time.monotonic() - self.grid_received_monotonic > SCAN_MAP_MAX_AGE_SECONDS
+                ):
+                    raise GatewayHTTPError(503, "The SLAM occupancy map is stale; refresh it before scanning.")
+                if self.pointcloud_received_monotonic is None or (
+                    time.monotonic() - self.pointcloud_received_monotonic > SCAN_SENSOR_MAX_AGE_SECONDS
+                ):
+                    raise GatewayHTTPError(503, "A fresh MID-360 point cloud is required before starting the scan.")
+                if not self.pointcloud_frame_id:
+                    raise GatewayHTTPError(503, "The MID-360 point-cloud frame is missing.")
+                if not self.spin_action_client.server_is_ready():
+                    raise GatewayHTTPError(503, "Nav2 Spin action server is not ready; no scan motion was started.")
+                localization = self._localization_snapshot()
+                if not localization.get("ready"):
+                    raise GatewayHTTPError(
+                        503,
+                        localization.get("error") or "Fresh robot localization is required before scanning.",
+                    )
+                try:
+                    self.tf_buffer.lookup_transform(
+                        self.config["map_frame"],
+                        self.pointcloud_frame_id,
+                        Time(),
+                        timeout=Duration(seconds=0.1),
+                    )
+                except self._transform_exception as error:
+                    raise GatewayHTTPError(
+                        503,
+                        f"LiDAR-to-map transform is unavailable; no scan motion was started: {error}",
+                    ) from error
                 if self.active_operation_id:
                     raise GatewayHTTPError(409, "Cannot scan while a Nav2 route owns locomotion.")
                 if self.active_scan_id:
@@ -299,16 +582,37 @@ def _make_ros_node(config: dict[str, Any]):
                         raise GatewayHTTPError(409, "A LiDAR scan is already active.")
                 job_id = str(uuid.uuid4())
                 now = _utc_now()
+                pose = localization["pose"]
                 self.scans[job_id] = {
                     "job_id": job_id,
                     "state": "scanning",
+                    "rotation_status": "submitted",
+                    "rotation_radians": 0.0,
+                    "last_yaw": pose["yaw_rad"],
+                    "created_monotonic": time.monotonic(),
+                    "last_cloud_monotonic": time.monotonic(),
                     "frame_id": self.config["map_frame"],
                     "created_at": now,
                     "updated_at": now,
                     "voxels": {},
+                    "_goal_handle": None,
                 }
                 self.active_scan_id = job_id
-                return self._public_scan(self.scans[job_id])
+                scan = self.scans[job_id]
+                goal = self._spin_action.Goal()
+                goal.target_yaw = SCAN_ROTATION_RADIANS
+                goal.time_allowance = Duration(
+                    seconds=self.config["scan_rotation_timeout_seconds"]
+                ).to_msg()
+                try:
+                    future = self.spin_action_client.send_goal_async(goal)
+                    future.add_done_callback(
+                        lambda completed, scan_id=job_id: self._scan_goal_response(scan_id, completed)
+                    )
+                except Exception as error:
+                    scan["rotation_status"] = "uncertain"
+                    scan["error"] = f"Nav2 Spin submission outcome is unknown: {error}"
+                return self._public_scan(scan)
 
         def complete_scan(self, job_id: str) -> dict[str, Any]:
             with self.lock:
@@ -317,25 +621,50 @@ def _make_ros_node(config: dict[str, Any]):
                     raise GatewayHTTPError(404, "LiDAR scan job was not found.")
                 if scan["state"] != "scanning":
                     return self._public_scan(scan)
-                if len(scan["voxels"]) < MIN_COMPLETED_SCAN_POINTS:
-                    scan["state"] = "failed"
-                    scan["error"] = (
-                        f"Scan has {len(scan['voxels'])} unique points; at least "
-                        f"{MIN_COMPLETED_SCAN_POINTS} are required. Sweep the sensor around the room and try again."
+                if scan.get("rotation_status") != "completed":
+                    raise GatewayHTTPError(
+                        409,
+                        "A complete, successful Nav2 360-degree rotation is required before finalizing the scan.",
                     )
-                else:
-                    grid = self.grid
-                    if grid is None:
+                now = time.monotonic()
+                if now - scan.get("last_cloud_monotonic", 0.0) > SCAN_SENSOR_MAX_AGE_SECONDS:
+                    scan["state"] = "failed"
+                    scan["rotation_status"] = "failed"
+                    scan["error"] = "MID-360 point-cloud data became stale before scan validation."
+                elif (
+                    self.grid_received_monotonic is None
+                    or now - self.grid_received_monotonic > SCAN_MAP_MAX_AGE_SECONDS
+                ):
+                    scan["state"] = "failed"
+                    scan["rotation_status"] = "failed"
+                    scan["error"] = "The SLAM occupancy map became stale before scan validation."
+                elif not self._localization_snapshot().get("ready"):
+                    scan["state"] = "failed"
+                    scan["rotation_status"] = "failed"
+                    scan["error"] = "Fresh robot localization is required to validate the completed scan."
+                if scan["state"] != "failed":
+                    if len(scan["voxels"]) < MIN_COMPLETED_SCAN_POINTS:
                         scan["state"] = "failed"
-                        scan["error"] = "The SLAM occupancy map is no longer available."
+                        scan["rotation_status"] = "failed"
+                        scan["error"] = (
+                            f"Scan has {len(scan['voxels'])} unique points; at least "
+                            f"{MIN_COMPLETED_SCAN_POINTS} are required. Check sensor coverage and try again."
+                        )
                     else:
-                        scan["state"] = "completed"
-                        scan["map_id"] = grid["map_id"]
-                        scan["map_version"] = grid["version"]
-                        scan["map_snapshot"] = {
-                            **self._metadata(grid),
-                            "data": list(grid["data"]),
-                        }
+                        grid = self.grid
+                        if grid is None:
+                            scan["state"] = "failed"
+                            scan["rotation_status"] = "failed"
+                            scan["error"] = "The SLAM occupancy map is no longer available."
+                        else:
+                            scan["state"] = "completed"
+                            scan["rotation_status"] = "completed"
+                            scan["map_id"] = grid["map_id"]
+                            scan["map_version"] = grid["version"]
+                            scan["map_snapshot"] = {
+                                **self._metadata(grid),
+                                "data": list(grid["data"]),
+                            }
                 scan["updated_at"] = _utc_now()
                 scan["completed_at"] = scan["updated_at"]
                 if self.active_scan_id == job_id:
@@ -348,11 +677,31 @@ def _make_ros_node(config: dict[str, Any]):
                 if scan is None:
                     raise GatewayHTTPError(404, "LiDAR scan job was not found.")
                 if scan["state"] == "scanning":
-                    scan["state"] = "canceled"
+                    if scan.get("rotation_status") == "completed":
+                        scan["state"] = "canceled"
+                        scan["rotation_status"] = "canceled"
+                        scan["error"] = "The teacher canceled the scan before map validation."
+                        scan["updated_at"] = _utc_now()
+                        scan["completed_at"] = scan["updated_at"]
+                        if self.active_scan_id == job_id:
+                            self.active_scan_id = None
+                        return self._public_scan(scan)
+                    scan["rotation_status"] = "cancel_requested"
                     scan["updated_at"] = _utc_now()
-                    scan["completed_at"] = scan["updated_at"]
-                if self.active_scan_id == job_id:
-                    self.active_scan_id = None
+                    handle = scan.get("_goal_handle")
+                    if handle is None:
+                        scan["error"] = "Waiting for Nav2 to confirm the Spin goal before cancellation."
+                    else:
+                        try:
+                            future = handle.cancel_goal_async()
+                            future.add_done_callback(
+                                lambda completed, scan_id=job_id: self._scan_cancel_response(scan_id, completed)
+                            )
+                        except Exception as error:
+                            scan["rotation_status"] = "uncertain"
+                            scan["error"] = f"Nav2 cancellation could not be confirmed: {error}"
+                elif scan["state"] not in {"canceled", "failed", "completed"}:
+                    raise GatewayHTTPError(409, "The scan is not in a cancelable state.")
                 return self._public_scan(scan)
 
         def scan_snapshot(self, job_id: str) -> dict[str, Any]:
@@ -367,7 +716,7 @@ def _make_ros_node(config: dict[str, Any]):
                 scan = self.scans.get(job_id)
                 if scan is None:
                     raise GatewayHTTPError(404, "LiDAR scan job was not found.")
-                if scan["state"] not in {"scanning", "completed"}:
+                if scan["state"] != "completed":
                     raise GatewayHTTPError(409, "A completed scan point cloud is not available.")
                 points = [
                     {"x": point[0], "y": point[1], "z": point[2]}
@@ -489,19 +838,33 @@ def _make_ros_node(config: dict[str, Any]):
             localization = self._localization_snapshot()
             with self.lock:
                 grid = self.grid
+                grid_age = (
+                    time.monotonic() - self.grid_received_monotonic
+                    if self.grid_received_monotonic is not None else math.inf
+                )
+                pointcloud_age = (
+                    time.monotonic() - self.pointcloud_received_monotonic
+                    if self.pointcloud_received_monotonic is not None else math.inf
+                )
                 active = self.operations.get(self.active_operation_id) if self.active_operation_id else None
-            map_ready = grid is not None
+            map_ready = grid is not None and grid_age <= SCAN_MAP_MAX_AGE_SECONDS
+            pointcloud_ready = pointcloud_age <= SCAN_SENSOR_MAX_AGE_SECONDS
             action_ready = self.action_client.server_is_ready()
-            ready = bool(map_ready and localization["ready"] and action_ready)
+            ready = bool(map_ready and pointcloud_ready and localization["ready"] and action_ready)
             return {
                 "ready": ready,
                 "status": "ready" if ready else "unavailable",
                 "planner_ready": bool(map_ready and action_ready),
                 "action_server_ready": action_ready,
                 "map_ready": map_ready,
+                "map_age_ms": round(max(0.0, grid_age) * 1000) if math.isfinite(grid_age) else None,
+                "pointcloud_ready": pointcloud_ready,
+                "pointcloud_age_ms": round(max(0.0, pointcloud_age) * 1000) if math.isfinite(pointcloud_age) else None,
                 "localization": localization,
                 "map": self._metadata(grid) if grid else None,
                 "active_operation": self._public_operation(active) if active else None,
+                "scan_rotation_ready": self.spin_action_client.server_is_ready(),
+                "route_preview_ready": self.plan_action_client.server_is_ready(),
             }
 
         @staticmethod
@@ -553,6 +916,147 @@ def _make_ros_node(config: dict[str, Any]):
             occupancy = grid["data"][row * grid["width"] + column]
             return 0 <= occupancy < self.config["occupied_threshold"]
 
+        def plan_route(self, request: Any) -> dict[str, Any]:
+            if not isinstance(request, dict):
+                raise GatewayHTTPError(400, "Request body must be a JSON object.")
+            if not self.plan_lock.acquire(blocking=False):
+                raise GatewayHTTPError(409, "A route preview is already being calculated.")
+            try:
+                with self.lock:
+                    grid = self.grid
+                    if grid is None:
+                        raise GatewayHTTPError(503, "No valid map is available yet.")
+                    if (
+                        self.grid_received_monotonic is None
+                        or time.monotonic() - self.grid_received_monotonic > SCAN_MAP_MAX_AGE_SECONDS
+                    ):
+                        raise GatewayHTTPError(503, "The SLAM occupancy map is stale; no route was planned.")
+                    if request.get("map_id") != grid["map_id"]:
+                        raise GatewayHTTPError(409, "map_id does not match the current map.")
+                    if request.get("version") != grid["version"]:
+                        raise GatewayHTTPError(409, "Map version is stale; fetch the current map and retry.")
+                    if request.get("frame_id") != grid["frame_id"] or grid["frame_id"] != self.config["map_frame"]:
+                        raise GatewayHTTPError(409, "frame_id must exactly match the current map frame.")
+                    goals = request.get("goals")
+                    if not isinstance(goals, list) or not goals or len(goals) > MAX_GOALS:
+                        raise GatewayHTTPError(400, f"goals must contain between 1 and {MAX_GOALS} poses.")
+                    valid_goals = []
+                    for index, goal in enumerate(goals):
+                        if not isinstance(goal, dict):
+                            raise GatewayHTTPError(400, f"Goal {index + 1} must be an object.")
+                        try:
+                            x = _finite_number(goal.get("x"), f"goal {index + 1} x")
+                            y = _finite_number(goal.get("y"), f"goal {index + 1} y")
+                            yaw = _finite_number(goal.get("yaw_rad", 0.0), f"goal {index + 1} yaw_rad")
+                        except ValueError as error:
+                            raise GatewayHTTPError(400, str(error)) from error
+                        if abs(x) > 1_000_000 or abs(y) > 1_000_000 or abs(yaw) > 1_000_000:
+                            raise GatewayHTTPError(400, f"Goal {index + 1} exceeds numeric bounds.")
+                        if not self._cell_is_free(grid, x, y):
+                            raise GatewayHTTPError(
+                                422, f"Goal {index + 1} is outside the map, unknown, or occupied."
+                            )
+                        valid_goals.append((x, y, yaw))
+                    map_id = grid["map_id"]
+                    map_version = grid["version"]
+                    frame_id = grid["frame_id"]
+
+                if (
+                    self.pointcloud_received_monotonic is None
+                    or time.monotonic() - self.pointcloud_received_monotonic > SCAN_SENSOR_MAX_AGE_SECONDS
+                ):
+                    raise GatewayHTTPError(503, "The MID-360 point-cloud stream is stale; no route was planned.")
+                if self.active_operation_id:
+                    operation = self.operations.get(self.active_operation_id)
+                    if operation and operation["state"] not in TERMINAL_STATES:
+                        raise GatewayHTTPError(409, "Cannot preview a route while Nav2 is executing another route.")
+                if self.active_scan_id:
+                    scan = self.scans.get(self.active_scan_id)
+                    if scan and scan["state"] == "scanning":
+                        raise GatewayHTTPError(409, "Cannot preview a route while a LiDAR scan is active.")
+                if not self.plan_action_client.server_is_ready():
+                    raise GatewayHTTPError(503, "Nav2 ComputePathThroughPoses action server is not ready.")
+                localization = self._localization_snapshot()
+                if not localization.get("ready"):
+                    raise GatewayHTTPError(
+                        503, localization.get("error") or "Fresh localization is required for route preview."
+                    )
+
+                goal_message = self._plan_action.Goal()
+                goal_message.use_start = False
+                goal_message.planner_id = self.config["planner_id"]
+                for x, y, yaw in valid_goals:
+                    pose = self._pose_stamped()
+                    pose.header.frame_id = frame_id
+                    pose.header.stamp = self.get_clock().now().to_msg()
+                    pose.pose.position.x = x
+                    pose.pose.position.y = y
+                    pose.pose.orientation.z = math.sin(yaw / 2.0)
+                    pose.pose.orientation.w = math.cos(yaw / 2.0)
+                    goal_message.goals.append(pose)
+
+                goal_future = self.plan_action_client.send_goal_async(goal_message)
+                goal_ready = threading.Event()
+                goal_future.add_done_callback(lambda _future: goal_ready.set())
+                deadline = time.monotonic() + self.config["plan_timeout_seconds"]
+                remaining = max(0.0, deadline - time.monotonic())
+                if not goal_ready.wait(remaining):
+                    raise GatewayHTTPError(504, "Nav2 did not respond to the route preview request in time.")
+                try:
+                    goal_handle = goal_future.result()
+                except Exception as error:
+                    raise GatewayHTTPError(503, f"Nav2 route preview response failed: {error}") from error
+                if not goal_handle.accepted:
+                    raise GatewayHTTPError(422, "Nav2 planner rejected the route preview.")
+
+                result_future = goal_handle.get_result_async()
+                result_ready = threading.Event()
+                result_future.add_done_callback(lambda _future: result_ready.set())
+                remaining = max(0.0, deadline - time.monotonic())
+                if not result_ready.wait(remaining):
+                    try:
+                        goal_handle.cancel_goal_async()
+                    except Exception as error:
+                        self.get_logger().error(f"Timed-out route preview cancellation failed: {error}")
+                    raise GatewayHTTPError(504, "Nav2 route preview timed out; no movement goal was sent.")
+                try:
+                    wrapped = result_future.result()
+                    if int(wrapped.status) != self._goal_status.STATUS_SUCCEEDED:
+                        raise GatewayHTTPError(422, "Nav2 could not find a valid path through the selected goals.")
+                    path = wrapped.result.path
+                except GatewayHTTPError:
+                    raise
+                except Exception as error:
+                    raise GatewayHTTPError(503, f"Nav2 route preview result failed: {error}") from error
+
+                if str(path.header.frame_id).strip() != frame_id:
+                    raise GatewayHTTPError(503, "Nav2 preview path frame does not match the current map.")
+                if not path.poses or len(path.poses) > MAX_PREVIEW_PATH_POSES:
+                    raise GatewayHTTPError(422, "Nav2 returned an empty or oversized route preview.")
+                points = []
+                for index, pose in enumerate(path.poses):
+                    if str(pose.header.frame_id).strip() != frame_id:
+                        raise GatewayHTTPError(
+                            503, f"Nav2 preview pose {index + 1} does not use the current map frame."
+                        )
+                    x = float(pose.pose.position.x)
+                    y = float(pose.pose.position.y)
+                    if not math.isfinite(x) or not math.isfinite(y):
+                        raise GatewayHTTPError(503, f"Nav2 preview pose {index + 1} is not finite.")
+                    points.append({"x": x, "y": y})
+                with self.lock:
+                    if self.grid is None or self.grid["version"] != map_version:
+                        raise GatewayHTTPError(409, "Map changed while calculating route preview; refresh and retry.")
+                return {
+                    "map_id": map_id,
+                    "version": map_version,
+                    "frame_id": frame_id,
+                    "planner_id": self.config["planner_id"],
+                    "path": points,
+                }
+            finally:
+                self.plan_lock.release()
+
         def submit_route(self, request: Any) -> dict[str, Any]:
             if not isinstance(request, dict):
                 raise GatewayHTTPError(400, "Request body must be a JSON object.")
@@ -560,6 +1064,16 @@ def _make_ros_node(config: dict[str, Any]):
                 grid = self.grid
                 if grid is None:
                     raise GatewayHTTPError(503, "No valid map is available yet.")
+                if (
+                    self.grid_received_monotonic is None
+                    or time.monotonic() - self.grid_received_monotonic > SCAN_MAP_MAX_AGE_SECONDS
+                ):
+                    raise GatewayHTTPError(503, "The SLAM occupancy map is stale; no navigation route was started.")
+                if (
+                    self.pointcloud_received_monotonic is None
+                    or time.monotonic() - self.pointcloud_received_monotonic > SCAN_SENSOR_MAX_AGE_SECONDS
+                ):
+                    raise GatewayHTTPError(503, "The MID-360 point-cloud stream is stale; no navigation route was started.")
                 if request.get("map_id") != grid["map_id"]:
                     raise GatewayHTTPError(409, "map_id does not match the current map.")
                 if request.get("version") != grid["version"]:
@@ -611,6 +1125,10 @@ def _make_ros_node(config: dict[str, Any]):
                     if active and active["state"] not in TERMINAL_STATES:
                         raise GatewayHTTPError(409, "A navigation route is already active.")
                     self.active_operation_id = None
+                if self.active_scan_id is not None:
+                    scan = self.scans.get(self.active_scan_id)
+                    if scan and scan["state"] not in {"completed", "failed", "canceled"}:
+                        raise GatewayHTTPError(409, "A 360-degree LiDAR scan owns locomotion.")
                 if not self.action_client.server_is_ready():
                     raise GatewayHTTPError(503, "Nav2 NavigateThroughPoses action server is not ready.")
 
@@ -889,6 +1407,8 @@ def _make_handler(node: Any, token: str):
                 elif self.command == "POST" and path == "/api/v1/navigation/goal":
                     operation = node.submit_route(self._body())
                     self._json(202, operation)
+                elif self.command == "POST" and path == "/api/v1/navigation/plan":
+                    self._json(200, node.plan_route(self._body()))
                 else:
                     parts = [unquote(part) for part in path.strip("/").split("/")]
                     if (len(parts) == 4 and parts[:3] == ["api", "v1", "scans"]
