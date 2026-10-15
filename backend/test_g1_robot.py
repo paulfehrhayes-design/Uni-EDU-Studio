@@ -46,6 +46,196 @@ class G1RobotProgramTests(unittest.TestCase):
         )
         self.assertEqual(commands[-1]["degrees"], 90)
 
+    def test_distance_condition_preserves_both_validated_branches(self):
+        nodes = parse_robot_program(
+            "if robot.front_distance_m() < 1.25:\n"
+            "    robot.walk(2)\n"
+            "else:\n"
+            '    robot.turn("left", 90)'
+        )
+        self.assertEqual(
+            nodes,
+            [{
+                "type": "condition",
+                "sensor": "front_distance_m",
+                "operator": "<",
+                "threshold": 1.25,
+                "then": [{"method": "walk", "steps": 2}],
+                "else": [{"method": "turn", "direction": "left", "degrees": 90}],
+            }],
+        )
+
+    def test_distance_condition_loops_remain_structured_and_are_bounded(self):
+        nodes = parse_robot_program(
+            "for _ in range(2):\n"
+            "    if robot.front_distance_m() <= 0.5:\n"
+            "        robot.walktime(0.2)\n"
+            "    else:\n"
+            '        robot.turn("right", 45)'
+        )
+        self.assertEqual(nodes[0]["type"], "repeat")
+        self.assertEqual(nodes[0]["times"], 2)
+        self.assertEqual(nodes[0]["body"][0]["type"], "condition")
+
+    def test_rear_distance_condition_is_parsed_and_uses_rear_sensor(self):
+        nodes = parse_robot_program(
+            "if robot.rear_distance_m() < 0.8:\n"
+            "    robot.backward(1)\n"
+            "else:\n"
+            '    robot.turn("left", 90)'
+        )
+        self.assertEqual(nodes[0]["sensor"], "rear_distance_m")
+        self.assertEqual(nodes[0]["then"][0]["method"], "backward")
+
+        class FakeLocoClient:
+            def __init__(self):
+                self.fsm_ids = []
+
+            def SetFsmId(self, fsm_id):
+                self.fsm_ids.append(fsm_id)
+                return 0
+
+        client = FakeLocoClient()
+        original_client = g1_robot._client
+        g1_robot._client = client
+        try:
+            with patch.object(
+                g1_robot,
+                "get_rear_distance_sample",
+                return_value={"distance_m": 0.5, "age_ms": 25, "timestamp": "sample"},
+            ) as rear_sample, patch.object(g1_robot, "get_front_distance_sample") as front_sample:
+                result = g1_robot.execute_robot_program(
+                    "if robot.rear_distance_m() < 0.8:\n"
+                    "    robot.stand()\n"
+                    "else:\n"
+                    "    robot.stand_to_squat()"
+                )
+            rear_sample.assert_called_once_with()
+            front_sample.assert_not_called()
+            self.assertEqual(client.fsm_ids, [500])
+            self.assertEqual(result["conditionsEvaluated"][0]["sensor"], "rear_distance_m")
+        finally:
+            g1_robot._client = original_client
+
+    def test_distance_condition_rejects_unsupported_or_unbounded_predicates(self):
+        for code in (
+            "if robot.distance() < 1:\n    robot.stand()",
+            "if robot.side_distance_m() < 1:\n    robot.stand()",
+            "if robot.front_distance_m() < robot.getfsm():\n    robot.stand()",
+            "if robot.front_distance_m() ** 2 < 1:\n    robot.stand()",
+            "if robot.front_distance_m() < 20.1:\n    robot.stand()",
+            "if robot.front_distance_m() < 1:\n    robot.stand()\nelif robot.front_distance_m() < 2:\n    robot.walk(1)",
+            "if robot.front_distance_m() < 1:\n    pass",
+        ):
+            with self.subTest(code=code), self.assertRaises(CommandValidationError):
+                parse_robot_program(code)
+
+    def test_backend_executes_only_branch_selected_by_live_distance(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.fsm_ids = []
+
+            def SetFsmId(self, fsm_id):
+                self.fsm_ids.append(fsm_id)
+                return 0
+
+        program = (
+            "if robot.front_distance_m() < 1:\n"
+            "    robot.stand()\n"
+            "else:\n"
+            "    robot.stand_to_squat()"
+        )
+        original_client = g1_robot._client
+        client = FakeLocoClient()
+        g1_robot._client = client
+        try:
+            with patch.object(
+                g1_robot,
+                "get_front_distance_sample",
+                return_value={"distance_m": 0.75, "age_ms": 20, "timestamp": "sample"},
+            ):
+                result = g1_robot.execute_robot_program(program)
+            self.assertEqual(client.fsm_ids, [500])
+            self.assertEqual(result["conditionsEvaluated"][0]["branch"], "then")
+            self.assertEqual(result["commandsExecuted"], 1)
+
+            client.fsm_ids.clear()
+            with patch.object(
+                g1_robot,
+                "get_front_distance_sample",
+                return_value={"distance_m": 1.2, "age_ms": 50, "timestamp": "sample"},
+            ):
+                result = g1_robot.execute_robot_program(program)
+            self.assertEqual(client.fsm_ids, [706])
+            self.assertEqual(result["conditionsEvaluated"][0]["branch"], "else")
+        finally:
+            g1_robot._client = original_client
+
+    def test_invalid_distance_requests_sdk_stop_and_aborts_without_else(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.stop_count = 0
+
+            def SetFsmId(self, fsm_id):
+                return 0
+
+            def StopMove(self):
+                self.stop_count += 1
+                return 0
+
+        client = FakeLocoClient()
+        original_client = g1_robot._client
+        g1_robot._client = client
+        try:
+            with patch.object(
+                g1_robot,
+                "get_front_distance_sample",
+                side_effect=g1_robot.DistanceSensorError("MID-360 sample is stale"),
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    g1_robot.execute_robot_program(
+                        "if robot.front_distance_m() < 1:\n"
+                        "    robot.stand()\n"
+                        "else:\n"
+                        "    robot.stand_to_squat()"
+                    )
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertIn("stop was requested", raised.exception.detail)
+            self.assertEqual(client.stop_count, 1)
+        finally:
+            g1_robot._client = original_client
+
+    def test_unavailable_rear_sample_requests_stop_and_aborts(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.stop_count = 0
+
+            def StopMove(self):
+                self.stop_count += 1
+                return 0
+
+        client = FakeLocoClient()
+        original_client = g1_robot._client
+        g1_robot._client = client
+        try:
+            with patch.object(
+                g1_robot,
+                "get_rear_distance_sample",
+                side_effect=g1_robot.DistanceSensorError("rear-sector sample unavailable"),
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    g1_robot.execute_robot_program(
+                        "if robot.rear_distance_m() < 1:\n"
+                        "    robot.stand()\n"
+                        "else:\n"
+                        "    robot.backward(1)"
+                    )
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertIn("stop was requested", raised.exception.detail)
+            self.assertEqual(client.stop_count, 1)
+        finally:
+            g1_robot._client = original_client
+
     def test_motion_values_are_bounded(self):
         commands = parse_robot_program('robot.walktime(99)')
         self.assertEqual(commands[0]["seconds"], 10)
@@ -64,9 +254,10 @@ class G1RobotProgramTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandValidationError, "duration in seconds"):
             parse_robot_program("robot.wait()")
 
-    def test_sit_command_is_a_bounded_no_argument_posture_command(self):
-        self.assertEqual(parse_robot_program("robot.sit()"), [{"method": "sit"}])
-        with self.assertRaisesRegex(CommandValidationError, "takes no arguments"):
+    def test_sit_command_is_rejected(self):
+        with self.assertRaisesRegex(CommandValidationError, "Unknown robot command: sit"):
+            parse_robot_program("robot.sit()")
+        with self.assertRaisesRegex(CommandValidationError, "Unknown robot command: sit"):
             parse_robot_program("robot.sit(1)")
 
     def test_arm_presets_accept_only_known_names_and_resolve_official_ids(self):
@@ -91,10 +282,37 @@ class G1RobotProgramTests(unittest.TestCase):
 
         for action, action_id in expected.items():
             with self.subTest(action=action):
+                expected_commands = [{"method": "arm_action", "action": action, "action_id": action_id}]
+                if action != "release arm":
+                    expected_commands.append({
+                        "method": "arm_action",
+                        "action": "release arm",
+                        "action_id": 99,
+                    })
                 self.assertEqual(
                     parse_robot_program(f'robot.arm_action("{action}")'),
-                    [{"method": "arm_action", "action": action, "action_id": action_id}],
+                    expected_commands,
                 )
+
+    def test_arm_presets_release_between_gestures_without_duplicate_release(self):
+        self.assertEqual(
+            parse_robot_program(
+                'for _ in range(2):\n'
+                '    robot.arm_action("hands up")\n'
+                '    robot.arm_action("release arm")\n'
+                '    robot.arm_action("right heart")'
+            ),
+            [
+                {"method": "arm_action", "action": "hands up", "action_id": 15},
+                {"method": "arm_action", "action": "release arm", "action_id": 99},
+                {"method": "arm_action", "action": "right heart", "action_id": 21},
+                {"method": "arm_action", "action": "release arm", "action_id": 99},
+                {"method": "arm_action", "action": "hands up", "action_id": 15},
+                {"method": "arm_action", "action": "release arm", "action_id": 99},
+                {"method": "arm_action", "action": "right heart", "action_id": 21},
+                {"method": "arm_action", "action": "release arm", "action_id": 99},
+            ],
+        )
 
         for code in (
             'robot.arm_action(15)',
@@ -234,7 +452,7 @@ class G1RobotProgramTests(unittest.TestCase):
                 self.assertAlmostEqual(g1_robot._STEP_METERS, 0.345)
                 self.assertAlmostEqual(g1_robot._estimated_duration(command), duration)
 
-    def test_robot_program_dispatches_sit_to_the_sdk_sit_fsm(self):
+    def test_robot_program_dispatches_stand_to_the_sdk_ready_fsm(self):
         class FakeLocoClient:
             def __init__(self):
                 self.fsm_requests = []
@@ -247,11 +465,11 @@ class G1RobotProgramTests(unittest.TestCase):
         original_client = g1_robot._client
         g1_robot._client = client
         try:
-            result = g1_robot.execute_robot_program("robot.sit()")
+            result = g1_robot.execute_robot_program("robot.stand()")
         finally:
             g1_robot._client = original_client
 
-        self.assertEqual(client.fsm_requests, [3])
+        self.assertEqual(client.fsm_requests, [500])
         self.assertEqual(result["commandsExecuted"], 1)
 
     def test_robot_program_dispatches_posture_transitions_to_sdk_fsms(self):
@@ -389,8 +607,8 @@ class G1RobotProgramTests(unittest.TestCase):
                 ("PlayStop", "example"),
             ],
         )
-        self.assertEqual(arm_client.actions, [15])
-        self.assertEqual(result["commandsExecuted"], 8)
+        self.assertEqual(arm_client.actions, [15, 99])
+        self.assertEqual(result["commandsExecuted"], 9)
 
     def test_stop_during_arm_action_spacing_does_not_claim_to_cancel_arm(self):
         class FakeLocoClient:

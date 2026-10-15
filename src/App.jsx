@@ -12,10 +12,11 @@ import * as Zh from 'blockly/msg/zh-hans';
 import 'blockly/blocks';
 import g1BasicConfigZh from '../block_configurations/g1_basic/g1_basic.json';
 import g1BasicConfigEn from '../block_configurations/g1_basic/g1_basic_en.json';
-import { G1_EDU_23_ENV, G1_MOTION_TEMPLATES, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import { G1_EDU_23_ENV, SIMULATOR_MODES, buildPlannerMotionCommands, clampScenePoint, createEmptyG1Edu23State, simulateG1Edu23Program } from './sim/g1Edu23Env';
+import { getSceneObjectBaseDimensions, getSceneObjectDimensions } from './sim/sceneObjects';
 import G1Simulation3D from './components/G1Simulation3D';
 import { compileMotionPrompt } from './sim/textToMotion';
-import { flattenG1Commands, formatG1Program, G1_ARM_PRESET_DESCRIPTIONS, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, getG1BlocklyCommandBlocks, parseG1Program } from './sim/g1Commands';
+import { flattenG1Commands, formatG1Program, G1_ARM_PRESET_DESCRIPTIONS, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './sim/g1Commands';
 import { createRobotConnection } from './robot/RobotConnection';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
@@ -287,7 +288,7 @@ const SAFE_COMMAND_LIMITS = {
   STEPS: { min: 1, max: 10 },
   ANGLE: { min: 5, max: 180 },
   DEGREES: { min: 0, max: 180 },
-  SECONDS: { min: 0.1, max: 5 },
+  SECONDS: { min: 0.1, max: 10 },
   TIME: { min: 0, max: 10 },
 };
 
@@ -401,7 +402,6 @@ const sanitizeRobotCode = (code = '') => {
     return `for (let i = 0; i < ${safeValue}; i++) {\n  robot.raiseBothArms();\n}\n`;
   });
   sanitized = sanitized.replace(/robot\.stop\(\)/g, () => 'robot.stop();');
-  sanitized = sanitized.replace(/robot\.sit\(\)/g, () => 'robot.sit();');
   sanitized = sanitized.replace(/robot\.lowerBothArms\(\)/g, () => 'robot.lowerBothArms();');
   sanitized = sanitized.replace(/robot\.waveRight\(\)/g, () => 'robot.waveRight();');
   return { code: sanitized, changed };
@@ -619,14 +619,6 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
     codeTemplate: 'robot.stop();\n',
   },
   {
-    type: 'robot_sit',
-    message0: 'Sit',
-    previousStatement: null,
-    nextStatement: null,
-    colour: 280,
-    codeTemplate: 'robot.sit();\n',
-  },
-  {
     type: 'robot_wave_left',
     message0: 'Wave Left',
     previousStatement: null,
@@ -705,6 +697,7 @@ export default function App() {
   const [simulatorMode, setSimulatorMode] = useState('kid-preview');
   const [simulatorSidebarTab, setSimulatorSidebarTab] = useState('add-object');
   const [sceneObjects, setSceneObjects] = useState([]);
+  const [selectedSceneObjectId, setSelectedSceneObjectId] = useState(null);
   const [activeDragItem, setActiveDragItem] = useState(null);
   const [projectName, setProjectName] = useState('default');
   const [projectLibrary, setProjectLibrary] = useState([]);
@@ -733,8 +726,34 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
   const [classroomStatus, setClassroomStatus] = useState('idle');
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
+  const [lidarTestStatus, setLidarTestStatus] = useState('Not tested');
+  const [navigationBridgeStatus, setNavigationBridgeStatus] = useState('Not checked');
+  const [isNavigationBridgeChecking, setIsNavigationBridgeChecking] = useState(false);
+  const [navigationMapSnapshot, setNavigationMapSnapshot] = useState(null);
+  const [navigationMapStatus, setNavigationMapStatus] = useState('Map not loaded');
+  const [isNavigationMapLoading, setIsNavigationMapLoading] = useState(false);
+  const [isNavigationMapVisible, setIsNavigationMapVisible] = useState(false);
+  const [navigationRouteWaypoints, setNavigationRouteWaypoints] = useState([]);
+  const [isNavigationGoalPlacementEnabled, setIsNavigationGoalPlacementEnabled] = useState(false);
+  const [navigationOperation, setNavigationOperation] = useState(null);
+  const [navigationExecutionStatus, setNavigationExecutionStatus] = useState('No navigation operation');
+  const [isNavigationStarting, setIsNavigationStarting] = useState(false);
+  const [lidarScanJob, setLidarScanJob] = useState(null);
+  const [lidarScanStatus, setLidarScanStatus] = useState('No room scan');
+  const [liveLidarScanPoints, setLiveLidarScanPoints] = useState([]);
+  const [isLidarScanStarting, setIsLidarScanStarting] = useState(false);
+  const [isLidarScanFinalizing, setIsLidarScanFinalizing] = useState(false);
+  const [sharedLidarOverlayEnabled, setSharedLidarOverlayEnabled] = useState(false);
+  const [sharedLidarMap, setSharedLidarMap] = useState(null);
+  const [isSharedLidarMapLoading, setIsSharedLidarMapLoading] = useState(false);
+  const [navigationLiveStatus, setNavigationLiveStatus] = useState('Live updates disconnected');
+  const sharedMapVersionRef = useRef(null);
+  const sharedMapLoadedRef = useRef(false);
+  const liveNavigationMapVersionRef = useRef(null);
+  const navigationMapCoordinatesRef = useRef(null);
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [isRobotConnecting, setIsRobotConnecting] = useState(false);
+  const [isLidarTesting, setIsLidarTesting] = useState(false);
   const [safetyNotice, setSafetyNotice] = useState('');
   const [blockSyncError, setBlockSyncError] = useState('');
 
@@ -812,9 +831,12 @@ export default function App() {
         robotConnection.status()
           .then((status) => {
             setIsRobotConnected(status.sdkAvailable);
-            setRobotConnectionStatus(status.sdkAvailable
+            const sensorText = status.distanceSensor?.ready
+              ? `MID-360 ready (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms)`
+              : `MID-360 unavailable (${status.distanceSensor?.error || 'provider status not reported'})`;
+            setRobotConnectionStatus(`${status.sdkAvailable
               ? `SDK connected on ${status.interface}`
-              : 'Disconnected • backend must run on the G1 computer');
+              : 'Disconnected • backend must run on the G1 computer'} • ${sensorText}`);
           })
           .catch((error) => {
             setIsRobotConnected(false);
@@ -864,6 +886,128 @@ export default function App() {
     }, 250);
     return () => clearTimeout(timer);
   }, [session, projectName, sceneObjects, plannerWaypoints, generatedCode]);
+
+  useEffect(() => {
+    if (!session?.token) {
+      setLidarScanJob(null);
+      setLiveLidarScanPoints([]);
+      setSharedLidarMap(null);
+      setNavigationLiveStatus('Live updates disconnected');
+      sharedMapVersionRef.current = null;
+      sharedMapLoadedRef.current = false;
+      liveNavigationMapVersionRef.current = null;
+      return undefined;
+    }
+
+    let active = true;
+    Promise.all([
+      apiFetch('/api/lidar/settings'),
+      apiFetch('/api/lidar/map'),
+    ]).then(([settings, sharedMap]) => {
+      if (!active) return;
+      setSharedLidarOverlayEnabled(settings.show_shared_overlay === true);
+      setSharedLidarMap(sharedMap.map ? sharedMap : null);
+      sharedMapVersionRef.current = sharedMap.map?.map?.version || null;
+      sharedMapLoadedRef.current = Boolean(sharedMap.map);
+    }).catch((error) => {
+      if (active) setNavigationLiveStatus(`Live map unavailable • ${error.message}`);
+    });
+
+    const socketScheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(
+      `${socketScheme}//${window.location.host}/api/lidar/live`,
+      [`edu-auth.${session.token}`],
+    );
+    socket.onopen = () => {
+      if (active) setNavigationLiveStatus('Live LiDAR and navigation updates connected');
+    };
+    socket.onmessage = (event) => {
+      if (!active) return;
+      try {
+        const update = JSON.parse(event.data);
+        const scan = update.scan;
+        if (scan) {
+          setLidarScanJob(scan);
+          setLiveLidarScanPoints(Array.isArray(scan.preview_points) ? scan.preview_points : []);
+          setLidarScanStatus(
+            scan.error
+              ? `Scan ${scan.status} • ${scan.error}`
+              : `Scan ${scan.status} • ${scan.point_count || 0} unique 3D points`,
+          );
+        }
+        setSharedLidarOverlayEnabled(update.shared_overlay_enabled === true);
+        setNavigationLiveStatus(
+          update.navigation?.ready
+            ? `Live • ${update.navigation.map?.map_id} ${update.navigation.map?.version} • ${update.navigation.localization?.age_ms ?? '—'} ms localization`
+            : `Live • navigation unavailable${update.navigation?.error ? ` • ${update.navigation.error}` : ''}`,
+        );
+        const sharedVersion = update.shared_map_version || null;
+        if (sharedVersion && sharedVersion !== sharedMapVersionRef.current) {
+          sharedMapVersionRef.current = sharedVersion;
+          if (session.user.role === 'teacher' || update.shared_overlay_enabled) {
+            apiFetch('/api/lidar/map')
+              .then((result) => {
+                if (!active) return;
+                setSharedLidarMap(result.map ? result : null);
+                sharedMapLoadedRef.current = Boolean(result.map);
+              })
+              .catch((error) => {
+                if (active) setNavigationLiveStatus(`Published map refresh failed • ${error.message}`);
+              });
+          }
+        } else if (update.shared_overlay_enabled && !sharedMapLoadedRef.current) {
+          apiFetch('/api/lidar/map')
+            .then((result) => {
+              if (!active) return;
+              setSharedLidarMap(result.map ? result : null);
+              sharedMapLoadedRef.current = Boolean(result.map);
+              sharedMapVersionRef.current = result.map?.map?.version || null;
+            })
+            .catch((error) => {
+              if (active) setNavigationLiveStatus(`Published map refresh failed • ${error.message}`);
+            });
+        }
+        const liveMapVersion = update.navigation?.map?.version || null;
+        if (
+          session.user.role === 'teacher'
+          && liveNavigationMapVersionRef.current
+          && liveMapVersion
+          && liveMapVersion !== liveNavigationMapVersionRef.current
+        ) {
+          const previousVersion = liveNavigationMapVersionRef.current;
+          liveNavigationMapVersionRef.current = liveMapVersion;
+          apiFetch('/api/navigation/map')
+            .then((result) => {
+              if (!active) return;
+              if (result.map.version !== previousVersion) {
+                setNavigationRouteWaypoints([]);
+                setIsNavigationGoalPlacementEnabled(false);
+              }
+              setNavigationMapSnapshot(result);
+              setNavigationMapStatus(
+                `Live map update • ${result.map.width} × ${result.map.height} cells • version ${result.map.version}`,
+              );
+            })
+            .catch((error) => {
+              if (active) setNavigationMapStatus(`Live map refresh failed • ${error.message}`);
+            });
+        }
+      } catch (error) {
+        setNavigationLiveStatus(`Invalid live update • ${error.message}`);
+      }
+    };
+    socket.onerror = () => {
+      if (active) setNavigationLiveStatus('Live updates unavailable • check the authenticated backend connection');
+    };
+    socket.onclose = () => {
+      if (active) setNavigationLiveStatus('Live updates disconnected');
+    };
+
+    return () => {
+      active = false;
+      socket.close();
+    };
+  }, [session?.token, session?.user?.role, apiFetch]);
 
   const handleLogin = async (event) => {
     event.preventDefault();
@@ -988,7 +1132,10 @@ export default function App() {
         throw new Error('Backend did not confirm a connected robot.');
       }
       setIsRobotConnected(true);
-      setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
+      const sensorText = connection.distanceSensor?.ready
+        ? `MID-360 ready (${connection.distanceSensor.distance_m.toFixed(2)} m, ${connection.distanceSensor.age_ms} ms)`
+        : `MID-360 unavailable (${connection.distanceSensor?.error || 'provider status not reported'})`;
+      setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
     } catch (error) {
       setIsRobotConnected(false);
       setRobotConnectionStatus(`Connection failed: ${error.message}`);
@@ -1017,6 +1164,341 @@ export default function App() {
       setIsRunning(false);
     }
   };
+
+  const handleTestLidar = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      alert('Teacher login is required to test the LiDAR connection.');
+      return;
+    }
+
+    setIsLidarTesting(true);
+    setLidarTestStatus('Reading a fresh MID-360 sample…');
+    try {
+      const status = await robotConnection.status();
+      const sensor = status.distanceSensor;
+      if (sensor?.ready) {
+        const sampleTime = sensor.timestamp ? ` • ${new Date(sensor.timestamp).toLocaleTimeString()}` : '';
+        const rear = sensor.rear?.ready
+          ? `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m • ${sensor.rear.age_ms} ms old`
+          : `Rear unavailable • ${sensor.rear?.error || 'provider status not reported'}`;
+        setLidarTestStatus(
+          `Front ready • ${sensor.distance_m.toFixed(2)} m • ${sensor.age_ms} ms old • ${sensor.frame_id}${sampleTime} • ${rear}`,
+        );
+      } else {
+        const rear = sensor?.rear?.ready
+          ? `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m`
+          : `Rear unavailable • ${sensor?.rear?.error || 'provider status not reported'}`;
+        setLidarTestStatus(`Front unavailable • ${sensor?.error || 'Backend did not report LiDAR status.'} • ${rear}`);
+      }
+    } catch (error) {
+      setLidarTestStatus(`Test failed • ${error.message}`);
+    } finally {
+      setIsLidarTesting(false);
+    }
+  };
+
+  const handleCheckNavigationBridge = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationBridgeStatus('Teacher login is required to check the navigation bridge.');
+      return;
+    }
+    setIsNavigationBridgeChecking(true);
+    setNavigationBridgeStatus('Checking bridge, localization, and map metadata…');
+    try {
+      const result = await apiFetch('/api/navigation/status');
+      if (result.activeOperation) {
+        setNavigationOperation(result.activeOperation);
+        setNavigationExecutionStatus(
+          `Recovered navigation operation ${result.activeOperation.operation_id} • ${result.activeOperation.status}`,
+        );
+      } else {
+        setNavigationOperation(null);
+      }
+      if (!result.ready) {
+        setNavigationBridgeStatus(`Unavailable • ${result.error || 'Bridge is not ready.'}`);
+        return;
+      }
+      const { map, localization } = result;
+      setNavigationBridgeStatus(
+        `Ready • map ${map.map_id} • version ${map.version} • ${map.frame_id} • `
+        + `pose ${localization.pose.x.toFixed(2)}, ${localization.pose.y.toFixed(2)} m `
+        + `(${localization.age_ms} ms old)`,
+      );
+    } catch (error) {
+      setNavigationBridgeStatus(`Check failed • ${error.message}`);
+    } finally {
+      setIsNavigationBridgeChecking(false);
+    }
+  };
+
+  const handleLoadNavigationMap = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationMapStatus('Teacher login is required to load the map preview.');
+      return;
+    }
+    setIsNavigationMapLoading(true);
+    setNavigationMapStatus('Loading occupancy map…');
+    try {
+      const result = await apiFetch('/api/navigation/map');
+      setNavigationMapSnapshot(result);
+      liveNavigationMapVersionRef.current = result.map.version;
+      setIsNavigationMapVisible(true);
+      if (
+        navigationMapSnapshot?.map?.map_id !== result.map.map_id
+        || navigationMapSnapshot?.map?.version !== result.map.version
+      ) {
+        setNavigationRouteWaypoints([]);
+        setIsNavigationGoalPlacementEnabled(false);
+      }
+      setNavigationMapStatus(
+        `Loaded • ${result.map.width} × ${result.map.height} cells • map ${result.map.map_id} • version ${result.map.version}`,
+      );
+    } catch (error) {
+      setNavigationMapSnapshot(null);
+      setIsNavigationMapVisible(false);
+      setNavigationMapStatus(`Unavailable • ${error.message}`);
+    } finally {
+      setIsNavigationMapLoading(false);
+    }
+  };
+
+  const handleStartLidarScan = async () => {
+    if (session?.user?.role !== 'teacher') return;
+    setIsLidarScanStarting(true);
+    setLidarScanStatus('Starting read-only LiDAR capture…');
+    try {
+      const scan = await apiFetch('/api/lidar/scan', { method: 'POST' });
+      setLidarScanJob(scan);
+      setLiveLidarScanPoints([]);
+      setLidarScanStatus('Capturing 3D LiDAR points in the SLAM map frame • robot movement is not commanded');
+    } catch (error) {
+      setLidarScanStatus(`Scan could not start • ${error.message}`);
+    } finally {
+      setIsLidarScanStarting(false);
+    }
+  };
+
+  const handleCompleteLidarScan = async () => {
+    if (!lidarScanJob?.job_id || session?.user?.role !== 'teacher') return;
+    setIsLidarScanFinalizing(true);
+    setLidarScanStatus('Validating 3D point cloud and metric occupancy grid…');
+    try {
+      const result = await apiFetch(`/api/lidar/scan/${lidarScanJob.job_id}/complete`, {
+        method: 'POST',
+      });
+      setLidarScanJob(result);
+      setLidarScanStatus(
+        `Scan complete • ${result.point_count} 3D points • ${result.map.width} × ${result.map.height} cells at ${result.map.resolution_m} m/cell`,
+      );
+    } catch (error) {
+      setLidarScanStatus(`Scan finalization failed • ${error.message}`);
+    } finally {
+      setIsLidarScanFinalizing(false);
+    }
+  };
+
+  const handleCancelLidarScan = async () => {
+    if (!lidarScanJob?.job_id || session?.user?.role !== 'teacher') return;
+    setIsLidarScanFinalizing(true);
+    try {
+      const result = await apiFetch(`/api/lidar/scan/${lidarScanJob.job_id}/cancel`, {
+        method: 'POST',
+      });
+      setLidarScanJob(result);
+      setLiveLidarScanPoints([]);
+      setLidarScanStatus('Room scan canceled • no map was published');
+    } catch (error) {
+      setLidarScanStatus(`Scan cancellation failed • ${error.message}`);
+    } finally {
+      setIsLidarScanFinalizing(false);
+    }
+  };
+
+  const handlePublishLidarMap = async () => {
+    if (!lidarScanJob?.job_id || session?.user?.role !== 'teacher') return;
+    try {
+      const result = await apiFetch('/api/lidar/map/publish', {
+        method: 'POST',
+        body: JSON.stringify({ job_id: lidarScanJob.job_id }),
+      });
+      const sharedMap = await apiFetch('/api/lidar/map');
+      setSharedLidarMap(sharedMap);
+      sharedMapVersionRef.current = result.map.version;
+      sharedMapLoadedRef.current = Boolean(sharedMap.map);
+      setLidarScanStatus(
+        `Published shared room map • ${result.map.width * result.map.resolution_m} m × ${result.map.height * result.map.resolution_m} m`,
+      );
+    } catch (error) {
+      setLidarScanStatus(`Map publication failed • ${error.message}`);
+    }
+  };
+
+  const handleRefreshSharedLidarMap = async () => {
+    setIsSharedLidarMapLoading(true);
+    try {
+      const result = await apiFetch('/api/lidar/map');
+      setSharedLidarMap(result.map ? result : null);
+      sharedMapVersionRef.current = result.map?.map?.version || null;
+      sharedMapLoadedRef.current = Boolean(result.map);
+    } catch (error) {
+      setNavigationLiveStatus(`Shared map unavailable • ${error.message}`);
+    } finally {
+      setIsSharedLidarMapLoading(false);
+    }
+  };
+
+  const handleSharedLidarOverlayToggle = async (enabled) => {
+    const previousValue = sharedLidarOverlayEnabled;
+    setSharedLidarOverlayEnabled(enabled);
+    try {
+      const result = await apiFetch('/api/lidar/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ show_shared_overlay: enabled }),
+      });
+      setSharedLidarOverlayEnabled(result.show_shared_overlay);
+    } catch (error) {
+      setSharedLidarOverlayEnabled(previousValue);
+      setNavigationLiveStatus(`Shared overlay setting was not saved • ${error.message}`);
+    }
+  };
+
+  useEffect(() => {
+    const jobId = lidarScanJob?.job_id;
+    if (!jobId || lidarScanJob.status !== 'scanning' || session?.user?.role !== 'teacher') return undefined;
+    let active = true;
+    const pollScan = async () => {
+      try {
+        const result = await apiFetch(`/api/lidar/scan/${jobId}`);
+        if (!active) return;
+        setLidarScanJob(result);
+        setLiveLidarScanPoints(Array.isArray(result.preview_points) ? result.preview_points : []);
+        setLidarScanStatus(
+          `Capturing 3D room scan • ${result.point_count || 0} unique points • move/sweep only under teacher supervision`,
+        );
+      } catch (error) {
+        if (active) setLidarScanStatus(`Scan status unavailable • ${error.message}`);
+      }
+    };
+    pollScan();
+    const timer = window.setInterval(pollScan, 1200);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [lidarScanJob?.job_id, lidarScanJob?.status, session?.user?.role, apiFetch]);
+
+
+  const handleNavigationMapClick = (event) => {
+    if (!isNavigationGoalPlacementEnabled || !navigationMapSnapshot?.map) return;
+    const mapGroup = navigationMapCoordinatesRef.current;
+    if (!mapGroup) return;
+    const screenPoint = mapGroup.ownerSVGElement.createSVGPoint();
+    screenPoint.x = event.clientX;
+    screenPoint.y = event.clientY;
+    const localPoint = screenPoint.matrixTransform(mapGroup.getScreenCTM().inverse());
+    const { map } = navigationMapSnapshot;
+    const mapWidth = map.width * map.resolution_m;
+    const mapHeight = map.height * map.resolution_m;
+    if (localPoint.x < 0 || localPoint.y < 0 || localPoint.x >= mapWidth || localPoint.y >= mapHeight) return;
+    const localY = mapHeight - localPoint.y;
+    const cosine = Math.cos(map.origin.yaw_rad);
+    const sine = Math.sin(map.origin.yaw_rad);
+    const x = map.origin.x + cosine * localPoint.x - sine * localY;
+    const y = map.origin.y + sine * localPoint.x + cosine * localY;
+    setNavigationRouteWaypoints((points) => [
+      ...points,
+      { id: `nav-${Date.now()}-${points.length}`, x, y },
+    ]);
+    setNavigationExecutionStatus('Destination added • route will be checked against the current map before start.');
+  };
+
+  const handleStartNavigation = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationExecutionStatus('Teacher login is required to start navigation.');
+      return;
+    }
+    if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
+      setNavigationExecutionStatus('Load the map and add at least one destination before starting.');
+      return;
+    }
+    if (navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status)) {
+      setNavigationExecutionStatus('A navigation operation is already active.');
+      return;
+    }
+    if (!window.confirm(
+      `Start ROS navigation on map ${navigationMapSnapshot.map.map_id} (${navigationMapSnapshot.map.version}) `
+      + `with ${navigationRouteWaypoints.length} destination(s)? Keep the robot area clear and the physical emergency stop accessible.`,
+    )) return;
+
+    setIsNavigationStarting(true);
+    setNavigationExecutionStatus('Submitting route to the ROS Nav2 controller…');
+    try {
+      const result = await apiFetch('/api/navigation/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          map_id: navigationMapSnapshot.map.map_id,
+          version: navigationMapSnapshot.map.version,
+          frame_id: navigationMapSnapshot.map.frame_id,
+          waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
+        }),
+      });
+      setNavigationOperation(result);
+      setNavigationExecutionStatus(
+        `Route ${result.operation_id} • ${result.status}; controller status will be polled.`,
+      );
+      setIsNavigationGoalPlacementEnabled(false);
+    } catch (error) {
+      setNavigationExecutionStatus(`Navigation start rejected • ${error.message}`);
+    } finally {
+      setIsNavigationStarting(false);
+    }
+  };
+
+  const handleStopNavigation = async () => {
+    if (!navigationOperation?.operation_id) return;
+    setNavigationExecutionStatus('Requesting Nav2 cancellation…');
+    try {
+      const result = await apiFetch(`/api/navigation/operation/${navigationOperation.operation_id}/stop`, {
+        method: 'POST',
+      });
+      setNavigationOperation((current) => current
+        ? { ...current, status: result.status }
+        : current);
+      setNavigationExecutionStatus(
+        `Cancellation requested • waiting for Nav2 terminal status (${navigationOperation.operation_id}).`,
+      );
+    } catch (error) {
+      setNavigationExecutionStatus(`Cancellation request failed • ${error.message}`);
+    }
+  };
+
+  useEffect(() => {
+    const operationId = navigationOperation?.operation_id;
+    if (!operationId || ['completed', 'canceled', 'failed'].includes(navigationOperation.status)) return undefined;
+    let active = true;
+    const pollOperation = async () => {
+      try {
+        const result = await apiFetch(`/api/navigation/operation/${operationId}`);
+        if (!active) return;
+        setNavigationOperation(result);
+        {
+          let statusText = `Navigation ${result.status}`;
+          if (result.status === 'succeeded') statusText = `Navigation completed${result.current_waypoint ? ` • destination ${result.current_waypoint}` : ''}`;
+          else if (result.status === 'failed') statusText = `Navigation failed${result.current_waypoint ? ` • destination ${result.current_waypoint}` : ''}`;
+          else if (result.status === 'canceled') statusText = `Navigation canceled${result.current_waypoint ? ` • destination ${result.current_waypoint}` : ''}`;
+          setNavigationExecutionStatus(statusText);
+        }
+      } catch (error) {
+        if (active) setNavigationExecutionStatus(`Navigation status unavailable • ${error.message}; execution remains locked.`);
+      }
+    };
+    pollOperation();
+    const timer = window.setInterval(pollOperation, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [navigationOperation?.operation_id, navigationOperation?.status]);
 
   useEffect(() => {
     const handleClickOutside = () => setActiveMenu(null);
@@ -1078,6 +1560,14 @@ export default function App() {
     return `
     <xml xmlns="https://developers.google.com/blockly/xml">
       ${commandCategoriesXml}
+      <category name="${language === 'zh' ? '距离条件' : 'Distance conditions'}" colour="200">
+        <block type="controls_if"></block>
+        <block type="controls_if"><mutation else="1"></mutation></block>
+        <block type="logic_compare"></block>
+        <block type="g1_front_distance_m"></block>
+        <block type="g1_rear_distance_m"></block>
+        <block type="math_number"><field name="NUM">1</field></block>
+      </category>
       <sep></sep>
       <category name="${cats.loops}" colour="120">
         <block type="controls_repeat_ext"><value name="TIMES"><shadow type="math_number"><field name="NUM">10</field></shadow></value></block>
@@ -1119,6 +1609,7 @@ export default function App() {
     const commandBlocks = [
       ...ROBOT_IDE_COMMAND_BLOCKS,
       ...getG1BlocklyCommandBlocks(G1_COMMANDS),
+      ...getG1BlocklyConditionBlocks(),
     ];
     const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
       const definition = { ...blockDef };
@@ -1275,6 +1766,7 @@ export default function App() {
     if (window.confirm(t.confirmClear)) {
       workspaceRef.current?.clear();
       setSceneObjects([]);
+      setSelectedSceneObjectId(null);
       setPlannerWaypoints([]);
       setIsWaypointPlacementEnabled(false);
       applyGeneratedCode('', { syncBlocks: false });
@@ -1289,6 +1781,7 @@ export default function App() {
     if (!project) return;
     setProjectName(project.name || 'default');
     setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
+    setSelectedSceneObjectId(null);
     setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
     setIsWaypointPlacementEnabled(false);
     const nextCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
@@ -1359,7 +1852,10 @@ export default function App() {
         setIsRunning(true);
         const result = await robotConnection.run(generatedCode);
         const output = result.results?.length ? ` SDK output: ${JSON.stringify(result.results)}` : '';
-        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.${output}`);
+        const conditionOutput = result.conditionsEvaluated?.length
+          ? ` Distance branches: ${result.conditionsEvaluated.map(({ distance_m, operator, threshold_m, branch }) => `${distance_m.toFixed(2)} m ${operator} ${threshold_m} m → ${branch}`).join('; ')}.`
+          : '';
+        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${output}`);
       } catch (error) {
         alert(`Robot run failed: ${error.message}`);
       } finally {
@@ -1430,17 +1926,43 @@ export default function App() {
       const createBlocks = (program, parentConnection = null) => {
         let previousBlock = null;
         program.forEach((node) => {
-          const block = node.type === 'repeat'
-            ? workspace.newBlock('controls_repeat_ext')
-            : workspace.newBlock(node.method === 'arm_action'
+          let block;
+          if (node.type === 'repeat') {
+            block = workspace.newBlock('controls_repeat_ext');
+          } else if (node.type === 'condition') {
+            block = workspace.newBlock('controls_if');
+            if (node.else.length) {
+              const mutation = document.createElement('mutation');
+              mutation.setAttribute('else', '1');
+              block.domToMutation(mutation);
+            }
+          } else {
+            block = workspace.newBlock(node.method === 'arm_action'
               ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
               : `g1_command_${node.method}`);
+          }
           if (node.type === 'repeat') {
             const repeatCount = workspace.newBlock('math_number');
             repeatCount.setFieldValue(String(node.times), 'NUM');
             repeatCount.initSvg();
             repeatCount.render();
             block.getInput('TIMES').connection.connect(repeatCount.outputConnection);
+          } else if (node.type === 'condition') {
+            const comparison = workspace.newBlock('logic_compare');
+            const distance = workspace.newBlock(node.sensor === 'rear_distance_m'
+              ? 'g1_rear_distance_m'
+              : 'g1_front_distance_m');
+            const threshold = workspace.newBlock('math_number');
+            const operatorFields = { '<': 'LT', '<=': 'LTE', '>': 'GT', '>=': 'GTE', '==': 'EQ', '!=': 'NEQ' };
+            comparison.setFieldValue(operatorFields[node.operator], 'OP');
+            threshold.setFieldValue(String(node.threshold), 'NUM');
+            [distance, threshold, comparison].forEach((conditionBlock) => {
+              conditionBlock.initSvg();
+              conditionBlock.render();
+            });
+            comparison.getInput('A').connection.connect(distance.outputConnection);
+            comparison.getInput('B').connection.connect(threshold.outputConnection);
+            block.getInput('IF0').connection.connect(comparison.outputConnection);
           } else {
             const definition = G1_COMMANDS.find((entry) => entry.method === node.method);
             definition.args.forEach((argument, index) => {
@@ -1454,6 +1976,10 @@ export default function App() {
           if (previousBlock) previousBlock.nextConnection.connect(block.previousConnection);
           else if (parentConnection) parentConnection.connect(block.previousConnection);
           if (node.type === 'repeat') createBlocks(node.body, block.getInput('DO').connection);
+          if (node.type === 'condition') {
+            createBlocks(node.then, block.getInput('DO0').connection);
+            if (node.else.length) createBlocks(node.else, block.getInput('ELSE').connection);
+          }
           previousBlock = block;
         });
       };
@@ -1508,27 +2034,30 @@ export default function App() {
     commands.forEach(({ method, values }) => {
       const numberOfSteps = Number(values[0] || 0);
       let forwardDistance = 0;
-      if (method === 'walk') forwardDistance = numberOfSteps * 0.4;
-      if (method === 'backward') forwardDistance = -numberOfSteps * 0.4;
+      let moved = false;
+      if (method === 'walk') forwardDistance = numberOfSteps * G1_NOMINAL_STEP_METERS;
+      if (method === 'backward') forwardDistance = -numberOfSteps * G1_NOMINAL_STEP_METERS;
       if (method === 'walktime') forwardDistance = numberOfSteps * 0.4;
       if (method === 'backwardtime') forwardDistance = -numberOfSteps * 0.4;
-      if (method === 'slowwalk') forwardDistance = numberOfSteps * 0.4;
+      if (method === 'slowwalk') forwardDistance = numberOfSteps * G1_NOMINAL_STEP_METERS;
       if (method === 'slowwalktime') forwardDistance = numberOfSteps * 0.2;
-      if (method === 'fastwalk') forwardDistance = numberOfSteps * 0.4;
+      if (method === 'fastwalk') forwardDistance = numberOfSteps * G1_NOMINAL_STEP_METERS;
       if (method === 'fastwalktime') forwardDistance = numberOfSteps * 0.8;
       if (method === 'sidestep') {
         const sideHeading = heading + (values[0] === 'left' ? 90 : -90);
-        x += Math.cos((sideHeading * Math.PI) / 180) * 0.4;
-        y += Math.sin((sideHeading * Math.PI) / 180) * 0.4;
+        x += Math.cos((sideHeading * Math.PI) / 180) * G1_NOMINAL_STEP_METERS;
+        y += Math.sin((sideHeading * Math.PI) / 180) * G1_NOMINAL_STEP_METERS;
+        moved = true;
       } else if (method === 'turn') {
         heading += values[0] === 'right' ? -Number(values[1]) : Number(values[1]);
       } else if (forwardDistance) {
         x += Math.cos((heading * Math.PI) / 180) * forwardDistance;
         y += Math.sin((heading * Math.PI) / 180) * forwardDistance;
-      } else {
-        return;
+        moved = true;
       }
-      points.push({ id: `planner-${points.length}`, x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+      if (moved) {
+        points.push({ id: `planner-${points.length}`, x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+      }
     });
 
     if (points.length < 2) {
@@ -1601,7 +2130,7 @@ export default function App() {
       setMotionPrompt(response.text);
       applyMotionPromptResult(response.text, `Hugging Face: ${response.model}`);
       setMotionPromptStatus('hf');
-    } catch (error) {
+    } catch {
       applyMotionPromptResult(motionPrompt, 'Local fallback');
       setMotionPromptStatus('fallback');
     }
@@ -1633,10 +2162,6 @@ export default function App() {
   useEffect(() => {
     setSimulatorState(simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles }));
   }, [generatedCode, simulatorMode, activeObstacles]);
-
-  const applyMotionTemplate = (template) => {
-    updateGeneratedCode(template.code);
-  };
 
   const addStudentObstacle = (type = 'box') => {
     const preset = OBJECT_LIBRARY.find((item) => item.id === type) || OBJECT_LIBRARY[0];
@@ -1670,9 +2195,15 @@ export default function App() {
         x: defaultPosition.x,
         y: defaultPosition.y,
         radius: preset.defaultRadius,
+        dimensions: getSceneObjectDimensions({ type: preset.id, radius: preset.defaultRadius }),
         },
       ];
     });
+  };
+
+  const selectSceneObject = (id) => {
+    setSelectedSceneObjectId(id);
+    setSimulatorSidebarTab('scene-objects');
   };
 
   const updateStudentObstacle = (id, patch) => {
@@ -1689,14 +2220,116 @@ export default function App() {
 
   const removeStudentObstacle = (id) => {
     setSceneObjects((prev) => prev.filter((obstacle) => obstacle.id !== id));
+    setSelectedSceneObjectId((selectedId) => selectedId === id ? null : selectedId);
   };
 
   const obstacleDragRef = useRef(null);
   const plannerDragRef = useRef(null);
   const sceneOrigin = 110;
-  const sceneScale = 220 / gridSize;
-  const sceneX = (meters) => sceneOrigin + meters * sceneScale;
-  const sceneY = (meters) => sceneOrigin - meters * sceneScale;
+  const sharedMapMetadata = sharedLidarMap?.map?.map;
+  const mapCenterLocalX = sharedMapMetadata ? sharedMapMetadata.width * sharedMapMetadata.resolution_m / 2 : 0;
+  const mapCenterLocalY = sharedMapMetadata ? sharedMapMetadata.height * sharedMapMetadata.resolution_m / 2 : 0;
+  const mapCenterCosine = Math.cos(sharedMapMetadata?.origin?.yaw_rad || 0);
+  const mapCenterSine = Math.sin(sharedMapMetadata?.origin?.yaw_rad || 0);
+  const sceneCenterX = sharedLidarOverlayEnabled && sharedMapMetadata
+    ? sharedMapMetadata.origin.x + mapCenterCosine * mapCenterLocalX - mapCenterSine * mapCenterLocalY
+    : 0;
+  const sceneCenterY = sharedLidarOverlayEnabled && sharedMapMetadata
+    ? sharedMapMetadata.origin.y + mapCenterSine * mapCenterLocalX + mapCenterCosine * mapCenterLocalY
+    : 0;
+  const sceneExtent = sharedLidarOverlayEnabled && sharedMapMetadata
+    ? Math.max(
+      gridSize,
+      sharedMapMetadata.width * sharedMapMetadata.resolution_m,
+      sharedMapMetadata.height * sharedMapMetadata.resolution_m,
+    )
+    : gridSize;
+  const sceneScale = 220 / sceneExtent;
+  const sceneX = (meters) => sceneOrigin + (meters - sceneCenterX) * sceneScale;
+  const sceneY = (meters) => sceneOrigin - (meters - sceneCenterY) * sceneScale;
+  const navigationOccupiedCellsPath = useMemo(() => {
+    if (!navigationMapSnapshot?.data?.length || !navigationMapSnapshot.map) return '';
+    const { data, map } = navigationMapSnapshot;
+    const commands = [];
+    for (let index = 0; index < data.length; index += 1) {
+      if (data[index] < 65) continue;
+      const column = index % map.width;
+      const row = Math.floor(index / map.width);
+      const x = column * map.resolution_m;
+      const y = row * map.resolution_m;
+      const size = map.resolution_m;
+      commands.push(`M${x} ${y}h${size}v${size}h-${size}z`);
+    }
+    return commands.join('');
+  }, [navigationMapSnapshot]);
+  const sharedOccupiedCellsPath = useMemo(() => {
+    const snapshot = sharedLidarMap?.map;
+    if (!snapshot?.data?.length || !snapshot.map) return '';
+    const { data, map } = snapshot;
+    const commands = [];
+    for (let index = 0; index < data.length; index += 1) {
+      if (data[index] < 65) continue;
+      const column = index % map.width;
+      const row = Math.floor(index / map.width);
+      const x = column * map.resolution_m;
+      const y = row * map.resolution_m;
+      const size = map.resolution_m;
+      commands.push(`M${x} ${y}h${size}v${size}h-${size}z`);
+    }
+    return commands.join('');
+  }, [sharedLidarMap]);
+  const sharedPointCloudPreview = useMemo(() => {
+    const snapshot = sharedLidarMap?.map;
+    const points = sharedLidarMap?.pointcloud?.points;
+    if (!snapshot?.map || !Array.isArray(points)) return [];
+    const { map } = snapshot;
+    const stride = Math.max(1, Math.ceil(points.length / 5_000));
+    const cosine = Math.cos(map.origin.yaw_rad);
+    const sine = Math.sin(map.origin.yaw_rad);
+    return points.filter((_, index) => index % stride === 0).flatMap((point) => {
+      const dx = point.x - map.origin.x;
+      const dy = point.y - map.origin.y;
+      const x = cosine * dx + sine * dy;
+      const y = -sine * dx + cosine * dy;
+      if (x < 0 || y < 0 || x >= map.width * map.resolution_m || y >= map.height * map.resolution_m) return [];
+      return [{ ...point, mapX: x, mapY: y }];
+    });
+  }, [sharedLidarMap]);
+  const sharedGridOverlayPath = useMemo(() => {
+    const snapshot = sharedLidarMap?.map;
+    if (!sharedLidarOverlayEnabled || !snapshot?.data?.length || !snapshot.map) return '';
+    const { data, map } = snapshot;
+    const resolution = map.resolution_m;
+    const cosine = Math.cos(map.origin.yaw_rad);
+    const sine = Math.sin(map.origin.yaw_rad);
+    const halfGrid = sceneExtent / 2;
+    const commands = [];
+    for (let index = 0; index < data.length; index += 1) {
+      if (data[index] < 65) continue;
+      const column = index % map.width;
+      const row = Math.floor(index / map.width);
+      const localX = (column + 0.5) * resolution;
+      const localY = (row + 0.5) * resolution;
+      const centerX = map.origin.x + cosine * localX - sine * localY;
+      const centerY = map.origin.y + sine * localX + cosine * localY;
+      if (
+        centerX < -halfGrid - resolution || centerX > halfGrid + resolution
+        || centerY < -halfGrid - resolution || centerY > halfGrid + resolution
+      ) continue;
+      const corners = [
+        [column * resolution, row * resolution],
+        [(column + 1) * resolution, row * resolution],
+        [(column + 1) * resolution, (row + 1) * resolution],
+        [column * resolution, (row + 1) * resolution],
+      ].map(([x, y]) => {
+        const worldX = map.origin.x + cosine * x - sine * y;
+        const worldY = map.origin.y + sine * x + cosine * y;
+        return `${sceneX(worldX)} ${sceneY(worldY)}`;
+      });
+      commands.push(`M${corners.join('L')}z`);
+    }
+    return commands.join('');
+  }, [sceneCenterX, sceneCenterY, sceneExtent, sceneOrigin, sceneScale, sharedLidarMap, sharedLidarOverlayEnabled]);
 
   const getSvgCoords = (event) => {
     const svg = event.currentTarget.ownerSVGElement || event.currentTarget;
@@ -1713,7 +2346,7 @@ export default function App() {
   };
 
   const handleObstaclePointerDown = (event, obstacleId) => {
-    if (currentUser.role === 'teacher') return;
+    selectSceneObject(obstacleId);
     obstacleDragRef.current = { obstacleId, pointerId: event.pointerId };
     setActiveDragItem({ kind: 'obstacle', id: obstacleId });
     event.stopPropagation();
@@ -2134,6 +2767,19 @@ export default function App() {
                       </button>
                     )}
                   </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleTestLidar}
+                      disabled={isLidarTesting || isRobotConnecting}
+                      className="rounded-lg border border-cyan-700 bg-white px-2.5 py-1.5 text-xs font-semibold text-cyan-800 disabled:cursor-wait disabled:opacity-60"
+                    >
+                      {isLidarTesting ? 'Testing LiDAR…' : 'Test LiDAR'}
+                    </button>
+                    <span role="status" aria-live="polite" className="min-w-0 text-xs text-slate-700">
+                      {lidarTestStatus}
+                    </span>
+                  </div>
                   <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Simulation works while disconnected.</p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
                 </div>
@@ -2255,7 +2901,11 @@ export default function App() {
                   <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 p-3 text-xs text-slate-500">No scene objects yet. Add one from the object library.</p>
                 ) : (
                   sceneObjects.map((obstacle) => (
-                    <div key={obstacle.id} className="rounded-lg border border-slate-200 bg-slate-50 p-2">
+                    <div
+                      key={obstacle.id}
+                      onClick={() => setSelectedSceneObjectId(obstacle.id)}
+                      className={`rounded-lg border p-2 ${selectedSceneObjectId === obstacle.id ? 'border-blue-400 bg-blue-50 ring-1 ring-blue-200' : 'border-slate-200 bg-slate-50'}`}
+                    >
                       <div className="mb-2 flex items-center justify-between">
                         <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-600">{obstacle.label}</span>
                         <button type="button" onClick={() => removeStudentObstacle(obstacle.id)} className="text-[10px] text-red-600">Delete</button>
@@ -2273,6 +2923,27 @@ export default function App() {
                           R
                           <input type="number" value={obstacle.radius} min="4" max="24" step="1" onChange={(event) => updateStudentObstacle(obstacle.id, { radius: Number(event.target.value) })} className="mt-1 w-full rounded border border-slate-200 bg-white px-1 py-1" />
                         </label>
+                      </div>
+                      <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-slate-600">
+                        {Object.entries(getSceneObjectDimensions(obstacle)).map(([dimension, value]) => (
+                          <label key={dimension}>
+                            {dimension === 'width' ? 'Width (m)' : dimension === 'height' ? 'Height (m)' : 'Depth (m)'}
+                            <input
+                              type="number"
+                              value={value}
+                              min="0.1"
+                              max="8"
+                              step="0.1"
+                              onChange={(event) => updateStudentObstacle(obstacle.id, {
+                                dimensions: {
+                                  ...getSceneObjectDimensions(obstacle),
+                                  [dimension]: Math.min(8, Math.max(0.1, Number(event.target.value))),
+                                },
+                              })}
+                              className="mt-1 w-full rounded border border-slate-200 bg-white px-1 py-1"
+                            />
+                          </label>
+                        ))}
                       </div>
                     </div>
                   ))
@@ -2298,12 +2969,6 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-2 text-[11px] text-slate-600">
-                  <div className="flex items-center justify-between"><span>Robot</span><span className="font-medium text-slate-700">{G1_EDU_23_ENV.robotType}</span></div>
-                  <div className="mt-2 flex items-center justify-between"><span>Grid cells</span><span className="font-medium text-slate-700">1 m x 1 m</span></div>
-                  <div className="mt-2 flex items-center justify-between"><span>Goal</span><span className="font-medium text-slate-700">{simulatorState.goal ? `${simulatorState.goal.x.toFixed(1)}, ${simulatorState.goal.y.toFixed(1)}` : 'None'}</span></div>
-                  <div className="mt-2 flex items-center justify-between"><span>Collisions</span><span className="font-medium text-slate-700">{simulatorState.collisions || 0}</span></div>
-                </div>
                 <div className="rounded-lg border border-slate-200 bg-white p-2 text-[10px] text-slate-600">
                   <label className="flex items-center justify-between font-semibold">
                     <span>Grid size</span>
@@ -2317,6 +2982,35 @@ export default function App() {
                   <input type="range" min="0.1" max="3" step="0.1" value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))} className="mt-2 w-full accent-cyan-600" />
                   <p className="mt-2 text-[10px] text-slate-500">Speed changes timing only. Distances remain in meters.</p>
                 </div>
+
+                <div className="rounded-lg border border-cyan-200 bg-white p-2 text-[10px] text-slate-700">
+                  <p className="font-semibold uppercase tracking-wide text-slate-500">Shared LiDAR room map</p>
+                  <label className="mt-2 flex items-center justify-between gap-2 font-semibold">
+                    <span>Show shared map on student grids</span>
+                    <input
+                      type="checkbox"
+                      aria-label="Show shared LiDAR map overlay"
+                      checked={sharedLidarOverlayEnabled}
+                      disabled={session?.user?.role !== 'teacher'}
+                      onChange={(event) => handleSharedLidarOverlayToggle(event.target.checked)}
+                      className="h-4 w-4 accent-cyan-600"
+                    />
+                  </label>
+                  <p className="mt-1 text-slate-500">
+                    {sharedLidarMap?.map?.map
+                      ? `${sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} m × ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m} m • ${sharedLidarMap.map.map.resolution_m} m/cell`
+                      : 'No approved shared map has been published.'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleRefreshSharedLidarMap}
+                    disabled={isSharedLidarMapLoading}
+                    className="mt-2 rounded border border-slate-300 px-2 py-1 font-semibold disabled:opacity-50"
+                  >
+                    {isSharedLidarMapLoading ? 'Refreshing…' : 'Refresh shared map'}
+                  </button>
+                  <p role="status" aria-live="polite" className="mt-2 break-words text-slate-500">{navigationLiveStatus}</p>
+                </div>
               </div>
             )}
 
@@ -2328,18 +3022,61 @@ export default function App() {
                   </pattern>
                 </defs>
                 <rect x="0" y="0" width="220" height="220" fill="url(#grid-pattern)" rx="12"/>
+                {sharedLidarOverlayEnabled && sharedLidarMap?.map?.map && (
+                  <g pointerEvents="none">
+                    <path
+                      data-testid="shared-lidar-grid-overlay"
+                      d={sharedGridOverlayPath}
+                      fill="#ef4444"
+                      fillOpacity="0.24"
+                      stroke="#b91c1c"
+                      strokeOpacity="0.35"
+                      strokeWidth="0.35"
+                    />
+                    <g data-testid="shared-lidar-pointcloud-overlay">
+                      {sharedPointCloudPreview.map((point, index) => (
+                        <circle
+                          key={`${index}-${point.x}-${point.y}`}
+                          cx={sceneX(point.x)}
+                          cy={sceneY(point.y)}
+                          r={Math.max(0.45, Math.min(1.4, sceneScale * 0.025))}
+                          fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
+                          fillOpacity="0.72"
+                        />
+                      ))}
+                    </g>
+                  </g>
+                )}
+                {session?.user?.role === 'teacher' && lidarScanJob?.status === 'scanning' && (
+                  <g data-testid="live-lidar-scan-preview" pointerEvents="none">
+                    {liveLidarScanPoints.map((point, index) => (
+                      <circle
+                        key={`live-${index}-${point.x}-${point.y}`}
+                        cx={sceneX(point.x)}
+                        cy={sceneY(point.y)}
+                        r={Math.max(0.5, Math.min(1.5, sceneScale * 0.03))}
+                        fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
+                        fillOpacity="0.8"
+                      />
+                    ))}
+                  </g>
+                )}
                 {activeObstacles.map((obstacle) => {
                   const isStudentObstacle = String(obstacle.id).startsWith('student-');
-                  const isEditable = currentUser.role !== 'teacher' && isStudentObstacle;
                   const isDragging = activeDragItem?.kind === 'obstacle' && activeDragItem.id === obstacle.id;
                   const color = obstacle.color || (isStudentObstacle ? '#a78bfa' : '#fbbf24');
                   const centerX = sceneX(obstacle.x);
                   const centerY = sceneY(obstacle.y);
                   const size = (obstacle.radius / 12) * sceneScale;
+                  const dimensions = getSceneObjectDimensions(obstacle);
+                  const baseDimensions = getSceneObjectBaseDimensions(obstacle.type, obstacle.radius);
+                  const objectScaleX = dimensions.width / baseDimensions.width;
+                  const objectScaleY = dimensions.depth / baseDimensions.depth;
                   return (
-                    <g key={obstacle.id} onPointerDown={isEditable ? (event) => handleObstaclePointerDown(event, obstacle.id) : undefined} style={{ cursor: isEditable ? (isDragging ? 'grabbing' : 'grab') : 'default' }}>
+                    <g key={obstacle.id} onPointerDown={(event) => handleObstaclePointerDown(event, obstacle.id)} style={{ cursor: isDragging ? 'grabbing' : 'grab' }}>
                       <g data-obstacle-type={obstacle.type || 'unknown'}>
-                      {isDragging && <circle cx={centerX} cy={centerY} r={size + 4} fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
+                      {(isDragging || selectedSceneObjectId === obstacle.id) && <circle cx={centerX} cy={centerY} r={size + 4} fill="none" stroke="#0891b2" strokeWidth="2" strokeDasharray="4 2" />}
+                      <g transform={`translate(${centerX} ${centerY}) scale(${objectScaleX} ${objectScaleY}) translate(${-centerX} ${-centerY})`}>
                       <SceneObstacleShape
                         obstacle={obstacle}
                         centerX={centerX}
@@ -2348,10 +3085,11 @@ export default function App() {
                         color={color}
                         opacity={isStudentObstacle ? 0.45 : 0.35}
                         stroke={isStudentObstacle ? '#7c3aed' : '#f59e0b'}
-                        strokeWidth={isEditable ? 2.5 : 2}
-                        strokeDasharray={isEditable ? '0' : '6 3'}
+                        strokeWidth={2.5}
+                        strokeDasharray="0"
                       />
-                      {isEditable && <text x={centerX} y={centerY + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>}
+                      </g>
+                      <text x={centerX} y={centerY + 4} textAnchor="middle" fontSize="8" fill="#fff">drag</text>
                       </g>
                     </g>
                   );
@@ -2398,49 +3136,6 @@ export default function App() {
               </svg>
             </div>
 
-            <div className="space-y-2">
-              {G1_MOTION_TEMPLATES.map((template) => (
-                <button
-                  key={template.id}
-                  type="button"
-                  onClick={() => applyMotionTemplate(template)}
-                  className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  {template.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex items-center justify-between text-xs text-slate-600">
-              <span>Position: {simulatorState.x.toFixed(1)}, {simulatorState.y.toFixed(1)}</span>
-              <span>Heading: {simulatorState.heading.toFixed(0)}°</span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-[11px] text-slate-600">
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Torso pitch: {simulatorState.torsoPitch.toFixed(1)}°</div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Torso roll: {simulatorState.torsoRoll.toFixed(1)}°</div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Joints: {G1_EDU_23_ENV.jointCount}</div>
-              <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">Collisions: {simulatorState.collisions || 0}</div>
-            </div>
-            <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-[11px] text-slate-700">
-              <span className="font-semibold">Mission:</span> {simulatorState.goalReached ? 'Goal reached ✓' : simulatorState.blocked ? 'Stuck on obstacle ⚠️' : 'In progress'}
-            </div>
-            <div className="space-y-2">
-              {simulatorState.actions.map((action, index) => (
-                <div key={`${action.label}-${index}`} className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">
-                  <p className="text-xs font-semibold text-slate-700">{action.label}</p>
-                  <p className="text-[11px] text-slate-500">{action.summary}</p>
-                </div>
-              ))}
-            </div>
-            <div className="space-y-2">
-              <p className="text-[10px] uppercase tracking-wide text-slate-500">Replay timeline</p>
-              {(simulatorState.timeline?.length ? simulatorState.timeline : [{ label: 'Waiting', summary: 'No motion yet' }]).slice(0, 5).map((step, index) => (
-                <div key={`${step.label}-${index}`} className="rounded-lg border border-slate-200 bg-white px-2 py-1.5">
-                  <p className="text-[11px] font-semibold text-slate-700">{step.label}</p>
-                  <p className="text-[10px] text-slate-500">{step.summary}</p>
-                </div>
-              ))}
-            </div>
           </div>
         </div>
       </div>
@@ -2456,7 +3151,7 @@ export default function App() {
           obstacles={activeObstacles}
           waypoints={plannerWaypoints}
           isWaypointPlacementEnabled={isWaypointPlacementEnabled}
-          isObstacleEditable={currentUser.role !== 'teacher'}
+          onObstacleSelect={selectSceneObject}
           onObstacleChange={updateStudentObstacle}
           onWaypointChange={updatePlannerWaypoint}
           onWaypointPlace={placePlannerWaypoint}
@@ -2533,7 +3228,13 @@ export default function App() {
                     <button type="button" onClick={() => setIsSimulatorOpen(true)} className="flex-1 rounded-md bg-blue-500 px-2 py-2 text-[10px] font-bold text-white hover:bg-blue-400">
                       Open queue
                     </button>
-                    <button type="button" onClick={handleRunCode} className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400" title={isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}>
+                    <button
+                      type="button"
+                      onClick={handleRunCode}
+                      disabled={lidarScanJob?.status === 'scanning' && !isRunning}
+                      className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
+                      title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}
+                    >
                       {isRunning ? 'Stop robot' : 'Robot run'}
                     </button>
                   </>
@@ -2589,8 +3290,8 @@ export default function App() {
                           <button
                             type="button"
                             onClick={handleRunCode}
-                            disabled={!isRobotConnected && !isRunning}
-                            title={isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : isRobotConnected ? 'Send this program to the connected G1' : 'Connect the G1 SDK before sending commands'}
+                            disabled={(!isRobotConnected && !isRunning) || (lidarScanJob?.status === 'scanning' && !isRunning)}
+                            title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : isRobotConnected ? 'Send this program to the connected G1' : 'Connect the G1 SDK before sending commands'}
                             className="flex-1 rounded-md bg-amber-500 px-2 py-2 text-xs font-semibold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {isRunning ? 'Stop robot' : 'Send to robot'}
@@ -2600,14 +3301,16 @@ export default function App() {
                       </div>
                       {currentUser.role === 'teacher' && (
                         <p className="mt-2 text-[10px] text-slate-400" role="status" aria-live="polite">
-                          {isRunning ? 'Sending/running program on the G1…' : isRobotConnected ? 'G1 connected and ready for a program.' : 'Connect the G1 SDK before sending a physical run.'}
+                          {lidarScanJob?.status === 'scanning'
+                            ? 'SDK motion is locked while the room scan captures data.'
+                            : isRunning ? 'Sending/running program on the G1…' : isRobotConnected ? 'G1 connected and ready for a program.' : 'Connect the G1 SDK before sending a physical run.'}
                         </p>
                       )}
                     </div>
                     <div className="relative h-[min(680px,calc(100vh-16rem))] min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-900">
                       <div ref={blocklyDiv} className="h-full w-full" />
                       {blockSyncError && (
-                        <div className="pointer-events-auto absolute inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-800 p-4" role="alert">
+                        <div className="pointer-events-auto absolute inset-0 z-[10000] flex items-center justify-center overflow-y-auto bg-slate-800 p-4" role="alert">
                           <div className="max-w-lg rounded-xl border border-amber-500/60 bg-amber-950 p-5 text-center shadow-xl">
                             <p className="text-sm font-semibold text-amber-200">This code cannot be represented with Blocks</p>
                             <p className="mt-2 text-xs leading-5 text-slate-200">{blockSyncError}</p>
@@ -2652,9 +3355,269 @@ export default function App() {
 
                 {mainTab === 'planner' && (
                   <div className="space-y-3 text-slate-200">
-                    <p className="rounded-lg border border-amber-500/30 bg-amber-950/40 p-2 text-[10px] text-amber-200">
-                      Physical paths use timed walking primitives. Without robot localization feedback, waypoint stops are approximate.
+                        <p className="rounded-lg border border-amber-500/30 bg-amber-950/40 p-2 text-[10px] text-amber-200">
+                          Compile remains the open-loop SDK path. Start Nav2 submits map-frame goals to the separate ROS controller and requires a commissioned gateway.
                     </p>
+                    <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">ROS navigation bridge</span>
+                        {session?.user?.role === 'teacher' && (
+                          <button
+                            type="button"
+                            onClick={handleCheckNavigationBridge}
+                            disabled={isNavigationBridgeChecking}
+                            className="rounded-md border border-cyan-700 px-2 py-1 text-[10px] font-semibold text-cyan-200 disabled:opacity-60"
+                          >
+                            {isNavigationBridgeChecking ? 'Checking…' : 'Check status'}
+                          </button>
+                        )}
+                      </div>
+                      <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-400">
+                        {navigationBridgeStatus}
+                      </p>
+                      {session?.user?.role === 'teacher' && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={handleLoadNavigationMap}
+                            disabled={isNavigationMapLoading}
+                            className="rounded-md border border-slate-600 px-2 py-1 text-[10px] font-semibold text-slate-200 disabled:opacity-60"
+                          >
+                            {isNavigationMapLoading ? 'Loading map…' : 'Load occupancy map'}
+                          </button>
+                          {navigationMapSnapshot && (
+                            <button
+                              type="button"
+                              onClick={() => setIsNavigationMapVisible((visible) => !visible)}
+                              className="rounded-md border border-slate-600 px-2 py-1 text-[10px] font-semibold text-slate-200"
+                            >
+                              {isNavigationMapVisible ? 'Hide overlay' : 'Show overlay'}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      <p className="break-words text-[10px] text-slate-400">{navigationMapStatus}</p>
+                      <p className="text-[10px] text-amber-300">
+                        Execution requires the separately installed Nav2 gateway, a healthy map/localization/controller, and an accessible physical emergency stop.
+                      </p>
+                    </div>
+                    <div className="space-y-2 rounded-lg border border-cyan-800 bg-slate-900 p-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200">3D room scan</span>
+                        {session?.user?.role === 'teacher' && (
+                          <div className="flex flex-wrap gap-2">
+                            {!lidarScanJob || ['completed', 'failed', 'canceled'].includes(lidarScanJob.status) ? (
+                              <button
+                                type="button"
+                                onClick={handleStartLidarScan}
+                                disabled={isLidarScanStarting}
+                                className="rounded-md bg-cyan-700 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                              >
+                                {isLidarScanStarting ? 'Starting…' : 'Start room scan'}
+                              </button>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={handleCompleteLidarScan}
+                                  disabled={isLidarScanFinalizing}
+                                  className="rounded-md bg-amber-500 px-2 py-1 text-[10px] font-semibold text-slate-950 disabled:opacity-50"
+                                >
+                                  {isLidarScanFinalizing ? 'Validating…' : 'Finish and validate scan'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleCancelLidarScan}
+                                  disabled={isLidarScanFinalizing}
+                                  className="rounded-md border border-red-700 px-2 py-1 text-[10px] font-semibold text-red-200 disabled:opacity-50"
+                                >
+                                  Cancel scan
+                                </button>
+                              </>
+                            )}
+                            {lidarScanJob?.status === 'completed' && (
+                              <button
+                                type="button"
+                                onClick={handlePublishLidarMap}
+                                className="rounded-md border border-emerald-600 px-2 py-1 text-[10px] font-semibold text-emerald-200"
+                              >
+                                Publish shared map
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-300">{lidarScanStatus}</p>
+                      <p className="text-[10px] leading-4 text-amber-200">
+                        Capture is read-only: it does not move the robot. For a full room, a teacher must manually sweep the LiDAR through the room while the commissioned SLAM system publishes a correctly registered map. Keep people clear and maintain supervised control.
+                      </p>
+                      <p className="text-[10px] text-slate-400">{navigationLiveStatus}</p>
+                    </div>
+                    {sharedLidarMap?.map?.map && (session?.user?.role === 'teacher' || sharedLidarOverlayEnabled) && (
+                      <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-200">Published room map • 3D points projected to grid</span>
+                          <span className="text-[10px] text-slate-400">
+                            {sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} m × {sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m} m • {sharedLidarMap.map.map.resolution_m} m/cell
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          Frame {sharedLidarMap.map.map.frame_id} • origin {sharedLidarMap.map.map.origin.x.toFixed(2)}, {sharedLidarMap.map.map.origin.y.toFixed(2)} m • {sharedLidarMap.pointcloud?.point_count || 0} 3D points
+                        </p>
+                        <svg
+                          viewBox={`0 0 ${sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m}`}
+                          role="img"
+                          aria-label="Published shared occupancy map with 3D LiDAR points colored by height"
+                          className="block max-h-72 w-full rounded-md bg-slate-100"
+                        >
+                          <rect
+                            x="0"
+                            y="0"
+                            width={sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m}
+                            height={sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m}
+                            fill="#f8fafc"
+                          />
+                          <g transform={`translate(0 ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m}) scale(1 -1)`}>
+                            <path d={sharedOccupiedCellsPath} fill="#ef4444" fillOpacity="0.45" />
+                            {sharedPointCloudPreview.map((point, index) => (
+                              <circle
+                                key={`${index}-${point.x}-${point.y}`}
+                                cx={point.mapX}
+                                cy={point.mapY}
+                                r={sharedLidarMap.map.map.resolution_m * 0.35}
+                                fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
+                                fillOpacity="0.8"
+                              />
+                            ))}
+                          </g>
+                        </svg>
+                        <p className="text-[10px] text-slate-400">Blue: low points • green/orange: room-height structure • purple: high points. Overlay positions use the map’s resolution, origin, rotation, and frame.</p>
+                      </div>
+                    )}
+                    {isNavigationMapVisible && navigationMapSnapshot && (
+                      <div className="overflow-hidden rounded-lg border border-slate-700 bg-slate-800 p-1">
+                        <svg
+                          viewBox={`0 0 ${navigationMapSnapshot.map.width * navigationMapSnapshot.map.resolution_m} ${navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}`}
+                          role="img"
+                          aria-label="ROS occupancy map and navigation destinations"
+                          onClick={handleNavigationMapClick}
+                          className={`block max-h-80 w-full rounded-md bg-slate-100 ${isNavigationGoalPlacementEnabled ? 'cursor-crosshair' : ''}`}
+                        >
+                          <defs>
+                            <pattern id="navigation-grid-pattern" width={navigationMapSnapshot.map.resolution_m} height={navigationMapSnapshot.map.resolution_m} patternUnits="userSpaceOnUse">
+                              <path d={`M ${navigationMapSnapshot.map.resolution_m} 0 L 0 0 0 ${navigationMapSnapshot.map.resolution_m}`} fill="none" stroke="#dfe7f3" strokeWidth="0.004"/>
+                            </pattern>
+                          </defs>
+                          <rect
+                            x="0"
+                            y="0"
+                            width={navigationMapSnapshot.map.width * navigationMapSnapshot.map.resolution_m}
+                            height={navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}
+                            fill="url(#navigation-grid-pattern)"
+                          />
+                          <g
+                            ref={navigationMapCoordinatesRef}
+                            transform={`translate(0 ${navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}) scale(1 -1)`}
+                            style={{ cursor: isNavigationGoalPlacementEnabled ? 'crosshair' : 'default' }}
+                          >
+                            <g
+                            data-testid="ros-occupancy-overlay"
+                            pointerEvents="none"
+                            >
+                              <path d={navigationOccupiedCellsPath} fill="#ef4444" fillOpacity="0.72" />
+                            </g>
+                            {navigationRouteWaypoints.map((point, index) => {
+                              const dx = point.x - navigationMapSnapshot.map.origin.x;
+                              const dy = point.y - navigationMapSnapshot.map.origin.y;
+                              const cosine = Math.cos(navigationMapSnapshot.map.origin.yaw_rad);
+                              const sine = Math.sin(navigationMapSnapshot.map.origin.yaw_rad);
+                              const localX = cosine * dx + sine * dy;
+                              const localY = -sine * dx + cosine * dy;
+                              return (
+                                <g key={point.id} pointerEvents="none">
+                                  <circle
+                                    cx={localX}
+                                    cy={localY}
+                                    r={navigationMapSnapshot.map.resolution_m * 2}
+                                    fill="#2563eb"
+                                    stroke="#fff"
+                                    strokeWidth={navigationMapSnapshot.map.resolution_m * 0.15}
+                                  />
+                                  <text
+                                    x={localX}
+                                    y={localY}
+                                    textAnchor="middle"
+                                    dominantBaseline="central"
+                                    fontSize={navigationMapSnapshot.map.resolution_m * 1.3}
+                                    fill="#fff"
+                                  >
+                                    {index + 1}
+                                  </text>
+                                </g>
+                              );
+                            })}
+                          </g>
+                        </svg>
+                      </div>
+                    )}
+                    {session?.user?.role === 'teacher' && navigationMapSnapshot && (
+                      <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
+                        <p className="text-[10px] text-slate-300">
+                          Add ordered goals by clicking the map. The backend and Nav2 gateway reject stale maps, out-of-map goals, and unknown or occupied cells.
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setIsNavigationGoalPlacementEnabled((enabled) => !enabled)}
+                            disabled={Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            className={`rounded-md px-2 py-1 text-[10px] font-semibold ${isNavigationGoalPlacementEnabled ? 'bg-blue-600 text-white' : 'border border-slate-600 text-slate-200'} disabled:opacity-50`}
+                          >
+                            {isNavigationGoalPlacementEnabled ? 'Click map to add goals' : 'Add map goals'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setNavigationRouteWaypoints([])}
+                            disabled={!navigationRouteWaypoints.length || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            className="rounded-md border border-slate-600 px-2 py-1 text-[10px] text-slate-200 disabled:opacity-50"
+                          >
+                            Clear goals
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleStartNavigation}
+                            disabled={isNavigationStarting || !navigationRouteWaypoints.length || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                          >
+                            {isNavigationStarting ? 'Starting…' : 'Start Nav2'}
+                          </button>
+                          {navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status) && (
+                            <button
+                              type="button"
+                              onClick={handleStopNavigation}
+                              className="rounded-md bg-red-600 px-2 py-1 text-[10px] font-semibold text-white"
+                            >
+                              Request stop
+                            </button>
+                          )}
+                        </div>
+                        <p role="status" aria-live="polite" data-testid="navigation-execution-status" className="break-words text-[10px] text-cyan-200">
+                          {navigationExecutionStatus}
+                        </p>
+                        {navigationRouteWaypoints.map((point, index) => (
+                          <div key={point.id} className="flex items-center justify-between text-[10px] text-slate-400">
+                            <span>Goal {index + 1}: {point.x.toFixed(2)}, {point.y.toFixed(2)} m ({navigationMapSnapshot.map.frame_id})</span>
+                            <button
+                              type="button"
+                              onClick={() => setNavigationRouteWaypoints((points) => points.filter((item) => item.id !== point.id))}
+                              disabled={Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                              className="text-red-300 disabled:opacity-50"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     <div className="flex gap-2">
                       <button
                         type="button"
@@ -2848,7 +3811,7 @@ export default function App() {
                     {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
                     {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
                     <p className="text-[10px] text-slate-400">IDE text is synchronized to Blocks when you leave the editor. Incomplete or unsupported lines remain editable here but cannot be shown as Blocks.</p>
-                    <p className="text-[10px] text-slate-400">The IDE reference and Blocks toolbox list only commands mapped by the G1 SDK adapter. Unsupported code is rejected for physical runs; simulation-only actions are not offered here.</p>
+                    <p className="text-[10px] text-slate-400">The IDE and Blocks support front-obstacle distance conditions. Physical conditions require a fresh MID-360 reading (500 ms maximum) from the configured provider; missing or stale readings abort and request a stop.</p>
                   </div>
                 )}
               </div>

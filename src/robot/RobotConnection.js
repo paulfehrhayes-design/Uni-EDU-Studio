@@ -6,21 +6,30 @@ const MAX_EXPANDED_COMMANDS = 100;
 function getPhysicalCommands(code, adapter, isSupported) {
   const commands = [];
   const visit = (nodes) => {
+    let pathCommandCount = 0;
     for (const node of nodes) {
       if (node.type === 'command') {
         if (!isSupported(node.method)) {
           throw new Error(`robot.${node.method}() is not supported by the ${adapter} connection.`);
         }
         commands.push(node);
-        if (commands.length > MAX_EXPANDED_COMMANDS) {
-          throw new Error(`Programs may contain at most ${MAX_EXPANDED_COMMANDS} expanded commands.`);
-        }
+        pathCommandCount += 1;
         continue;
       }
-      for (let iteration = 0; iteration < node.times; iteration += 1) visit(node.body);
+      if (node.type === 'condition') {
+        pathCommandCount += Math.max(visit(node.then), visit(node.else));
+        continue;
+      }
+      for (let iteration = 0; iteration < node.times; iteration += 1) {
+        pathCommandCount += visit(node.body);
+      }
     }
+    return pathCommandCount;
   };
-  visit(parseG1Program(code));
+  const expandedCommandCount = visit(parseG1Program(code));
+  if (expandedCommandCount > MAX_EXPANDED_COMMANDS) {
+    throw new Error(`Programs may contain at most ${MAX_EXPANDED_COMMANDS} expanded commands.`);
+  }
   if (commands.length === 0) {
     throw new Error('Program contains no robot commands.');
   }
@@ -79,6 +88,14 @@ export class MockRobotConnection {
   }
 
   async run(code) {
+    const containsCondition = (nodes) => nodes.some((node) => {
+      if (node.type === 'condition') return true;
+      if (node.type === 'repeat') return containsCondition(node.body);
+      return false;
+    });
+    if (containsCondition(parseG1Program(code))) {
+      throw new Error('Distance conditions require the authenticated G1 SDK backend and a live MID-360 sensor.');
+    }
     if (!this.connected) throw new Error('Connect the mock robot before running a program.');
     const commands = getPhysicalCommands(code, 'mock', (method) => (
       commandDefinitions.get(method)?.adapters.sdk === true

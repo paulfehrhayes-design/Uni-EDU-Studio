@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { ChevronDown, ChevronUp, Pause, Play, RotateCcw } from 'lucide-react';
 import { buildG1SimulationFrames, G1_EDU_23_ENV } from '../sim/g1Edu23Env';
+import { getSceneObjectScale } from '../sim/sceneObjects';
 
 const JOINT_AXES = {
   left_hip_pitch: 'x', right_hip_pitch: 'x', left_knee: 'x', right_knee: 'x', left_knee_pitch: 'x', right_knee_pitch: 'x',
@@ -33,6 +34,7 @@ function addBox(parent, size, position, color, radius = 0.04) {
 function createObstacleMesh(obstacle) {
   const group = new THREE.Group();
   const size = Math.max(0.45, Number(obstacle.radius) / 10 || 1);
+  const dimensionsScale = getSceneObjectScale(obstacle);
   const color = obstacle.color || (String(obstacle.id).startsWith('student-') ? '#8b5cf6' : '#f59e0b');
   const addMesh = (geometry, position) => {
     const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
@@ -103,6 +105,7 @@ function createObstacleMesh(obstacle) {
   }
 
   group.position.set(obstacle.x, 0, -obstacle.y);
+  group.scale.set(dimensionsScale.x, dimensionsScale.y, dimensionsScale.z);
   group.userData.obstacleId = String(obstacle.id);
   group.userData.obstacleType = obstacle.type || 'unknown';
   return group;
@@ -498,7 +501,7 @@ async function loadG1MeshRig() {
   return { robot, joints };
 }
 
-export default function G1Simulation3D({ code, simulatorState, obstacles = [], waypoints = [], isObstacleEditable = false, onObstacleChange, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
+export default function G1Simulation3D({ code, simulatorState, obstacles = [], waypoints = [], onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const rendererRef = useRef(null);
@@ -512,6 +515,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   const plannerLineRef = useRef(null);
   const waypointsRef = useRef(waypoints);
   const obstacleChangeCallbackRef = useRef(onObstacleChange);
+  const obstacleSelectCallbackRef = useRef(onObstacleSelect);
   const waypointChangeCallbackRef = useRef(onWaypointChange);
   const waypointPlaceCallbackRef = useRef(onWaypointPlace);
   const waypointPlacementEnabledRef = useRef(isWaypointPlacementEnabled);
@@ -559,13 +563,14 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   useEffect(() => {
     waypointsRef.current = waypoints;
     obstacleChangeCallbackRef.current = onObstacleChange;
+    obstacleSelectCallbackRef.current = onObstacleSelect;
     waypointChangeCallbackRef.current = onWaypointChange;
     waypointPlaceCallbackRef.current = onWaypointPlace;
     waypointPlacementEnabledRef.current = isWaypointPlacementEnabled;
     if (rendererRef.current) {
       rendererRef.current.domElement.style.cursor = isWaypointPlacementEnabled ? 'crosshair' : '';
     }
-  }, [waypoints, onObstacleChange, onWaypointChange, isWaypointPlacementEnabled, onWaypointPlace]);
+  }, [waypoints, onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled, onWaypointPlace]);
 
   useEffect(() => {
     if (!waypoints.length) return;
@@ -758,17 +763,6 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
 
     const onPointerDown = (event) => {
       readPointer(event);
-      const waypointHit = raycaster.intersectObjects(waypointGroup.children, true)
-        .find((hit) => hit.object.userData.waypointId !== undefined);
-      if (waypointHit) {
-        const waypointId = waypointHit.object.userData.waypointId;
-        const marker = waypointGroup.children.find((item) => item.userData.waypointId === waypointId);
-        draggingMarkerRef.current = { kind: 'waypoint', id: waypointId, pointerId: event.pointerId };
-        setWaypointMarkerDragging(marker, true);
-        renderer.domElement.setPointerCapture?.(event.pointerId);
-        event.preventDefault();
-        return;
-      }
       if (waypointPlacementEnabledRef.current) {
         const worldPosition = raycaster.ray.intersectPlane(groundPlane, new THREE.Vector3());
         const halfGrid = gridSize / 2;
@@ -785,17 +779,27 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
         event.preventDefault();
         return;
       }
-      if (isObstacleEditable) {
-        const obstacleHit = raycaster.intersectObjects(obstacleGroup.children, true)
-          .find((hit) => hit.object.userData.obstacleId !== undefined);
-        if (obstacleHit) {
-          const obstacleId = obstacleHit.object.userData.obstacleId;
-          draggingMarkerRef.current = { kind: 'obstacle', id: obstacleId, pointerId: event.pointerId };
-          setObstacleHighlight(obstacleId, true);
-          renderer.domElement.setPointerCapture?.(event.pointerId);
-          event.preventDefault();
-          return;
-        }
+      const waypointHit = raycaster.intersectObjects(waypointGroup.children, true)
+        .find((hit) => hit.object.userData.waypointId !== undefined);
+      if (waypointHit) {
+        const waypointId = waypointHit.object.userData.waypointId;
+        const marker = waypointGroup.children.find((item) => item.userData.waypointId === waypointId);
+        draggingMarkerRef.current = { kind: 'waypoint', id: waypointId, pointerId: event.pointerId };
+        setWaypointMarkerDragging(marker, true);
+        renderer.domElement.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+        return;
+      }
+      const obstacleHit = raycaster.intersectObjects(obstacleGroup.children, true)
+        .find((hit) => hit.object.userData.obstacleId !== undefined);
+      if (obstacleHit) {
+        const obstacleId = obstacleHit.object.userData.obstacleId;
+        obstacleSelectCallbackRef.current?.(obstacleId);
+        draggingMarkerRef.current = { kind: 'obstacle', id: obstacleId, pointerId: event.pointerId };
+        setObstacleHighlight(obstacleId, true);
+        renderer.domElement.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+        return;
       }
       const view = viewRef.current;
       view.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -989,7 +993,7 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
       plannerLineRef.current = null;
       obstacleGroupRef.current = null;
     };
-  }, [gridSize, isObstacleEditable]);
+  }, [gridSize]);
 
   useEffect(() => {
     syncWaypointMarkers(waypointGroupRef.current, plannerLineRef.current, waypoints);
