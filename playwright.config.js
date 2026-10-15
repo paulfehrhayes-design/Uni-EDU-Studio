@@ -4,7 +4,7 @@ export default defineConfig({
   testDir: './tests',
   timeout: 30000,
   webServer: {
-    command: 'npm run dev -- --host 0.0.0.0 --port 4173',
+    command: 'python backend/server.py >/tmp/uni-edu-backend.log 2>&1 & sleep 3 && npm run dev -- --host 0.0.0.0 --port 4173',
     url: 'http://localhost:4173',
     reuseExistingServer: true,
     timeout: 120000,

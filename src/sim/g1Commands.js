@@ -43,7 +43,6 @@ const textArgument = (name, label, value) => ({
 
 const SDK_COMMAND_METHODS = {
   stand: 'LocoClient.Start() / SetFsmId(500)',
-  sit: 'LocoClient.Sit (SetFsmId(3))',
   walk: 'LocoClient.SetVelocity',
   walktime: 'LocoClient.SetVelocity',
   backward: 'LocoClient.SetVelocity',
@@ -100,7 +99,9 @@ const command = (method, label, category, description, args = []) => ({
   physicalSupported: Boolean(SDK_COMMAND_METHODS[method]) || method === 'wait',
   args,
   blockType: `g1_command_${method}`,
-  blockMessage: `${label}${args.map((_, index) => ` %${index + 1}`).join('')}`,
+  blockMessage: /%[1-9]\d*/.test(label)
+    ? label
+    : `${label}${args.map((_, index) => ` %${index + 1}`).join('')}`,
   stringFields: args.filter((argument) => argument.kind === 'text').map((argument) => argument.name),
   codeTemplate: `robot.${method}(${args.map((argument) => {
     if (argument.kind === 'choice') return `"{{${argument.name}}}"`;
@@ -135,7 +136,6 @@ const ARM_PRESETS = [
 const commandGroups = [
   [
     command('stand', 'Stand / ready', 'Basics', 'Stand ready to move.'),
-    command('sit', 'Sit down', 'Basics', 'Sit down.'),
     command('wait', 'Wait for', 'Basics', 'Pause for the selected number of seconds.', [seconds()]),
   ],
   [
@@ -301,8 +301,34 @@ function normalizeCommand(method, rawArgs) {
   return { method, values, code };
 }
 
+const MIN_DISTANCE_METERS = 0.1;
+const MAX_DISTANCE_METERS = 20;
+
+function nextProgramLine(lines, index) {
+  while (index < lines.length && (!lines[index].text || lines[index].text.startsWith('#'))) index += 1;
+  return index;
+}
+
+function parseDistanceCondition(text, lineNumber) {
+  const match = text.match(/^if\s+robot\.(front|rear)_distance_m\(\)\s*(<=|>=|==|!=|<|>)\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\s*:\s*$/);
+  if (!match) return null;
+  const [, sector, operator, rawThreshold] = match;
+  const sensor = `${sector}_distance_m`;
+  const threshold = Number(rawThreshold);
+  if (!Number.isFinite(threshold) || threshold < MIN_DISTANCE_METERS || threshold > MAX_DISTANCE_METERS) {
+    throw new Error(`Distance threshold on line ${lineNumber} must be between ${MIN_DISTANCE_METERS} and ${MAX_DISTANCE_METERS} meters.`);
+  }
+  return {
+    type: 'condition',
+    sensor,
+    operator,
+    threshold,
+    code: `robot.${sensor}() ${operator} ${threshold}`,
+  };
+}
+
 function parseLines(lines, startIndex, indentLevel, depth) {
-  if (depth > 5) throw new Error('Loops may be nested at most five levels.');
+  if (depth > 5) throw new Error('Programs may be nested at most five levels.');
   const nodes = [];
   let index = startIndex;
   while (index < lines.length) {
@@ -314,12 +340,35 @@ function parseLines(lines, startIndex, indentLevel, depth) {
     if (indent < indentLevel) break;
     if (indent > indentLevel) throw new Error(`Unexpected indentation on line ${lineNumber}.`);
 
+    const condition = parseDistanceCondition(text, lineNumber);
+    if (condition) {
+      let bodyStart = nextProgramLine(lines, index + 1);
+      if (bodyStart >= lines.length || lines[bodyStart].indent <= indentLevel) {
+        throw new Error(`Conditional on line ${lineNumber} has no body.`);
+      }
+      const [thenBody, nextIndex] = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+      if (!thenBody.length) throw new Error(`Conditional on line ${lineNumber} has no body.`);
+      index = nextProgramLine(lines, nextIndex);
+      let elseBody = [];
+      if (index < lines.length && lines[index].indent === indentLevel && lines[index].text === 'else:') {
+        const elseLineNumber = lines[index].lineNumber;
+        bodyStart = nextProgramLine(lines, index + 1);
+        if (bodyStart >= lines.length || lines[bodyStart].indent <= indentLevel) {
+          throw new Error(`Else branch on line ${elseLineNumber} has no body.`);
+        }
+        const parsedElse = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+        [elseBody, index] = parsedElse;
+        if (!elseBody.length) throw new Error(`Else branch on line ${elseLineNumber} has no body.`);
+      }
+      nodes.push({ ...condition, then: thenBody, else: elseBody });
+      continue;
+    }
+
     const loop = text.match(/^for\s+\w+\s+in\s+range\(\s*(?:0\s*,\s*)?(\d+)\s*\)\s*:\s*$/);
     if (loop) {
       const times = Number(loop[1]);
       if (times < 1 || times > 20) throw new Error(`Loop count on line ${lineNumber} must be between 1 and 20.`);
-      index += 1;
-      while (index < lines.length && (!lines[index].text || lines[index].text.startsWith('#'))) index += 1;
+      index = nextProgramLine(lines, index + 1);
       if (index >= lines.length || lines[index].indent <= indentLevel) throw new Error(`Loop on line ${lineNumber} has no body.`);
       const [body, nextIndex] = parseLines(lines, index, lines[index].indent, depth + 1);
       nodes.push({ type: 'repeat', times, body });
@@ -328,7 +377,7 @@ function parseLines(lines, startIndex, indentLevel, depth) {
     }
 
     const call = text.match(/^robot\.([A-Za-z]\w*)\((.*)\);?$/);
-    if (!call) throw new Error(`Unsupported statement on line ${lineNumber}. Use a robot command or a for/range loop.`);
+    if (!call) throw new Error(`Unsupported statement on line ${lineNumber}. Use a robot command, bounded for/range loop, or distance condition.`);
     nodes.push({ type: 'command', ...normalizeCommand(call[1], call[2]) });
     index += 1;
   }
@@ -344,7 +393,37 @@ export function parseG1Program(code = '') {
   if (endIndex < lines.length && lines.slice(endIndex).some(({ text }) => text && !text.startsWith('#'))) {
     throw new Error(`Invalid indentation on line ${lines[endIndex].lineNumber}.`);
   }
-  return nodes;
+  const addArmReleases = (programNodes) => {
+    const normalizedNodes = programNodes.map((node) => {
+      if (node.type === 'repeat') return { ...node, body: addArmReleases(node.body) };
+      if (node.type === 'condition') {
+        return { ...node, then: addArmReleases(node.then), else: addArmReleases(node.else) };
+      }
+      return node;
+    });
+    return normalizedNodes.flatMap((node, index) => {
+      if (node.type !== 'command' || node.method !== 'arm_action' || node.values[0] === 'release arm') {
+        return [node];
+      }
+      const nextNode = normalizedNodes[index + 1];
+      const releaseFollows = nextNode?.type === 'command'
+        && nextNode.method === 'arm_action'
+        && nextNode.values[0] === 'release arm';
+      return releaseFollows
+        ? [node]
+        : [node, { type: 'command', ...normalizeCommand('arm_action', '"release arm"') }];
+    });
+  };
+  const normalized = addArmReleases(nodes);
+  const commandCount = (programNodes) => programNodes.reduce((total, node) => {
+    if (node.type === 'command') return total + 1;
+    if (node.type === 'repeat') return total + node.times * commandCount(node.body);
+    return total + Math.max(commandCount(node.then), commandCount(node.else));
+  }, 0);
+  if (commandCount(normalized) > 100) {
+    throw new Error('Programs may contain at most 100 expanded commands per execution path.');
+  }
+  return normalized;
 }
 
 export function flattenG1Commands(nodes, result = []) {
@@ -352,6 +431,9 @@ export function flattenG1Commands(nodes, result = []) {
     if (node.type === 'command') {
       result.push(node);
       return;
+    }
+    if (node.type === 'condition') {
+      throw new Error('Programs with distance conditions cannot be flattened without sensor data.');
     }
     for (let count = 0; count < node.times; count += 1) flattenG1Commands(node.body, result);
   });
@@ -362,8 +444,36 @@ export function formatG1Program(nodes, indent = 0) {
   const padding = ' '.repeat(indent);
   return nodes.map((node) => {
     if (node.type === 'command') return `${padding}${node.code}`;
-    return `${padding}for _ in range(${node.times}):\n${formatG1Program(node.body, indent + 4)}`;
+    if (node.type === 'repeat') {
+      return `${padding}for _ in range(${node.times}):\n${formatG1Program(node.body, indent + 4)}`;
+    }
+    const thenBody = formatG1Program(node.then, indent + 4);
+    const elseBody = node.else.length
+      ? `\n${padding}else:\n${formatG1Program(node.else, indent + 4)}`
+      : '';
+    return `${padding}if ${node.code}:\n${thenBody}${elseBody}`;
   }).join('\n');
+}
+
+export function getG1BlocklyConditionBlocks() {
+  return [
+    {
+      type: 'g1_front_distance_m',
+      message0: 'Front obstacle distance (m)',
+      output: 'Number',
+      colour: 200,
+      tooltip: 'Distance to the closest obstacle in the forward MID-360 sector.',
+      codeTemplate: 'robot.front_distance_m()',
+    },
+    {
+      type: 'g1_rear_distance_m',
+      message0: 'Rear obstacle distance (m)',
+      output: 'Number',
+      colour: 200,
+      tooltip: 'Distance to the closest obstacle in the rear MID-360 sector.',
+      codeTemplate: 'robot.rear_distance_m()',
+    },
+  ];
 }
 
 export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
@@ -381,9 +491,7 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
       : [{
         ...definition,
         type: definition.blockType,
-        message: definition.args.length
-          ? `${definition.label} ${definition.args.map((_, index) => `%${index + 1}`).join(' ')}`
-          : definition.label,
+        message: definition.blockMessage,
       }];
 
     return variants.map((variant) => ({

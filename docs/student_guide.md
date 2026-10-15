@@ -26,7 +26,6 @@ Try these steps:
 
 Simple commands are best for learning:
 - Stand / ready (selects normal locomotion-ready mode; it is not the squat-to-stand recovery action)
-- Sit
 - Squat to stand, lie to stand, and stand to squat
 - Walk forward or backward
 - Sidestep left or right
@@ -38,7 +37,6 @@ The IDE reference and Blocks toolbox show the commands currently mapped by the G
 
 ```python
 robot.stand()
-robot.sit()
 robot.wait(2)
 robot.squat_to_stand()
 robot.lie_to_stand()
@@ -48,7 +46,29 @@ robot.turn("left", 90)
 robot.backwardtime(1)
 ```
 
-Programs can also use bounded `for` loops. The legacy G1 arm presets are available with `robot.arm_action("hands up")` and the other names listed below. Simulation shows approximate poses, not the SDK trajectories. The physical SDK reports whether it accepted a preset request, not when the motion finishes. The teacher's `Stop robot` button stops locomotion but cannot cancel an accepted arm preset, so keep the robot area clear and use direct teacher supervision.
+Programs can also use bounded `for` loops. The legacy G1 arm presets are available with `robot.arm_action("hands up")` and the other names listed below. Each preset automatically runs `robot.arm_action("release arm")` afterward (unless a release command already follows) so the next gesture starts from the relaxed arm pose. Simulation shows approximate poses, not the SDK trajectories. The physical SDK reports whether it accepted a preset request, not when the motion finishes. The teacher's `Stop robot` button stops locomotion but cannot cancel an accepted arm preset, so keep the robot area clear and use direct teacher supervision.
+
+Distance conditions can choose which supported commands run:
+
+```python
+if robot.front_distance_m() < 1:
+    robot.walk(1)
+else:
+    robot.turn("left", 90)
+```
+
+`front_distance_m()` and `rear_distance_m()` read the closest valid obstacle in the forward or rear MID-360 sector. The simulator uses the closest scene obstacle in the selected sector; the physical backend obtains readings from the configured, read-only ROS 2 sensor provider. Physical readings must be valid, match the configured sensor and frame, and be no older than 500 ms. If the selected provider is unavailable or its reading is invalid or stale, the backend aborts the program and requests a locomotion stop; it does not silently run the `else` branch. Rear checks assume the sensor frame's x-axis is aligned with the robot's forward direction and require valid LiDAR returns behind the robot. A teacher should use **Test LiDAR** to check both sectors before running a physical conditional program.
+
+Use `rear_distance_m()` to base a branch on obstacles behind the robot:
+
+```python
+if robot.rear_distance_m() < 1:
+    robot.stand()
+else:
+    robot.backward(1)
+```
+
+The backend provider uses `G1_DISTANCE_PROVIDER_URL` for the forward sector and `G1_DISTANCE_REAR_PROVIDER_URL` for the rear sector, with shared `G1_DISTANCE_PROVIDER_TOKEN`, `G1_DISTANCE_SENSOR_ID`, and `G1_DISTANCE_FRAME_ID` settings. The separately deployed ROS 2 provider serves current JSON samples with `valid: true`, `sector` (`"forward"` or `"rear"`), `distance_m`, ISO-8601 `timestamp`, `sensor_id`, and `frame_id` fields. Keep the provider on the trusted robot network; its service token must not be exposed to the browser. This provider supplies sensor readings only and must not issue locomotion commands.
 
 `stand()` sets the robot ready to move (SDK FSM 500). `squat_to_stand()` and `stand_to_squat()` use SDK FSM 706; `lie_to_stand()` uses FSM 702. The robot confirms each request, but the app does not know when the movement is finished. Simulator poses are approximate. `HighStand`, `LowStand`, and `Damp` are not included because their effects have not been confirmed for this setup.
 

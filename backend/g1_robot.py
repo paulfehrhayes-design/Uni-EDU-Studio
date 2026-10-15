@@ -14,6 +14,11 @@ from typing import Any
 
 from fastapi import HTTPException
 
+try:
+    from .lidar_distance import DistanceSensorError, distance_sensor_status, get_front_distance_sample, get_rear_distance_sample
+except ImportError:
+    from lidar_distance import DistanceSensorError, distance_sensor_status, get_front_distance_sample, get_rear_distance_sample
+
 _client = None
 _arm_client = None
 _audio_client = None
@@ -156,7 +161,7 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
     method = call.func.attr
     args = call.args
 
-    if method in {"stand", "sit", *_POSTURE_TRANSITION_FSM_IDS}:
+    if method in {"stand", *_POSTURE_TRANSITION_FSM_IDS}:
         if args:
             raise CommandValidationError(f"robot.{method}() takes no arguments.")
         return {"method": method}
@@ -272,36 +277,147 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
     except SyntaxError as error:
         raise CommandValidationError(f"Invalid command syntax on line {error.lineno}: {error.msg}") from error
 
-    commands: list[dict[str, Any]] = []
+    def contains_condition(nodes: list[dict[str, Any]]) -> bool:
+        return any(
+            node.get("type") == "condition"
+            or (node.get("type") == "repeat" and contains_condition(node["body"]))
+            for node in nodes
+        )
 
-    def visit(statements: list[ast.stmt], depth: int = 0) -> None:
+    def visit(statements: list[ast.stmt], depth: int = 0) -> list[dict[str, Any]]:
         if depth > 5:
-            raise CommandValidationError("Loops may be nested at most five levels.")
+            raise CommandValidationError("Programs may be nested at most five levels.")
+        nodes: list[dict[str, Any]] = []
         for statement in statements:
             if isinstance(statement, ast.For):
                 count = _loop_count(statement)
-                nested: list[dict[str, Any]] = []
-                previous = commands[:]
-                commands.clear()
-                visit(statement.body, depth + 1)
-                nested.extend(commands)
-                commands[:] = previous
-                if len(commands) + len(nested) * count > _MAX_EXPANDED_COMMANDS:
-                    raise CommandValidationError(f"Programs may contain at most {_MAX_EXPANDED_COMMANDS} expanded commands.")
-                for _ in range(count):
-                    commands.extend(nested)
+                nested = visit(statement.body, depth + 1)
+                if not nested:
+                    raise CommandValidationError("Loops must contain at least one supported command.")
+                if contains_condition(nested):
+                    nodes.append({"type": "repeat", "times": count, "body": nested})
+                else:
+                    for _ in range(count):
+                        nodes.extend(nested)
+            elif isinstance(statement, ast.If):
+                if (
+                    not isinstance(statement.test, ast.Compare)
+                    or len(statement.test.ops) != 1
+                    or len(statement.test.comparators) != 1
+                ):
+                    raise CommandValidationError(
+                        "Conditions must compare robot.front_distance_m() or robot.rear_distance_m() with one numeric threshold."
+                    )
+                comparison = statement.test
+                sensor = comparison.left
+                if (
+                    not isinstance(sensor, ast.Call)
+                    or not isinstance(sensor.func, ast.Attribute)
+                    or not isinstance(sensor.func.value, ast.Name)
+                    or sensor.func.value.id != "robot"
+                    or sensor.func.attr not in {"front_distance_m", "rear_distance_m"}
+                    or sensor.args
+                    or sensor.keywords
+                ):
+                    raise CommandValidationError("Conditions may only read robot.front_distance_m() or robot.rear_distance_m().")
+                operator_map = {
+                    ast.Lt: "<",
+                    ast.LtE: "<=",
+                    ast.Gt: ">",
+                    ast.GtE: ">=",
+                    ast.Eq: "==",
+                    ast.NotEq: "!=",
+                }
+                operator = operator_map.get(type(comparison.ops[0]))
+                threshold = comparison.comparators[0]
+                if operator is None:
+                    raise CommandValidationError(
+                        "Distance conditions support <, <=, >, >=, ==, and != comparisons only."
+                    )
+                if (
+                    not isinstance(threshold, ast.Constant)
+                    or isinstance(threshold.value, bool)
+                    or not isinstance(threshold.value, (int, float))
+                    or not math.isfinite(float(threshold.value))
+                    or not 0.1 <= float(threshold.value) <= 20
+                ):
+                    raise CommandValidationError(
+                        "Distance thresholds must be numeric literals between 0.1 and 20 meters."
+                    )
+                if not statement.body:
+                    raise CommandValidationError("Distance condition then-branches must contain at least one command.")
+                if any(isinstance(item, ast.If) for item in statement.orelse):
+                    raise CommandValidationError("elif is not supported; use a single if/else distance condition.")
+                then_nodes = visit(statement.body, depth + 1)
+                else_nodes = visit(statement.orelse, depth + 1)
+                nodes.append({
+                    "type": "condition",
+                    "sensor": sensor.func.attr,
+                    "operator": operator,
+                    "threshold": float(threshold.value),
+                    "then": then_nodes,
+                    "else": else_nodes,
+                })
             else:
-                commands.append(_validate_call(statement))
-            if len(commands) > _MAX_EXPANDED_COMMANDS:
-                raise CommandValidationError(f"Programs may contain at most {_MAX_EXPANDED_COMMANDS} expanded commands.")
+                nodes.append(_validate_call(statement))
+        return nodes
 
-    visit(tree.body)
-    if not commands:
+    def add_arm_releases(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized = []
+        for node in nodes:
+            if node.get("type") == "repeat":
+                normalized.append({**node, "body": add_arm_releases(node["body"])})
+            elif node.get("type") == "condition":
+                normalized.append({
+                    **node,
+                    "then": add_arm_releases(node["then"]),
+                    "else": add_arm_releases(node["else"]),
+                })
+            else:
+                normalized.append(node)
+        result = []
+        for index, node in enumerate(normalized):
+            result.append(node)
+            if node.get("type") in {"condition", "repeat"} or node["method"] != "arm_action" or node["action"] == "release arm":
+                continue
+            next_node = normalized[index + 1] if index + 1 < len(normalized) else None
+            if next_node and next_node.get("type") not in {"condition", "repeat"} and next_node["method"] == "arm_action" and next_node["action"] == "release arm":
+                continue
+            result.append({
+                "method": "arm_action",
+                "action": "release arm",
+                "action_id": _ARM_ACTION_IDS["release arm"],
+            })
+        return result
+
+    nodes = add_arm_releases(visit(tree.body))
+    if not nodes:
         raise CommandValidationError("Program contains no robot commands.")
-    duration = sum(_estimated_duration(command) for command in commands)
+
+    def path_metrics(program_nodes: list[dict[str, Any]]) -> tuple[int, float]:
+        count = 0
+        duration = 0.0
+        for node in program_nodes:
+            if node.get("type") not in {"repeat", "condition"}:
+                count += 1
+                duration += _estimated_duration(node)
+            elif node["type"] == "repeat":
+                nested_count, nested_duration = path_metrics(node["body"])
+                count += node["times"] * nested_count
+                duration += node["times"] * nested_duration
+            else:
+                then_count, then_duration = path_metrics(node["then"])
+                else_count, else_duration = path_metrics(node["else"])
+                count += max(then_count, else_count)
+                duration += max(then_duration, else_duration)
+        return count, duration
+
+    command_count, duration = path_metrics(nodes)
+    if command_count > _MAX_EXPANDED_COMMANDS:
+        raise CommandValidationError(f"Programs may contain at most {_MAX_EXPANDED_COMMANDS} expanded commands.")
     if duration > _MAX_PROGRAM_SECONDS:
         raise CommandValidationError(f"Program duration cannot exceed {_MAX_PROGRAM_SECONDS:g} seconds.")
-    return commands
+    return nodes
 
 
 def _estimated_duration(command: dict[str, Any]) -> float:
@@ -310,7 +426,7 @@ def _estimated_duration(command: dict[str, Any]) -> float:
         return command["seconds"]
     if method == "say":
         return len(command["text"]) / 12
-    if method in {"stand", "sit", *_POSTURE_TRANSITION_FSM_IDS, "getfsm", "getactions", "getvolume", "setvolume", "led", "playstop"}:
+    if method in {"stand", *_POSTURE_TRANSITION_FSM_IDS, "getfsm", "getactions", "getvolume", "setvolume", "led", "playstop"}:
         return 0
     if method == "arm_action":
         return _ARM_ACTION_REQUEST_SPACING_SECONDS
@@ -387,6 +503,7 @@ def connect_robot(interface: str) -> dict[str, Any]:
         "status": "connected",
         "interface": interface,
         "domain": domain,
+        "distanceSensor": distance_sensor_status(),
         "capabilities": {
             "locomotion": True,
             "armActions": True,
@@ -447,17 +564,21 @@ def execute_robot_program(code: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="A robot program is already running.")
 
     _stop_requested.clear()
-    results = []
+    results: list[dict[str, Any]] = []
+    conditions_evaluated: list[dict[str, Any]] = []
+    executed_count = 0
     try:
         _log_event("program_started", command_count=len(commands), commands=commands)
-        for index, command in enumerate(commands, start=1):
+
+        def execute_command(command: dict[str, Any]) -> None:
+            nonlocal executed_count
+            executed_count += 1
+            index = executed_count
             method = command["method"]
             _log_event("command_started", index=index, command=command)
             try:
                 if method == "stand":
                     _sdk_result(_client.SetFsmId(500), "Start")
-                elif method == "sit":
-                    _sdk_result(_client.SetFsmId(3), "Sit")
                 elif method in _POSTURE_TRANSITION_FSM_IDS:
                     _sdk_result(
                         _client.SetFsmId(_POSTURE_TRANSITION_FSM_IDS[method]),
@@ -530,13 +651,77 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                 _log_event("command_failed", index=index, command=command, error=str(error))
                 raise
             _log_event("command_completed", index=index, command=command)
-        _log_event("program_completed", command_count=len(commands))
-        return {
+
+        def execute_nodes(nodes: list[dict[str, Any]]) -> None:
+            for node in nodes:
+                if _stop_requested.is_set():
+                    raise HTTPException(status_code=409, detail="Robot program stopped by teacher.")
+                node_type = node.get("type")
+                if node_type is None:
+                    execute_command(node)
+                    continue
+                if node_type == "repeat":
+                    for _ in range(node["times"]):
+                        execute_nodes(node["body"])
+                    continue
+                try:
+                    sensor = node["sensor"]
+                    sample = (
+                        get_front_distance_sample()
+                        if sensor == "front_distance_m"
+                        else get_rear_distance_sample()
+                    )
+                except DistanceSensorError as error:
+                    _log_event("distance_condition_failed", sensor=node["sensor"], error=str(error), condition=node)
+                    _stop_requested.set()
+                    try:
+                        _sdk_result(_client.StopMove(), "StopMove")
+                    except Exception as stop_error:
+                        _log_event("safety_stop_failed", reason=str(error), error=str(stop_error))
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Distance condition failed: {error}. The G1 stop request also failed: {stop_error}",
+                        ) from stop_error
+                    _log_event("safety_stop_requested", reason="invalid_or_stale_distance_sample")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Distance condition aborted safely: {error}. G1 locomotion stop was requested.",
+                    ) from error
+                if _stop_requested.is_set():
+                    raise HTTPException(status_code=409, detail="Robot program stopped by teacher.")
+
+                operators = {
+                    "<": lambda measured, target: measured < target,
+                    "<=": lambda measured, target: measured <= target,
+                    ">": lambda measured, target: measured > target,
+                    ">=": lambda measured, target: measured >= target,
+                    "==": lambda measured, target: measured == target,
+                    "!=": lambda measured, target: measured != target,
+                }
+                selected_then = operators[node["operator"]](sample["distance_m"], node["threshold"])
+                decision = {
+                    "sensor": sensor,
+                    "operator": node["operator"],
+                    "threshold_m": node["threshold"],
+                    "distance_m": sample["distance_m"],
+                    "age_ms": sample["age_ms"],
+                    "branch": "then" if selected_then else "else",
+                }
+                conditions_evaluated.append(decision)
+                _log_event("distance_condition_evaluated", **decision)
+                execute_nodes(node["then"] if selected_then else node["else"])
+
+        execute_nodes(commands)
+        _log_event("program_completed", command_count=executed_count)
+        response = {
             "status": "completed",
-            "commandsExecuted": len(commands),
+            "commandsExecuted": executed_count,
             "results": results,
             "physicalMotionVerified": False,
         }
+        if conditions_evaluated:
+            response["conditionsEvaluated"] = conditions_evaluated
+        return response
     except HTTPException as error:
         _log_event("program_failed", error=str(error.detail))
         raise

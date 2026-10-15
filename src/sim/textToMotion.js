@@ -115,8 +115,8 @@ export function compileMotionPrompt(prompt = '') {
     addStep(steps, 'Stand', 'robot.stand()', 'finish safely');
   }
 
-  if (/\b(sit|squat|stop|wait|pause|lower|坐下|停止|等待)\b/.test(normalized)) {
-    unknown.push('Sitting, stop, wait, and lowering motions are not in the shared G1 command set yet.');
+  if (/\b(squat|stop|wait|pause|lower|停止|等待)\b/.test(normalized)) {
+    unknown.push('Stop, wait, and lowering motions are not in the shared G1 command set yet.');
   }
 
   return {

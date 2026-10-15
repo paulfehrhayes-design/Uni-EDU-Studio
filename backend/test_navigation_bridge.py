@@ -1,0 +1,331 @@
+import os
+import unittest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import patch
+
+try:
+    from . import navigation_bridge
+    from .navigation_bridge import navigation_bridge_status, navigation_map_snapshot
+except ImportError:
+    import navigation_bridge
+    from navigation_bridge import (
+        NavigationBridgeError,
+        navigation_bridge_status,
+        navigation_cancel_route,
+        navigation_map_snapshot,
+        navigation_start_route,
+    )
+
+
+class NavigationBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 14, 17, 0, tzinfo=timezone.utc)
+        self.status = {
+            "ready": True,
+            "planner_ready": True,
+            "localization": {
+                "ready": True,
+                "frame_id": "map",
+                "pose": {"x": 1.2, "y": -0.4, "yaw_rad": 0.3},
+                "timestamp": (self.now - timedelta(milliseconds=80)).isoformat(),
+            },
+        }
+        self.map_metadata = {
+            "map_id": "classroom",
+            "version": "v4",
+            "frame_id": "map",
+            "resolution_m": 0.05,
+            "width": 200,
+            "height": 150,
+            "origin": {"x": -5.0, "y": -3.75},
+            "updated_at": (self.now - timedelta(days=1)).isoformat(),
+        }
+        self.map_snapshot = {
+            **self.map_metadata,
+            "data": [0] * (self.map_metadata["width"] * self.map_metadata["height"]),
+        }
+        self.environment = patch.dict(
+            os.environ,
+            {
+                "G1_NAV_BRIDGE_URL": "http://127.0.0.1:8282",
+                "G1_NAV_BRIDGE_TOKEN": "test-bridge-token",
+            },
+        )
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def mock_bridge(self, status=None, map_metadata=None):
+        payloads = {
+            "/api/v1/status": status or self.status,
+            "/api/v1/map/metadata": map_metadata or self.map_metadata,
+            "/api/v1/map": self.map_snapshot,
+        }
+
+        def get(url, **kwargs):
+            path = url.removeprefix("http://127.0.0.1:8282")
+            return SimpleNamespace(status_code=200, json=lambda: payloads[path])
+
+        return patch.object(navigation_bridge.httpx, "get", side_effect=get)
+
+    def test_valid_bridge_status_and_map_metadata_are_reported_read_only(self):
+        with self.mock_bridge():
+            result = navigation_bridge_status(now=self.now)
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["localization"]["frame_id"], "map")
+        self.assertEqual(result["localization"]["age_ms"], 80)
+        self.assertEqual(result["map"]["version"], "v4")
+        self.assertEqual(result["map"]["width"], 200)
+
+    def test_bridge_requests_are_authenticated_and_do_not_redirect(self):
+        with self.mock_bridge(), patch.object(navigation_bridge.httpx, "get", wraps=navigation_bridge.httpx.get) as request:
+            navigation_bridge_status(now=self.now)
+        self.assertEqual(request.call_count, 2)
+        for call in request.call_args_list:
+            self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer test-bridge-token")
+            self.assertFalse(call.kwargs["follow_redirects"])
+            self.assertEqual(call.kwargs["timeout"], navigation_bridge.BRIDGE_TIMEOUT_SECONDS)
+
+    def test_missing_bridge_configuration_reports_unavailable(self):
+        with patch.dict(os.environ, {"G1_NAV_BRIDGE_URL": "", "G1_NAV_BRIDGE_TOKEN": ""}):
+            result = navigation_bridge_status(now=self.now)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIn("not configured", result["error"])
+
+    def test_insecure_non_loopback_bridge_is_rejected(self):
+        with patch.dict(os.environ, {"G1_NAV_BRIDGE_URL": "http://192.168.1.8:8282"}):
+            result = navigation_bridge_status(now=self.now)
+        self.assertFalse(result["ready"])
+        self.assertIn("HTTPS unless", result["error"])
+
+    def test_stale_localization_and_wrong_map_frame_are_rejected(self):
+        stale = {
+            **self.status,
+            "localization": {
+                **self.status["localization"],
+                "timestamp": (self.now - timedelta(seconds=2)).isoformat(),
+            },
+        }
+        with self.mock_bridge(status=stale):
+            stale_result = navigation_bridge_status(now=self.now)
+        self.assertFalse(stale_result["ready"])
+        self.assertIn("stale", stale_result["error"])
+
+        wrong_map = {**self.map_metadata, "frame_id": "odom"}
+        with self.mock_bridge(map_metadata=wrong_map):
+            frame_result = navigation_bridge_status(now=self.now)
+        self.assertFalse(frame_result["ready"])
+        self.assertIn("does not match", frame_result["error"])
+
+    def test_map_dimensions_are_bounded(self):
+        too_large = {**self.map_metadata, "width": 100_000, "height": 100_000}
+        with self.mock_bridge(map_metadata=too_large):
+            result = navigation_bridge_status(now=self.now)
+        self.assertFalse(result["ready"])
+        self.assertIn("dimensions", result["error"])
+
+    def test_map_snapshot_validates_complete_bounded_occupancy_grid(self):
+        with self.mock_bridge():
+            result = navigation_map_snapshot(now=self.now)
+        self.assertTrue(result["ready"])
+        self.assertEqual(len(result["data"]), 30_000)
+
+        malformed = {**self.map_snapshot, "data": [0, 100]}
+        with self.mock_bridge(), patch.object(
+            navigation_bridge,
+            "_get_json",
+            side_effect=[self.status, malformed],
+        ):
+            invalid = navigation_map_snapshot(now=self.now)
+        self.assertFalse(invalid["ready"])
+        self.assertIn("length does not match", invalid["error"])
+
+    def test_map_snapshot_rejects_values_outside_occupancy_range(self):
+        small_status = self.status
+        small_map = {**self.map_metadata, "width": 2, "height": 2}
+        invalid_map = {**small_map, "data": [0, 100, -2, 50]}
+        with self.mock_bridge(), patch.object(
+            navigation_bridge,
+            "_get_json",
+            side_effect=[small_status, invalid_map],
+        ):
+            result = navigation_map_snapshot(now=self.now)
+        self.assertFalse(result["ready"])
+        self.assertIn("integers from -1 through 100", result["error"])
+
+    def test_map_snapshot_preserves_origin_rotation_and_metadata(self):
+        rotated_map = {
+            **self.map_metadata,
+            "origin": {"x": -3.0, "y": 2.0, "yaw_rad": 0.5},
+            "data": [0] * 30_000,
+        }
+        with self.mock_bridge(), patch.object(
+            navigation_bridge,
+            "_get_json",
+            side_effect=[self.status, rotated_map],
+        ):
+            result = navigation_map_snapshot(now=self.now)
+        self.assertTrue(result["ready"])
+        self.assertAlmostEqual(result["map"]["origin"]["yaw_rad"], 0.5)
+
+    def test_map_snapshot_requires_ready_localization_and_bounds_payload_size(self):
+        unavailable_status = {**self.status, "planner_ready": False}
+        with self.mock_bridge(status=unavailable_status):
+            unavailable = navigation_map_snapshot(now=self.now)
+        self.assertFalse(unavailable["ready"])
+        self.assertIn("not ready", unavailable["error"])
+
+        oversized = {
+            **self.map_metadata,
+            "width": 600,
+            "height": 500,
+            "data": [0] * 300_000,
+        }
+        with self.mock_bridge(), patch.object(
+            navigation_bridge,
+            "_get_json",
+            side_effect=[self.status, oversized],
+        ):
+            bounded = navigation_map_snapshot(now=self.now)
+        self.assertFalse(bounded["ready"])
+        self.assertIn("preview limit", bounded["error"])
+
+    def test_route_start_requires_enabled_execution_and_current_free_map_targets(self):
+        route = [{"x": -4.975, "y": -3.725}]
+        operation_id = "12345678-1234-1234-1234-123456789abc"
+        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "0"}):
+            with self.assertRaisesRegex(NavigationBridgeError, "disabled"):
+                navigation_start_route(
+                    "classroom", "v4", "map", route, operation_id, now=self.now
+                )
+
+        accepted = {
+            "operation_id": "12345678-1234-1234-1234-123456789abc",
+            "status": "accepted",
+        }
+        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
+            navigation_bridge.httpx,
+            "post",
+            return_value=SimpleNamespace(status_code=202, json=lambda: accepted),
+        ) as request:
+            result = navigation_start_route(
+                "classroom", "v4", "map", route, operation_id, now=self.now
+            )
+        self.assertEqual(result["operation_id"], accepted["operation_id"])
+        self.assertEqual(
+            request.call_args.kwargs["json"]["goals"],
+            [{"x": route[0]["x"], "y": route[0]["y"], "yaw_rad": 0.0}],
+        )
+
+        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}):
+            with self.assertRaisesRegex(NavigationBridgeError, "map changed"):
+                navigation_start_route(
+                    "classroom", "old-version", "map", route, operation_id, now=self.now
+                )
+            with self.assertRaisesRegex(NavigationBridgeError, "outside the current map"):
+                navigation_start_route(
+                    "classroom", "v4", "map", [{"x": 100, "y": 100}],
+                    operation_id, now=self.now,
+                )
+
+        occupied_map = {
+            **self.map_metadata,
+            "width": 2,
+            "height": 2,
+            "origin": {"x": 0, "y": 0, "yaw_rad": 0},
+        }
+        occupied = {**occupied_map, "data": [100, 0, 0, 0]}
+        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
+            navigation_bridge,
+            "_get_json",
+            side_effect=[self.status, occupied],
+        ):
+            with self.assertRaisesRegex(NavigationBridgeError, "known free space"):
+                navigation_start_route(
+                    "classroom", "v4", "map", [{"x": 0.025, "y": 0.025}],
+                    operation_id, now=self.now,
+                )
+
+    def test_route_cancellation_requires_valid_operation_and_terminal_contract(self):
+        operation_id = "12345678-1234-1234-1234-123456789abc"
+        response = {"operation_id": operation_id, "status": "cancel_requested"}
+        with patch.object(
+            navigation_bridge.httpx,
+            "post",
+            return_value=SimpleNamespace(status_code=200, json=lambda: response),
+        ) as request:
+            self.assertEqual(navigation_cancel_route(operation_id), response)
+        self.assertTrue(request.call_args.args[0].endswith(f"/{operation_id}/cancel"))
+        with self.assertRaisesRegex(NavigationBridgeError, "ID is invalid"):
+            navigation_cancel_route("../../other")
+
+    def test_scan_start_and_status_validate_job_contract(self):
+        job_id = "12345678-1234-1234-1234-123456789abc"
+        with patch.object(
+            navigation_bridge,
+            "_post_json",
+            return_value={"job_id": job_id, "status": "scanning"},
+        ) as start:
+            result = navigation_bridge.navigation_start_scan()
+        self.assertEqual(result, {"job_id": job_id, "status": "scanning"})
+        start.assert_called_once()
+
+        with patch.object(
+            navigation_bridge,
+            "_get_json",
+            return_value={"job_id": job_id, "status": "scanning", "point_count": 1250},
+        ):
+            status = navigation_bridge.navigation_scan_status(job_id)
+        self.assertEqual(status["point_count"], 1250)
+        with patch.object(
+            navigation_bridge,
+            "_get_json",
+            return_value={"job_id": job_id, "status": "scanning", "point_count": -1},
+        ):
+            with self.assertRaisesRegex(NavigationBridgeError, "point count"):
+                navigation_bridge.navigation_scan_status(job_id)
+
+    def test_scan_pointcloud_requires_finite_map_frame_points_and_timestamp(self):
+        job_id = "12345678-1234-1234-1234-123456789abc"
+        payload = {
+            "job_id": job_id,
+            "frame_id": "map",
+            "captured_at": self.now.isoformat(),
+            "points": [{"x": 1.0, "y": -2.0, "z": 0.4}],
+        }
+        with patch.object(navigation_bridge, "_get_json", return_value=payload):
+            cloud = navigation_bridge.navigation_scan_pointcloud(job_id)
+        self.assertEqual(cloud["point_count"], 1)
+        self.assertEqual(cloud["points"][0]["z"], 0.4)
+
+        invalid = {**payload, "points": [{"x": float("nan"), "y": 0, "z": 0}]}
+        with patch.object(navigation_bridge, "_get_json", return_value=invalid):
+            with self.assertRaisesRegex(NavigationBridgeError, "finite number"):
+                navigation_bridge.navigation_scan_pointcloud(job_id)
+
+    def test_completed_scan_map_is_validated_as_a_metric_snapshot(self):
+        job_id = "12345678-1234-1234-1234-123456789abc"
+        payload = {
+            **self.map_metadata,
+            "width": 2,
+            "height": 2,
+            "data": [0, 100, -1, 50],
+        }
+        with patch.object(navigation_bridge, "_get_json", return_value=payload):
+            snapshot = navigation_bridge.navigation_scan_map_snapshot(job_id)
+        self.assertEqual(snapshot["map"]["resolution_m"], 0.05)
+        self.assertEqual(snapshot["data"], [0, 100, -1, 50])
+
+        with patch.object(
+            navigation_bridge,
+            "_get_json",
+            return_value={**payload, "data": [0]},
+        ):
+            with self.assertRaisesRegex(NavigationBridgeError, "length does not match"):
+                navigation_bridge.navigation_scan_map_snapshot(job_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

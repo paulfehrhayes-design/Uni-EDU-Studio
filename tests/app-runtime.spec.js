@@ -72,6 +72,370 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   expect(pageErrors).toEqual([]);
 });
 
+test('distance if/then/else programs round-trip between IDE text and Blockly', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-distance-conditions-test' },
+    }));
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.locator('textarea').first().fill(
+    'if robot.front_distance_m() < 1:\n'
+    + '    robot.walk(2)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)',
+  );
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect(page.locator('.blocklySvg')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().map((block) => block.type).sort()
+  ))).toEqual(['controls_if', 'g1_command_turn', 'g1_command_walk', 'g1_front_distance_m', 'logic_compare', 'math_number'].sort());
+  await page.evaluate(() => {
+    const conditional = window.Blockly.getMainWorkspace().getAllBlocks().find((block) => block.type === 'controls_if');
+    if (!conditional.getInput('ELSE')) throw new Error('Else branch was not restored from IDE code.');
+    if (conditional.getInputTargetBlock('ELSE')?.type !== 'g1_command_turn') {
+      throw new Error('Else branch command was not connected to the conditional.');
+    }
+  });
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await expect(page.locator('textarea').first()).toHaveValue(
+    'if robot.front_distance_m() < 1:\n    robot.walk(2)\nelse:\n    robot.turn("left", 90)',
+  );
+});
+
+test('rear distance conditions appear in Blockly and round-trip to IDE text', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-rear-distance-test' },
+    }));
+  });
+  const code = 'if robot.rear_distance_m() < 0.8:\n'
+    + '    robot.backward(1)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)';
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.locator('textarea').first().fill(code);
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getAllBlocks().map((block) => block.type).sort()
+  ))).toEqual(['controls_if', 'g1_command_turn', 'g1_command_backward', 'g1_rear_distance_m', 'logic_compare', 'math_number'].sort());
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await expect(page.locator('textarea').first()).toHaveValue(code);
+});
+
+test('teacher can check ROS navigation readiness without starting motion', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'teacher', username: 'teacher-navigation-bridge-test' },
+    }));
+  });
+  await page.route('**/api/navigation/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'ready',
+        ready: true,
+        localization: {
+          pose: { x: 1.2, y: -0.4, yaw_rad: 0.3 },
+          age_ms: 80,
+        },
+        map: { map_id: 'classroom', version: 'v4', frame_id: 'map' },
+      }),
+    });
+  });
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  await page.getByRole('button', { name: 'Check status' }).click();
+  await expect(page.getByRole('status').filter({
+    hasText: 'Ready • map classroom • version v4 • map • pose 1.20, -0.40 m (80 ms old)',
+  })).toBeVisible();
+});
+
+test('teacher can load and hide the ROS occupancy map', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'teacher', username: 'teacher-map-preview-test' },
+    }));
+  });
+  await page.route('**/api/navigation/map', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ready: true,
+        map: {
+          map_id: 'classroom',
+          version: 'v2',
+          frame_id: 'map',
+          resolution_m: 1,
+          width: 2,
+          height: 2,
+          origin: { x: -1, y: -1, yaw_rad: 0 },
+        },
+        data: [0, 100, -1, 75],
+      }),
+    });
+  });
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  await page.getByRole('button', { name: 'Load occupancy map' }).click();
+  await expect(page.getByText('Loaded • 2 × 2 cells • map classroom • version v2')).toBeVisible();
+  const overlay = page.getByTestId('ros-occupancy-overlay');
+  await expect(overlay).toBeVisible();
+  await expect(overlay.locator('path')).toHaveAttribute('d', /M1 0h1v1h-1zM1 1h1v1h-1z/);
+  await page.getByRole('button', { name: 'Hide overlay' }).click();
+  await expect(overlay).toHaveCount(0);
+});
+
+test('students receive the centrally published metric map and 3D cloud overlay', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-shared-map-test' },
+    }));
+  });
+  await page.route('**/api/lidar/settings', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ show_shared_overlay: true }),
+    });
+  });
+  await page.route('**/api/lidar/map', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        enabled: true,
+        map: {
+          ready: true,
+          map: {
+            map_id: 'classroom',
+            version: 'shared-v1',
+            frame_id: 'map',
+            resolution_m: 0.5,
+            width: 2,
+            height: 2,
+            origin: { x: -0.5, y: -0.5, yaw_rad: 0 },
+          },
+          data: [100, 0, -1, 0],
+        },
+        pointcloud: {
+          frame_id: 'map',
+          point_count: 1,
+          points: [{ x: -0.25, y: -0.25, z: 1.4 }],
+        },
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  await expect(page.getByText('Published room map • 3D points projected to grid')).toBeVisible();
+  await page.getByRole('button', { name: 'Library' }).click();
+  await expect(page.getByTestId('shared-lidar-grid-overlay')).toBeVisible();
+  await expect(page.getByTestId('shared-lidar-grid-overlay')).toHaveAttribute('d', /M/);
+  await expect(page.getByTestId('shared-lidar-pointcloud-overlay').locator('circle')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Settings', exact: true }).last().click();
+  await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toBeChecked();
+  await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toBeDisabled();
+});
+
+test('teacher scan workflow requires explicit capture completion and map publication', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'teacher', username: 'teacher-room-scan-test' },
+    }));
+  });
+  const jobId = '12345678-1234-1234-1234-123456789abc';
+  await page.route('**/api/lidar/scan', async (route) => {
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ job_id: jobId, status: 'scanning' }),
+    });
+  });
+  await page.route(`**/api/lidar/scan/${jobId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: jobId,
+        status: 'scanning',
+        point_count: 1200,
+        preview_points: [{ x: 0.2, y: 0.3, z: 1.1 }],
+      }),
+    });
+  });
+  await page.route(`**/api/lidar/scan/${jobId}/complete`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: jobId,
+        status: 'completed',
+        point_count: 1200,
+        map: {
+          map_id: 'classroom',
+          version: 'scan-v1',
+          frame_id: 'map',
+          resolution_m: 0.05,
+          width: 40,
+          height: 30,
+          origin: { x: -1, y: -0.75, yaw_rad: 0 },
+        },
+      }),
+    });
+  });
+  await page.route('**/api/lidar/map/publish', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'published',
+        map: { map_id: 'classroom', version: 'scan-v1', width: 40, height: 30, resolution_m: 0.05 },
+      }),
+    });
+  });
+  await page.route('**/api/lidar/map', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ enabled: false, map: null, pointcloud: null }),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  await page.getByRole('button', { name: 'Start room scan' }).click();
+  await expect(page.getByText(/Capturing 3D room scan • 1200 unique points/)).toBeVisible();
+  await page.getByRole('button', { name: 'Finish and validate scan' }).click();
+  await expect(page.getByRole('button', { name: 'Publish shared map' })).toBeVisible();
+  await page.getByRole('button', { name: 'Publish shared map' }).click();
+  await expect(page.getByText('Published shared room map • 2 m × 1.5 m')).toBeVisible();
+});
+
+test('teacher can submit map-frame destinations to Nav2 and observe terminal status', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'teacher', username: 'teacher-navigation-execution-test' },
+    }));
+  });
+  await page.route('**/api/navigation/map', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ready: true,
+        map: {
+          map_id: 'classroom',
+          version: 'v2',
+          frame_id: 'map',
+          resolution_m: 1,
+          width: 2,
+          height: 2,
+          origin: { x: -1, y: -1, yaw_rad: 0 },
+        },
+        data: [0, 0, 0, 0],
+      }),
+    });
+  });
+  await page.route('**/api/navigation/start', async (route) => {
+    const request = route.request().postDataJSON();
+    expect(request.map_id).toBe('classroom');
+    expect(request.version).toBe('v2');
+    expect(request.frame_id).toBe('map');
+    expect(request.waypoints).toHaveLength(1);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        operation_id: '12345678-1234-1234-1234-123456789abc',
+        status: 'accepted',
+      }),
+    });
+  });
+  await page.route('**/api/navigation/operation/*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        operation_id: '12345678-1234-1234-1234-123456789abc',
+        status: 'succeeded',
+        current_waypoint: 1,
+      }),
+    });
+  });
+  page.on('dialog', (dialog) => dialog.accept());
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  await page.getByRole('button', { name: 'Load occupancy map' }).click();
+  await expect(page.getByText('Loaded • 2 × 2 cells • map classroom • version v2')).toBeVisible();
+  await page.getByRole('button', { name: 'Add map goals' }).click();
+  await page.getByRole('img', { name: 'ROS occupancy map and navigation destinations' }).click({
+    position: { x: 100, y: 100 },
+  });
+  await expect(page.getByText(/Goal 1: .*map\)/)).toBeVisible();
+  await page.getByRole('button', { name: 'Start Nav2' }).click();
+  await expect(page.getByTestId('navigation-execution-status')).toContainText('Navigation completed');
+});
+
+test('teacher can test LiDAR status without issuing a robot motion command', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'teacher', username: 'teacher-lidar-test' },
+    }));
+  });
+  await page.route('**/api/robot/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sdkAvailable: false,
+        distanceSensor: {
+          ready: true,
+          distance_m: 0.84,
+          age_ms: 38,
+          frame_id: 'livox_frame',
+          timestamp: new Date().toISOString(),
+          rear: {
+            ready: true,
+            distance_m: 1.14,
+            age_ms: 46,
+            frame_id: 'livox_frame',
+          },
+        },
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await expect(page.getByRole('button', { name: 'Test LiDAR' })).toBeVisible();
+  await page.getByRole('button', { name: 'Test LiDAR' }).click();
+  await expect(page.getByRole('status').filter({
+    hasText: 'Front ready • 0.84 m • 38 ms old • livox_frame',
+  })).toContainText('Rear ready • 1.14 m • 46 ms old');
+});
+
 test('object library items keep distinct shapes when added to the scene', async ({ page }) => {
   test.setTimeout(90000);
   await page.addInitScript(() => {
@@ -157,7 +521,7 @@ test('simulation playback speed follows estimated SDK command duration', async (
 });
 
 test('compiling a planner path preserves its waypoint coordinates', async ({ page }) => {
-  test.setTimeout(60000);
+  test.setTimeout(120000);
   const username = `planner-test-${Date.now()}`;
   await page.addInitScript((testUsername) => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({

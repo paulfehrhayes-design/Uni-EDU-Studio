@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, parseG1Program } from './g1Commands.js';
+import * as Blockly from 'blockly';
+import { pythonGenerator } from 'blockly/python';
+import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './g1Commands.js';
 import { compileMotionPrompt } from './textToMotion.js';
 import { buildG1SimulationFrames } from './g1Edu23Env.js';
 
@@ -13,7 +15,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     blocks.map((block) => block.type),
     [
       ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
-        .slice(0, 13).map((command) => command.blockType),
+        .slice(0, 12).map((command) => command.blockType),
       'g1_command_squat_to_stand',
       'g1_command_lie_to_stand',
       'g1_command_stand_to_squat',
@@ -33,8 +35,13 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
       'g1_command_arm_action_face_wave',
       'g1_command_arm_action_high_wave',
       'g1_command_arm_action_shake_hand',
-      ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
-        .slice(16).map((command) => command.blockType),
+      'g1_command_getfsm',
+      'g1_command_getactions',
+      'g1_command_say',
+      'g1_command_getvolume',
+      'g1_command_setvolume',
+      'g1_command_led',
+      'g1_command_playstop',
     ],
   );
   assert.ok(blocks.every((block) => G1_EXECUTABLE_COMMANDS.some((command) => (
@@ -44,8 +51,8 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'arm_action' && command.category === 'Gestures'));
   assert.ok(getG1BlocklyCommandBlocks(G1_COMMANDS).some((block) => block.type === 'g1_command_kickleftDegrees'));
   assert.deepEqual(
-    G1_EXECUTABLE_COMMANDS.slice(0, 13).map((command) => command.method),
-    ['stand', 'sit', 'wait', 'walk', 'walktime', 'backward', 'backwardtime', 'sidestep', 'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn'],
+    G1_EXECUTABLE_COMMANDS.slice(0, 12).map((command) => command.method),
+    ['stand', 'wait', 'walk', 'walktime', 'backward', 'backwardtime', 'sidestep', 'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn'],
   );
   assert.deepEqual(
     G1_EXECUTABLE_COMMANDS.filter((command) => command.category === 'Postures').map(({ method }) => method),
@@ -55,8 +62,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.equal(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'lie_to_stand').sdkMethod, 'LocoClient.SetFsmId(702) / Lie2StandUp');
   assert.equal(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'stand_to_squat').sdkMethod, 'LocoClient.SetFsmId(706) / StandUp2Squat');
   assert.equal(G1_EXECUTABLE_COMMANDS[0].sdkMethod, 'LocoClient.Start() / SetFsmId(500)');
-  assert.equal(G1_EXECUTABLE_COMMANDS[1].sdkMethod, 'LocoClient.Sit (SetFsmId(3))');
-  assert.equal(G1_EXECUTABLE_COMMANDS[2].sdkMethod, null);
+  assert.equal(G1_EXECUTABLE_COMMANDS[1].sdkMethod, null);
   assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'wait').description, /Pause/);
   assert.ok(G1_EXECUTABLE_COMMANDS.filter((command) => ['walk', 'walktime', 'backward', 'backwardtime', 'sidestep', 'slowwalk', 'slowwalktime', 'fastwalk', 'fastwalktime', 'turn'].includes(command.method))
     .every((command) => command.sdkMethod === 'LocoClient.SetVelocity'));
@@ -64,10 +70,17 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'walk').description, /may vary/);
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'getactions' && command.sdkMethod === 'G1ArmActionClient.GetActionList'));
   assert.ok(G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'say' && command.sdkMethod === 'AudioClient.TtsMaker'));
+  const audioMethods = ['say', 'getvolume', 'setvolume', 'led', 'playstop'];
+  assert.deepEqual(
+    G1_EXECUTABLE_COMMANDS.filter((command) => command.category === 'Audio').map(({ method }) => method),
+    audioMethods,
+  );
+  assert.ok(audioMethods.every((method) => blocks.some((block) => block.type === `g1_command_${method}`)));
   const sayBlock = blocks.find((block) => block.type === 'g1_command_say');
   assert.deepEqual(sayBlock.stringFields, ['TEXT']);
   assert.equal(sayBlock.args0[0].type, 'field_input');
   assert.equal(sayBlock.args0[1].type, 'field_dropdown');
+  assert.equal(sayBlock.message0, 'Speak %1 with voice %2');
   assert.ok(G1_EXECUTABLE_COMMANDS.filter((command) => ['Audio', 'Diagnostics'].includes(command.category))
     .every((command) => !command.adapters.simulator));
   assert.ok(G1_COMMANDS.filter((command) => !['Audio', 'Diagnostics'].includes(command.category))
@@ -97,6 +110,26 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   );
 });
 
+test('all executable Blockly command blocks instantiate successfully', () => {
+  const blocks = getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS);
+  const definitions = blocks.map((block) => {
+    const definition = { ...block };
+    delete definition.codeTemplate;
+    delete definition.stringFields;
+    delete definition.category;
+    delete definition.armPreset;
+    return definition;
+  });
+  Blockly.common.defineBlocksWithJsonArray(definitions);
+  const workspace = new Blockly.Workspace();
+
+  try {
+    blocks.forEach(({ type }) => workspace.newBlock(type));
+  } finally {
+    workspace.dispose();
+  }
+});
+
 test('G1 program parser normalizes commands, clamps numbers, and expands loops', () => {
   const nodes = parseG1Program('robot.walk(99)\nfor _ in range(2):\n    robot.turn("left")\n');
   assert.equal(nodes[0].code, 'robot.walk(10)');
@@ -117,6 +150,127 @@ test('wait command is bounded, included in the IDE catalog, and previews its ful
 test('G1 program formatter preserves executable loop structure', () => {
   const nodes = parseG1Program('for _ in range(2):\n    robot.waveleft("high")\n');
   assert.equal(formatG1Program(nodes), 'for _ in range(2):\n    robot.waveleft("high")');
+});
+
+test('distance conditions preserve if/then and if/then/else branches in IDE code', () => {
+  const code = [
+    'if robot.front_distance_m() < 1.25:',
+    '    robot.walk(2)',
+    'else:',
+    '    robot.turn("left", 90)',
+  ].join('\n');
+  const nodes = parseG1Program(code);
+
+  assert.equal(nodes[0].type, 'condition');
+  assert.equal(nodes[0].sensor, 'front_distance_m');
+  assert.equal(nodes[0].operator, '<');
+  assert.equal(nodes[0].threshold, 1.25);
+  assert.equal(nodes[0].then[0].method, 'walk');
+  assert.equal(nodes[0].else[0].method, 'turn');
+  assert.equal(formatG1Program(nodes), code);
+  assert.throws(() => flattenG1Commands(nodes), /cannot be flattened without sensor data/);
+});
+
+test('distance conditions support nested branches and bounds without flattening their logic', () => {
+  const nodes = parseG1Program(
+    'for _ in range(2):\n'
+    + '    if robot.front_distance_m() <= 0.5:\n'
+    + '        robot.walktime(0.2)\n'
+    + '    else:\n'
+    + '        robot.turn("right", 45)',
+  );
+  assert.equal(nodes[0].type, 'repeat');
+  assert.equal(nodes[0].times, 2);
+  assert.equal(nodes[0].body[0].type, 'condition');
+  assert.equal(formatG1Program(nodes).includes('else:'), true);
+  assert.throws(
+    () => parseG1Program('if robot.front_distance_m() < 0.01:\n    robot.walk(1)'),
+    /between 0.1 and 20 meters/,
+  );
+  assert.throws(
+    () => parseG1Program('if robot.front_distance_m() < 1:\n    robot.walk(1)\nelse:\n    '),
+    /no body/,
+  );
+});
+
+test('rear distance conditions round-trip through the same structured parser', () => {
+  const code = 'if robot.rear_distance_m() < 0.8:\n'
+    + '    robot.backward(1)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)';
+  const [node] = parseG1Program(code);
+  assert.equal(node.sensor, 'rear_distance_m');
+  assert.equal(node.then[0].method, 'backward');
+  assert.equal(formatG1Program([node]), code);
+  assert.ok(getG1BlocklyConditionBlocks().some((block) => block.type === 'g1_rear_distance_m'));
+});
+
+test('distance condition Blockly value block is a numeric expression', () => {
+  const [distanceBlock] = getG1BlocklyConditionBlocks();
+  const definition = { ...distanceBlock };
+  delete definition.codeTemplate;
+  Blockly.common.defineBlocksWithJsonArray([definition]);
+  const workspace = new Blockly.Workspace();
+  try {
+    const condition = workspace.newBlock('controls_if');
+    const comparison = workspace.newBlock('logic_compare');
+    const sensor = workspace.newBlock('g1_front_distance_m');
+    const threshold = workspace.newBlock('math_number');
+    comparison.setFieldValue('LT', 'OP');
+    threshold.setFieldValue('1', 'NUM');
+    condition.getInput('IF0').connection.connect(comparison.outputConnection);
+    comparison.getInput('A').connection.connect(sensor.outputConnection);
+    comparison.getInput('B').connection.connect(threshold.outputConnection);
+    assert.ok(condition.getInput('DO0'));
+    assert.equal(sensor.outputConnection.getCheck().includes('Number'), true);
+
+    pythonGenerator.forBlock.g1_front_distance_m = () => ['robot.front_distance_m()', pythonGenerator.ORDER_ATOMIC];
+    const generated = pythonGenerator.workspaceToCode(workspace);
+    assert.match(generated, /robot\.front_distance_m\(\)\s*<\s*1/);
+  } finally {
+    workspace.dispose();
+  }
+});
+
+test('simulator selects the near-obstacle branch from the forward sector', () => {
+  const frames = buildG1SimulationFrames(
+    'if robot.front_distance_m() < 1:\n'
+    + '    robot.walk(1)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)',
+    { obstacles: [{ id: 'near', x: 0.8, y: 0, radius: 0.1 }] },
+  );
+  const finalFrame = frames.at(-1);
+  assert.ok(finalFrame.x > 0.3);
+  assert.equal(finalFrame.heading, 0);
+  assert.match(finalFrame.timeline[0].summary, /0\.70 m < 1 m → then/);
+});
+
+test('simulator selects else for out-of-sector or missing obstacles', () => {
+  const program = 'if robot.front_distance_m() < 1:\n'
+    + '    robot.walk(1)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)';
+  const sideObstacle = buildG1SimulationFrames(program, {
+    obstacles: [{ id: 'side', x: 1, y: 2, radius: 0 }],
+  });
+  const noObstacle = buildG1SimulationFrames(program, { obstacles: [] });
+  assert.equal(sideObstacle.at(-1).heading, 90);
+  assert.equal(noObstacle.at(-1).heading, 90);
+  assert.match(noObstacle[1].timeline[0].summary, /20\.00 m < 1 m → else/);
+});
+
+test('simulator evaluates rear obstacle distance behind the robot', () => {
+  const frames = buildG1SimulationFrames(
+    'if robot.rear_distance_m() < 1:\n'
+    + '    robot.walk(1)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)',
+    { obstacles: [{ id: 'rear', x: -0.8, y: 0, radius: 0.1 }] },
+  );
+  assert.ok(frames.at(-1).x > 0.3);
+  assert.equal(frames.at(-1).heading, 0);
+  assert.match(frames[1].timeline[0].summary, /Nearest rear obstacle: 0\.70 m < 1 m → then/);
 });
 
 test('G1 parser reads Blockly Python formatting and semicolon-terminated commands', () => {
@@ -200,21 +354,37 @@ test('legacy arm presets share the same approximate simulation and executable co
   const frames = buildG1SimulationFrames('robot.arm_action("hands up")');
   const finalFrame = frames.at(-1);
 
-  assert.match(finalFrame.actions[0].label, /hands up/i);
-  assert.match(finalFrame.actions[0].summary, /Approximate simulator pose/);
-  assert.ok(finalFrame.joints.left_shoulder_pitch < 0);
-  assert.ok(finalFrame.joints.right_shoulder_pitch < 0);
+  assert.equal(finalFrame.actions.at(-1).label, 'Arm preset preview: release arm');
+  assert.equal(Number(finalFrame.joints.left_shoulder_pitch), 0);
+  assert.equal(Number(finalFrame.joints.right_shoulder_pitch), 0);
 
   const presets = G1_COMMANDS.find((entry) => entry.method === 'arm_action').args[0].choices;
   presets.forEach(([, preset]) => {
-    const presetFrame = buildG1SimulationFrames(`robot.arm_action(${JSON.stringify(preset)})`).at(-1);
-    assert.match(presetFrame.actions[0].label, new RegExp(preset, 'i'));
+    const presetProgram = parseG1Program(`robot.arm_action(${JSON.stringify(preset)})`);
+    assert.deepEqual(
+      presetProgram.map(({ values }) => values[0]),
+      preset === 'release arm' ? ['release arm'] : [preset, 'release arm'],
+    );
   });
 });
 
-test('sit command is available in simulator with an approximate seated pose', () => {
-  const finalFrame = buildG1SimulationFrames('robot.sit()').at(-1);
-
-  assert.equal(finalFrame.actions[0].label, 'Sit');
-  assert.equal(finalFrame.torsoPitch, 12);
+test('arm preset parsing adds one release after gestures and preserves explicit releases', () => {
+  const nodes = parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'robot.arm_action("release arm")\n'
+    + 'robot.arm_action("right heart")',
+  );
+  assert.deepEqual(nodes.map(({ values }) => values[0]), [
+    'hands up',
+    'release arm',
+    'right heart',
+    'release arm',
+  ]);
+  assert.equal(
+    formatG1Program(nodes),
+    'robot.arm_action("hands up")\n'
+      + 'robot.arm_action("release arm")\n'
+      + 'robot.arm_action("right heart")\n'
+      + 'robot.arm_action("release arm")',
+  );
 });

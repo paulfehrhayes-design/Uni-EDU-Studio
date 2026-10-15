@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -7,20 +8,52 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Header, Query
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 try:
     from .g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from .lidar_distance import distance_sensor_status
+    from .navigation_bridge import (
+        NavigationBridgeError,
+        navigation_bridge_status,
+        navigation_cancel_route,
+        navigation_cancel_scan,
+        navigation_complete_scan,
+        navigation_map_snapshot,
+        navigation_operation_status,
+        navigation_scan_pointcloud,
+        navigation_scan_map_snapshot,
+        navigation_scan_status,
+        navigation_start_scan,
+        navigation_start_route,
+    )
 except ImportError:
     from g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from lidar_distance import distance_sensor_status
+    from navigation_bridge import (
+        NavigationBridgeError,
+        navigation_bridge_status,
+        navigation_cancel_route,
+        navigation_cancel_scan,
+        navigation_complete_scan,
+        navigation_map_snapshot,
+        navigation_operation_status,
+        navigation_scan_pointcloud,
+        navigation_scan_map_snapshot,
+        navigation_scan_status,
+        navigation_start_scan,
+        navigation_start_route,
+    )
 
 # 确保 unitree_sdk2py 在路径中
 # 假设 backend 文件夹与 unitree_sdk2py 同级，或者已安装
@@ -41,6 +74,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 @app.middleware("http")
 async def prevent_stale_frontend_index(request, call_next):
@@ -75,6 +109,20 @@ class ProjectSaveRequest(BaseModel):
     plannerWaypoints: List[dict] = []
     generatedCode: str = ""
 
+class NavigationStartRequest(BaseModel):
+    map_id: str
+    version: str
+    frame_id: str
+    waypoints: List[dict]
+
+
+class SharedLidarSettingsRequest(BaseModel):
+    show_shared_overlay: bool
+
+
+class LidarMapPublishRequest(BaseModel):
+    job_id: str
+
 class SignupRequest(BaseModel):
     username: str
     password: str
@@ -88,12 +136,267 @@ DEFAULT_USERS: Dict[str, Dict[str, str]] = {
 }
 SESSION_TOKENS: Dict[str, str] = {}
 _QUEUE_RUN_LOCK = threading.Lock()
+_MOTION_START_LOCK = threading.Lock()
+_NAVIGATION_ACTIVE_STATES = ("accepted", "starting", "running", "cancel_requested", "uncertain")
+_WEBSOCKET_TICKETS: Dict[str, tuple[str, float]] = {}
+_WEBSOCKET_TICKET_LOCK = threading.Lock()
 
 
 def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def record_navigation_map_version(metadata: dict):
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO navigation_map_versions (map_id, version, metadata)
+        VALUES (?, ?, ?)
+        """,
+        (metadata["map_id"], metadata["version"], json.dumps(metadata, separators=(",", ":"))),
+    )
+    conn.commit()
+    rows = conn.execute(
+        """
+        SELECT map_id, version, metadata, first_seen_at
+        FROM navigation_map_versions
+        ORDER BY first_seen_at DESC, map_id ASC, version DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "map_id": row["map_id"],
+            "version": row["version"],
+            "metadata": json.loads(row["metadata"]),
+            "first_seen_at": row["first_seen_at"],
+        }
+        for row in rows
+    ]
+
+
+def list_navigation_map_versions():
+    conn = get_db_connection()
+    rows = conn.execute(
+        """
+        SELECT map_id, version, metadata, first_seen_at
+        FROM navigation_map_versions
+        ORDER BY first_seen_at DESC, map_id ASC, version DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "map_id": row["map_id"],
+            "version": row["version"],
+            "metadata": json.loads(row["metadata"]),
+            "first_seen_at": row["first_seen_at"],
+        }
+        for row in rows
+    ]
+
+
+def save_navigation_operation(operation: dict, username: str, route: dict) -> None:
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO navigation_operations (
+            operation_id, status, username, route, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(operation_id)
+        DO UPDATE SET status = excluded.status, username = excluded.username, route = excluded.route, updated_at = excluded.updated_at
+        """,
+        (
+            operation["operation_id"],
+            operation["status"],
+            username,
+            json.dumps(route, separators=(",", ":")),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_navigation_operation(operation_id: str, status: str) -> None:
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO navigation_operations (operation_id, status, username, route, updated_at)
+        VALUES (?, ?, 'teacher', '{}', ?)
+        ON CONFLICT(operation_id)
+        DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at
+        """,
+        (operation_id, status, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_lidar_scan(
+    job_id: str,
+    status: str,
+    username: str,
+    map_snapshot: Optional[dict] = None,
+    pointcloud: Optional[dict] = None,
+) -> None:
+    map_json = json.dumps(map_snapshot, separators=(",", ":")) if map_snapshot else None
+    points_blob = (
+        zlib.compress(json.dumps(pointcloud, separators=(",", ":")).encode("utf-8"), level=6)
+        if pointcloud else None
+    )
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO lidar_scans (job_id, status, username, map_snapshot, pointcloud, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET
+            status = excluded.status,
+            map_snapshot = COALESCE(excluded.map_snapshot, lidar_scans.map_snapshot),
+            pointcloud = COALESCE(excluded.pointcloud, lidar_scans.pointcloud),
+            updated_at = excluded.updated_at
+        """,
+        (
+            job_id, status, username, map_json, points_blob,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    if status in {"completed", "failed", "canceled"}:
+        conn.execute(
+            """
+            DELETE FROM lidar_scans
+            WHERE job_id IN (
+                SELECT job_id FROM lidar_scans
+                WHERE status IN ('completed', 'failed', 'canceled')
+                ORDER BY updated_at DESC
+                LIMIT -1 OFFSET 20
+            )
+            """
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_lidar_scan(job_id: str):
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT job_id, status, username, map_snapshot, pointcloud, updated_at FROM lidar_scans WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    pointcloud = None
+    if row["pointcloud"] is not None:
+        pointcloud = json.loads(zlib.decompress(row["pointcloud"]).decode("utf-8"))
+    return {
+        "job_id": row["job_id"],
+        "status": row["status"],
+        "username": row["username"],
+        "map_snapshot": json.loads(row["map_snapshot"]) if row["map_snapshot"] else None,
+        "pointcloud": pointcloud,
+        "updated_at": row["updated_at"],
+    }
+
+
+def save_shared_lidar_map(map_snapshot: dict, pointcloud: dict, username: str) -> None:
+    map_json = json.dumps(map_snapshot, separators=(",", ":"))
+    points_blob = zlib.compress(
+        json.dumps(pointcloud, separators=(",", ":")).encode("utf-8"), level=6
+    )
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO shared_lidar_map (id, map_snapshot, pointcloud, published_by, published_at)
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            map_snapshot = excluded.map_snapshot,
+            pointcloud = excluded.pointcloud,
+            published_by = excluded.published_by,
+            published_at = excluded.published_at
+        """,
+        (map_json, points_blob, username, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_shared_lidar_map():
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT map_snapshot, pointcloud, published_by, published_at FROM shared_lidar_map WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "map": json.loads(row["map_snapshot"]),
+        "pointcloud": json.loads(zlib.decompress(row["pointcloud"]).decode("utf-8")),
+        "published_by": row["published_by"],
+        "published_at": row["published_at"],
+    }
+
+
+def get_shared_lidar_map_version():
+    conn = get_db_connection()
+    row = conn.execute("SELECT map_snapshot FROM shared_lidar_map WHERE id = 1").fetchone()
+    conn.close()
+    if not row:
+        return None
+    return json.loads(row["map_snapshot"])["map"]["version"]
+
+
+def get_shared_lidar_overlay_enabled() -> bool:
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT show_shared_overlay FROM lidar_settings WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    return bool(row["show_shared_overlay"]) if row else False
+
+
+def active_navigation_operation():
+    conn = get_db_connection()
+    placeholders = ",".join("?" for _ in _NAVIGATION_ACTIVE_STATES)
+    row = conn.execute(
+        f"SELECT operation_id, status FROM navigation_operations WHERE status IN ({placeholders}) "
+        "ORDER BY updated_at DESC LIMIT 1",
+        _NAVIGATION_ACTIVE_STATES,
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def active_lidar_scan():
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT job_id, status FROM lidar_scans WHERE status = 'scanning' ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def ensure_sdk_motion_available() -> None:
+    operation = active_navigation_operation()
+    if operation:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "ROS navigation owns locomotion "
+                f"({operation['status']}, operation {operation['operation_id']}); "
+                "wait for a terminal navigation status before connecting or running SDK motion."
+            ),
+        )
+    scan = active_lidar_scan()
+    if scan:
+        raise HTTPException(
+            status_code=409,
+            detail=f"LiDAR scan {scan['job_id']} is capturing the room; stop the scan before running SDK motion.",
+        )
 
 
 def list_users():
@@ -113,6 +416,60 @@ def init_db():
             username TEXT PRIMARY KEY,
             password TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'student'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS navigation_map_versions (
+            map_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            metadata TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (map_id, version)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS navigation_operations (
+            operation_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            username TEXT NOT NULL,
+            route TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lidar_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            show_shared_overlay INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute("INSERT OR IGNORE INTO lidar_settings (id, show_shared_overlay) VALUES (1, 0)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lidar_scans (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            username TEXT NOT NULL,
+            map_snapshot TEXT,
+            pointcloud BLOB,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shared_lidar_map (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            map_snapshot TEXT NOT NULL,
+            pointcloud BLOB NOT NULL,
+            published_by TEXT NOT NULL,
+            published_at TEXT NOT NULL
         )
         """
     )
@@ -571,7 +928,9 @@ def run_next(user: dict = Depends(auth_required)):
                 set_queue_item_status(item["id"], "running")
                 item["status"] = "running"
                 try:
-                    result = execute_robot_program(item["code"])
+                    with _MOTION_START_LOCK:
+                        ensure_sdk_motion_available()
+                        result = execute_robot_program(item["code"])
                 except HTTPException as error:
                     set_queue_item_status(
                         item["id"],
@@ -591,6 +950,7 @@ def run_next(user: dict = Depends(auth_required)):
 def stop_current(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
+    ensure_sdk_motion_available()
     result = stop_robot()
     if result["status"] == "stopping":
         queue = list_queue_items()
@@ -693,24 +1053,381 @@ def classroom_users(user: dict = Depends(auth_required)):
 def run_code(request: CodeRequest, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    return execute_robot_program(request.code)
+    with _MOTION_START_LOCK:
+        ensure_sdk_motion_available()
+        return execute_robot_program(request.code)
 
 @app.post("/api/robot/connect")
 def robot_connect(request: ConnectRobotRequest, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    return connect_robot(request.interface or os.getenv("UNITREE_INTERFACE", "eth0"))
+    with _MOTION_START_LOCK:
+        ensure_sdk_motion_available()
+        return connect_robot(request.interface or os.getenv("UNITREE_INTERFACE", "eth0"))
 
 @app.get("/api/robot/status")
 def get_robot_status(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    return robot_status()
+    return {**robot_status(), "distanceSensor": distance_sensor_status()}
+
+
+@app.get("/api/navigation/status")
+def get_navigation_status(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    status = navigation_bridge_status()
+    if status.get("map"):
+        known_map_versions = record_navigation_map_version(status["map"])
+    else:
+        known_map_versions = list_navigation_map_versions()
+    active_operation = active_navigation_operation()
+    if active_operation:
+        try:
+            operation_status = navigation_operation_status(active_operation["operation_id"])
+            operation_state = operation_status["status"]
+            if operation_state == "succeeded":
+                operation_state = "completed"
+            update_navigation_operation(active_operation["operation_id"], operation_state)
+            active_operation = {**operation_status, "status": operation_state}
+            if operation_state not in _NAVIGATION_ACTIVE_STATES:
+                active_operation = None
+        except NavigationBridgeError as error:
+            active_operation = {
+                **active_operation,
+                "status": "uncertain",
+                "error": str(error),
+            }
+    return {
+        **status,
+        "knownMapVersions": known_map_versions,
+        "activeOperation": active_operation,
+    }
+
+
+@app.get("/api/navigation/map")
+def get_navigation_map(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    snapshot = navigation_map_snapshot()
+    if not snapshot["ready"]:
+        raise HTTPException(status_code=503, detail=snapshot["error"])
+    return {**snapshot, "knownMapVersions": record_navigation_map_version(snapshot["map"])}
+
+
+@app.post("/api/lidar/scan")
+def start_lidar_scan(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
+    try:
+        if robot_status()["running"]:
+            raise HTTPException(status_code=409, detail="Stop SDK motion before starting a room scan.")
+        if active_navigation_operation():
+            raise HTTPException(status_code=409, detail="Cannot scan while ROS navigation owns locomotion.")
+        if active_lidar_scan():
+            raise HTTPException(status_code=409, detail="A LiDAR room scan is already active.")
+        try:
+            scan = navigation_start_scan()
+        except NavigationBridgeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        save_lidar_scan(scan["job_id"], scan["status"], user["username"])
+        return scan
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.get("/api/lidar/scan/{job_id}")
+def get_lidar_scan_status(job_id: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    stored = get_lidar_scan(job_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="LiDAR scan job not found.")
+    if stored["status"] in {"scanning", "completed"} and not stored["map_snapshot"]:
+        try:
+            scan = navigation_scan_status(job_id)
+        except NavigationBridgeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        if scan["status"] in {"failed", "canceled"}:
+            save_lidar_scan(job_id, scan["status"], stored["username"])
+        return scan
+    return {
+        "job_id": stored["job_id"],
+        "status": stored["status"],
+        "point_count": stored["pointcloud"]["point_count"] if stored["pointcloud"] else 0,
+        "map_version": stored["map_snapshot"]["map"]["version"] if stored["map_snapshot"] else None,
+        "updated_at": stored["updated_at"],
+        "error": None,
+    }
+
+
+@app.post("/api/lidar/scan/{job_id}/complete")
+def complete_lidar_scan(job_id: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    stored = get_lidar_scan(job_id)
+    if not stored:
+        raise HTTPException(status_code=404, detail="LiDAR scan job not found.")
+    if stored["status"] not in {"scanning", "completed"}:
+        raise HTTPException(status_code=409, detail="Only an active LiDAR scan can be completed.")
+    try:
+        scan = navigation_complete_scan(job_id)
+        if scan["status"] != "completed":
+            save_lidar_scan(job_id, "failed", stored["username"])
+            raise HTTPException(status_code=409, detail=scan.get("error") or "LiDAR scan did not complete.")
+        map_snapshot = navigation_scan_map_snapshot(job_id)
+        if not map_snapshot["ready"]:
+            raise NavigationBridgeError(map_snapshot.get("error") or "SLAM occupancy map is not ready.")
+        if (
+            map_snapshot["map"]["map_id"] != scan.get("map_id")
+            or map_snapshot["map"]["version"] != scan.get("map_version")
+        ):
+            raise NavigationBridgeError("SLAM map changed while finalizing the scan; reload and scan again.")
+        pointcloud = navigation_scan_pointcloud(job_id)
+        if (
+            pointcloud["frame_id"] != map_snapshot["map"]["frame_id"]
+            or scan.get("frame_id") != map_snapshot["map"]["frame_id"]
+        ):
+            raise NavigationBridgeError("3D point cloud frame does not match the SLAM occupancy map.")
+        if pointcloud["point_count"] < 1_000:
+            raise NavigationBridgeError("The completed room scan contains too few unique 3D points.")
+    except NavigationBridgeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    save_lidar_scan(
+        job_id, "completed", stored["username"],
+        map_snapshot=map_snapshot, pointcloud=pointcloud,
+    )
+    return {
+        "job_id": job_id,
+        "status": "completed",
+        "point_count": pointcloud["point_count"],
+        "map": map_snapshot["map"],
+    }
+
+
+@app.post("/api/lidar/scan/{job_id}/cancel")
+def cancel_lidar_scan(job_id: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    stored = get_lidar_scan(job_id)
+    if not stored or stored["status"] != "scanning":
+        raise HTTPException(status_code=409, detail="There is no active LiDAR scan to cancel.")
+    try:
+        scan = navigation_cancel_scan(job_id)
+    except NavigationBridgeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    save_lidar_scan(job_id, scan["status"], stored["username"])
+    return scan
+
+
+@app.post("/api/lidar/map/publish")
+def publish_lidar_map(request: LidarMapPublishRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    scan = get_lidar_scan(request.job_id)
+    if not scan or scan["status"] != "completed" or not scan["map_snapshot"] or not scan["pointcloud"]:
+        raise HTTPException(status_code=409, detail="Publish requires a completed, validated 3D room scan.")
+    save_shared_lidar_map(scan["map_snapshot"], scan["pointcloud"], user["username"])
+    return {
+        "status": "published",
+        "map": scan["map_snapshot"]["map"],
+        "point_count": scan["pointcloud"]["point_count"],
+    }
+
+
+@app.get("/api/lidar/map")
+def get_shared_lidar_map_endpoint(user: dict = Depends(auth_required)):
+    enabled = get_shared_lidar_overlay_enabled()
+    shared_map = get_shared_lidar_map()
+    if user["role"] != "teacher" and not enabled:
+        return {"enabled": False, "map": None, "pointcloud": None}
+    return {
+        "enabled": enabled,
+        **(shared_map or {"map": None, "pointcloud": None}),
+    }
+
+
+@app.get("/api/lidar/settings")
+def get_lidar_settings(user: dict = Depends(auth_required)):
+    return {"show_shared_overlay": get_shared_lidar_overlay_enabled()}
+
+
+@app.put("/api/lidar/settings")
+def update_lidar_settings(
+    request: SharedLidarSettingsRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE lidar_settings SET show_shared_overlay = ? WHERE id = 1",
+        (int(request.show_shared_overlay),),
+    )
+    conn.commit()
+    conn.close()
+    return {"show_shared_overlay": request.show_shared_overlay}
+
+
+@app.websocket("/api/lidar/live")
+async def lidar_live_updates(websocket: WebSocket):
+    protocol = next(
+        (
+            value.strip() for value in websocket.headers.get("sec-websocket-protocol", "").split(",")
+            if value.strip().startswith("edu-auth.")
+        ),
+        None,
+    )
+    token = protocol.removeprefix("edu-auth.") if protocol else None
+    user = get_user_from_token(token)
+    if not user:
+        await websocket.close(code=1008, reason="Authenticated classroom session required.")
+        return
+    await websocket.accept(subprotocol=protocol)
+    try:
+        while True:
+            scan = await asyncio.to_thread(active_lidar_scan)
+            scan_status = None
+            if scan:
+                try:
+                    scan_status = await asyncio.to_thread(navigation_scan_status, scan["job_id"])
+                    if scan_status["status"] in {"failed", "canceled"}:
+                        await asyncio.to_thread(
+                            save_lidar_scan, scan["job_id"], scan_status["status"], "teacher"
+                        )
+                except NavigationBridgeError as error:
+                    scan_status = {
+                        "job_id": scan["job_id"],
+                        "status": "unavailable",
+                        "error": str(error),
+                    }
+            bridge_status = await asyncio.to_thread(navigation_bridge_status)
+            shared_map_version = await asyncio.to_thread(get_shared_lidar_map_version)
+            await websocket.send_json({
+                "type": "live_update",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "navigation": {
+                    "ready": bridge_status["ready"],
+                    "status": bridge_status["status"],
+                    "map": bridge_status.get("map"),
+                    "localization": bridge_status.get("localization"),
+                    "error": bridge_status.get("error"),
+                },
+                "scan": scan_status,
+                "shared_overlay_enabled": await asyncio.to_thread(get_shared_lidar_overlay_enabled),
+                "shared_map_version": shared_map_version,
+            })
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        return
+
+
+@app.post("/api/navigation/start")
+def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
+    try:
+        ensure_sdk_motion_available()
+        if active_lidar_scan():
+            raise HTTPException(status_code=409, detail="Complete or cancel the active LiDAR scan before navigation.")
+        if robot_status()["running"]:
+            raise HTTPException(status_code=409, detail="Stop the active SDK robot program before starting navigation.")
+        operation_id = str(uuid.uuid4())
+        route = {
+            "map_id": request.map_id,
+            "version": request.version,
+            "frame_id": request.frame_id,
+            "waypoints": request.waypoints,
+        }
+        dispatch_started = False
+
+        def persist_starting_operation():
+            nonlocal dispatch_started
+            save_navigation_operation(
+                {"operation_id": operation_id, "status": "starting"},
+                user["username"],
+                route,
+            )
+            dispatch_started = True
+
+        try:
+            operation = navigation_start_route(
+                request.map_id,
+                request.version,
+                request.frame_id,
+                request.waypoints,
+                operation_id,
+                on_dispatch=persist_starting_operation,
+            )
+        except NavigationBridgeError as error:
+            if dispatch_started:
+                update_navigation_operation(operation_id, "uncertain")
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        save_navigation_operation(
+            {"operation_id": operation_id, "status": operation.get("status", "accepted")},
+            user["username"],
+            route,
+        )
+        operation_status = "completed" if operation["status"] == "succeeded" else operation["status"]
+        update_navigation_operation(operation_id, operation_status)
+        return {**operation, "status": operation_status}
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.get("/api/navigation/operation/{operation_id}")
+def get_navigation_operation(operation_id: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT operation_id, status, route, updated_at FROM navigation_operations WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Navigation operation not found.")
+    try:
+        operation = navigation_operation_status(operation_id)
+    except NavigationBridgeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    status = operation["status"]
+    if status == "succeeded":
+        status = "completed"
+    update_navigation_operation(operation_id, status)
+    return {
+        **operation,
+        "status": status,
+        "route": json.loads(row["route"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.post("/api/navigation/operation/{operation_id}/stop")
+def stop_navigation(operation_id: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not active_navigation_operation():
+        raise HTTPException(status_code=409, detail="There is no active navigation operation.")
+    try:
+        operation = navigation_cancel_route(operation_id)
+    except NavigationBridgeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    operation_status = operation.get("status", "cancel_requested")
+    if operation_status == "succeeded":
+        operation_status = "completed"
+    update_navigation_operation(operation_id, operation_status)
+    return {**operation, "status": operation_status}
 
 @app.post("/api/stop")
 def stop_code(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
+    ensure_sdk_motion_available()
     return stop_robot()
 
 @app.get("/api/status")
