@@ -62,8 +62,18 @@ if [[ "$ROS_RUNTIME" == "host" ]]; then
   fi
 fi
 
-read -r -p "IPv4 address of the PC2 NIC physically connected to MID-360: " G1_LIDAR_HOST_IP
-read -r -p "MID-360 IPv4 address on that sensor network: " G1_LIDAR_DEVICE_IP
+SAVED_HOST_IP=""
+SAVED_DEVICE_IP=""
+if [[ -f "$ENV_FILE" ]]; then
+  SAVED_HOST_IP="$(awk -F= '$1 == "G1_LIDAR_HOST_IP" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_DEVICE_IP="$(awk -F= '$1 == "G1_LIDAR_DEVICE_IP" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+fi
+DEFAULT_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-192.168.123.164}}"
+DEFAULT_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-192.168.123.120}}"
+read -r -p "IPv4 address of the PC2 NIC physically connected to MID-360 [$DEFAULT_HOST_IP]: " INPUT_HOST_IP
+G1_LIDAR_HOST_IP="${INPUT_HOST_IP:-$DEFAULT_HOST_IP}"
+read -r -p "MID-360 IPv4 address on that sensor network [$DEFAULT_DEVICE_IP]: " INPUT_DEVICE_IP
+G1_LIDAR_DEVICE_IP="${INPUT_DEVICE_IP:-$DEFAULT_DEVICE_IP}"
 read -r -p "Is the LiDAR x-axis aligned with the robot's forward direction? [y/N] " FORWARD_AXIS_CONFIRMED
 if [[ "$FORWARD_AXIS_CONFIRMED" == "y" || "$FORWARD_AXIS_CONFIRMED" == "Y" ]]; then
   AXIS_CONFIRMED=1
@@ -221,6 +231,8 @@ G1_LIDAR_CONFIG_PATH=$CONFIG_FILE
 G1_LIDAR_ROS_WS=$ROS_WS
 G1_LIDAR_ROS_DISTRO=$ROS_DISTRO_REQUIRED
 G1_LIDAR_ROS_RUNTIME=$ROS_RUNTIME
+G1_LIDAR_HOST_IP=$G1_LIDAR_HOST_IP
+G1_LIDAR_DEVICE_IP=$G1_LIDAR_DEVICE_IP
 G1_DISTANCE_PROVIDER_PORT=8181
 G1_LIDAR_FORWARD_HALF_ANGLE_DEGREES=15
 G1_LIDAR_MINIMUM_HEIGHT_M=-0.5
