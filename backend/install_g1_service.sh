@@ -72,14 +72,20 @@ import sys
 unit_path = Path(sys.argv[1])
 environment_file = sys.argv[2]
 unit = unit_path.read_text(encoding="utf-8")
-unit = unit.replace(
-    "Wants=network-online.target\n",
-    "Wants=network-online.target uni-edu-lidar-driver.service uni-edu-lidar-provider.service\n",
+runtime = next(
+    line.partition("=")[2]
+    for line in Path(environment_file).read_text(encoding="utf-8").splitlines()
+    if line.startswith("G1_LIDAR_ROS_RUNTIME=")
 )
-unit = unit.replace(
-    "After=network-online.target\n",
-    "After=network-online.target uni-edu-lidar-driver.service uni-edu-lidar-provider.service\n",
-)
+if runtime == "host":
+    unit = unit.replace(
+        "Wants=network-online.target\n",
+        "Wants=network-online.target uni-edu-lidar-driver.service uni-edu-lidar-provider.service\n",
+    )
+    unit = unit.replace(
+        "After=network-online.target\n",
+        "After=network-online.target uni-edu-lidar-driver.service uni-edu-lidar-provider.service\n",
+    )
 unit = unit.replace("[Service]\n", f"[Service]\nEnvironmentFile={environment_file}\n")
 unit_path.write_text(unit, encoding="utf-8")
 PY
@@ -87,7 +93,9 @@ fi
 
 systemctl --user daemon-reload
 if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
-  systemctl --user enable --now uni-edu-lidar-driver.service uni-edu-lidar-provider.service
+  if grep -q '^G1_LIDAR_ROS_RUNTIME=host$' "$HOME/.config/uni-edu-studio/lidar.env"; then
+    systemctl --user enable --now uni-edu-lidar-driver.service uni-edu-lidar-provider.service
+  fi
   if ! command -v curl >/dev/null 2>&1; then
     echo "LiDAR services were started, but curl is unavailable for the initial provider readiness check." >&2
   else

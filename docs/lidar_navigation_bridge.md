@@ -1,5 +1,9 @@
 # LiDAR navigation gateway and execution contract
 
+The onboard Ubuntu 20.04 LiDAR sensor driver may run in an isolated ROS 2 Humble
+container, but this does not install or run Nav2. The Path Planner gateway below
+still requires a separate, fully configured ROS 2 Humble/Nav2 environment.
+
 The Path Planner can submit ordered map-frame goals to a separate ROS 2 Humble
 Nav2 gateway. Nav2 owns route planning and publishes its controller output to
 the `/cmd_vel` input of the separately installed Unitree G1 bridge. The browser
