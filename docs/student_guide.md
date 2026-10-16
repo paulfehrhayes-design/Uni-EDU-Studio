@@ -48,6 +48,10 @@ robot.backwardtime(1)
 
 Programs can also use bounded `for` loops. The legacy G1 arm presets are available with `robot.arm_action("hands up")` and the other names listed below. A preset does not automatically release the arms; add `robot.arm_action("release arm")` explicitly when you want that motion. For a timed static-pose sequence, use `robot.hold_arm("hands up", 3)`; the available poses are the stationary arm presets shown in the Blocks toolbox, excluding moving gestures such as clapping and waving. This command starts the preset and keeps the program on that pose for at least the requested 0.1–10 seconds. It does not send continuous joint targets: the physical SDK confirms request acceptance but does not report that the pose was reached or actively hold it, so actual pose duration depends on the G1 preset/controller behavior. Simulation shows approximate poses, not SDK trajectories. Allow a preset to finish before asking the robot to walk. Walking is sent only when the locomotion FSM reports ready state 500; if it is in another state, the program stops with an instruction to run `robot.stand()` and wait for that transition. The teacher's `Stop robot` button stops locomotion but cannot cancel an accepted arm preset, so keep the robot area clear and use direct teacher supervision.
 
+`robot.wait(2)` pauses the program for 2 seconds. Wait durations are entered in seconds, from 0.1 to 10, in both Blocks and the IDE.
+
+There is no overall 30-second runtime cap for a program. Per-command input bounds and the limit of 200 expanded commands still apply. The teacher's explicit stop path remains available; as noted above, the SDK cannot cancel an arm preset it has already accepted.
+
 Distance conditions can choose which supported commands run:
 
 ```python

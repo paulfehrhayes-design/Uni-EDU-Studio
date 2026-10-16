@@ -2,7 +2,12 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source /opt/ros/humble/setup.bash
+ROS_DISTRO="${G1_LIDAR_ROS_DISTRO:-}"
+if [[ "$ROS_DISTRO" != "foxy" && "$ROS_DISTRO" != "humble" ]]; then
+  echo "G1_LIDAR_ROS_DISTRO must be foxy or humble." >&2
+  exit 1
+fi
+source "/opt/ros/$ROS_DISTRO/setup.bash"
 source "$G1_LIDAR_ROS_WS/install/setup.bash"
 
 exec ros2 launch "$PROJECT_DIR/backend/ros/mid360_launch.py" \

@@ -332,102 +332,102 @@ const sanitizeRobotCode = (code = '') => {
 
   let sanitized = code;
   let changed = false;
-  sanitized = sanitized.replace(/robot\.walkForward\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkForward\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkForward(${safeValue});`;
+    return `robot.walkForward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkForwardSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkForwardSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkForward(${safeValue});`;
+    return `robot.walkForward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkBackward\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkBackward\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkBackward(${safeValue});`;
+    return `robot.walkBackward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkBackwardSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkBackwardSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkBackward(${safeValue});`;
+    return `robot.walkBackward(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysLeft\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysLeft\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysLeft(${safeValue});`;
+    return `robot.walkSidewaysLeft(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysLeftSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysLeftSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysLeft(${safeValue});`;
+    return `robot.walkSidewaysLeft(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysRight\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysRight\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SPEED');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysRight(${safeValue});`;
+    return `robot.walkSidewaysRight(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.walkSidewaysRightSteps\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.walkSidewaysRightSteps\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.walkSidewaysRight(${safeValue});`;
+    return `robot.walkSidewaysRight(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.turnLeft\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.turnLeft\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'ANGLE');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.turnLeft(${safeValue});`;
+    return `robot.turnLeft(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.turnRight\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.turnRight\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'ANGLE');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.turnRight(${safeValue});`;
+    return `robot.turnRight(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseLeftArm\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseLeftArm\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseLeftArm(${position}, ${degrees});`;
+    return `robot.raiseLeftArm(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseRightArm\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseRightArm\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseRightArm(${position}, ${degrees});`;
+    return `robot.raiseRightArm(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseLeftLeg\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseLeftLeg\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseLeftLeg(${position}, ${degrees});`;
+    return `robot.raiseLeftLeg(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.raiseRightLeg\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.raiseRightLeg\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const parts = value.split(',').map((part) => part.trim());
     const position = parts[0] || 'mid';
     const degrees = sanitizeNumber(parts[1] || 90, 'DEGREES');
     if (degrees !== (parts[1] || '90').trim()) changed = true;
-    return `robot.raiseRightLeg(${position}, ${degrees});`;
+    return `robot.raiseRightLeg(${position}, ${degrees})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.wait\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.wait\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SECONDS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.wait(${safeValue});`;
+    return `robot.wait(${safeValue})${terminator}`;
   });
-  sanitized = sanitized.replace(/robot\.waitSeconds\(([^)]+)\)/g, (_, value) => {
+  sanitized = sanitized.replace(/robot\.waitSeconds\(([^)]+)\)(;?)/g, (_, value, terminator) => {
     const safeValue = sanitizeNumber(value, 'SECONDS');
     if (safeValue !== value.trim()) changed = true;
-    return `robot.wait(${safeValue});`;
+    return `robot.wait(${safeValue})${terminator}`;
   });
   sanitized = sanitized.replace(/robot\.repeatLoop\(([^)]+)\)/g, (_, value) => {
     const safeValue = sanitizeNumber(value, 'STEPS');
     if (safeValue !== value.trim()) changed = true;
     return `for (let i = 0; i < ${safeValue}; i++) {\n  robot.raiseBothArms();\n}\n`;
   });
-  sanitized = sanitized.replace(/robot\.stop\(\)/g, () => 'robot.stop();');
-  sanitized = sanitized.replace(/robot\.lowerBothArms\(\)/g, () => 'robot.lowerBothArms();');
-  sanitized = sanitized.replace(/robot\.waveRight\(\)/g, () => 'robot.waveRight();');
+  sanitized = sanitized.replace(/robot\.stop\(\)(;?)/g, (_, terminator) => `robot.stop()${terminator}`);
+  sanitized = sanitized.replace(/robot\.lowerBothArms\(\)(;?)/g, (_, terminator) => `robot.lowerBothArms()${terminator}`);
+  sanitized = sanitized.replace(/robot\.waveRight\(\)(;?)/g, (_, terminator) => `robot.waveRight()${terminator}`);
   return { code: sanitized, changed };
 };
 
@@ -609,21 +609,21 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   },
   {
     type: 'robot_wait',
-    message0: 'Wait %1 s',
-    args0: [{ type: 'field_number', name: 'SECONDS', value: 0.5, min: 0.1, precision: 0.1 }],
+    message0: 'Wait %1 seconds',
+    args0: [{ type: 'field_number', name: 'SECONDS', value: 1, min: 0.1, max: 10, precision: 0.001 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
-    codeTemplate: 'robot.wait({{SECONDS}});\n',
+    codeTemplate: 'robot.wait({{SECONDS}})\n',
   },
   {
     type: 'robot_wait_seconds',
     message0: 'Wait %1 seconds',
-    args0: [{ type: 'field_number', name: 'SECONDS', value: 1, min: 0.1, max: 5, precision: 0.1 }],
+    args0: [{ type: 'field_number', name: 'SECONDS', value: 1, min: 0.1, max: 10, precision: 0.001 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
-    codeTemplate: 'robot.waitSeconds({{SECONDS}});\n',
+    codeTemplate: 'robot.wait({{SECONDS}})\n',
   },
   {
     type: 'robot_repeat_loop',

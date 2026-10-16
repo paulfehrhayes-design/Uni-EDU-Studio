@@ -27,8 +27,7 @@ _connection_log_path: Path | None = None
 _log_lock = threading.Lock()
 _run_lock = threading.Lock()
 _stop_requested = threading.Event()
-_MAX_PROGRAM_SECONDS = 30.0
-_MAX_EXPANDED_COMMANDS = 100
+_MAX_EXPANDED_COMMANDS = 200
 _ARM_ACTION_REQUEST_SPACING_SECONDS = 2.0
 _CONTINUOUS_MOVE_DURATION = 864000.0
 _STEP_METERS = 0.345
@@ -392,29 +391,23 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
     if not nodes:
         raise CommandValidationError("Program contains no robot commands.")
 
-    def path_metrics(program_nodes: list[dict[str, Any]]) -> tuple[int, float]:
+    def path_command_count(program_nodes: list[dict[str, Any]]) -> int:
         count = 0
-        duration = 0.0
         for node in program_nodes:
             if node.get("type") not in {"repeat", "condition"}:
                 count += 1
-                duration += _estimated_duration(node)
             elif node["type"] == "repeat":
-                nested_count, nested_duration = path_metrics(node["body"])
-                count += node["times"] * nested_count
-                duration += node["times"] * nested_duration
+                count += node["times"] * path_command_count(node["body"])
             else:
-                then_count, then_duration = path_metrics(node["then"])
-                else_count, else_duration = path_metrics(node["else"])
-                count += max(then_count, else_count)
-                duration += max(then_duration, else_duration)
-        return count, duration
+                count += max(
+                    path_command_count(node["then"]),
+                    path_command_count(node["else"]),
+                )
+        return count
 
-    command_count, duration = path_metrics(nodes)
+    command_count = path_command_count(nodes)
     if command_count > _MAX_EXPANDED_COMMANDS:
         raise CommandValidationError(f"Programs may contain at most {_MAX_EXPANDED_COMMANDS} expanded commands.")
-    if duration > _MAX_PROGRAM_SECONDS:
-        raise CommandValidationError(f"Program duration cannot exceed {_MAX_PROGRAM_SECONDS:g} seconds.")
     return nodes
 
 

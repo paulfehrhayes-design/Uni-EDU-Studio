@@ -2,7 +2,6 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ROS_DISTRO_REQUIRED="humble"
 ROS_WS="${G1_LIDAR_ROS_WS:-$HOME/uni-edu-lidar-ws}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uni-edu-studio"
 CONFIG_FILE="$CONFIG_DIR/MID360_config.json"
@@ -18,10 +17,25 @@ if [[ ! -r /etc/os-release ]]; then
   exit 1
 fi
 source /etc/os-release
-if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "22.04" ]]; then
-  echo "Automatic ROS 2 Humble installation is supported only on Ubuntu 22.04. Detected ${PRETTY_NAME:-unknown}." >&2
-  echo "Do not force installation on a different robot image; use a compatible ROS computer instead." >&2
+if [[ "${ID:-}" != "ubuntu" ]]; then
+  echo "Automatic LiDAR setup supports Ubuntu 20.04 with ROS 2 Foxy or Ubuntu 22.04 with ROS 2 Humble. Detected ${PRETTY_NAME:-unknown}." >&2
   exit 1
+fi
+case "${VERSION_ID:-}" in
+  20.04) ROS_DISTRO_REQUIRED="foxy"; ROS_BUILD_ARGUMENT="ROS2"; ROS_UBUNTU_CODENAME="focal" ;;
+  22.04) ROS_DISTRO_REQUIRED="humble"; ROS_BUILD_ARGUMENT="humble"; ROS_UBUNTU_CODENAME="jammy" ;;
+  *)
+    echo "Automatic LiDAR setup supports Ubuntu 20.04 with ROS 2 Foxy or Ubuntu 22.04 with ROS 2 Humble. Detected ${PRETTY_NAME:-unknown}." >&2
+    exit 1
+    ;;
+esac
+if [[ -n "${G1_LIDAR_ROS_DISTRO:-}" && "$G1_LIDAR_ROS_DISTRO" != "$ROS_DISTRO_REQUIRED" ]]; then
+  echo "Ubuntu ${VERSION_ID} is supported with ROS 2 ${ROS_DISTRO_REQUIRED^}, not ${G1_LIDAR_ROS_DISTRO}." >&2
+  exit 1
+fi
+echo "Configuring ROS 2 ${ROS_DISTRO_REQUIRED^} for Ubuntu ${VERSION_ID}."
+if [[ "$ROS_DISTRO_REQUIRED" == "foxy" ]]; then
+  echo "ROS 2 Foxy reached end of life in 2023; this uses its Ubuntu 20.04 packages and will not receive upstream security updates." >&2
 fi
 ARCH="$(dpkg --print-architecture)"
 if [[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]]; then
@@ -95,41 +109,21 @@ if not any(device in network for network in host_networks):
 PY
 
 if [[ ! -f "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash" ]]; then
-  echo "Installing ROS 2 Humble on Ubuntu 22.04. This uses apt and requires sudo."
+  echo "Installing ROS 2 ${ROS_DISTRO_REQUIRED^} on Ubuntu ${VERSION_ID}. This uses apt and requires sudo."
   sudo apt-get update
   sudo apt-get install -y software-properties-common curl
   sudo add-apt-repository -y universe
-  ROS_APT_VERSION="$(python3 - <<'PY'
-import json
-import urllib.request
-
-request = urllib.request.Request(
-    "https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest",
-    headers={"Accept": "application/vnd.github+json", "User-Agent": "Uni-EDU-Studio-setup"},
-)
-with urllib.request.urlopen(request, timeout=15) as response:
-    print(json.load(response)["tag_name"])
-PY
-)"
-  if [[ ! "$ROS_APT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Could not validate the ROS apt source release version." >&2
-    exit 1
-  fi
-  ROS_APT_DEB="/tmp/ros2-apt-source_${ROS_APT_VERSION}.jammy_all.deb"
-  curl -fsSL \
-    "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_VERSION}/ros2-apt-source_${ROS_APT_VERSION}.jammy_all.deb" \
-    -o "$ROS_APT_DEB"
-  sudo dpkg -i "$ROS_APT_DEB"
+  sudo curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+    -o /usr/share/keyrings/ros-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $ROS_UBUNTU_CODENAME main" \
+    | sudo tee /etc/apt/sources.list.d/ros2.list >/dev/null
   sudo apt-get update
-  sudo apt-get install -y curl ros-humble-ros-base ros-humble-rmw-cyclonedds-cpp \
-    ros-humble-sensor-msgs-py python3-colcon-common-extensions \
-    git cmake build-essential
-else
-  sudo apt-get update
-  sudo apt-get install -y curl ros-humble-rmw-cyclonedds-cpp \
-    ros-humble-sensor-msgs-py python3-colcon-common-extensions \
-    git cmake build-essential
 fi
+sudo apt-get update
+sudo apt-get install -y "ros-${ROS_DISTRO_REQUIRED}-ros-base" \
+  "ros-${ROS_DISTRO_REQUIRED}-rmw-cyclonedds-cpp" \
+  "ros-${ROS_DISTRO_REQUIRED}-sensor-msgs-py" \
+  python3-colcon-common-extensions git cmake build-essential
 
 if [[ ! -d "$HOME/Livox-SDK2/.git" ]]; then
   git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git "$HOME/Livox-SDK2"
@@ -146,7 +140,7 @@ fi
 (
   source "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash"
   cd "$ROS_WS/src/livox_ros_driver2"
-  ./build.sh humble
+  ./build.sh "$ROS_BUILD_ARGUMENT"
 )
 
 mkdir -p "$CONFIG_DIR" "$USER_UNIT_DIR"
@@ -183,6 +177,7 @@ G1_DISTANCE_FRAME_ID=livox_frame
 G1_LIDAR_TOPIC=/mid360/livox/lidar
 G1_LIDAR_CONFIG_PATH=$CONFIG_FILE
 G1_LIDAR_ROS_WS=$ROS_WS
+G1_LIDAR_ROS_DISTRO=$ROS_DISTRO_REQUIRED
 G1_DISTANCE_PROVIDER_PORT=8181
 G1_LIDAR_FORWARD_HALF_ANGLE_DEGREES=15
 G1_LIDAR_MINIMUM_HEIGHT_M=-0.5

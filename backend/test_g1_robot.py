@@ -240,7 +240,7 @@ class G1RobotProgramTests(unittest.TestCase):
         commands = parse_robot_program('robot.walktime(99)')
         self.assertEqual(commands[0]["seconds"], 10)
 
-    def test_wait_is_bounded_and_counts_toward_program_duration(self):
+    def test_wait_is_bounded_without_aggregate_program_duration_limit(self):
         self.assertEqual(
             parse_robot_program("robot.wait(2)"),
             [{"method": "wait", "seconds": 2}],
@@ -249,8 +249,10 @@ class G1RobotProgramTests(unittest.TestCase):
             parse_robot_program("robot.wait(99)"),
             [{"method": "wait", "seconds": 10}],
         )
-        with self.assertRaisesRegex(CommandValidationError, "duration"):
-            parse_robot_program("robot.wait(10)\nrobot.wait(10)\nrobot.wait(10)\nrobot.wait(1)")
+        self.assertEqual(
+            len(parse_robot_program("robot.wait(10)\nrobot.wait(10)\nrobot.wait(10)\nrobot.wait(1)")),
+            4,
+        )
         with self.assertRaisesRegex(CommandValidationError, "duration in seconds"):
             parse_robot_program("robot.wait()")
 
@@ -395,13 +397,13 @@ class G1RobotProgramTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(CommandValidationError):
                 parse_robot_program(code)
 
-    def test_tts_counts_toward_the_program_duration_limit(self):
+    def test_tts_program_can_exceed_thirty_seconds(self):
         long_phrase = "h" * 100
-        with self.assertRaisesRegex(CommandValidationError, "duration"):
-            parse_robot_program(
-                (f'robot.say("{long_phrase}", 1)\n' * 3)
-                + 'robot.walktime(10)'
-            )
+        commands = parse_robot_program(
+            (f'robot.say("{long_phrase}", 1)\n' * 3)
+            + 'robot.walktime(10)'
+        )
+        self.assertEqual(len(commands), 4)
 
     def test_arbitrary_python_and_sim_only_actions_are_rejected(self):
         for code in (
@@ -414,13 +416,23 @@ class G1RobotProgramTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(CommandValidationError):
                 parse_robot_program(code)
 
-    def test_loop_count_and_program_duration_are_bounded(self):
+    def test_loop_and_expanded_command_limits_remain_without_runtime_cap(self):
         with self.assertRaisesRegex(CommandValidationError, "Loop count"):
             parse_robot_program('for count in range(21):\n    robot.stand()')
-        with self.assertRaisesRegex(CommandValidationError, "duration"):
-            parse_robot_program('robot.walktime(10)\nrobot.walktime(10)\nrobot.walktime(10)\nrobot.walktime(10)')
-        with self.assertRaisesRegex(CommandValidationError, "duration"):
-            parse_robot_program('robot.arm_action("hands up")\n' * 16)
+        self.assertEqual(
+            len(parse_robot_program('robot.walktime(10)\n' * 4)),
+            4,
+        )
+        self.assertEqual(
+            len(parse_robot_program('robot.arm_action("hands up")\n' * 16)),
+            16,
+        )
+        self.assertEqual(
+            len(parse_robot_program('robot.stand()\n' * 200)),
+            200,
+        )
+        with self.assertRaisesRegex(CommandValidationError, "expanded commands"):
+            parse_robot_program('robot.stand()\n' * 201)
 
     def test_motion_is_held_continuously_until_stop(self):
         class FakeLocoClient:

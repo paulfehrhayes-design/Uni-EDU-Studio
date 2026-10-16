@@ -140,7 +140,7 @@ const ARM_HOLD_PRESETS = ARM_PRESETS.filter(([, preset]) => (
 const commandGroups = [
   [
     command('stand', 'Stand / ready', 'Basics', 'Stand ready to move.'),
-    command('wait', 'Wait for', 'Basics', 'Pause for the selected number of seconds.', [seconds()]),
+    command('wait', 'Wait for %1 seconds', 'Basics', 'Pause for the selected number of seconds.', [seconds()]),
   ],
   [
     command('walk', 'Walk forward', 'Walking', 'Walk forward the selected number of steps. Distance may vary.', [steps()]),
@@ -410,8 +410,8 @@ export function parseG1Program(code = '') {
     if (node.type === 'repeat') return total + node.times * commandCount(node.body);
     return total + Math.max(commandCount(node.then), commandCount(node.else));
   }, 0);
-  if (commandCount(normalized) > 100) {
-    throw new Error('Programs may contain at most 100 expanded commands per execution path.');
+  if (commandCount(normalized) > 200) {
+    throw new Error('Programs may contain at most 200 expanded commands per execution path.');
   }
   return normalized;
 }

@@ -140,7 +140,16 @@ test('G1 program parser normalizes commands, clamps numbers, and expands loops',
 });
 
 test('wait command is bounded, included in the IDE catalog, and previews its full duration', () => {
+  const waitCommand = G1_COMMANDS.find((command) => command.method === 'wait');
+  const [waitBlock] = getG1BlocklyCommandBlocks([waitCommand]);
+  assert.equal(waitBlock.message0, 'Wait for %1 seconds');
+  assert.deepEqual(
+    [waitBlock.args0[0].value, waitBlock.args0[0].min, waitBlock.args0[0].max, waitBlock.args0[0].precision],
+    [1, 0.1, 10, 0.001],
+  );
+  assert.equal(parseG1Program('robot.wait(0.1)')[0].values[0], 0.1);
   assert.equal(parseG1Program('robot.wait(2)')[0].code, 'robot.wait(2)');
+  assert.equal(parseG1Program('robot.wait(2);')[0].code, 'robot.wait(2)');
   assert.equal(parseG1Program('robot.wait(99)')[0].code, 'robot.wait(10)');
   const frames = buildG1SimulationFrames('robot.wait(2)');
   assert.ok(Math.abs(frames.at(-1).time - 2) < 1e-9);
@@ -336,6 +345,11 @@ test('G1 parser safely normalizes SDK diagnostics and audio arguments', () => {
 test('G1 program parser rejects unknown commands and loop counts outside safe limits', () => {
   assert.throws(() => parseG1Program('robot.moveTo(1, 2)'), /Unknown robot command/);
   assert.throws(() => parseG1Program('for _ in range(21):\n    robot.stand()'), /between 1 and 20/);
+  assert.equal(parseG1Program('robot.stand()\n'.repeat(200)).length, 200);
+  assert.throws(
+    () => parseG1Program('robot.stand()\n'.repeat(201)),
+    /at most 200 expanded commands/,
+  );
 });
 
 test('prompt output uses only shared catalog commands', () => {

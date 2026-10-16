@@ -14,8 +14,8 @@ test('mock connection runs catalog robot commands and expands bounded loops', as
   assert.equal(connection.executions[1][0].method, 'wait');
   await assert.rejects(connection.run('robot.waveleft("high")'), /not supported by the mock connection/);
   await assert.rejects(
-    connection.run('for _ in range(20):\n    for _ in range(20):\n        robot.walk(1)'),
-    /at most 100 expanded commands/,
+    connection.run('for _ in range(20):\n    for _ in range(20):\n        robot.walk(1)\n        robot.walk(1)'),
+    /at most 200 expanded commands/,
   );
   await assert.rejects(
     connection.run('if robot.front_distance_m() < 1:\n    robot.walk(1)'),
