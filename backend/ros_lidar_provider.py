@@ -134,6 +134,7 @@ def serve_http(cache: SampleCache, host: str, port: int, token: str) -> Threadin
 def main() -> None:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs_py import point_cloud2
     from sensor_msgs.msg import PointCloud2
 
@@ -153,9 +154,16 @@ def main() -> None:
         def __init__(self) -> None:
             super().__init__("uni_edu_lidar_distance_provider")
             self.cache = SampleCache(sensor_id, frame_id)
-            self.create_subscription(PointCloud2, topic, self.on_cloud, 10)
+            self.received_first_cloud = False
+            self.create_subscription(PointCloud2, topic, self.on_cloud, qos_profile_sensor_data)
 
         def on_cloud(self, message: PointCloud2) -> None:
+            if not self.received_first_cloud:
+                self.get_logger().info(
+                    f"Received first point cloud: frame={message.header.frame_id}, "
+                    f"points={message.width * message.height}."
+                )
+                self.received_first_cloud = True
             self.cache.update(
                 point_cloud2.read_points(
                     message,
