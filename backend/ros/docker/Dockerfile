@@ -2,6 +2,7 @@ FROM ros:humble-ros-base-jammy
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CMAKE_BUILD_PARALLEL_LEVEL=2
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/aarch64-linux-gnu
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,6 +21,8 @@ RUN git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-S
     && cmake -S /tmp/Livox-SDK2 -B /tmp/Livox-SDK2/build \
     && cmake --build /tmp/Livox-SDK2/build --parallel 2 \
     && cmake --install /tmp/Livox-SDK2/build \
+    && ldconfig \
+    && ldconfig -p | grep -F 'liblivox_lidar_sdk_shared.so' \
     && rm -rf /tmp/Livox-SDK2
 
 RUN mkdir -p /opt/livox_ws/src \
