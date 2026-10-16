@@ -65,9 +65,11 @@ fi
 read -r -p "IPv4 address of the PC2 NIC physically connected to MID-360: " G1_LIDAR_HOST_IP
 read -r -p "MID-360 IPv4 address on that sensor network: " G1_LIDAR_DEVICE_IP
 read -r -p "Is the LiDAR x-axis aligned with the robot's forward direction? [y/N] " FORWARD_AXIS_CONFIRMED
-if [[ "$FORWARD_AXIS_CONFIRMED" != "y" && "$FORWARD_AXIS_CONFIRMED" != "Y" ]]; then
-  echo "Configure and verify the sensor extrinsic transform before enabling distance conditionals." >&2
-  exit 1
+if [[ "$FORWARD_AXIS_CONFIRMED" == "y" || "$FORWARD_AXIS_CONFIRMED" == "Y" ]]; then
+  AXIS_CONFIRMED=1
+else
+  AXIS_CONFIRMED=0
+  echo "Axis alignment is unconfirmed. The driver will be installed for sensor diagnostics, but the distance provider and physical distance conditions will remain disabled." >&2
 fi
 python3 - "$G1_LIDAR_HOST_IP" "$G1_LIDAR_DEVICE_IP" <<'PY'
 import ipaddress
@@ -210,6 +212,7 @@ umask 077
 cat > "$ENV_FILE" <<EOF
 G1_DISTANCE_PROVIDER_URL=http://127.0.0.1:8181/distance/front
 G1_DISTANCE_REAR_PROVIDER_URL=http://127.0.0.1:8181/distance/rear
+G1_LIDAR_AXIS_CONFIRMED=$AXIS_CONFIRMED
 G1_DISTANCE_PROVIDER_TOKEN=$TOKEN
 G1_DISTANCE_SENSOR_ID=mid360-front
 G1_DISTANCE_FRAME_ID=livox_frame
@@ -272,8 +275,15 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
-  sudo systemctl enable uni-edu-lidar-driver.service uni-edu-lidar-provider.service
-  sudo systemctl restart uni-edu-lidar-driver.service uni-edu-lidar-provider.service
+  sudo systemctl enable uni-edu-lidar-driver.service
+  sudo systemctl restart uni-edu-lidar-driver.service
+  if [[ "$AXIS_CONFIRMED" == "1" ]]; then
+    sudo systemctl enable uni-edu-lidar-provider.service
+    sudo systemctl restart uni-edu-lidar-provider.service
+  else
+    sudo systemctl disable uni-edu-lidar-provider.service >/dev/null 2>&1 || true
+    sudo systemctl stop uni-edu-lidar-provider.service >/dev/null 2>&1 || true
+  fi
 else
   for service in uni-edu-lidar-driver.service uni-edu-lidar-provider.service; do
     if [[ -f "/etc/systemd/system/$service" ]]; then
@@ -324,6 +334,11 @@ fi
 
 touch "$INSTALL_MARKER"
 chmod 600 "$INSTALL_MARKER"
-echo "MID-360 driver and read-only HTTP provider are configured using ROS 2 $ROS_DISTRO_REQUIRED ($ROS_RUNTIME)."
+echo "MID-360 driver is configured using ROS 2 $ROS_DISTRO_REQUIRED ($ROS_RUNTIME)."
+if [[ "$AXIS_CONFIRMED" == "1" ]]; then
+  echo "The read-only distance provider is enabled."
+else
+  echo "The distance provider and physical distance conditions are disabled until the sensor axis is verified."
+fi
 echo "Review $CONFIG_FILE and verify the NIC/device addresses before relying on sensor data."
 echo "The installer enables sensor data only; it does not install or start a ROS locomotion bridge."

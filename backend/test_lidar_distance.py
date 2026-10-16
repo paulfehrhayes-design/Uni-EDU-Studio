@@ -30,6 +30,7 @@ class LidarDistanceTests(unittest.TestCase):
                 "G1_DISTANCE_PROVIDER_TOKEN": "test-token",
                 "G1_DISTANCE_SENSOR_ID": "mid360-front",
                 "G1_DISTANCE_FRAME_ID": "lidar_link",
+                "G1_LIDAR_AXIS_CONFIRMED": "1",
             },
         )
         self.environment.start()
@@ -55,6 +56,13 @@ class LidarDistanceTests(unittest.TestCase):
         with patch.dict("os.environ", {"G1_DISTANCE_PROVIDER_URL": ""}):
             with self.assertRaisesRegex(DistanceSensorError, "not configured"):
                 get_front_distance_sample(now=self.now)
+
+    def test_unconfirmed_lidar_axis_disables_distance_conditions(self):
+        with patch.dict("os.environ", {"G1_LIDAR_AXIS_CONFIRMED": "0"}):
+            with patch.object(lidar_distance.httpx, "get") as request:
+                with self.assertRaisesRegex(DistanceSensorError, "axis alignment is unconfirmed"):
+                    get_front_distance_sample(now=self.now)
+        request.assert_not_called()
 
     def test_rear_provider_requires_a_fresh_rear_sample(self):
         payload = {**self.payload, "sector": "rear", "distance_m": 1.2}
