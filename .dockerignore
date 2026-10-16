@@ -1,0 +1,10 @@
+.git
+.github
+.vscode
+node_modules
+backend/static
+backend/classroom.db
+backend/*.log
+backend/__pycache__
+playwright-report
+test-results
