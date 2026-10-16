@@ -1104,7 +1104,10 @@ def robot_connect(request: ConnectRobotRequest, user: dict = Depends(auth_requir
 def get_robot_status(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    return {**robot_status(), "distanceSensor": distance_sensor_status()}
+    status = robot_status()
+    if not status["sdkAvailable"]:
+        return status
+    return {**status, "distanceSensor": distance_sensor_status()}
 
 
 @app.get("/api/navigation/status")

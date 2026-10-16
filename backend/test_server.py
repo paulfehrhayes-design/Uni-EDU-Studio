@@ -446,7 +446,11 @@ class ServerClassroomTests(unittest.TestCase):
             'age_ms': 40,
         }
 
-        with patch.object(server, 'distance_sensor_status', return_value=sensor_status):
+        with patch.object(server, 'robot_status', return_value={'sdkAvailable': True}), patch.object(
+            server,
+            'distance_sensor_status',
+            return_value=sensor_status,
+        ):
             response = client.get('/api/robot/status', headers=teacher_headers)
             denied = client.get('/api/robot/status', headers=student_headers)
             anonymous = client.get('/api/robot/status')
@@ -455,6 +459,24 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response.json()['distanceSensor'], sensor_status)
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(anonymous.status_code, 401)
+
+    def test_robot_status_does_not_query_lidar_until_sdk_connected(self):
+        client = TestClient(app)
+        teacher = client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        headers = {'Authorization': 'Bearer ' + teacher['token']}
+
+        with patch.object(server, 'robot_status', return_value={'sdkAvailable': False}), patch.object(
+            server,
+            'distance_sensor_status',
+        ) as sensor_status:
+            response = client.get('/api/robot/status', headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('distanceSensor', response.json())
+        sensor_status.assert_not_called()
 
     def test_classroom_login_and_queue_flow(self):
         client = TestClient(app)

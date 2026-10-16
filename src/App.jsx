@@ -863,12 +863,14 @@ export default function App() {
         robotConnection.status()
           .then((status) => {
             setIsRobotConnected(status.sdkAvailable);
-            const sensorText = status.distanceSensor?.ready
-              ? `MID-360 ready (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms)`
-              : `MID-360 unavailable (${status.distanceSensor?.error || 'provider status not reported'})`;
-            setRobotConnectionStatus(`${status.sdkAvailable
-              ? `SDK connected on ${status.interface}`
-              : 'Disconnected • backend must run on the G1 computer'} • ${sensorText}`);
+            if (status.sdkAvailable) {
+              const sensorText = status.distanceSensor?.ready
+                ? `MID-360 ready (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms)`
+                : `MID-360 unavailable (${status.distanceSensor?.error || 'provider status not reported'})`;
+              setRobotConnectionStatus(`SDK connected on ${status.interface} • ${sensorText}`);
+            } else {
+              setRobotConnectionStatus('Disconnected • backend must run on the G1 computer • LiDAR is checked after Connect');
+            }
           })
           .catch((error) => {
             setIsRobotConnected(false);
@@ -1239,6 +1241,10 @@ export default function App() {
   const handleTestLidar = async () => {
     if (!session || session.user.role !== 'teacher') {
       alert('Teacher login is required to test the LiDAR connection.');
+      return;
+    }
+    if (!isRobotConnected) {
+      setLidarTestStatus('Connect the G1 first; LiDAR is checked after connection.');
       return;
     }
 
@@ -2950,7 +2956,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleTestLidar}
-                      disabled={isLidarTesting || isRobotConnecting}
+                      disabled={!isRobotConnected || isLidarTesting || isRobotConnecting}
                       className="rounded-lg border border-cyan-700 bg-white px-2.5 py-1.5 text-xs font-semibold text-cyan-800 disabled:cursor-wait disabled:opacity-60"
                     >
                       {isLidarTesting ? 'Testing LiDAR…' : 'Test LiDAR'}

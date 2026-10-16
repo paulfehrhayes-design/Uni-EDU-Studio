@@ -107,40 +107,8 @@ if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
   fi
   if [[ "$AXIS_CONFIRMED" != "1" ]]; then
     echo "MID-360 driver installed for diagnostics; distance provider/conditions remain disabled pending axis verification."
-  elif ! command -v curl >/dev/null 2>&1; then
-    echo "LiDAR services were started, but curl is unavailable for the initial provider readiness check." >&2
   else
-  set -a
-  source "$HOME/.config/uni-edu-studio/lidar.env"
-  set +a
-  SENSOR_READY=0
-  REAR_SENSOR_READY=0
-  for _ in $(seq 1 20); do
-    if curl --silent --show-error --fail --max-time 1 \
-      -H "Authorization: Bearer $G1_DISTANCE_PROVIDER_TOKEN" \
-      "$G1_DISTANCE_PROVIDER_URL" -o /dev/null; then
-      SENSOR_READY=1
-    fi
-    if curl --silent --show-error --fail --max-time 1 \
-      -H "Authorization: Bearer $G1_DISTANCE_PROVIDER_TOKEN" \
-      "$G1_DISTANCE_REAR_PROVIDER_URL" -o /dev/null; then
-      REAR_SENSOR_READY=1
-    fi
-    if [[ "$SENSOR_READY" == "1" && "$REAR_SENSOR_READY" == "1" ]]; then
-      break
-    fi
-    sleep 1
-  done
-  if [[ "$SENSOR_READY" == "1" ]]; then
-    echo "MID-360 forward provider returned a fresh authenticated sample."
-  else
-    echo "LiDAR services started, but no fresh forward sample was received. Check sensor IP/topic and service logs before using forward distance conditions." >&2
-  fi
-  if [[ "$REAR_SENSOR_READY" == "1" ]]; then
-    echo "MID-360 rear provider returned a fresh authenticated sample."
-  else
-    echo "No fresh rear sample was received. Rear distance conditions will remain fail-closed until valid rear returns are available." >&2
-  fi
+    echo "LiDAR services installed. Fresh sensor data will be checked only after a teacher clicks Connect."
   fi
 fi
 systemctl --user enable --now uni-edu-studio.service
