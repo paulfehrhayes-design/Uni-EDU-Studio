@@ -8,8 +8,8 @@ if [[ "$ROS_RUNTIME" != "host" ]]; then
   echo "The $ROS_DISTRO LiDAR runtime is managed by its system container service." >&2
   exit 1
 fi
-if [[ "$ROS_DISTRO" != "foxy" && "$ROS_DISTRO" != "humble" ]]; then
-  echo "G1_LIDAR_ROS_DISTRO must be foxy or humble." >&2
+if [[ "$ROS_DISTRO" != "humble" ]]; then
+  echo "G1_LIDAR_ROS_DISTRO must be humble." >&2
   exit 1
 fi
 source "/opt/ros/$ROS_DISTRO/setup.bash"

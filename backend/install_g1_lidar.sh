@@ -22,19 +22,10 @@ if [[ "${ID:-}" != "ubuntu" ]]; then
   exit 1
 fi
 case "${VERSION_ID:-}" in
-  20.04)
-    if [[ "${G1_LIDAR_ROS_DISTRO:-humble}" == "foxy" ]]; then
-      ROS_DISTRO_REQUIRED="foxy"
-      ROS_RUNTIME="host"
-      ROS_UBUNTU_CODENAME="focal"
-    else
-      ROS_DISTRO_REQUIRED="humble"
-      ROS_RUNTIME="container"
-    fi
-    ;;
+  20.04) ROS_DISTRO_REQUIRED="humble"; ROS_RUNTIME="container" ;;
   22.04) ROS_DISTRO_REQUIRED="humble"; ROS_RUNTIME="host"; ROS_UBUNTU_CODENAME="jammy" ;;
   *)
-    echo "Automatic LiDAR setup supports Ubuntu 20.04 with ROS 2 Humble in a container (or Foxy natively), or Ubuntu 22.04 with ROS 2 Humble. Detected ${PRETTY_NAME:-unknown}." >&2
+    echo "Automatic LiDAR setup supports Ubuntu 20.04 with ROS 2 Humble in a container, or Ubuntu 22.04 with ROS 2 Humble. Detected ${PRETTY_NAME:-unknown}." >&2
     exit 1
     ;;
 esac
@@ -48,8 +39,6 @@ if [[ "$ROS_RUNTIME" == "container" ]]; then
     echo "Container setup requires project and configuration paths without whitespace." >&2
     exit 1
   fi
-elif [[ "$ROS_DISTRO_REQUIRED" == "foxy" ]]; then
-  echo "ROS 2 Foxy reached end of life in 2023; this uses its Ubuntu 20.04 packages and will not receive upstream security updates." >&2
 fi
 ARCH="$(dpkg --print-architecture)"
 if [[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]]; then
@@ -179,7 +168,7 @@ else
     source "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash"
     set -u
     cd "$ROS_WS/src/livox_ros_driver2"
-    ./build.sh "$([[ "$ROS_DISTRO_REQUIRED" == "foxy" ]] && echo ROS2 || echo humble)"
+    ./build.sh humble
   )
 fi
 
