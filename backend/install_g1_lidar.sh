@@ -69,10 +69,24 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 DEFAULT_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-192.168.123.164}}"
 DEFAULT_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-192.168.123.120}}"
-read -r -p "IPv4 address of the PC2 NIC physically connected to MID-360 [$DEFAULT_HOST_IP]: " INPUT_HOST_IP
-G1_LIDAR_HOST_IP="${INPUT_HOST_IP:-$DEFAULT_HOST_IP}"
-read -r -p "MID-360 IPv4 address on that sensor network [$DEFAULT_DEVICE_IP]: " INPUT_DEVICE_IP
-G1_LIDAR_DEVICE_IP="${INPUT_DEVICE_IP:-$DEFAULT_DEVICE_IP}"
+
+read_ipv4() {
+  local prompt="$1"
+  local default="$2"
+  local input
+  while true; do
+    read -r -p "$prompt [$default]: " input
+    input="${input:-$default}"
+    if python3 -c 'import ipaddress, sys; ipaddress.IPv4Address(sys.argv[1])' "$input" >/dev/null 2>&1; then
+      printf '%s' "$input"
+      return 0
+    fi
+    echo "Invalid IPv4 address '$input'. Enter only the numeric address (for example, 192.168.123.164)." >&2
+  done
+}
+
+G1_LIDAR_HOST_IP="$(read_ipv4 "IPv4 address of the PC2 NIC physically connected to MID-360" "$DEFAULT_HOST_IP")"
+G1_LIDAR_DEVICE_IP="$(read_ipv4 "MID-360 IPv4 address on that sensor network" "$DEFAULT_DEVICE_IP")"
 read -r -p "Is the LiDAR x-axis aligned with the robot's forward direction? [y/N] " FORWARD_AXIS_CONFIRMED
 if [[ "$FORWARD_AXIS_CONFIRMED" == "y" || "$FORWARD_AXIS_CONFIRMED" == "Y" ]]; then
   AXIS_CONFIRMED=1

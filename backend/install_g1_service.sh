@@ -19,12 +19,20 @@ fi
 
 LIDAR_CONFIGURED=0
 LIDAR_ENV_FILE="$HOME/.config/uni-edu-studio/lidar.env"
+LIDAR_PREVIOUSLY_INSTALLED=0
+if [[ -f "$HOME/.config/uni-edu-studio/lidar-installed" && -f "$LIDAR_ENV_FILE" ]]; then
+  LIDAR_PREVIOUSLY_INSTALLED=1
+fi
 if [[ "${INSTALL_G1_LIDAR:-0}" == "1" ]]; then
   if bash "$PROJECT_DIR/backend/install_g1_lidar.sh"; then
     LIDAR_CONFIGURED=1
   else
-    echo "WARNING: LiDAR setup did not complete; continuing with the G1 SDK backend and ordinary supported SDK commands." >&2
-    echo "Distance-condition programs will remain fail-closed until LiDAR setup succeeds." >&2
+    if [[ "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then
+      echo "WARNING: LiDAR setup retry did not complete; preserving the existing LiDAR installation and configuration." >&2
+    else
+      echo "WARNING: LiDAR setup did not complete; continuing with the G1 SDK backend and ordinary supported SDK commands." >&2
+      echo "Distance-condition programs will remain fail-closed until LiDAR setup succeeds." >&2
+    fi
   fi
 elif [[ -f "$HOME/.config/uni-edu-studio/lidar-installed" ]]; then
   LIDAR_CONFIGURED=1
@@ -122,6 +130,8 @@ echo
 echo "Uni EDU Studio is enabled and will start automatically at boot."
 echo "Open http://<this-computer-wifi-ip>:5179 on a device connected to the same Wi-Fi."
 echo "Check service status with: systemctl --user status uni-edu-studio"
-if [[ "$LIDAR_CONFIGURED" != "1" ]]; then
+if [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" != "1" ]]; then
   echo "The app/backend is installed without LiDAR. SDK connection and supported non-conditional SDK commands remain available."
+elif [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then
+  echo "The existing LiDAR services/configuration were preserved; the latest LiDAR setup retry did not complete."
 fi
