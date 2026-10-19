@@ -7,7 +7,7 @@ This is the easiest way to use the robot coding app.
 - Use a student account such as:
   - username: `student1`
   - password: `student1`
-- If your teacher made a different account, use that instead.
+- Log in with your classroom account, or choose **Create Account** to register a student account. Public registration cannot create teacher accounts.
 
 ## 2. Choose a tab
 You will see tabs like:

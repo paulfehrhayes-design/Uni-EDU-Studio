@@ -845,7 +845,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
 
   const closestObstacleDistance = (sector) => {
     const radians = (heading * Math.PI) / 180;
-    const maxRangeMeters = 20;
+    const maxRangeMeters = 40;
     const direction = sector === 'rear' ? -1 : 1;
     let closestDistance = maxRangeMeters;
     obstacles.forEach((obstacle) => {

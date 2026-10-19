@@ -13,10 +13,148 @@ test('App loads without runtime initialization errors', async ({ page }) => {
 
   await page.goto('/');
   await expect(page.getByRole('button', { name: 'Log In' }).first()).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Create Account' }).first()).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create Account' })).toBeVisible();
 
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);
+});
+
+test('public account registration creates a student account only', async ({ page }) => {
+  let registration;
+  await page.route('**/api/classroom/register', async (route) => {
+    registration = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        token: 'registered-student-token',
+        user: { username: 'new_student', role: 'student' },
+      }),
+    });
+  });
+  await page.route('**/api/**', async (route) => {
+    if (new URL(route.request().url()).pathname === '/api/classroom/register') {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Create Account' }).click();
+  await expect(page.getByRole('button', { name: 'Create Student Account' })).toBeVisible();
+  await expect(page.getByLabel('Role')).toHaveCount(0);
+  await page.locator('input[autocomplete="username"]').fill('new_student');
+  await page.locator('input[autocomplete="new-password"]').fill('new-student-password');
+  await page.getByRole('button', { name: 'Create Student Account' }).click();
+
+  await expect.poll(() => registration).toEqual({
+    username: 'new_student',
+    password: 'new-student-password',
+  });
+  await expect(page.getByText('Student workspace')).toBeVisible();
+});
+
+test('teacher can create and delete student accounts from the classroom panel', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-account-test-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  let users = [
+    { username: 'teacher', role: 'teacher' },
+    { username: 'student1', role: 'student' },
+  ];
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const method = request.method();
+    let response = { status: 200, body: {} };
+
+    if (url.pathname === '/api/classroom/codes') response.body = { codes: [] };
+    else if (url.pathname === '/api/classroom/queue') response.body = { items: [] };
+    else if (url.pathname === '/api/classroom/users' && method === 'GET') response.body = { users };
+    else if (url.pathname === '/api/classroom/users' && method === 'POST') {
+      const account = JSON.parse(request.postData());
+      users = [...users, { username: account.username, role: account.role || 'student' }];
+      response = { status: 201, body: { status: 'created', user: users.at(-1) } };
+    } else if (url.pathname.startsWith('/api/classroom/users/') && method === 'DELETE') {
+      const username = decodeURIComponent(url.pathname.split('/').at(-1));
+      users = users.filter((user) => user.username !== username);
+      response.body = { status: 'deleted', username };
+    } else if (url.pathname === '/api/classroom/status') response.body = { status: 'idle' };
+    else if (url.pathname === '/api/classroom/projects/all') response.body = { projects: [] };
+    else if (url.pathname === '/api/classroom/project') {
+      response.body = { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } };
+    } else if (url.pathname === '/api/robot/status') {
+      response.body = { sdkAvailable: false, running: false };
+    }
+    await route.fulfill({
+      status: response.status,
+      contentType: 'application/json',
+      body: JSON.stringify(response.body),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await expect(page.getByText('Manage classroom accounts')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Delete account teacher' })).toHaveCount(0);
+
+  await page.getByLabel('New student username').fill('classroom_24');
+  await page.getByLabel('Initial password').fill('classroom-password');
+  await page.getByRole('button', { name: 'Create student account' }).click();
+  await expect(page.getByText('classroom_24', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Delete account classroom_24' })).toBeVisible();
+
+  await page.getByLabel('Account type').selectOption('teacher');
+  await page.getByLabel('New teacher username').fill('assistant_teacher');
+  await page.getByLabel('Initial password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Create teacher account' }).click();
+  await expect(page.getByText('assistant_teacher', { exact: true })).toBeVisible();
+  await expect(page.getByText('teacher', { exact: true }).last()).toBeVisible();
+
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Delete account classroom_24' }).click();
+  await expect(page.getByRole('button', { name: 'Delete account classroom_24' })).toHaveCount(0);
+});
+
+test('student view does not expose teacher account management', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'student-account-test-token',
+      user: { role: 'student', username: 'student1' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url());
+    const responses = {
+      '/api/classroom/codes': { codes: [] },
+      '/api/classroom/status': { status: 'idle' },
+      '/api/classroom/projects': { projects: [] },
+      '/api/classroom/project': {
+        project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' },
+      },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(responses[url.pathname] || {}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Open queue' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Library' }).click();
+  await expect(page.getByText('Manage classroom accounts')).toHaveCount(0);
+  await expect(page.getByLabel('New student username')).toHaveCount(0);
 });
 
 test('student IDE multiline commands render as Blocks and generate code', async ({ page }) => {
@@ -293,14 +431,27 @@ test('students receive the centrally published metric map and 3D cloud overlay',
       }),
     });
   });
+  let liveSocket;
+  await page.routeWebSocket('**/api/lidar/live', (socket) => {
+    liveSocket = socket;
+  });
 
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'Path Planner' }).click();
-  await expect(page.getByText('Published room map • 3D points projected to grid')).toBeVisible();
+  await expect(page.getByText('Published room map • 3D points projected to grid')).toHaveCount(0);
   await expect(page.getByRole('img', {
     name: 'Published shared occupancy map with 3D LiDAR points colored by height',
-  })).toHaveAttribute('viewBox', '0 0 1 1');
+  })).toHaveCount(0);
+  await expect(page.getByText('Teacher-managed student grid overlay: enabled.')).toHaveCount(0);
+  await expect(page.getByText('Compile remains the open-loop SDK path.')).toHaveCount(0);
+  await expect(page.getByText('ROS navigation bridge', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('3D room scan', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Not checked', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('No room scan', { exact: true })).toHaveCount(0);
+  await expect(page.getByText(/Live updates disconnected/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Place waypoint' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Compile' })).toBeVisible();
   await page.getByRole('button', { name: 'Library' }).click();
   const gridOverlay = page.getByTestId('shared-lidar-grid-overlay');
   await expect(gridOverlay).toBeVisible();
@@ -309,9 +460,65 @@ test('students receive the centrally published metric map and 3D cloud overlay',
   await expect(pointOverlay).toHaveCount(1);
   await expect(pointOverlay).toHaveAttribute('cx', '107.25');
   await expect(pointOverlay).toHaveAttribute('cy', '112.75');
-  await page.getByRole('button', { name: 'Settings', exact: true }).first().click();
-  await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toBeChecked();
-  await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toBeDisabled();
+  await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toHaveCount(0);
+  await expect.poll(() => Boolean(liveSocket)).toBeTruthy();
+  liveSocket.send(JSON.stringify({
+    type: 'live_update',
+    navigation: { ready: false, error: 'navigation unavailable' },
+    scan: null,
+    shared_overlay_enabled: false,
+    shared_map_version: 'shared-v1',
+  }));
+  await expect(page.getByTestId('shared-lidar-grid-overlay')).toHaveCount(0);
+  liveSocket.send(JSON.stringify({
+    type: 'live_update',
+    navigation: { ready: false, error: 'navigation unavailable' },
+    scan: null,
+    shared_overlay_enabled: true,
+    shared_map_version: 'shared-v1',
+  }));
+  await expect(page.getByTestId('shared-lidar-grid-overlay')).toBeVisible();
+});
+
+test('only teachers can manage shared LiDAR display settings from Path Planner', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'teacher', username: 'teacher-shared-map-settings-test' },
+    }));
+  });
+  let settingEnabled = false;
+  await page.route('**/api/lidar/settings', async (route) => {
+    if (route.request().method() === 'PUT') {
+      expect(route.request().postDataJSON()).toEqual({ show_shared_overlay: true });
+      settingEnabled = true;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ show_shared_overlay: settingEnabled }),
+    });
+  });
+  await page.route('**/api/lidar/map', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ enabled: settingEnabled, map: null, pointcloud: null }),
+    });
+  });
+  await page.routeWebSocket('**/api/lidar/live', () => {});
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  const setting = page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' });
+  await expect(setting).toBeVisible();
+  await expect(setting).not.toBeChecked();
+  await setting.check();
+  await expect(setting).toBeChecked();
+
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect(page.getByRole('checkbox', { name: 'Show shared LiDAR map overlay' })).toHaveCount(0);
 });
 
 test('teacher scan workflow requires explicit capture completion and map publication', async ({ page }) => {
@@ -637,7 +844,7 @@ test('compiling a planner path preserves its waypoint coordinates', async ({ pag
   await page.addInitScript((testUsername) => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'test-token',
-      user: { role: 'student', username: testUsername },
+      user: { role: 'teacher', username: testUsername },
     }));
   }, username);
   page.on('dialog', (dialog) => dialog.accept());
@@ -718,4 +925,47 @@ test('compiling a planner path preserves its waypoint coordinates', async ({ pag
   ))).toEqual(['g1_command_walk', 'g1_command_turn']);
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
   await expect(page.locator('textarea').first()).toHaveValue('robot.walk(3)\nrobot.turn("right", 45)');
+
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  await expect(secondWaypoint).toBeVisible();
+  await secondWaypoint.scrollIntoViewIfNeeded();
+  await secondWaypoint.getByRole('button', { name: 'Delete' }).click();
+  await expect(page.getByText('Waypoint 2', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Waypoint 1', { exact: true })).toBeVisible();
+});
+
+test('students can add, move, delete, and compile planner waypoints', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: `student-planner-${Date.now()}` },
+    }));
+  });
+  page.on('dialog', (dialog) => dialog.accept());
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Path Planner' }).click();
+  const canvas = page.locator('canvas');
+  const bounds = await canvas.boundingBox();
+
+  await page.getByRole('button', { name: 'Place waypoint' }).click();
+  await page.mouse.click(bounds.x + bounds.width * 0.3, bounds.y + bounds.height * 0.56);
+  await expect(page.getByText('Waypoint 1', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Place waypoint' }).click();
+  await page.mouse.click(bounds.x + bounds.width * 0.38, bounds.y + bounds.height * 0.56);
+  await expect(page.getByText('Waypoint 2', { exact: true })).toBeVisible();
+
+  const waypointCard = (index) => page.getByText(`Waypoint ${index}`, { exact: true }).locator('xpath=../..');
+  const firstWaypoint = waypointCard(1);
+  const secondWaypoint = waypointCard(2);
+  await page.getByRole('button', { name: 'Compile' }).click();
+  await firstWaypoint.locator('input[type="number"]').nth(0).fill('2.5');
+  await expect(firstWaypoint.locator('input[type="number"]').nth(0)).toHaveValue('2.5');
+  await expect(secondWaypoint).toBeVisible();
+  await firstWaypoint.scrollIntoViewIfNeeded();
+  await firstWaypoint.getByRole('button', { name: 'Delete' }).click();
+  await expect(page.getByText('Waypoint 2', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Waypoint 1', { exact: true })).toBeVisible();
+  await expect(page.locator('[data-testid="waypoint-total-distance"]')).toHaveCount(0);
 });

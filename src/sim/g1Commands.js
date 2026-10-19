@@ -313,7 +313,7 @@ function normalizeCommand(method, rawArgs) {
 }
 
 const MIN_DISTANCE_METERS = 0.1;
-const MAX_DISTANCE_METERS = 20;
+const MAX_DISTANCE_METERS = 40;
 
 function nextProgramLine(lines, index) {
   while (index < lines.length && (!lines[index].text || lines[index].text.startsWith('#'))) index += 1;

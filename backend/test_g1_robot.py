@@ -123,7 +123,7 @@ class G1RobotProgramTests(unittest.TestCase):
             "if robot.side_distance_m() < 1:\n    robot.stand()",
             "if robot.front_distance_m() < robot.getfsm():\n    robot.stand()",
             "if robot.front_distance_m() ** 2 < 1:\n    robot.stand()",
-            "if robot.front_distance_m() < 20.1:\n    robot.stand()",
+            "if robot.front_distance_m() < 40.1:\n    robot.stand()",
             "if robot.front_distance_m() < 1:\n    robot.stand()\nelif robot.front_distance_m() < 2:\n    robot.walk(1)",
             "if robot.front_distance_m() < 1:\n    pass",
         ):
@@ -170,6 +170,37 @@ class G1RobotProgramTests(unittest.TestCase):
             self.assertEqual(result["conditionsEvaluated"][0]["branch"], "else")
         finally:
             g1_robot._client = original_client
+
+    def test_clear_sector_selects_no_near_obstacle_branch(self):
+        class FakeLocoClient:
+            def SetFsmId(self, fsm_id):
+                return 0
+
+        original_client = g1_robot._client
+        g1_robot._client = FakeLocoClient()
+        try:
+            with patch.object(
+                g1_robot,
+                "get_front_distance_sample",
+                return_value={
+                    "distance_m": None,
+                    "clear": True,
+                    "max_range_m": 40.0,
+                    "age_ms": 15,
+                    "timestamp": "sample",
+                },
+            ):
+                result = g1_robot.execute_robot_program(
+                    "if robot.front_distance_m() < 1:\n"
+                    "    robot.stand()\n"
+                    "else:\n"
+                    "    robot.stand_to_squat()"
+                )
+        finally:
+            g1_robot._client = original_client
+
+        self.assertEqual(result["conditionsEvaluated"][0]["branch"], "else")
+        self.assertTrue(result["conditionsEvaluated"][0]["clear"])
 
     def test_invalid_distance_requests_sdk_stop_and_aborts_without_else(self):
         class FakeLocoClient:

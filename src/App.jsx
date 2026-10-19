@@ -745,9 +745,12 @@ export default function App() {
   const [queueItems, setQueueItems] = useState([]);
   const [teacherRoster, setTeacherRoster] = useState([]);
   const [loginForm, setLoginForm] = useState({ username: 'teacher', password: 'teacher', role: 'teacher' });
-  const [signupForm, setSignupForm] = useState({ username: '', password: '', role: 'student' });
-  const [authMode, setAuthMode] = useState('login');
   const [loginError, setLoginError] = useState('');
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [newStudent, setNewStudent] = useState({ username: '', password: '', role: 'student' });
+  const [accountManagementError, setAccountManagementError] = useState('');
+  const [isCreatingStudent, setIsCreatingStudent] = useState(false);
+  const [deletingUsername, setDeletingUsername] = useState('');
   const [classroomStatus, setClassroomStatus] = useState('idle');
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
   const [lidarTestStatus, setLidarTestStatus] = useState('Not tested');
@@ -865,7 +868,9 @@ export default function App() {
             setIsRobotConnected(status.sdkAvailable);
             if (status.sdkAvailable) {
               const sensorText = status.distanceSensor?.ready
-                ? `MID-360 ready (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms)`
+                ? status.distanceSensor.clear
+                  ? `MID-360 streaming • no forward-sector returns within ${status.distanceSensor.max_range_m} m`
+                  : `MID-360 ready (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms)`
                 : `MID-360 unavailable (${status.distanceSensor?.error || 'provider status not reported'})`;
               setRobotConnectionStatus(`SDK connected on ${status.interface} • ${sensorText}`);
             } else {
@@ -1096,16 +1101,15 @@ export default function App() {
     }
   };
 
-  const handleSignup = async (event) => {
+  const handleRegisterStudent = async (event) => {
     event.preventDefault();
     setLoginError('');
     try {
-      const response = await apiFetch('/api/classroom/signup', {
+      const response = await apiFetch('/api/classroom/register', {
         method: 'POST',
-        body: JSON.stringify(signupForm)
+        body: JSON.stringify({ username: loginForm.username, password: loginForm.password }),
       }, false);
       setSession({ token: response.token, user: response.user });
-      setAuthMode('login');
     } catch (err) {
       setLoginError(err.message);
     }
@@ -1115,7 +1119,42 @@ export default function App() {
     setSession(null);
     setSavedCodes([]);
     setQueueItems([]);
+    setTeacherRoster([]);
     setClassroomStatus('idle');
+  };
+
+  const handleCreateStudent = async (event) => {
+    event.preventDefault();
+    setAccountManagementError('');
+    setIsCreatingStudent(true);
+    try {
+      await apiFetch('/api/classroom/users', {
+        method: 'POST',
+        body: JSON.stringify(newStudent),
+      });
+      setNewStudent({ username: '', password: '', role: 'student' });
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setIsCreatingStudent(false);
+    }
+  };
+
+  const handleDeleteUser = async (username) => {
+    if (!window.confirm(
+      `Delete ${username}? Their saved programs, projects, queue submissions, and account-owned operation records will be permanently removed.`,
+    )) return;
+    setAccountManagementError('');
+    setDeletingUsername(username);
+    try {
+      await apiFetch(`/api/classroom/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+      await refreshClassroomData();
+    } catch (error) {
+      setAccountManagementError(error.message);
+    } finally {
+      setDeletingUsername('');
+    }
   };
 
   const handleSaveCodeToAccount = async () => {
@@ -1206,7 +1245,9 @@ export default function App() {
       }
       setIsRobotConnected(true);
       const sensorText = connection.distanceSensor?.ready
-        ? `MID-360 ready (${connection.distanceSensor.distance_m.toFixed(2)} m, ${connection.distanceSensor.age_ms} ms)`
+        ? connection.distanceSensor.clear
+          ? `MID-360 streaming • no forward-sector returns within ${connection.distanceSensor.max_range_m} m`
+          : `MID-360 ready (${connection.distanceSensor.distance_m.toFixed(2)} m, ${connection.distanceSensor.age_ms} ms)`
         : `MID-360 unavailable (${connection.distanceSensor?.error || 'provider status not reported'})`;
       setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
     } catch (error) {
@@ -1256,14 +1297,20 @@ export default function App() {
       if (sensor?.ready) {
         const sampleTime = sensor.timestamp ? ` • ${new Date(sensor.timestamp).toLocaleTimeString()}` : '';
         const rear = sensor.rear?.ready
-          ? `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m • ${sensor.rear.age_ms} ms old`
+          ? sensor.rear.clear
+            ? `Rear sector has no returns within ${sensor.rear.max_range_m} m`
+            : `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m • ${sensor.rear.age_ms} ms old`
           : `Rear unavailable • ${sensor.rear?.error || 'provider status not reported'}`;
         setLidarTestStatus(
-          `Front ready • ${sensor.distance_m.toFixed(2)} m • ${sensor.age_ms} ms old • ${sensor.frame_id}${sampleTime} • ${rear}`,
+          `${sensor.clear
+            ? `Front sector has no returns within ${sensor.max_range_m} m`
+            : `Front ready • ${sensor.distance_m.toFixed(2)} m • ${sensor.age_ms} ms old`} • ${sensor.frame_id}${sampleTime} • ${rear}`,
         );
       } else {
         const rear = sensor?.rear?.ready
-          ? `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m`
+          ? sensor.rear.clear
+            ? `Rear sector has no returns within ${sensor.rear.max_range_m} m`
+            : `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m`
           : `Rear unavailable • ${sensor?.rear?.error || 'provider status not reported'}`;
         setLidarTestStatus(`Front unavailable • ${sensor?.error || 'Backend did not report LiDAR status.'} • ${rear}`);
       }
@@ -1449,6 +1496,7 @@ export default function App() {
   };
 
   const handleSharedLidarOverlayToggle = async (enabled) => {
+    if (session?.user?.role !== 'teacher') return;
     const previousValue = sharedLidarOverlayEnabled;
     setSharedLidarOverlayEnabled(enabled);
     try {
@@ -2016,7 +2064,7 @@ export default function App() {
         const result = await robotConnection.run(generatedCode);
         const output = result.results?.length ? ` SDK output: ${JSON.stringify(result.results)}` : '';
         const conditionOutput = result.conditionsEvaluated?.length
-          ? ` Distance branches: ${result.conditionsEvaluated.map(({ distance_m, operator, threshold_m, branch }) => `${distance_m.toFixed(2)} m ${operator} ${threshold_m} m → ${branch}`).join('; ')}.`
+          ? ` Distance branches: ${result.conditionsEvaluated.map(({ distance_m, clear, max_range_m, operator, threshold_m, branch }) => `${clear ? `clear within ${max_range_m} m` : `${distance_m.toFixed(2)} m`} ${operator} ${threshold_m} m → ${branch}`).join('; ')}.`
           : '';
         setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${output}`);
       } catch (error) {
@@ -2672,31 +2720,15 @@ export default function App() {
             <p className="text-sm text-blue-100 mt-1">One robot, one queue, easy for every class.</p>
           </div>
 
-          <div className="px-6 pt-4 flex gap-2">
-            <button
-              type="button"
-              onClick={() => setAuthMode('login')}
-              className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium ${authMode === 'login' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600'}`}
-            >
-              Log In
-            </button>
-            <button
-              type="button"
-              onClick={() => setAuthMode('signup')}
-              className={`flex-1 rounded-lg px-3 py-2 text-sm font-medium ${authMode === 'signup' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600'}`}
-            >
-              Create Account
-            </button>
-          </div>
-
-          {authMode === 'login' ? (
-            <form onSubmit={handleLogin} className="p-6 space-y-4">
+          <form onSubmit={isRegistering ? handleRegisterStudent : handleLogin} className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Username</label>
                 <input
                   type="text"
                   value={loginForm.username}
                   onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })}
+                  autoComplete="username"
+                  required
                   className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
@@ -2706,10 +2738,13 @@ export default function App() {
                   type="password"
                   value={loginForm.password}
                   onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                  autoComplete={isRegistering ? 'new-password' : 'current-password'}
+                  minLength={isRegistering ? 8 : undefined}
+                  required
                   className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
-              <div>
+              {!isRegistering && <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Role</label>
                 <select
                   value={loginForm.role}
@@ -2719,51 +2754,31 @@ export default function App() {
                   <option value="teacher">Teacher</option>
                   <option value="student">Student</option>
                 </select>
-              </div>
+              </div>}
               {loginError && <p className="text-red-600 text-sm">{loginError}</p>}
-              <button type="submit" className="w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold hover:bg-blue-700 transition-colors">Log In</button>
+              <button type="submit" className="w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold hover:bg-blue-700 transition-colors">
+                {isRegistering ? 'Create Student Account' : 'Log In'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsRegistering((registering) => !registering);
+                  setLoginError('');
+                }}
+                className="w-full rounded-xl border border-slate-200 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-50"
+              >
+                {isRegistering ? 'Back to Log In' : 'Create Account'}
+              </button>
               <div className="text-xs text-slate-500 space-y-1">
-                <p>Teacher demo: teacher / teacher</p>
-                <p>Student demo: student1 / student1</p>
+                {isRegistering
+                  ? <p>Student accounts only. Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
+                  : <>
+                    <p>Teacher demo: teacher / teacher</p>
+                    <p>Student demo: student1 / student1</p>
+                    <p>Create a student account to join the classroom.</p>
+                  </>}
               </div>
-            </form>
-          ) : (
-            <form onSubmit={handleSignup} className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">New username</label>
-                <input
-                  type="text"
-                  value={signupForm.username}
-                  onChange={(e) => setSignupForm({ ...signupForm, username: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="student24"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-                <input
-                  type="password"
-                  value={signupForm.password}
-                  onChange={(e) => setSignupForm({ ...signupForm, password: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  placeholder="At least 4 characters"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Role</label>
-                <select
-                  value={signupForm.role}
-                  onChange={(e) => setSignupForm({ ...signupForm, role: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="student">Student</option>
-                  <option value="teacher">Teacher</option>
-                </select>
-              </div>
-              {loginError && <p className="text-red-600 text-sm">{loginError}</p>}
-              <button type="submit" className="w-full bg-emerald-600 text-white rounded-xl py-2.5 font-semibold hover:bg-emerald-700 transition-colors">Create Classroom Account</button>
-            </form>
-          )}
+          </form>
         </div>
       </div>
     );
@@ -2970,14 +2985,79 @@ export default function App() {
                 </div>
 
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Class roster</p>
+                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Manage classroom accounts</p>
+                  <form onSubmit={handleCreateStudent} className="mt-2 space-y-2 rounded-lg border border-blue-100 bg-white p-2">
+                    <label className="block text-xs font-medium text-slate-700">
+                      Account type
+                      <select
+                        value={newStudent.role}
+                        onChange={(event) => setNewStudent({ ...newStudent, role: event.target.value })}
+                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                      >
+                        <option value="student">Student</option>
+                        <option value="teacher">Teacher</option>
+                      </select>
+                    </label>
+                    <label className="block text-xs font-medium text-slate-700">
+                      New {newStudent.role} username
+                      <input
+                        type="text"
+                        value={newStudent.username}
+                        onChange={(event) => setNewStudent({ ...newStudent, username: event.target.value })}
+                        minLength={3}
+                        maxLength={32}
+                        pattern="[A-Za-z0-9_-]{3,32}"
+                        autoComplete="off"
+                        required
+                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                        placeholder="student24"
+                      />
+                    </label>
+                    <label className="block text-xs font-medium text-slate-700">
+                      Initial password
+                      <input
+                        type="password"
+                        value={newStudent.password}
+                        onChange={(event) => setNewStudent({ ...newStudent, password: event.target.value })}
+                        minLength={8}
+                        maxLength={128}
+                        autoComplete="new-password"
+                        required
+                        className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-sm"
+                      />
+                    </label>
+                    <p className="text-[10px] text-slate-500">Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
+                    <button
+                      type="submit"
+                      disabled={isCreatingStudent}
+                      className="w-full rounded-lg bg-blue-600 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+                    >
+                      {isCreatingStudent ? 'Creating…' : `Create ${newStudent.role} account`}
+                    </button>
+                  </form>
+                  {accountManagementError && (
+                    <p role="alert" className="mt-2 text-xs text-red-700">{accountManagementError}</p>
+                  )}
                   <div className="mt-2 space-y-2">
                     {teacherRoster.length === 0 ? (
-                      <p className="text-xs text-slate-500">No students yet.</p>
+                      <p className="text-xs text-slate-500">No classroom accounts found.</p>
                     ) : teacherRoster.map((user) => (
                       <div key={user.username} className="flex items-center justify-between rounded-lg bg-white border border-slate-200 px-2 py-1.5">
-                        <span className="text-sm text-slate-700">{user.username}</span>
-                        <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{user.role}</span>
+                        <span className="min-w-0 truncate text-sm text-slate-700">{user.username}</span>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{user.role}</span>
+                          {user.username !== currentUser.username && (
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteUser(user.username)}
+                              disabled={deletingUsername === user.username}
+                              aria-label={`Delete account ${user.username}`}
+                              className="rounded px-2 py-1 text-[10px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
+                            >
+                              {deletingUsername === user.username ? 'Deleting…' : 'Delete'}
+                            </button>
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -3168,34 +3248,6 @@ export default function App() {
                   <p className="mt-2 text-[10px] text-slate-500">Speed changes timing only. Distances remain in meters.</p>
                 </div>
 
-                <div className="rounded-lg border border-cyan-200 bg-white p-2 text-[10px] text-slate-700">
-                  <p className="font-semibold uppercase tracking-wide text-slate-500">Shared LiDAR room map</p>
-                  <label className="mt-2 flex items-center justify-between gap-2 font-semibold">
-                    <span>Show shared map on student grids</span>
-                    <input
-                      type="checkbox"
-                      aria-label="Show shared LiDAR map overlay"
-                      checked={sharedLidarOverlayEnabled}
-                      disabled={session?.user?.role !== 'teacher'}
-                      onChange={(event) => handleSharedLidarOverlayToggle(event.target.checked)}
-                      className="h-4 w-4 accent-cyan-600"
-                    />
-                  </label>
-                  <p className="mt-1 text-slate-500">
-                    {sharedLidarMap?.map?.map
-                      ? `${sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} m × ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m} m • ${sharedLidarMap.map.map.resolution_m} m/cell`
-                      : 'No approved shared map has been published.'}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={handleRefreshSharedLidarMap}
-                    disabled={isSharedLidarMapLoading}
-                    className="mt-2 rounded border border-slate-300 px-2 py-1 font-semibold disabled:opacity-50"
-                  >
-                    {isSharedLidarMapLoading ? 'Refreshing…' : 'Refresh shared map'}
-                  </button>
-                  <p role="status" aria-live="polite" className="mt-2 break-words text-slate-500">{navigationLiveStatus}</p>
-                </div>
               </div>
             )}
 
@@ -3540,9 +3592,11 @@ export default function App() {
 
                 {mainTab === 'planner' && (
                   <div className="space-y-3 text-slate-200">
+                    {session?.user?.role === 'teacher' && (
+                      <>
                         <p className="rounded-lg border border-amber-500/30 bg-amber-950/40 p-2 text-[10px] text-amber-200">
                           Compile remains the open-loop SDK path. Start Nav2 submits map-frame goals to the separate ROS controller and requires a commissioned gateway.
-                    </p>
+                        </p>
                     <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">ROS navigation bridge</span>
@@ -3638,7 +3692,50 @@ export default function App() {
                       </p>
                       <p className="text-[10px] text-slate-400">{navigationLiveStatus}</p>
                     </div>
-                    {sharedLidarMap?.map?.map && (session?.user?.role === 'teacher' || sharedLidarOverlayEnabled) && (
+                      </>
+                    )}
+                    {session?.user?.role === 'teacher' && (
+                    <div className="space-y-2 rounded-lg border border-cyan-800 bg-slate-900 p-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200">Shared LiDAR map</span>
+                        {session?.user?.role === 'teacher' && (
+                          <button
+                            type="button"
+                            onClick={handleRefreshSharedLidarMap}
+                            disabled={isSharedLidarMapLoading}
+                            className="rounded-md border border-slate-600 px-2 py-1 text-[10px] font-semibold text-slate-200 disabled:opacity-60"
+                          >
+                            {isSharedLidarMapLoading ? 'Refreshing…' : 'Refresh shared map'}
+                          </button>
+                        )}
+                      </div>
+                      {session?.user?.role === 'teacher' ? (
+                        <label className="flex items-center justify-between gap-2 text-[10px] font-semibold text-slate-200">
+                          <span>Show shared map on student grids</span>
+                          <input
+                            type="checkbox"
+                            aria-label="Show shared LiDAR map overlay"
+                            checked={sharedLidarOverlayEnabled}
+                            onChange={(event) => handleSharedLidarOverlayToggle(event.target.checked)}
+                            className="h-4 w-4 accent-cyan-600"
+                          />
+                        </label>
+                      ) : (
+                        <p className="text-[10px] text-slate-300">
+                          Teacher-managed student grid overlay: {sharedLidarOverlayEnabled ? 'enabled' : 'disabled'}.
+                        </p>
+                      )}
+                      {sharedLidarOverlayEnabled && (
+                        <p className="text-[10px] text-slate-400">
+                          {sharedLidarMap?.map?.map
+                            ? `${sharedLidarMap.map.map.width * sharedLidarMap.map.map.resolution_m} m × ${sharedLidarMap.map.map.height * sharedLidarMap.map.map.resolution_m} m • ${sharedLidarMap.map.map.resolution_m} m/cell`
+                            : 'No shared room map is currently available.'}
+                        </p>
+                      )}
+                      <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-400">{navigationLiveStatus}</p>
+                    </div>
+                    )}
+                    {session?.user?.role === 'teacher' && sharedLidarMap?.map?.map && (
                       <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-200">Published room map • 3D points projected to grid</span>

@@ -116,10 +116,16 @@ class ServerClassroomTests(unittest.TestCase):
                 headers=student_headers,
                 json={"show_shared_overlay": True},
             )
+            hidden_student_settings = client.get(
+                "/api/lidar/settings", headers=student_headers
+            )
             enabled = client.put(
                 "/api/lidar/settings",
                 headers=teacher_headers,
                 json={"show_shared_overlay": True},
+            )
+            shared_student_settings = client.get(
+                "/api/lidar/settings", headers=student_headers
             )
             shared_student_map = client.get("/api/lidar/map", headers=student_headers)
 
@@ -133,7 +139,9 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(published.json()["status"], "published")
         self.assertFalse(hidden_student_map.json()["enabled"])
         self.assertEqual(forbidden_toggle.status_code, 403)
+        self.assertFalse(hidden_student_settings.json()["show_shared_overlay"])
         self.assertTrue(enabled.json()["show_shared_overlay"])
+        self.assertTrue(shared_student_settings.json()["show_shared_overlay"])
         self.assertEqual(shared_student_map.json()["map"]["map"]["version"], "v-room-1")
         self.assertEqual(shared_student_map.json()["pointcloud"]["point_count"], 1000)
 
@@ -147,6 +155,15 @@ class ServerClassroomTests(unittest.TestCase):
                 "/api/classroom/login",
                 json={"username": "student1", "password": "student1"},
             ).json()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            enabled = client.put(
+                "/api/lidar/settings",
+                headers={"Authorization": f"Bearer {teacher['token']}"},
+                json={"show_shared_overlay": True},
+            )
             bridge_status = {
                 "ready": False,
                 "status": "unavailable",
@@ -163,7 +180,8 @@ class ServerClassroomTests(unittest.TestCase):
 
         self.assertEqual(update["type"], "live_update")
         self.assertFalse(update["navigation"]["ready"])
-        self.assertFalse(update["shared_overlay_enabled"])
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(update["shared_overlay_enabled"])
 
     def test_navigation_status_is_teacher_only_and_records_map_versions(self):
         client = TestClient(app)
@@ -510,7 +528,15 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(len(matching_items), 1)
         self.assertEqual(matching_items[0]['status'], 'queued')
 
-    def test_teacher_can_signup_student_and_view_roster(self):
+    def test_teacher_can_create_student_and_view_roster(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        db_patcher = patch.object(
+            server, 'DB_PATH', os.path.join(temp_dir.name, 'classroom.db')
+        )
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+        server.init_db()
         client = TestClient(app)
 
         teacher = client.post('/api/classroom/login', json={'username': 'teacher', 'password': 'teacher'})
@@ -518,9 +544,13 @@ class ServerClassroomTests(unittest.TestCase):
         teacher_token = teacher.json()['token']
 
         unique_username = f'newstudent_{uuid.uuid4().hex[:8]}'
-        signup = client.post('/api/classroom/signup', json={'username': unique_username, 'password': 'secret123', 'role': 'student'})
-        self.assertEqual(signup.status_code, 200)
-        self.assertEqual(signup.json()['user']['username'], unique_username)
+        created = client.post(
+            '/api/classroom/users',
+            headers={'Authorization': 'Bearer ' + teacher_token},
+            json={'username': unique_username, 'password': 'secret123'},
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()['user'], {'username': unique_username, 'role': 'student'})
 
         roster = client.get('/api/classroom/users', headers={'Authorization': f'Bearer {teacher_token}'})
         self.assertEqual(roster.status_code, 200)
@@ -667,6 +697,238 @@ class ServerClassroomTests(unittest.TestCase):
             ).json()["items"]
             self.assertEqual(items[0]["id"], submission["id"])
             self.assertEqual(items[0]["status"], "queued")
+
+
+class AccountManagementTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_patcher = patch.object(
+            server, 'DB_PATH', os.path.join(self.temp_dir.name, 'classroom.db')
+        )
+        self.db_patcher.start()
+        server.SESSION_TOKENS.clear()
+        server.init_db()
+        self.client = TestClient(app)
+        self.teacher = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        self.teacher_headers = {'Authorization': 'Bearer ' + self.teacher['token']}
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def create_student(self, username='class_student', role='student'):
+        return self.client.post(
+            '/api/classroom/users',
+            headers=self.teacher_headers,
+            json={'username': username, 'password': 'long-enough-password', 'role': role},
+        )
+
+    def test_accounts_api_is_teacher_only_and_public_registration_creates_students_only(self):
+        student_created = self.create_student('managed_student')
+        self.assertEqual(student_created.status_code, 201)
+        student = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'managed_student', 'password': 'long-enough-password'},
+        ).json()
+        student_headers = {'Authorization': 'Bearer ' + student['token']}
+
+        self.assertEqual(self.client.get('/api/classroom/users').status_code, 401)
+        self.assertEqual(self.client.get('/api/classroom/users', headers=student_headers).status_code, 403)
+        self.assertEqual(
+            self.client.post(
+                '/api/classroom/users',
+                headers=student_headers,
+                json={'username': 'no_admin', 'password': 'long-enough-password', 'role': 'teacher'},
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.delete('/api/classroom/users/managed_student', headers=student_headers).status_code,
+            403,
+        )
+        registration = self.client.post(
+            '/api/classroom/register',
+            json={
+                'username': 'self_registered',
+                'password': 'long-enough-password',
+                'role': 'teacher',
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        self.assertEqual(
+            registration.json()['user'],
+            {'username': 'self_registered', 'role': 'student'},
+        )
+        self.assertEqual(
+            self.client.get(
+                '/api/classroom/me',
+                headers={'Authorization': 'Bearer ' + registration.json()['token']},
+            ).json()['user']['role'],
+            'student',
+        )
+
+    def test_public_registration_validates_credentials_and_duplicate_username(self):
+        invalid_username = self.client.post(
+            '/api/classroom/register',
+            json={'username': 'ab', 'password': 'long-enough-password'},
+        )
+        invalid_password = self.client.post(
+            '/api/classroom/register',
+            json={'username': 'new_student', 'password': 'short'},
+        )
+        self.assertEqual(invalid_username.status_code, 400)
+        self.assertEqual(invalid_password.status_code, 400)
+
+        first = self.client.post(
+            '/api/classroom/register',
+            json={'username': 'new_student', 'password': 'long-enough-password'},
+        )
+        duplicate = self.client.post(
+            '/api/classroom/register',
+            json={'username': 'new_student', 'password': 'long-enough-password'},
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(duplicate.status_code, 409)
+
+    def test_creation_validates_username_password_and_duplicate(self):
+        for username, password in (
+            ('ab', 'long-enough-password'),
+            ('invalid name', 'long-enough-password'),
+            ('student_ok', 'short'),
+            ('student_ok', '        '),
+        ):
+            response = self.client.post(
+                '/api/classroom/users',
+                headers=self.teacher_headers,
+                json={'username': username, 'password': password},
+            )
+            self.assertEqual(response.status_code, 400)
+
+        created = self.create_student('student_ok')
+        duplicate = self.create_student('student_ok')
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()['user'], {'username': 'student_ok', 'role': 'student'})
+        self.assertEqual(duplicate.status_code, 409)
+
+    def test_teacher_can_create_teacher_accounts_but_cannot_assign_other_roles(self):
+        created = self.create_student('assistant_teacher', role='teacher')
+        invalid_role = self.client.post(
+            '/api/classroom/users',
+            headers=self.teacher_headers,
+            json={
+                'username': 'invalid_role',
+                'password': 'long-enough-password',
+                'role': 'admin',
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()['user'], {'username': 'assistant_teacher', 'role': 'teacher'})
+        self.assertEqual(invalid_role.status_code, 400)
+        teacher_login = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'assistant_teacher', 'password': 'long-enough-password'},
+        )
+        self.assertEqual(teacher_login.status_code, 200)
+        self.assertEqual(teacher_login.json()['user']['role'], 'teacher')
+
+    def test_delete_cleans_owned_data_revokes_sessions_and_preserves_shared_map(self):
+        self.assertEqual(self.create_student('remove_me').status_code, 201)
+        student = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'remove_me', 'password': 'long-enough-password'},
+        ).json()
+        server.upsert_program('remove_me', 'saved', 'robot.stand()')
+        server.save_project_for_user(
+            'remove_me',
+            {'name': 'project', 'sceneObjects': [], 'plannerWaypoints': [], 'generatedCode': ''},
+        )
+        server.insert_queue_item('remove_me', 'submitted', 'robot.stand()')
+        conn = server.get_db_connection()
+        conn.execute(
+            "INSERT INTO navigation_operations (operation_id, status, username, route, updated_at) "
+            "VALUES ('nav-done', 'completed', 'remove_me', '{}', 'now')"
+        )
+        conn.execute(
+            "INSERT INTO lidar_scans (job_id, status, username, updated_at) "
+            "VALUES ('scan-done', 'completed', 'remove_me', 'now')"
+        )
+        conn.execute(
+            "INSERT INTO shared_lidar_map (id, map_snapshot, pointcloud, published_by, published_at) "
+            "VALUES (1, '{}', X'01', 'remove_me', 'now')"
+        )
+        conn.commit()
+        conn.close()
+
+        deleted = self.client.delete(
+            '/api/classroom/users/remove_me',
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(
+            self.client.get(
+                '/api/classroom/me',
+                headers={'Authorization': 'Bearer ' + student['token']},
+            ).status_code,
+            401,
+        )
+        conn = server.get_db_connection()
+        for table, column in (
+            ('users', 'username'),
+            ('programs', 'username'),
+            ('projects', 'username'),
+            ('queue', 'student'),
+            ('navigation_operations', 'username'),
+            ('lidar_scans', 'username'),
+        ):
+            self.assertEqual(
+                conn.execute(f'SELECT COUNT(*) FROM {table} WHERE {column} = ?', ('remove_me',)).fetchone()[0],
+                0,
+            )
+        self.assertEqual(
+            conn.execute('SELECT published_by FROM shared_lidar_map WHERE id = 1').fetchone()[0],
+            'deleted account',
+        )
+        conn.close()
+
+    def test_delete_protects_current_and_last_teacher_and_live_queue_work(self):
+        current_account = self.client.delete(
+            '/api/classroom/users/teacher',
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(current_account.status_code, 409)
+        self.assertIn('currently using', current_account.json()['detail'])
+
+        with self.assertRaises(HTTPException) as last_teacher:
+            server.delete_user_account('teacher', 'another_teacher')
+        self.assertIn('last teacher', last_teacher.exception.detail)
+
+        self.assertEqual(self.create_student('busy_student').status_code, 201)
+        running = server.insert_queue_item('busy_student', 'running', 'robot.stand()')
+        server.set_queue_item_status(running['id'], 'running')
+        blocked = self.client.delete(
+            '/api/classroom/users/busy_student',
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIsNotNone(server.get_user_by_username('busy_student'))
+
+        conn = server.get_db_connection()
+        conn.execute(
+            "INSERT INTO lidar_scans (job_id, status, username, updated_at) "
+            "VALUES ('scan-live', 'scanning', 'busy_student', 'now')"
+        )
+        conn.commit()
+        conn.close()
+        server.set_queue_item_status(running['id'], 'completed')
+        blocked_scan = self.client.delete(
+            '/api/classroom/users/busy_student',
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(blocked_scan.status_code, 409)
+        self.assertIsNotNone(server.get_user_by_username('busy_student'))
 
 
 if __name__ == '__main__':

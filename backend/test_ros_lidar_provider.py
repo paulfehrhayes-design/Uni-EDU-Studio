@@ -53,6 +53,17 @@ class RosLidarProviderTests(unittest.TestCase):
         self.assertIsNone(cache.current_sample())
         self.assertIsNone(cache.current_sample("rear"))
 
+    def test_fresh_cloud_with_no_points_in_sector_is_reported_as_clear(self):
+        cache = SampleCache("mid360-front", "livox_frame")
+        cache.update([], "livox_frame", 15, -0.5, 1.5)
+
+        sample = cache.current_sample("forward")
+
+        self.assertTrue(sample["valid"])
+        self.assertTrue(sample["clear"])
+        self.assertIsNone(sample["distance_m"])
+        self.assertEqual(sample["max_range_m"], 40.0)
+
     def test_http_endpoint_requires_token_and_returns_only_fresh_samples(self):
         from threading import Thread
 

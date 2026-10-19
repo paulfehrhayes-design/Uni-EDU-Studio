@@ -18,6 +18,7 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 LIDAR_CONFIGURED=0
+LIDAR_ENV_FILE="$HOME/.config/uni-edu-studio/lidar.env"
 if [[ "${INSTALL_G1_LIDAR:-0}" == "1" ]]; then
   if bash "$PROJECT_DIR/backend/install_g1_lidar.sh"; then
     LIDAR_CONFIGURED=1
@@ -64,19 +65,20 @@ RestartSec=3
 WantedBy=default.target
 EOF
 
-if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
-  python3 - "$UNIT_DIR/uni-edu-studio.service" "$HOME/.config/uni-edu-studio/lidar.env" <<'PY'
+if [[ "$LIDAR_CONFIGURED" == "1" || -f "$LIDAR_ENV_FILE" ]]; then
+  python3 - "$UNIT_DIR/uni-edu-studio.service" "$LIDAR_ENV_FILE" "$LIDAR_CONFIGURED" <<'PY'
 from pathlib import Path
 import sys
 
 unit_path = Path(sys.argv[1])
 environment_file = sys.argv[2]
+lidar_setup_succeeded = sys.argv[3] == "1"
 unit = unit_path.read_text(encoding="utf-8")
 environment = Path(environment_file).read_text(encoding="utf-8").splitlines()
 settings = dict(line.split("=", 1) for line in environment if "=" in line)
 runtime = settings.get("G1_LIDAR_ROS_RUNTIME", "")
 axis_confirmed = settings.get("G1_LIDAR_AXIS_CONFIRMED") == "1"
-if runtime == "host":
+if lidar_setup_succeeded and runtime == "host":
     dependencies = "uni-edu-lidar-driver.service"
     if axis_confirmed:
         dependencies += " uni-edu-lidar-provider.service"
@@ -95,9 +97,9 @@ fi
 
 systemctl --user daemon-reload
 if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
-  AXIS_SETTING="$(grep '^G1_LIDAR_AXIS_CONFIRMED=' "$HOME/.config/uni-edu-studio/lidar.env" || printf 'G1_LIDAR_AXIS_CONFIRMED=1')"
+  AXIS_SETTING="$(grep '^G1_LIDAR_AXIS_CONFIRMED=' "$LIDAR_ENV_FILE" || printf 'G1_LIDAR_AXIS_CONFIRMED=1')"
   AXIS_CONFIRMED="${AXIS_SETTING#*=}"
-  if grep -q '^G1_LIDAR_ROS_RUNTIME=host$' "$HOME/.config/uni-edu-studio/lidar.env"; then
+  if grep -q '^G1_LIDAR_ROS_RUNTIME=host$' "$LIDAR_ENV_FILE"; then
     systemctl --user enable --now uni-edu-lidar-driver.service
     if [[ "$AXIS_CONFIRMED" == "1" ]]; then
       systemctl --user enable --now uni-edu-lidar-provider.service
@@ -110,6 +112,8 @@ if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
   else
     echo "LiDAR services installed. Fresh sensor data will be checked only after a teacher clicks Connect."
   fi
+elif [[ -f "$LIDAR_ENV_FILE" ]]; then
+  echo "LiDAR setup did not complete; reusing the saved provider configuration for diagnostics."
 fi
 systemctl --user enable --now uni-edu-studio.service
 sudo loginctl enable-linger "$USER"

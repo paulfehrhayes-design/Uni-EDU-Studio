@@ -195,8 +195,11 @@ test('distance conditions support nested branches and bounds without flattening 
   assert.equal(formatG1Program(nodes).includes('else:'), true);
   assert.throws(
     () => parseG1Program('if robot.front_distance_m() < 0.01:\n    robot.walk(1)'),
-    /between 0.1 and 20 meters/,
+    /between 0.1 and 40 meters/,
   );
+  assert.doesNotThrow(() => parseG1Program(
+    'if robot.front_distance_m() < 40:\n    robot.walk(1)',
+  ));
   assert.throws(
     () => parseG1Program('if robot.front_distance_m() < 1:\n    robot.walk(1)\nelse:\n    '),
     /no body/,
@@ -267,7 +270,7 @@ test('simulator selects else for out-of-sector or missing obstacles', () => {
   const noObstacle = buildG1SimulationFrames(program, { obstacles: [] });
   assert.equal(sideObstacle.at(-1).heading, 90);
   assert.equal(noObstacle.at(-1).heading, 90);
-  assert.match(noObstacle[1].timeline[0].summary, /20\.00 m < 1 m → else/);
+  assert.match(noObstacle[1].timeline[0].summary, /40\.00 m < 1 m → else/);
 });
 
 test('simulator evaluates rear obstacle distance behind the robot', () => {

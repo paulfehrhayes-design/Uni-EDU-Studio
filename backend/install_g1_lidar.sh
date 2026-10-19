@@ -10,7 +10,6 @@ INSTALL_MARKER="$CONFIG_DIR/lidar-installed"
 USER_UNIT_DIR="$HOME/.config/systemd/user"
 
 mkdir -p "$CONFIG_DIR"
-rm -f "$INSTALL_MARKER"
 
 if [[ ! -r /etc/os-release ]]; then
   echo "Cannot identify the host operating system; stopping without installing ROS." >&2
@@ -143,7 +142,7 @@ if [[ "$ROS_RUNTIME" == "container" ]]; then
     exit 1
   fi
   echo "Building the native-architecture ROS 2 Humble container with the Livox MID-360 driver."
-  sudo docker build -t uni-edu-lidar-humble:local \
+  sudo docker build --pull=false -t uni-edu-lidar-humble:local \
     -f "$PROJECT_DIR/backend/ros/docker/Dockerfile" "$PROJECT_DIR"
 else
   if [[ ! -f "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash" ]]; then

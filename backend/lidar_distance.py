@@ -77,11 +77,17 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
         raise DistanceSensorError("MID-360 sample frame does not match the configured frame.")
 
     distance = payload.get("distance_m")
-    if isinstance(distance, bool) or not isinstance(distance, (int, float)):
-        raise DistanceSensorError("MID-360 sample distance must be numeric meters.")
-    distance_m = float(distance)
-    if not 0 < distance_m <= MAX_DISTANCE_METERS:
-        raise DistanceSensorError(f"MID-360 sample distance must be greater than 0 and at most {MAX_DISTANCE_METERS:g} meters.")
+    clear = payload.get("clear") is True
+    if distance is None and clear and payload.get("max_range_m") == MAX_DISTANCE_METERS:
+        distance_m = None
+    else:
+        if isinstance(distance, bool) or not isinstance(distance, (int, float)):
+            raise DistanceSensorError("MID-360 sample distance must be numeric meters.")
+        distance_m = float(distance)
+        if not 0 < distance_m <= MAX_DISTANCE_METERS or clear:
+            raise DistanceSensorError(
+                f"MID-360 sample distance must be greater than 0 and at most {MAX_DISTANCE_METERS:g} meters."
+            )
 
     timestamp = _parse_timestamp(payload.get("timestamp"))
     current_time = now or datetime.now(timezone.utc)
@@ -98,6 +104,8 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
     return {
         "sector": sector,
         "distance_m": distance_m,
+        "clear": clear,
+        "max_range_m": MAX_DISTANCE_METERS,
         "timestamp": timestamp.isoformat(),
         "age_ms": max(0, round(age_seconds * 1000)),
         "sensor_id": expected_sensor_id,

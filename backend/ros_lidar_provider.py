@@ -87,7 +87,7 @@ class SampleCache:
             distance = self._distances_m[sector]
             received_at = self._received_at
             frame_id = self._sample_frame_id
-        if distance is None or received_at is None or frame_id != self.frame_id:
+        if received_at is None or frame_id != self.frame_id:
             return None
         age = (datetime.now(timezone.utc) - received_at).total_seconds()
         if age < 0 or age > MAX_SAMPLE_AGE_SECONDS:
@@ -96,6 +96,8 @@ class SampleCache:
             "valid": True,
             "sector": sector,
             "distance_m": distance,
+            "clear": distance is None,
+            "max_range_m": MAX_DISTANCE_METERS,
             "timestamp": received_at.isoformat(),
             "sensor_id": self.sensor_id,
             "frame_id": frame_id,

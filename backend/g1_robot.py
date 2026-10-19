@@ -364,10 +364,10 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
                     or isinstance(threshold.value, bool)
                     or not isinstance(threshold.value, (int, float))
                     or not math.isfinite(float(threshold.value))
-                    or not 0.1 <= float(threshold.value) <= 20
+                    or not 0.1 <= float(threshold.value) <= 40
                 ):
                     raise CommandValidationError(
-                        "Distance thresholds must be numeric literals between 0.1 and 20 meters."
+                        "Distance thresholds must be numeric literals between 0.1 and 40 meters."
                     )
                 if not statement.body:
                     raise CommandValidationError("Distance condition then-branches must contain at least one command.")
@@ -723,12 +723,17 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                     "==": lambda measured, target: measured == target,
                     "!=": lambda measured, target: measured != target,
                 }
-                selected_then = operators[node["operator"]](sample["distance_m"], node["threshold"])
+                measured_distance = (
+                    float("inf") if sample.get("clear") else sample["distance_m"]
+                )
+                selected_then = operators[node["operator"]](measured_distance, node["threshold"])
                 decision = {
                     "sensor": sensor,
                     "operator": node["operator"],
                     "threshold_m": node["threshold"],
                     "distance_m": sample["distance_m"],
+                    "clear": bool(sample.get("clear")),
+                    "max_range_m": sample.get("max_range_m", 40.0),
                     "age_ms": sample["age_ms"],
                     "branch": "then" if selected_then else "else",
                 }

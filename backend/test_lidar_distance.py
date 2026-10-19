@@ -51,6 +51,24 @@ class LidarDistanceTests(unittest.TestCase):
             follow_redirects=False,
         )
 
+    def test_clear_sample_is_valid_when_no_object_is_within_40_meters(self):
+        clear_payload = {
+            **self.payload,
+            "distance_m": None,
+            "clear": True,
+            "max_range_m": 40.0,
+        }
+        with patch.object(
+            lidar_distance.httpx,
+            "get",
+            return_value=SimpleNamespace(status_code=200, json=lambda: clear_payload),
+        ):
+            sample = get_front_distance_sample(now=self.now)
+
+        self.assertTrue(sample["clear"])
+        self.assertIsNone(sample["distance_m"])
+        self.assertEqual(sample["max_range_m"], 40.0)
+
     def test_provider_must_be_configured_and_return_fresh_matching_data(self):
         response = SimpleNamespace(status_code=200, json=lambda: self.payload)
         with patch.dict("os.environ", {"G1_DISTANCE_PROVIDER_URL": ""}):

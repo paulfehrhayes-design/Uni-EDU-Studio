@@ -131,7 +131,7 @@ class SharedLidarSettingsRequest(BaseModel):
 class LidarMapPublishRequest(BaseModel):
     job_id: str
 
-class SignupRequest(BaseModel):
+class CreateUserRequest(BaseModel):
     username: str
     password: str
     role: str = "student"
@@ -428,6 +428,94 @@ def list_users():
     ).fetchall()
     conn.close()
     return [{"username": row["username"], "role": row["role"]} for row in rows]
+
+
+def validate_account_credentials(username: str, password: str) -> tuple[str, str]:
+    normalized_username = username.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,32}", normalized_username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 3–32 characters using letters, numbers, _ or -.",
+        )
+    if len(password) < 8 or len(password) > 128 or not password.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be 8–128 characters and cannot be only whitespace.",
+        )
+    return normalized_username, password
+
+
+def delete_user_account(username: str, active_username: str) -> None:
+    if username == active_username:
+        raise HTTPException(status_code=409, detail="You cannot delete the account you are currently using.")
+
+    if not _QUEUE_RUN_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Wait for the running classroom queue item to finish before deleting an account.")
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        account = conn.execute(
+            "SELECT username, role FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found.")
+
+        if account["role"] == "teacher":
+            teacher_count = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'teacher'"
+            ).fetchone()[0]
+            if teacher_count <= 1:
+                raise HTTPException(status_code=409, detail="The last teacher account cannot be deleted.")
+
+        running_queue_item = conn.execute(
+            "SELECT 1 FROM queue WHERE student = ? AND status = 'running' LIMIT 1",
+            (username,),
+        ).fetchone()
+        if running_queue_item:
+            raise HTTPException(status_code=409, detail="This account has a running queue item; stop or finish it before deletion.")
+
+        active_navigation = conn.execute(
+            "SELECT 1 FROM navigation_operations WHERE username = ? AND status IN ("
+            + ",".join("?" for _ in _NAVIGATION_ACTIVE_STATES)
+            + ") LIMIT 1",
+            (username, *_NAVIGATION_ACTIVE_STATES),
+        ).fetchone()
+        active_scan = conn.execute(
+            "SELECT 1 FROM lidar_scans WHERE username = ? AND status = 'scanning' LIMIT 1",
+            (username,),
+        ).fetchone()
+        if active_navigation or active_scan:
+            raise HTTPException(status_code=409, detail="This account owns an active robot operation; wait for it to finish before deletion.")
+
+        for table, owner_column in (
+            ("programs", "username"),
+            ("projects", "username"),
+            ("queue", "student"),
+            ("navigation_operations", "username"),
+            ("lidar_scans", "username"),
+        ):
+            conn.execute(f"DELETE FROM {table} WHERE {owner_column} = ?", (username,))
+        conn.execute(
+            "UPDATE shared_lidar_map SET published_by = 'deleted account' WHERE published_by = ?",
+            (username,),
+        )
+        conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+        _QUEUE_RUN_LOCK.release()
+
+    for token, token_username in list(SESSION_TOKENS.items()):
+        if token_username == username:
+            SESSION_TOKENS.pop(token, None)
 
 
 def init_db():
@@ -828,35 +916,6 @@ async def hf_text_to_motion(request: HFTextMotionRequest, user: dict = Depends(a
         raise HTTPException(status_code=502, detail=f"Hugging Face request failed: {exc}") from exc
 
 
-@app.post("/api/classroom/signup")
-def classroom_signup(request: SignupRequest):
-    username = request.username.strip()
-    if not username:
-        raise HTTPException(status_code=400, detail="Username is required")
-    if len(request.password) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
-
-    role = request.role.strip().lower() if request.role else "student"
-    if role not in {"teacher", "student"}:
-        raise HTTPException(status_code=400, detail="Role must be teacher or student")
-
-    existing = get_user_by_username(username)
-    if existing:
-        raise HTTPException(status_code=409, detail="Username already exists")
-
-    conn = get_db_connection()
-    conn.execute(
-        "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-        (username, request.password, role),
-    )
-    conn.commit()
-    conn.close()
-
-    token = uuid.uuid4().hex
-    SESSION_TOKENS[token] = username
-    return {"token": token, "user": {"username": username, "role": role}}
-
-
 @app.post("/api/classroom/login")
 def classroom_login(request: LoginRequest):
     normalized = request.username.strip()
@@ -865,18 +924,10 @@ def classroom_login(request: LoginRequest):
 
     user = get_user_by_username(normalized)
     if user is None:
-        user = {
-            "username": normalized,
-            "password": request.password,
-            "role": request.role or "student",
-        }
-        conn = get_db_connection()
-        conn.execute(
-            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-            (user["username"], user["password"], user["role"]),
+        raise HTTPException(
+            status_code=401,
+            detail="Account not found. Choose Create Account to register a student account.",
         )
-        conn.commit()
-        conn.close()
 
     if user["password"] != request.password:
         raise HTTPException(status_code=401, detail="Incorrect password")
@@ -887,6 +938,27 @@ def classroom_login(request: LoginRequest):
     token = uuid.uuid4().hex
     SESSION_TOKENS[token] = normalized
     return {"token": token, "user": {"username": normalized, "role": user["role"]}}
+
+
+@app.post("/api/classroom/register", status_code=201)
+def classroom_register_student(request: CreateUserRequest):
+    username, password = validate_account_credentials(request.username, request.password)
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password, role) VALUES (?, ?, 'student')",
+            (username, password),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as error:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="Username already exists.") from error
+    finally:
+        conn.close()
+
+    token = uuid.uuid4().hex
+    SESSION_TOKENS[token] = username
+    return {"token": token, "user": {"username": username, "role": "student"}}
 
 
 @app.get("/api/classroom/me")
@@ -1082,6 +1154,39 @@ def classroom_users(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
     return {"users": list_users()}
+
+
+@app.post("/api/classroom/users", status_code=201)
+def classroom_create_user(
+    request: CreateUserRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if request.role not in {"student", "teacher"}:
+        raise HTTPException(status_code=400, detail="Account role must be student or teacher.")
+    username, password = validate_account_credentials(request.username, request.password)
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+            (username, password, request.role),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as error:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="Username already exists.") from error
+    finally:
+        conn.close()
+    return {"status": "created", "user": {"username": username, "role": request.role}}
+
+
+@app.delete("/api/classroom/users/{username}")
+def classroom_delete_user(username: str, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    delete_user_account(username, user["username"])
+    return {"status": "deleted", "username": username}
 
 
 @app.post("/api/run")
