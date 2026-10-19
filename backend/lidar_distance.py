@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,6 +11,8 @@ MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
 PROVIDER_TIMEOUT_SECONDS = 0.25
+PROVIDER_503_RETRIES = 2
+PROVIDER_RETRY_DELAY_SECONDS = 0.05
 
 
 class DistanceSensorError(RuntimeError):
@@ -61,6 +64,19 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
         )
     except httpx.HTTPError as error:
         raise DistanceSensorError(f"MID-360 distance provider could not be reached: {error}") from error
+    for attempt in range(PROVIDER_503_RETRIES):
+        if response.status_code != 503:
+            break
+        time.sleep(PROVIDER_RETRY_DELAY_SECONDS)
+        try:
+            response = httpx.get(
+                url,
+                headers=response.request.headers,
+                timeout=PROVIDER_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as error:
+            raise DistanceSensorError(f"MID-360 distance provider could not be reached: {error}") from error
     if response.status_code != 200:
         try:
             unavailable = response.json()

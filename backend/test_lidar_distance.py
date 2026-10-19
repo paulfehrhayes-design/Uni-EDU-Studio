@@ -79,13 +79,36 @@ class LidarDistanceTests(unittest.TestCase):
         response = SimpleNamespace(
             status_code=503,
             json=lambda: {"error": "Latest point cloud is stale (700 ms old)."},
+            request=SimpleNamespace(headers={}),
         )
-        with patch.object(lidar_distance.httpx, "get", return_value=response):
+        with patch.object(
+            lidar_distance.httpx,
+            "get",
+            side_effect=[response] * (lidar_distance.PROVIDER_503_RETRIES + 1),
+        ):
             with self.assertRaisesRegex(
                 DistanceSensorError,
                 "HTTP 503: Latest point cloud is stale \\(700 ms old\\)",
             ):
                 get_front_distance_sample(now=self.now)
+
+    def test_temporary_provider_503_retries_and_accepts_next_fresh_sample(self):
+        stale_response = SimpleNamespace(
+            status_code=503,
+            json=lambda: {"error": "Latest point cloud is stale."},
+            request=SimpleNamespace(headers={"Authorization": "Bearer test-token"}),
+        )
+        fresh_response = SimpleNamespace(status_code=200, json=lambda: self.payload)
+        with patch.object(
+            lidar_distance.httpx,
+            "get",
+            side_effect=[stale_response, fresh_response],
+        ) as request, patch.object(lidar_distance.time, "sleep") as sleep:
+            sample = get_front_distance_sample(now=self.now)
+
+        self.assertEqual(sample["distance_m"], 0.85)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(lidar_distance.PROVIDER_RETRY_DELAY_SECONDS)
 
     def test_unconfirmed_lidar_axis_disables_distance_conditions(self):
         with patch.dict("os.environ", {"G1_LIDAR_AXIS_CONFIRMED": "0"}):
