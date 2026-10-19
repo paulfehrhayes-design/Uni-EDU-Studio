@@ -75,6 +75,18 @@ class LidarDistanceTests(unittest.TestCase):
             with self.assertRaisesRegex(DistanceSensorError, "not configured"):
                 get_front_distance_sample(now=self.now)
 
+    def test_provider_unavailable_response_includes_diagnostic_reason(self):
+        response = SimpleNamespace(
+            status_code=503,
+            json=lambda: {"error": "Latest point cloud is stale (700 ms old)."},
+        )
+        with patch.object(lidar_distance.httpx, "get", return_value=response):
+            with self.assertRaisesRegex(
+                DistanceSensorError,
+                "HTTP 503: Latest point cloud is stale \\(700 ms old\\)",
+            ):
+                get_front_distance_sample(now=self.now)
+
     def test_unconfirmed_lidar_axis_disables_distance_conditions(self):
         with patch.dict("os.environ", {"G1_LIDAR_AXIS_CONFIRMED": "0"}):
             with patch.object(lidar_distance.httpx, "get") as request:

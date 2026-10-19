@@ -62,7 +62,15 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
     except httpx.HTTPError as error:
         raise DistanceSensorError(f"MID-360 distance provider could not be reached: {error}") from error
     if response.status_code != 200:
-        raise DistanceSensorError(f"MID-360 {sector}-sector distance provider returned HTTP {response.status_code}.")
+        try:
+            unavailable = response.json()
+        except ValueError:
+            unavailable = {}
+        provider_error = unavailable.get("error") if isinstance(unavailable, dict) else None
+        detail = f": {provider_error}" if isinstance(provider_error, str) and provider_error else ""
+        raise DistanceSensorError(
+            f"MID-360 {sector}-sector distance provider returned HTTP {response.status_code}{detail}."
+        )
     try:
         payload = response.json()
     except ValueError as error:

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
@@ -66,7 +67,9 @@ class SampleCache:
         self._lock = threading.Lock()
         self._distances_m: dict[str, float | None] = {"forward": None, "rear": None}
         self._received_at: datetime | None = None
+        self._received_monotonic: float | None = None
         self._sample_frame_id: str | None = None
+        self._cloud_count = 0
 
     def update(self, points: Iterable[object], frame_id: str, half_angle: float, min_z: float, max_z: float) -> None:
         front_distance, rear_distance = select_sector_distances(
@@ -78,7 +81,29 @@ class SampleCache:
         with self._lock:
             self._distances_m = {"forward": front_distance, "rear": rear_distance}
             self._received_at = datetime.now(timezone.utc)
+            self._received_monotonic = time.monotonic()
             self._sample_frame_id = frame_id
+            self._cloud_count += 1
+
+    def unavailable_reason(self) -> str:
+        with self._lock:
+            received_at = self._received_at
+            received_monotonic = self._received_monotonic
+            frame_id = self._sample_frame_id
+            cloud_count = self._cloud_count
+        if cloud_count == 0 or received_at is None or received_monotonic is None:
+            return "Provider has not received a point cloud yet."
+        if frame_id != self.frame_id:
+            return f"Received point-cloud frame {frame_id!r}; expected {self.frame_id!r}."
+        age_seconds = time.monotonic() - received_monotonic
+        if age_seconds < 0:
+            return "Provider monotonic clock moved backwards; sample freshness cannot be verified."
+        if age_seconds > MAX_SAMPLE_AGE_SECONDS:
+            return (
+                f"Latest point cloud is stale ({age_seconds * 1000:.0f} ms old; "
+                f"maximum is {MAX_SAMPLE_AGE_SECONDS * 1000:.0f} ms)."
+            )
+        return "Provider sample is temporarily unavailable."
 
     def current_sample(self, sector: str = "forward") -> dict[str, object] | None:
         if sector not in {"forward", "rear"}:
@@ -86,10 +111,11 @@ class SampleCache:
         with self._lock:
             distance = self._distances_m[sector]
             received_at = self._received_at
+            received_monotonic = self._received_monotonic
             frame_id = self._sample_frame_id
-        if received_at is None or frame_id != self.frame_id:
+        if received_at is None or received_monotonic is None or frame_id != self.frame_id:
             return None
-        age = (datetime.now(timezone.utc) - received_at).total_seconds()
+        age = time.monotonic() - received_monotonic
         if age < 0 or age > MAX_SAMPLE_AGE_SECONDS:
             return None
         return {
@@ -118,7 +144,19 @@ def serve_http(cache: SampleCache, host: str, port: int, token: str) -> Threadin
             sector = "rear" if self.path == "/distance/rear" else "forward"
             sample = cache.current_sample(sector)
             if sample is None:
-                self.send_error(503, f"No fresh {sector}-sector LiDAR sample is available.")
+                body = json.dumps(
+                    {
+                        "valid": False,
+                        "sector": sector,
+                        "error": cache.unavailable_reason(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self.send_response(503, "LiDAR sample unavailable")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             body = json.dumps(sample, separators=(",", ":")).encode("utf-8")
             self.send_response(200)

@@ -1,5 +1,4 @@
 import unittest
-from datetime import timedelta
 import json
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -49,7 +48,7 @@ class RosLidarProviderTests(unittest.TestCase):
 
         cache.update(points, "livox_frame", 15, -0.5, 1.5)
         with cache._lock:
-            cache._received_at -= timedelta(seconds=1)
+            cache._received_monotonic -= 1
         self.assertIsNone(cache.current_sample())
         self.assertIsNone(cache.current_sample("rear"))
 
@@ -103,11 +102,20 @@ class RosLidarProviderTests(unittest.TestCase):
         self.assertEqual(rear_payload["distance_m"], 1.2)
 
         with cache._lock:
-            cache._received_at -= timedelta(seconds=1)
+            cache._received_monotonic -= 1
         with self.assertRaises(HTTPError) as stale:
             urlopen(request, timeout=2)
         self.assertEqual(stale.exception.code, 503)
+        stale_payload = json.loads(stale.exception.read())
+        self.assertIn("Latest point cloud is stale", stale_payload["error"])
         stale.exception.close()
+
+    def test_unavailable_reason_distinguishes_no_cloud_and_wrong_frame(self):
+        cache = SampleCache("mid360-front", "livox_frame")
+        self.assertIn("has not received a point cloud", cache.unavailable_reason())
+
+        cache.update([(1.0, 0.0, 0.0)], "other_frame", 15, -0.5, 1.5)
+        self.assertIn("expected 'livox_frame'", cache.unavailable_reason())
 
 
 if __name__ == "__main__":
