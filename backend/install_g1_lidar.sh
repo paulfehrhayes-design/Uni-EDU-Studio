@@ -250,6 +250,7 @@ G1_DISTANCE_PROVIDER_PORT=8181
 G1_LIDAR_FORWARD_HALF_ANGLE_DEGREES=15
 G1_LIDAR_MINIMUM_HEIGHT_M=-0.5
 G1_LIDAR_MAXIMUM_HEIGHT_M=1.5
+FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 EOF
 chmod 600 "$ENV_FILE"
 
@@ -274,7 +275,7 @@ Requires=docker.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-driver --network host --ipc=shareable --env-file $ENV_FILE -v $CONFIG_FILE:/config/MID360_config.json:ro uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/mid360_launch.py config_path:=/config/MID360_config.json frame_id:=livox_frame
+ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-driver --network host --env-file $ENV_FILE -v $CONFIG_FILE:/config/MID360_config.json:ro uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/mid360_launch.py config_path:=/config/MID360_config.json frame_id:=livox_frame
 ExecStop=/usr/bin/docker stop --time 10 uni-edu-lidar-driver
 Restart=on-failure
 RestartSec=3
@@ -291,7 +292,7 @@ Requires=docker.service uni-edu-lidar-driver.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --ipc=container:uni-edu-lidar-driver --env-file $ENV_FILE uni-edu-lidar-humble:local python3 /opt/uni-edu/ros_lidar_provider.py
+ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --env-file $ENV_FILE uni-edu-lidar-humble:local python3 /opt/uni-edu/ros_lidar_provider.py
 ExecStop=/usr/bin/docker stop --time 10 uni-edu-lidar-provider
 Restart=on-failure
 RestartSec=3
