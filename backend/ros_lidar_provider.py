@@ -53,6 +53,40 @@ def select_forward_distance(
     )[0]
 
 
+def select_sector_distances_array(
+    points: object,
+    half_angle_degrees: float,
+    minimum_height_m: float,
+    maximum_height_m: float,
+) -> tuple[float | None, float | None, int]:
+    import numpy as np
+
+    values = np.asarray(points)
+    fields = values.dtype.names
+    if fields and all(axis in fields for axis in ("x", "y", "z")):
+        x, y, z = values["x"], values["y"], values["z"]
+    elif values.ndim == 2 and values.shape[1] >= 3:
+        x, y, z = values[:, 0], values[:, 1], values[:, 2]
+    else:
+        raise ValueError("Point cloud XYZ data must contain x, y, and z fields.")
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    valid_count = int(np.count_nonzero(finite))
+    if valid_count == 0:
+        raise ValueError("Point cloud contains no finite XYZ returns.")
+
+    tangent = math.tan(math.radians(half_angle_degrees))
+    in_height = finite & (z >= minimum_height_m) & (z <= maximum_height_m)
+    front = in_height & (x > 0) & (np.abs(y) <= x * tangent)
+    rear = in_height & (x < 0) & (np.abs(y) <= -x * tangent)
+    front_ranges = np.hypot(x[front], y[front])
+    rear_ranges = np.hypot(x[rear], y[rear])
+    front_ranges = front_ranges[front_ranges <= MAX_DISTANCE_METERS]
+    rear_ranges = rear_ranges[rear_ranges <= MAX_DISTANCE_METERS]
+    front_distance = float(np.min(front_ranges)) if front_ranges.size else None
+    rear_distance = float(np.min(rear_ranges)) if rear_ranges.size else None
+    return front_distance, rear_distance, valid_count
+
+
 def _point_values(point: object) -> tuple[float, float, float]:
     names = getattr(getattr(point, "dtype", None), "names", None)
     if names:
@@ -78,6 +112,14 @@ class SampleCache:
             min_z,
             max_z,
         )
+        self.update_distances(front_distance, rear_distance, frame_id)
+
+    def update_distances(
+        self,
+        front_distance: float | None,
+        rear_distance: float | None,
+        frame_id: str,
+    ) -> None:
         with self._lock:
             self._distances_m = {"forward": front_distance, "rear": rear_distance}
             self._received_at = datetime.now(timezone.utc)
@@ -195,26 +237,43 @@ def main() -> None:
             super().__init__("uni_edu_lidar_distance_provider")
             self.cache = SampleCache(sensor_id, frame_id)
             self.received_first_cloud = False
+            self.processed_clouds = 0
+            self.last_diagnostic_at = time.monotonic()
             self.create_subscription(PointCloud2, topic, self.on_cloud, qos_profile_sensor_data)
 
         def on_cloud(self, message: PointCloud2) -> None:
+            callback_started = time.monotonic()
             if not self.received_first_cloud:
                 self.get_logger().info(
                     f"Received first point cloud: frame={message.header.frame_id}, "
                     f"points={message.width * message.height}."
                 )
                 self.received_first_cloud = True
-            self.cache.update(
-                point_cloud2.read_points(
+            try:
+                points = point_cloud2.read_points(
                     message,
                     field_names=("x", "y", "z"),
-                    skip_nans=True,
-                ),
-                message.header.frame_id,
-                half_angle,
-                minimum_height,
-                maximum_height,
-            )
+                    skip_nans=False,
+                )
+                front_distance, rear_distance, valid_points = select_sector_distances_array(
+                    points,
+                    half_angle,
+                    minimum_height,
+                    maximum_height,
+                )
+            except ValueError as error:
+                self.get_logger().warning(f"Rejected invalid point cloud: {error}")
+                return
+            self.cache.update_distances(front_distance, rear_distance, message.header.frame_id)
+            self.processed_clouds += 1
+            now = time.monotonic()
+            if now - self.last_diagnostic_at >= 5:
+                callback_ms = (now - callback_started) * 1000
+                self.get_logger().info(
+                    f"Processed {self.processed_clouds} point clouds; latest has "
+                    f"{valid_points} finite XYZ returns; callback took {callback_ms:.1f} ms."
+                )
+                self.last_diagnostic_at = now
 
     rclpy.init()
     node = LidarNode()

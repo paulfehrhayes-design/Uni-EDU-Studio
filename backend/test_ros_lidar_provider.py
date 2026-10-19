@@ -10,6 +10,11 @@ except ImportError:
     import ros_lidar_provider
     from ros_lidar_provider import SampleCache, select_forward_distance
 
+try:
+    import numpy
+except ImportError:
+    numpy = None
+
 
 class RosLidarProviderTests(unittest.TestCase):
     def test_selects_nearest_point_inside_forward_sector_and_height(self):
@@ -36,6 +41,29 @@ class RosLidarProviderTests(unittest.TestCase):
                 1.5,
             )
         )
+
+    @unittest.skipIf(numpy is None, "NumPy is provided by the ROS runtime, not the backend test environment.")
+    def test_selects_sector_distances_from_vectorized_point_cloud(self):
+        points = numpy.array(
+            [
+                (1.2, 0.0, 0.0),
+                (-1.4, 0.0, 0.0),
+                (0.5, 1.0, 0.0),
+                (float("nan"), 0.0, 0.0),
+            ],
+            dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")],
+        )
+
+        front, rear, valid_points = ros_lidar_provider.select_sector_distances_array(
+            points,
+            15,
+            -0.5,
+            1.5,
+        )
+
+        self.assertAlmostEqual(front, 1.2)
+        self.assertAlmostEqual(rear, 1.4)
+        self.assertEqual(valid_points, 3)
 
     def test_sample_cache_requires_matching_frame_and_fresh_sample(self):
         cache = SampleCache("mid360-front", "livox_frame")
