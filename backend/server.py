@@ -1206,9 +1206,10 @@ def robot_connect(request: ConnectRobotRequest, user: dict = Depends(auth_requir
         return connect_robot(request.interface or os.getenv("UNITREE_INTERFACE", "eth0"))
 
 @app.get("/api/robot/status")
-def get_robot_status(user: dict = Depends(auth_required)):
+def get_robot_status(response: Response, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     status = robot_status()
     if not status["sdkAvailable"]:
         return status

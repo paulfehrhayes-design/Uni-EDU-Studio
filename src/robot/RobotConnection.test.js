@@ -49,6 +49,7 @@ test('SDK adapter wraps the existing API and rejects unsupported commands before
     '/api/run',
     '/api/stop',
   ]);
+  assert.deepEqual(requests[1][1], { cache: 'no-store' });
   assert.deepEqual(JSON.parse(requests[0][1].body), { interface: 'eth0' });
   assert.deepEqual(JSON.parse(requests[2][1].body), {
     code: 'robot.walk(1)\nrobot.wait(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()',
@@ -76,6 +77,7 @@ test('SDK status request can test LiDAR without running a robot command', async 
   assert.equal(status.sdkAvailable, false);
   assert.equal(status.distanceSensor.ready, true);
   assert.deepEqual(requests.map(([url]) => url), ['/api/robot/status']);
+  assert.deepEqual(requests[0][1], { cache: 'no-store' });
 });
 
 test('WebRTC adapter does not infer command support from an encoder alone', async () => {

@@ -50,7 +50,7 @@ export class SdkRobotConnection {
   }
 
   async status() {
-    return this.request('/api/robot/status');
+    return this.request('/api/robot/status', { cache: 'no-store' });
   }
 
   async run(code) {

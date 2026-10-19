@@ -869,8 +869,8 @@ export default function App() {
             if (status.sdkAvailable) {
               const sensorText = status.distanceSensor?.ready
                 ? status.distanceSensor.clear
-                  ? `MID-360 streaming • no forward-sector returns within ${status.distanceSensor.max_range_m} m`
-                  : `MID-360 ready (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms)`
+                  ? `MID-360 raw scan • no forward-sector returns within ${status.distanceSensor.max_range_m} m • not calibrated`
+                  : `MID-360 raw estimate (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms) • not calibrated`
                 : `MID-360 unavailable (${status.distanceSensor?.error || 'provider status not reported'})`;
               setRobotConnectionStatus(`SDK connected on ${status.interface} • ${sensorText}`);
             } else {
@@ -1246,8 +1246,8 @@ export default function App() {
       setIsRobotConnected(true);
       const sensorText = connection.distanceSensor?.ready
         ? connection.distanceSensor.clear
-          ? `MID-360 streaming • no forward-sector returns within ${connection.distanceSensor.max_range_m} m`
-          : `MID-360 ready (${connection.distanceSensor.distance_m.toFixed(2)} m, ${connection.distanceSensor.age_ms} ms)`
+          ? `MID-360 raw scan • no forward-sector returns within ${connection.distanceSensor.max_range_m} m • not calibrated`
+          : `MID-360 raw estimate (${connection.distanceSensor.distance_m.toFixed(2)} m, ${connection.distanceSensor.age_ms} ms) • not calibrated`
         : `MID-360 unavailable (${connection.distanceSensor?.error || 'provider status not reported'})`;
       setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
     } catch (error) {
@@ -1298,19 +1298,19 @@ export default function App() {
         const sampleTime = sensor.timestamp ? ` • ${new Date(sensor.timestamp).toLocaleTimeString()}` : '';
         const rear = sensor.rear?.ready
           ? sensor.rear.clear
-            ? `Rear sector has no returns within ${sensor.rear.max_range_m} m`
-            : `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m • ${sensor.rear.age_ms} ms old`
+            ? `Rear raw scan has no returns within ${sensor.rear.max_range_m} m`
+            : `Rear raw estimate • ${sensor.rear.distance_m.toFixed(2)} m • ${sensor.rear.age_ms} ms old`
           : `Rear unavailable • ${sensor.rear?.error || 'provider status not reported'}`;
         setLidarTestStatus(
           `${sensor.clear
-            ? `Front sector has no returns within ${sensor.max_range_m} m`
-            : `Front ready • ${sensor.distance_m.toFixed(2)} m • ${sensor.age_ms} ms old`} • ${sensor.frame_id}${sampleTime} • ${rear}`,
+            ? `Front raw scan has no returns within ${sensor.max_range_m} m`
+            : `Front raw estimate • ${sensor.distance_m.toFixed(2)} m • ${sensor.age_ms} ms old`} • ${sensor.frame_id}${sampleTime} • ${rear} • distances are not calibrated to robot position`,
         );
       } else {
         const rear = sensor?.rear?.ready
           ? sensor.rear.clear
-            ? `Rear sector has no returns within ${sensor.rear.max_range_m} m`
-            : `Rear ready • ${sensor.rear.distance_m.toFixed(2)} m`
+            ? `Rear raw scan has no returns within ${sensor.rear.max_range_m} m`
+            : `Rear raw estimate • ${sensor.rear.distance_m.toFixed(2)} m`
           : `Rear unavailable • ${sensor?.rear?.error || 'provider status not reported'}`;
         setLidarTestStatus(`Front unavailable • ${sensor?.error || 'Backend did not report LiDAR status.'} • ${rear}`);
       }

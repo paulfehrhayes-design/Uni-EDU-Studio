@@ -475,6 +475,7 @@ class ServerClassroomTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['distanceSensor'], sensor_status)
+        self.assertEqual(response.headers['cache-control'], 'no-store, max-age=0')
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(anonymous.status_code, 401)
 
