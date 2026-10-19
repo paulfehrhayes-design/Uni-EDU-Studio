@@ -123,7 +123,8 @@ if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
 elif [[ -f "$LIDAR_ENV_FILE" ]]; then
   echo "LiDAR setup did not complete; reusing the saved provider configuration for diagnostics."
 fi
-systemctl --user enable --now uni-edu-studio.service
+systemctl --user enable uni-edu-studio.service
+systemctl --user restart uni-edu-studio.service
 sudo loginctl enable-linger "$USER"
 
 echo
