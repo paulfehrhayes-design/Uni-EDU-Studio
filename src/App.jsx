@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import * as Blockly from 'blockly/core';
 import { pythonGenerator } from 'blockly/python';
+pythonGenerator.INDENT = '    ';
 import * as En from 'blockly/msg/en';
 import * as Zh from 'blockly/msg/zh-hans';
 import 'blockly/blocks';
@@ -301,6 +302,38 @@ function hasSameNavigationMapGeometry(previous, next) {
     && previousMap.origin.x === nextMap.origin.x
     && previousMap.origin.y === nextMap.origin.y
     && previousMap.origin.yaw_rad === nextMap.origin.yaw_rad;
+}
+
+function removeBlocklyVariableInitializers(code, initializers) {
+  const lines = code.split('\n');
+  let removedInitializer = false;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (initializers.has(lines[index])) {
+      lines.splice(index, 1);
+      removedInitializer = true;
+    }
+  }
+  return removedInitializer
+    ? lines.join('\n').replace(/^\n+/, '').replace(/\n{3,}/g, '\n\n')
+    : code;
+}
+
+function generateBlocklyPythonCode(workspace) {
+  const initializers = new Set();
+  workspace.getTopBlocks(true).forEach((topBlock) => {
+    let block = topBlock;
+    while (block) {
+      if (block.type === 'variables_set' && block.getInputTargetBlock('VALUE')?.type === 'logic_boolean') {
+        const variable = workspace.getVariableById(block.getFieldValue('VAR'));
+        if (variable) initializers.add(`${variable.getName()} = None`);
+      }
+      block = block.getNextBlock();
+    }
+  });
+  return removeBlocklyVariableInitializers(
+    pythonGenerator.workspaceToCode(workspace),
+    initializers,
+  );
 }
 
 function isNavigationWaypointInFreeSpace(waypoint, snapshot) {
@@ -771,6 +804,7 @@ export default function App() {
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
   const [lidarTestStatus, setLidarTestStatus] = useState('Not tested');
   const [navigationBridgeStatus, setNavigationBridgeStatus] = useState('Not checked');
+  const [navigationDiagnostics, setNavigationDiagnostics] = useState(null);
   const [isNavigationMotionReady, setIsNavigationMotionReady] = useState(false);
   const [isNavigationBridgeChecking, setIsNavigationBridgeChecking] = useState(false);
   const [navigationMapSnapshot, setNavigationMapSnapshot] = useState(null);
@@ -887,7 +921,7 @@ export default function App() {
               const sensorText = `MID-360 ${status.distanceSensor?.ready ? 'calibrated' : 'unavailable'} • ${formatLidarDistanceStatus(status.distanceSensor)}`;
               setRobotConnectionStatus(`SDK connected on ${status.interface} • ${sensorText}`);
             } else {
-              setRobotConnectionStatus('Disconnected • backend must run on the G1 computer • LiDAR is checked after Connect');
+              setRobotConnectionStatus('Disconnected • backend must run on the G1 computer • LiDAR status is available without SDK motion');
             }
           })
           .catch((error) => {
@@ -945,6 +979,7 @@ export default function App() {
       setLiveLidarScanPoints([]);
       setSharedLidarMap(null);
       setNavigationLiveStatus('Live updates disconnected');
+      setNavigationDiagnostics(null);
       setIsNavigationMotionReady(false);
       sharedMapVersionRef.current = null;
       sharedMapLoadedRef.current = false;
@@ -988,6 +1023,9 @@ export default function App() {
         }
         setSharedLidarOverlayEnabled(update.shared_overlay_enabled === true);
         setIsNavigationMotionReady(update.navigation?.motion_ready === true);
+        if (update.navigation?.diagnostics) {
+          setNavigationDiagnostics(update.navigation.diagnostics);
+        }
         setNavigationLiveStatus(
           update.navigation?.ready
             ? `Live • ${update.navigation.map?.map_id} ${update.navigation.map?.version} • ${update.navigation.localization?.age_ms ?? '—'} ms localization • MID-360 ${update.navigation.pointcloud_age_ms ?? '—'} ms old • ${update.navigation.motion_ready ? 'robot link and e-stop healthy' : [update.navigation.robot_health?.error, update.navigation.estop?.error].filter(Boolean).join(' • ') || 'robot/e-stop health unverified'}`
@@ -1295,11 +1333,6 @@ export default function App() {
       alert('Teacher login is required to test the LiDAR connection.');
       return;
     }
-    if (!isRobotConnected) {
-      setLidarTestStatus('Connect the G1 first; LiDAR is checked after connection.');
-      return;
-    }
-
     setIsLidarTesting(true);
     setLidarTestStatus('Reading a fresh MID-360 sample…');
     try {
@@ -1330,10 +1363,12 @@ export default function App() {
     }
     setIsNavigationBridgeChecking(true);
     setIsNavigationMotionReady(false);
+    setNavigationDiagnostics(null);
     setNavigationBridgeStatus('Checking bridge, fresh MID-360 data, localization, map metadata, and e-stop health…');
     try {
       const result = await apiFetch('/api/navigation/status');
       setIsNavigationMotionReady(result.motionReady === true);
+      setNavigationDiagnostics(result.diagnostics || null);
       if (result.activeOperation) {
         setNavigationOperation(result.activeOperation);
         setNavigationExecutionStatus(
@@ -1412,7 +1447,11 @@ export default function App() {
   const handleStartLidarScan = async () => {
     if (session?.user?.role !== 'teacher') return;
     if (!isNavigationMotionReady) {
-      setLidarScanStatus('Scan blocked • check bridge status and verify fresh healthy robot-link and e-stop signals first.');
+      setLidarScanStatus(
+        `Scan blocked • ${navigationDiagnostics?.execution_enabled === false
+          ? 'physical motion is disabled by deployment configuration.'
+          : navigationDiagnostics?.controller?.error || 'verify fresh healthy robot-link and e-stop signals first.'}`,
+      );
       return;
     }
     const confirmed = window.confirm(
@@ -1637,7 +1676,11 @@ export default function App() {
       return;
     }
     if (!isNavigationMotionReady) {
-      setNavigationExecutionStatus('Physical start blocked • check bridge status and verify a fresh healthy e-stop signal first.');
+      setNavigationExecutionStatus(
+        `Physical start blocked • ${navigationDiagnostics?.execution_enabled === false
+          ? 'physical motion is disabled by deployment configuration.'
+          : navigationDiagnostics?.controller?.error || 'verify a fresh healthy e-stop and robot-link signal first.'}`,
+      );
       return;
     }
     if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
@@ -1706,7 +1749,7 @@ export default function App() {
 
   useEffect(() => {
     const operationId = navigationOperation?.operation_id;
-    if (!operationId || ['completed', 'canceled', 'failed'].includes(navigationOperation.status)) return undefined;
+    if (!operationId || ['completed', 'succeeded', 'canceled', 'failed'].includes(navigationOperation.status)) return undefined;
     let active = true;
     const pollOperation = async () => {
       try {
@@ -1950,7 +1993,7 @@ export default function App() {
 
       const updateCode = () => {
         try {
-          const code = pythonGenerator.workspaceToCode(workspaceRef.current);
+          const code = generateBlocklyPythonCode(workspaceRef.current);
           applyGeneratedCode(code, { syncBlocks: false });
           setBlockSyncError('');
         } catch (error) {
@@ -2700,7 +2743,7 @@ export default function App() {
 
     if (workspaceRef.current && window.Blockly) {
       try {
-        const nextCode = pythonGenerator.workspaceToCode(workspaceRef.current);
+        const nextCode = generateBlocklyPythonCode(workspaceRef.current);
         applyGeneratedCode(nextCode, { syncBlocks: true });
       } catch (error) {
         console.warn('Failed to refresh generated code after block edit.', error);
@@ -3044,7 +3087,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleTestLidar}
-                      disabled={!isRobotConnected || isLidarTesting || isRobotConnecting}
+                      disabled={isLidarTesting || isRobotConnecting}
                       className="rounded-lg border border-cyan-700 bg-white px-2.5 py-1.5 text-xs font-semibold text-cyan-800 disabled:cursor-wait disabled:opacity-60"
                     >
                       {isLidarTesting ? 'Testing LiDAR…' : 'Test LiDAR'}
@@ -3053,7 +3096,7 @@ export default function App() {
                       {lidarTestStatus}
                     </span>
                   </div>
-                  <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Simulation works while disconnected.</p>
+                  <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.</p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
                 </div>
 
@@ -3687,6 +3730,43 @@ export default function App() {
                       <p role="status" aria-live="polite" className="break-words text-[10px] text-slate-400">
                         {navigationBridgeStatus}
                       </p>
+                      {navigationDiagnostics && (
+                        <div data-testid="navigation-diagnostics" className="space-y-1 break-words text-[10px] text-slate-400">
+                          <p>
+                            LiDAR {navigationDiagnostics.topics?.pointcloud || 'topic unavailable'}
+                            {' • '}frame {navigationDiagnostics.frames?.pointcloud || 'unavailable'}
+                            {' • '}{Number.isFinite(navigationDiagnostics.pointcloud?.rate_hz)
+                              ? `${navigationDiagnostics.pointcloud.rate_hz.toFixed(1)} Hz measured`
+                              : 'measured rate pending'}
+                            {' • '}sample age {navigationDiagnostics.pointcloud?.age_ms ?? '—'} ms
+                            {' • '}stamp age {navigationDiagnostics.pointcloud?.stamp_age_ms ?? '—'} ms
+                            {' • '}callback {navigationDiagnostics.pointcloud?.callback_duration_ms ?? '—'} ms
+                            {' • '}{navigationDiagnostics.pointcloud?.count ?? 0} valid clouds
+                          </p>
+                          <p>
+                            Map {navigationDiagnostics.topics?.map || 'topic unavailable'}
+                            {' • '}frame {navigationDiagnostics.frames?.map || 'unavailable'}
+                            {' • '}base {navigationDiagnostics.frames?.base || 'unavailable'}
+                            {' • '}threshold {navigationDiagnostics.map?.occupied_threshold ?? '—'}
+                            {navigationDiagnostics.map?.metadata && (
+                              <>
+                                {' • '}{navigationDiagnostics.map.metadata.resolution_m} m/cell
+                                {' • '}origin {navigationDiagnostics.map.metadata.origin.x.toFixed(2)}, {navigationDiagnostics.map.metadata.origin.y.toFixed(2)} m
+                                {' • '}map age {navigationDiagnostics.map.age_ms ?? '—'} ms
+                              </>
+                            )}
+                          </p>
+                          <p>
+                            Localization {navigationDiagnostics.localization?.quality || 'unavailable'}
+                            {' • '}actions Nav2 {navigationDiagnostics.actions?.navigation ? 'ready' : 'unavailable'},
+                            {' '}preview {navigationDiagnostics.actions?.route_preview ? 'ready' : 'unavailable'},
+                            {' '}Spin {navigationDiagnostics.actions?.spin ? 'ready' : 'unavailable'}
+                            {' • '}locomotion owner {navigationDiagnostics.controller?.owner || 'unverified'}
+                            {' • '}{navigationDiagnostics.controller?.ready ? 'commissioned' : 'not commissioned; motion locked'}
+                            {' • '}execution {navigationDiagnostics.execution_enabled ? 'enabled' : 'deployment-disabled'}
+                          </p>
+                        </div>
+                      )}
                       {session?.user?.role === 'teacher' && (
                         <div className="flex items-center gap-2">
                           <button
@@ -3876,6 +3956,14 @@ export default function App() {
                             transform={`translate(0 ${navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}) scale(1 -1)`}
                             style={{ cursor: isNavigationGoalPlacementEnabled ? 'crosshair' : 'default' }}
                           >
+                            <rect
+                              x="0"
+                              y="0"
+                              width={navigationMapSnapshot.map.width * navigationMapSnapshot.map.resolution_m}
+                              height={navigationMapSnapshot.map.height * navigationMapSnapshot.map.resolution_m}
+                              fill="transparent"
+                              pointerEvents="none"
+                            />
                             <g
                             data-testid="ros-occupancy-overlay"
                             pointerEvents="none"

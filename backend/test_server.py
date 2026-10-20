@@ -169,6 +169,9 @@ class ServerClassroomTests(unittest.TestCase):
                 "status": "unavailable",
                 "map": None,
                 "localization": {"ready": False},
+                "diagnostics": {
+                    "topics": {"pointcloud": "/mid360/livox/lidar"},
+                },
                 "error": "bridge unavailable",
             }
             with patch.object(server, "navigation_bridge_status", return_value=bridge_status):
@@ -180,6 +183,10 @@ class ServerClassroomTests(unittest.TestCase):
 
         self.assertEqual(update["type"], "live_update")
         self.assertFalse(update["navigation"]["ready"])
+        self.assertEqual(
+            update["navigation"]["diagnostics"]["topics"]["pointcloud"],
+            "/mid360/livox/lidar",
+        )
         self.assertEqual(enabled.status_code, 200)
         self.assertTrue(update["shared_overlay_enabled"])
 

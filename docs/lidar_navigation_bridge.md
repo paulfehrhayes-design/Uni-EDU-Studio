@@ -9,6 +9,8 @@ Nav2 gateway. Nav2 owns route planning and publishes its controller output to
 the `/cmd_vel` input of the separately installed Unitree G1 bridge. The browser
 does not publish ROS messages or velocity commands. This is a software
 integration path; it has not been commissioned or physically tested on a G1.
+Upstream repository, license, ROS-distro, and hardware-assumption notes are
+recorded in [the LiDAR source audit](./lidar_source_audit.md).
 
 ## Backend configuration
 
@@ -18,6 +20,8 @@ Configure the backend service with:
 G1_NAV_BRIDGE_URL=https://<trusted-navigation-host>/g1-navigation
 G1_NAV_BRIDGE_TOKEN=<strong random gateway token>
 G1_NAV_EXECUTION_ENABLED=1
+G1_NAV_LOCOMOTION_OWNER=nav2_via_single_unitree_bridge
+G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED=1
 ```
 
 HTTP is accepted only for a loopback bridge. Use HTTPS for any remote bridge.
@@ -26,6 +30,14 @@ The token stays on the application backend and is sent as a bearer token. The
 browser uses only teacher-authenticated application API routes and never
 connects directly to ROS or receives the bridge token. `G1_NAV_EXECUTION_ENABLED`
 defaults off; enable it only after commissioning the gateway and Nav2 deployment.
+The two controller-ownership settings are an additional fail-closed motion gate.
+Leave ownership unconfirmed until commissioning verifies that Nav2 sends through
+the single intended Unitree bridge and no competing locomotion controller is
+active. `G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED=1` does not itself detect other
+ROS publishers; it records the deployment owner's commissioning decision.
+The backend reports the execution-enable state in navigation diagnostics, and
+both physical route execution and Spin scans remain blocked while that switch
+is off.
 
 ## Deploy the ROS gateway
 
@@ -67,6 +79,15 @@ both freshness defaults are 1000). There are no default health topics because
 their meaning and wiring must be verified for the actual bridge and hardware.
 Motion remains disabled if either topic is unset, false, or stale; map viewing
 and route preview remain available.
+The additional motion gate uses `G1_NAV_LOCOMOTION_OWNER` (must be
+`nav2_via_single_unitree_bridge`) and
+`G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED` (must be `1`). The authenticated
+navigation status reports configured point-cloud/map topics and frames,
+observed point-cloud rate after a five-second measurement window, acquisition
+stamp age, gateway callback duration, map age/resolution/origin/occupancy
+threshold/version, localization freshness, action-server readiness, and
+controller-ownership confirmation. The callback metric is not a DDS packet-drop
+counter; verify delivery and loss independently on the robot with ROS tooling.
 The ROS host also needs the Python ROS packages used by the gateway:
 `rclpy`, `nav2_msgs`, `nav_msgs`, `geometry_msgs`, `action_msgs`, `tf2_ros`,
 `sensor_msgs`, `sensor_msgs_py`, and `std_msgs`.
@@ -185,6 +206,10 @@ endpoints:
 Localization timestamps must be timezone-aware and no more than one second
 old. The backend reports navigation readiness only when the bridge, planner,
 and localization are all ready and the localization pose is finite.
+Freshness also checks each received PointCloud2 acquisition stamp (maximum
+1.5 seconds old, at most 100 ms in the future); a newly delivered stale cloud
+does not refresh readiness. Point-cloud rate is initially reported as
+unmeasured until one complete five-second sample window has elapsed.
 
 ### `GET /api/v1/map/metadata`
 

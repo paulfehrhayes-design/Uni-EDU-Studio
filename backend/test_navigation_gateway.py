@@ -8,16 +8,20 @@ try:
         GatewayConfigurationError,
         _configuration,
         accumulate_scan_rotation,
+        controller_ownership_ready,
         scan_rotation_complete,
         validate_estop_health,
+        validate_pointcloud_timestamp,
     )
 except ImportError:
     from ros.navigation_gateway import (
         GatewayConfigurationError,
         _configuration,
         accumulate_scan_rotation,
+        controller_ownership_ready,
         scan_rotation_complete,
         validate_estop_health,
+        validate_pointcloud_timestamp,
     )
 
 
@@ -34,6 +38,17 @@ class NavigationGatewayScanTests(unittest.TestCase):
                 result = validate_estop_health(healthy, age, 1.0)
                 self.assertFalse(result["ready"])
                 self.assertIn(expected, result["error"])
+
+    def test_pointcloud_timestamps_reject_stale_future_and_malformed_samples(self):
+        self.assertAlmostEqual(validate_pointcloud_timestamp(100, 0, now_seconds=100.5), 0.5)
+        for stamp, expected in (
+            ((98, 0), "stale"),
+            ((101, 0), "future"),
+            ((0, 0), "missing"),
+            ((100, 1_000_000_000), "invalid"),
+        ):
+            with self.subTest(stamp=stamp), self.assertRaisesRegex(ValueError, expected):
+                validate_pointcloud_timestamp(*stamp, now_seconds=100)
 
     def test_scan_rotation_accumulates_wrapped_yaw_in_signed_direction(self):
         rotation = accumulate_scan_rotation(0.0, 3.1, -3.1)
@@ -135,6 +150,27 @@ class NavigationGatewayScanTests(unittest.TestCase):
             config = _configuration()
         self.assertEqual(config["robot_healthy_topic"], "/g1/controller_healthy")
         self.assertEqual(config["robot_health_max_age_seconds"], 0.75)
+
+    def test_motion_requires_explicit_single_bridge_ownership_commissioning(self):
+        with patch.dict(
+            os.environ,
+            {
+                "G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token",
+                "G1_NAV_LOCOMOTION_OWNER": "nav2_via_single_unitree_bridge",
+                "G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED": "1",
+            },
+            clear=True,
+        ):
+            config = _configuration()
+        self.assertEqual(config["locomotion_owner"], "nav2_via_single_unitree_bridge")
+        self.assertTrue(config["controller_ownership_confirmed"])
+        self.assertTrue(controller_ownership_ready(
+            config["locomotion_owner"],
+            config["controller_ownership_confirmed"],
+        ))
+        self.assertFalse(controller_ownership_ready("unverified", True))
+        self.assertFalse(controller_ownership_ready("other_controller", True))
+        self.assertFalse(controller_ownership_ready("nav2_via_single_unitree_bridge", False))
 
 
 if __name__ == "__main__":

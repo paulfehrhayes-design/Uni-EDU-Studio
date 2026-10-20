@@ -340,6 +340,32 @@ test('teacher can check ROS navigation readiness without starting motion', async
         },
         pointcloudAgeMs: 50,
         map: { map_id: 'classroom', version: 'v4', frame_id: 'map' },
+        diagnostics: {
+          topics: { pointcloud: '/mid360/livox/lidar', map: '/map' },
+          frames: { pointcloud: 'livox_frame', map: 'map', base: 'base_link' },
+          pointcloud: {
+            rate_hz: 20,
+            age_ms: 50,
+            stamp_age_ms: 30,
+            callback_duration_ms: 2,
+            count: 100,
+          },
+          map: {
+            occupied_threshold: 65,
+            age_ms: 40,
+            metadata: {
+              resolution_m: 0.05,
+              origin: { x: -5, y: -3.75, yaw_rad: 0 },
+            },
+          },
+          localization: { quality: 'fresh_transform' },
+          actions: { navigation: true, route_preview: true, spin: true },
+          controller: {
+            owner: 'nav2_via_single_unitree_bridge',
+            ready: true,
+          },
+          execution_enabled: true,
+        },
       }),
     });
   });
@@ -350,6 +376,9 @@ test('teacher can check ROS navigation readiness without starting motion', async
   await expect(page.getByRole('status').filter({
     hasText: 'Ready • map classroom • version v4 • map • pose 1.20, -0.40 m (80 ms old) • MID-360 50 ms old',
   })).toBeVisible();
+  await expect(page.getByTestId('navigation-diagnostics')).toContainText('/mid360/livox/lidar');
+  await expect(page.getByTestId('navigation-diagnostics')).toContainText('20.0 Hz measured');
+  await expect(page.getByTestId('navigation-diagnostics')).toContainText('nav2_via_single_unitree_bridge');
 });
 
 test('teacher can load and hide the ROS occupancy map', async ({ page }) => {
@@ -792,6 +821,7 @@ test('teacher can preview a route without motion before starting Nav2', async ({
     });
   });
   let navigationStartCalls = 0;
+  let operationPollCalls = 0;
   await page.route('**/api/navigation/start', async (route) => {
     navigationStartCalls += 1;
     const request = route.request().postDataJSON();
@@ -827,6 +857,7 @@ test('teacher can preview a route without motion before starting Nav2', async ({
     });
   });
   await page.route('**/api/navigation/operation/*', async (route) => {
+    operationPollCalls += 1;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -876,6 +907,7 @@ test('teacher can preview a route without motion before starting Nav2', async ({
   await page.getByRole('button', { name: 'Check status' }).click();
   await expect(startNavigation).toBeEnabled();
   await page.getByRole('button', { name: 'Start Nav2' }).click();
+  await expect.poll(() => operationPollCalls).toBeGreaterThan(0);
   await expect(page.getByTestId('navigation-execution-status')).toContainText('Navigation completed');
 });
 

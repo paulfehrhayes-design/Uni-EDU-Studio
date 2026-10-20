@@ -1,6 +1,8 @@
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -890,6 +892,74 @@ class G1RobotProgramTests(unittest.TestCase):
             self.assertIn("Start failed with code 3102", raised.exception.detail)
         finally:
             g1_robot._client = original_client
+
+    def test_sdk_probe_3102_keeps_connection_closed_before_motion_dispatch(self):
+        class FakeLocoClient:
+            def SetTimeout(self, timeout):
+                pass
+
+            def Init(self):
+                return 0
+
+            def GetFsmId(self):
+                return 3102, 0
+
+        def unexpected_client():
+            self.fail("The SDK probe must pass before other physical clients are initialized.")
+
+        package_names = (
+            "unitree_sdk2py",
+            "unitree_sdk2py.core",
+            "unitree_sdk2py.g1",
+            "unitree_sdk2py.g1.loco",
+            "unitree_sdk2py.g1.arm",
+            "unitree_sdk2py.g1.audio",
+        )
+        modules = {}
+        for name in package_names:
+            module = types.ModuleType(name)
+            module.__path__ = []
+            modules[name] = module
+        channel_module = types.ModuleType("unitree_sdk2py.core.channel")
+        channel_module.ChannelFactoryInitialize = lambda domain, interface: None
+        loco_module = types.ModuleType("unitree_sdk2py.g1.loco.g1_loco_client")
+        loco_module.LocoClient = FakeLocoClient
+        arm_module = types.ModuleType("unitree_sdk2py.g1.arm.g1_arm_action_client")
+        arm_module.G1ArmActionClient = unexpected_client
+        audio_module = types.ModuleType("unitree_sdk2py.g1.audio.g1_audio_client")
+        audio_module.AudioClient = unexpected_client
+        modules.update({
+            channel_module.__name__: channel_module,
+            loco_module.__name__: loco_module,
+            arm_module.__name__: arm_module,
+            audio_module.__name__: audio_module,
+        })
+        original_clients = (
+            g1_robot._client,
+            g1_robot._arm_client,
+            g1_robot._audio_client,
+            g1_robot._connected_interface,
+            g1_robot._connection_log_path,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+                os.environ, {"G1_DATA_DIR": temp_dir}
+            ), patch.dict(sys.modules, modules):
+                with self.assertRaises(HTTPException) as raised:
+                    g1_robot.connect_robot("eth0")
+                self.assertEqual(raised.exception.status_code, 502)
+                self.assertIn("RPC probe failed with code 3102", raised.exception.detail)
+                self.assertFalse(g1_robot.robot_status()["sdkAvailable"])
+                with self.assertRaisesRegex(HTTPException, "Connect the G1 SDK"):
+                    g1_robot.execute_robot_program("robot.walk(1)")
+        finally:
+            (
+                g1_robot._client,
+                g1_robot._arm_client,
+                g1_robot._audio_client,
+                g1_robot._connected_interface,
+                g1_robot._connection_log_path,
+            ) = original_clients
 
 
 if __name__ == "__main__":

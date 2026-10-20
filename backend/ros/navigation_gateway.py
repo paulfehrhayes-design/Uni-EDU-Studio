@@ -83,6 +83,8 @@ SCAN_ROTATION_RADIANS = 2 * math.pi
 SCAN_ROTATION_TOLERANCE_RADIANS = 0.15
 SCAN_SENSOR_MAX_AGE_SECONDS = 1.5
 SCAN_MAP_MAX_AGE_SECONDS = 2.0
+POINTCLOUD_MAX_FUTURE_SKEW_SECONDS = 0.1
+POINTCLOUD_RATE_WINDOW_SECONDS = 5.0
 
 
 class GatewayConfigurationError(ValueError):
@@ -115,6 +117,39 @@ def validate_estop_health(
     return {"ready": True, "age_ms": round(age_seconds * 1000), "error": None}
 
 
+def validate_pointcloud_timestamp(
+    seconds: int,
+    nanoseconds: int,
+    now_seconds: float | None = None,
+) -> float:
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or isinstance(nanoseconds, bool)
+        or not isinstance(nanoseconds, int)
+        or seconds < 0
+        or not 0 <= nanoseconds < 1_000_000_000
+    ):
+        raise ValueError("LiDAR point-cloud timestamp is invalid.")
+    stamp_seconds = seconds + nanoseconds / 1_000_000_000
+    if stamp_seconds <= 0:
+        raise ValueError("LiDAR point-cloud timestamp is missing.")
+    current_seconds = time.time() if now_seconds is None else now_seconds
+    age_seconds = current_seconds - stamp_seconds
+    if age_seconds < -POINTCLOUD_MAX_FUTURE_SKEW_SECONDS:
+        raise ValueError("LiDAR point-cloud timestamp is in the future.")
+    if age_seconds > SCAN_SENSOR_MAX_AGE_SECONDS:
+        raise ValueError(
+            f"LiDAR point-cloud timestamp is stale ({age_seconds * 1000:.0f} ms old; "
+            f"maximum is {SCAN_SENSOR_MAX_AGE_SECONDS * 1000:.0f} ms)."
+        )
+    return max(0.0, age_seconds)
+
+
+def controller_ownership_ready(owner: str, confirmed: bool) -> bool:
+    return owner == "nav2_via_single_unitree_bridge" and confirmed is True
+
+
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     raw = os.getenv(name, str(default))
     try:
@@ -145,9 +180,10 @@ def _configuration() -> dict[str, Any]:
     map_frame = os.getenv("G1_NAV_MAP_FRAME", "map").strip()
     base_frame = os.getenv("G1_NAV_BASE_FRAME", "base_link").strip()
     map_id = os.getenv("G1_NAV_MAP_ID", "nav2-map").strip()
+    locomotion_owner = os.getenv("G1_NAV_LOCOMOTION_OWNER", "unverified").strip()
     if not all((
         action_name, spin_action_name, plan_action_name, map_topic,
-        pointcloud_topic, map_frame, base_frame, map_id,
+        pointcloud_topic, map_frame, base_frame, map_id, locomotion_owner,
     )):
         raise GatewayConfigurationError("Action, map, frame, and map ID settings cannot be empty.")
     try:
@@ -178,6 +214,10 @@ def _configuration() -> dict[str, Any]:
         "estop_max_age_seconds": _env_int("G1_NAV_ESTOP_MAX_AGE_MS", 1000, 100, 5000) / 1000,
         "map_id": map_id,
         "occupied_threshold": threshold,
+        "locomotion_owner": locomotion_owner,
+        "controller_ownership_confirmed": os.getenv(
+            "G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED", "0"
+        ).strip() == "1",
     }
 
 
@@ -252,6 +292,12 @@ def _make_ros_node(config: dict[str, Any]):
             self.active_scan_id: str | None = None
             self.pointcloud_received_monotonic: float | None = None
             self.pointcloud_frame_id: str | None = None
+            self.pointcloud_stamp_age_ms: float | None = None
+            self.pointcloud_rate_started_monotonic = time.monotonic()
+            self.pointcloud_rate_window_count = 0
+            self.pointcloud_count = 0
+            self.pointcloud_rate_hz: float | None = None
+            self.pointcloud_callback_duration_ms: float | None = None
             self.estop_healthy: bool | None = None
             self.estop_received_monotonic: float | None = None
             self.robot_healthy: bool | None = None
@@ -347,8 +393,17 @@ def _make_ros_node(config: dict[str, Any]):
             )
 
         def _pointcloud_callback(self, message):
+            callback_started = time.monotonic()
             source_frame = str(message.header.frame_id).strip()
             if not source_frame:
+                return
+            try:
+                stamp_age_seconds = validate_pointcloud_timestamp(
+                    int(message.header.stamp.sec),
+                    int(message.header.stamp.nanosec),
+                )
+            except (TypeError, ValueError) as error:
+                self.get_logger().warning(f"Skipping invalid or stale LiDAR cloud: {error}")
                 return
             with self.lock:
                 scan_id = self.active_scan_id
@@ -367,8 +422,11 @@ def _make_ros_node(config: dict[str, Any]):
                         f"Skipping LiDAR readiness sample without a valid map transform: {error}"
                     )
                     return
-                self.pointcloud_received_monotonic = time.monotonic()
-                self.pointcloud_frame_id = source_frame
+                self._record_pointcloud(
+                    source_frame,
+                    stamp_age_seconds,
+                    time.monotonic() - callback_started,
+                )
                 return
             try:
                 if source_frame == self.config["map_frame"]:
@@ -415,8 +473,11 @@ def _make_ros_node(config: dict[str, Any]):
                 scan = self.scans.get(scan_id)
                 if not scan or scan["state"] != "scanning":
                     return
-                self.pointcloud_received_monotonic = time.monotonic()
-                self.pointcloud_frame_id = source_frame
+                self._record_pointcloud(
+                    source_frame,
+                    stamp_age_seconds,
+                    time.monotonic() - callback_started,
+                )
                 voxels = scan["voxels"]
                 for x, y, z in points:
                     key = (math.floor(x / 0.05), math.floor(y / 0.05), math.floor(z / 0.05))
@@ -425,6 +486,26 @@ def _make_ros_node(config: dict[str, Any]):
                     voxels[key] = (x, y, z)
                 scan["last_cloud_monotonic"] = time.monotonic()
                 scan["updated_at"] = _utc_now()
+
+        def _record_pointcloud(
+            self,
+            source_frame: str,
+            stamp_age_seconds: float,
+            callback_duration_seconds: float,
+        ) -> None:
+            now = time.monotonic()
+            with self.lock:
+                self.pointcloud_received_monotonic = now
+                self.pointcloud_frame_id = source_frame
+                self.pointcloud_stamp_age_ms = stamp_age_seconds * 1000
+                self.pointcloud_callback_duration_ms = callback_duration_seconds * 1000
+                self.pointcloud_count += 1
+                self.pointcloud_rate_window_count += 1
+                elapsed = now - self.pointcloud_rate_started_monotonic
+                if elapsed >= POINTCLOUD_RATE_WINDOW_SECONDS:
+                    self.pointcloud_rate_hz = self.pointcloud_rate_window_count / elapsed
+                    self.pointcloud_rate_started_monotonic = now
+                    self.pointcloud_rate_window_count = 0
 
         def _scan_health_tick(self):
             motion_health = self._motion_health_snapshot()
@@ -656,6 +737,14 @@ def _make_ros_node(config: dict[str, Any]):
 
         def start_scan(self) -> dict[str, Any]:
             with self.lock:
+                if not controller_ownership_ready(
+                    self.config["locomotion_owner"],
+                    self.config["controller_ownership_confirmed"],
+                ):
+                    raise GatewayHTTPError(
+                        503,
+                        "Single-controller ownership is not commissioned; no scan motion was started.",
+                    )
                 motion_health = self._motion_health_snapshot()
                 if not motion_health["ready"]:
                     raise GatewayHTTPError(503, motion_health["error"] or "Robot motion health is unavailable.")
@@ -965,12 +1054,22 @@ def _make_ros_node(config: dict[str, Any]):
                     time.monotonic() - self.pointcloud_received_monotonic
                     if self.pointcloud_received_monotonic is not None else math.inf
                 )
+                pointcloud_frame = self.pointcloud_frame_id
+                pointcloud_stamp_age_ms = self.pointcloud_stamp_age_ms
+                pointcloud_rate_hz = self.pointcloud_rate_hz
+                pointcloud_count = self.pointcloud_count
+                pointcloud_callback_duration_ms = self.pointcloud_callback_duration_ms
                 active = self.operations.get(self.active_operation_id) if self.active_operation_id else None
             map_ready = grid is not None and grid_age <= SCAN_MAP_MAX_AGE_SECONDS
             pointcloud_ready = pointcloud_age <= SCAN_SENSOR_MAX_AGE_SECONDS
             action_ready = self.action_client.server_is_ready()
             ready = bool(map_ready and pointcloud_ready and localization["ready"] and action_ready)
-            motion_ready = bool(ready and motion_health["ready"])
+            ownership_ready = controller_ownership_ready(
+                self.config["locomotion_owner"],
+                self.config["controller_ownership_confirmed"],
+            )
+            motion_ready = bool(ready and motion_health["ready"] and ownership_ready)
+            map_metadata = self._metadata(grid) if grid else None
             return {
                 "ready": ready,
                 "status": "ready" if ready else "unavailable",
@@ -984,7 +1083,44 @@ def _make_ros_node(config: dict[str, Any]):
                 "pointcloud_ready": pointcloud_ready,
                 "pointcloud_age_ms": round(max(0.0, pointcloud_age) * 1000) if math.isfinite(pointcloud_age) else None,
                 "localization": localization,
-                "map": self._metadata(grid) if grid else None,
+                "map": map_metadata,
+                "diagnostics": {
+                    "topics": {
+                        "pointcloud": self.config["pointcloud_topic"],
+                        "map": self.config["map_topic"],
+                    },
+                    "frames": {
+                        "pointcloud": pointcloud_frame,
+                        "map": self.config["map_frame"],
+                        "base": self.config["base_frame"],
+                    },
+                    "pointcloud": {
+                        "count": pointcloud_count,
+                        "rate_hz": pointcloud_rate_hz,
+                        "age_ms": round(max(0.0, pointcloud_age) * 1000)
+                        if math.isfinite(pointcloud_age) else None,
+                        "stamp_age_ms": round(pointcloud_stamp_age_ms, 1)
+                        if pointcloud_stamp_age_ms is not None else None,
+                        "callback_duration_ms": round(pointcloud_callback_duration_ms, 1)
+                        if pointcloud_callback_duration_ms is not None else None,
+                    },
+                    "map": {
+                        "occupied_threshold": self.config["occupied_threshold"],
+                        "metadata": map_metadata,
+                        "age_ms": round(max(0.0, grid_age) * 1000)
+                        if math.isfinite(grid_age) else None,
+                    },
+                    "actions": {
+                        "navigation": action_ready,
+                        "route_preview": self.plan_action_client.server_is_ready(),
+                        "spin": self.spin_action_client.server_is_ready(),
+                    },
+                    "controller": {
+                        "owner": self.config["locomotion_owner"],
+                        "ownership_confirmed": self.config["controller_ownership_confirmed"],
+                        "ready": ownership_ready,
+                    },
+                },
                 "active_operation": self._public_operation(active) if active else None,
                 "scan_rotation_ready": self.spin_action_client.server_is_ready(),
                 "route_preview_ready": self.plan_action_client.server_is_ready(),
@@ -1255,6 +1391,14 @@ def _make_ros_node(config: dict[str, Any]):
                 motion_health = self._motion_health_snapshot()
                 if not motion_health["ready"]:
                     raise GatewayHTTPError(503, motion_health["error"] or "Robot motion health is unavailable.")
+                if not controller_ownership_ready(
+                    self.config["locomotion_owner"],
+                    self.config["controller_ownership_confirmed"],
+                ):
+                    raise GatewayHTTPError(
+                        503,
+                        "Single-controller ownership is not commissioned; no navigation route was started.",
+                    )
                 if not self.action_client.server_is_ready():
                     raise GatewayHTTPError(503, "Nav2 NavigateThroughPoses action server is not ready.")
 

@@ -1536,6 +1536,7 @@ async def lidar_live_updates(websocket: WebSocket):
                     "localization": bridge_status.get("localization"),
                     "pointcloud_ready": bridge_status.get("pointcloudReady"),
                     "pointcloud_age_ms": bridge_status.get("pointcloudAgeMs"),
+                    "diagnostics": bridge_status.get("diagnostics"),
                     "error": bridge_status.get("error"),
                 },
                 "scan": scan_status,

@@ -34,6 +34,28 @@ class NavigationBridgeTests(unittest.TestCase):
             "planner_ready": True,
             "pointcloud_ready": True,
             "pointcloud_age_ms": 80,
+            "diagnostics": {
+                "topics": {"pointcloud": "/mid360/livox/lidar", "map": "/map"},
+                "frames": {"pointcloud": "livox_frame", "map": "map", "base": "base_link"},
+                "pointcloud": {
+                    "count": 120,
+                    "rate_hz": 20.0,
+                    "age_ms": 80,
+                    "stamp_age_ms": 30.0,
+                    "callback_duration_ms": 2.5,
+                },
+                "map": {
+                    "occupied_threshold": 65,
+                    "metadata": None,
+                    "age_ms": 40,
+                },
+                "actions": {"navigation": True, "route_preview": True, "spin": True},
+                "controller": {
+                    "owner": "nav2_via_single_unitree_bridge",
+                    "ownership_confirmed": True,
+                    "ready": True,
+                },
+            },
             "estop": {"ready": True, "age_ms": 40, "error": None},
             "robot_health": {"ready": True, "age_ms": 30, "error": None},
             "localization": {
@@ -62,6 +84,7 @@ class NavigationBridgeTests(unittest.TestCase):
             {
                 "G1_NAV_BRIDGE_URL": "http://127.0.0.1:8282",
                 "G1_NAV_BRIDGE_TOKEN": "test-bridge-token",
+                "G1_NAV_EXECUTION_ENABLED": "1",
             },
         )
         self.environment.start()
@@ -92,6 +115,49 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertEqual(result["localization"]["age_ms"], 80)
         self.assertEqual(result["map"]["version"], "v4")
         self.assertEqual(result["map"]["width"], 200)
+        self.assertEqual(result["diagnostics"]["topics"]["pointcloud"], "/mid360/livox/lidar")
+        self.assertEqual(result["diagnostics"]["pointcloud"]["rate_hz"], 20.0)
+        self.assertTrue(result["diagnostics"]["actions"]["spin"])
+        self.assertTrue(result["diagnostics"]["controller"]["ready"])
+        self.assertTrue(result["diagnostics"]["execution_enabled"])
+
+    def test_unconfirmed_or_competing_controller_ownership_disables_motion(self):
+        for controller in (
+            {
+                "owner": "unverified",
+                "ownership_confirmed": False,
+                "ready": False,
+            },
+            {
+                "owner": "another_controller",
+                "ownership_confirmed": True,
+                "ready": True,
+            },
+        ):
+            status = {
+                **self.status,
+                "diagnostics": {
+                    **self.status["diagnostics"],
+                    "controller": controller,
+                },
+            }
+            with self.subTest(controller=controller), self.mock_bridge(status=status):
+                result = navigation_bridge_status(now=self.now)
+            self.assertTrue(result["ready"])
+            self.assertFalse(result["motionReady"])
+            self.assertFalse(result["diagnostics"]["controller"]["ready"])
+            self.assertIn("not commissioned", result["diagnostics"]["controller"]["error"])
+
+    def test_execution_disabled_keeps_map_ready_but_disables_scan_and_navigation(self):
+        with patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "0"}), self.mock_bridge():
+            result = navigation_bridge_status(now=self.now)
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["motionReady"])
+        self.assertFalse(result["diagnostics"]["execution_enabled"])
+        with patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "0"}), self.assertRaisesRegex(
+            NavigationBridgeError, "Physical scan execution is disabled"
+        ):
+            navigation_bridge.navigation_start_scan()
 
     def test_missing_estop_signal_keeps_preview_ready_but_disables_motion(self):
         status_without_estop = {key: value for key, value in self.status.items() if key != "estop"}
