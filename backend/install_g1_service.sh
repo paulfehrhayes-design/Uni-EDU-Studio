@@ -89,7 +89,7 @@ axis_confirmed = settings.get("G1_LIDAR_AXIS_CONFIRMED") == "1"
 calibration_confirmed = settings.get("G1_DISTANCE_CALIBRATION_CONFIRMED") == "1"
 if lidar_setup_succeeded and runtime == "host":
     dependencies = "uni-edu-lidar-driver.service"
-  if axis_confirmed and calibration_confirmed:
+    if axis_confirmed and calibration_confirmed:
         dependencies += " uni-edu-lidar-provider.service"
     unit = unit.replace(
         "Wants=network-online.target\n",
