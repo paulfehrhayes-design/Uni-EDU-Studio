@@ -323,6 +323,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
 
   const countProgramCommands = (nodes) => nodes.reduce((total, node) => {
     if (node.type === 'command') return total + 1;
+    if (node.type === 'boolean_assignment') return total;
     if (node.type === 'repeat') return total + node.times * countProgramCommands(node.body);
     return total + Math.max(countProgramCommands(node.then), countProgramCommands(node.else));
   }, 0);
@@ -859,6 +860,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
     });
     return closestDistance;
   };
+  const booleanVariables = new Map();
 
   const executeNodes = (nodes) => {
     nodes.forEach((node) => {
@@ -867,26 +869,43 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
         executeCommand([node.code, node.method, node.code.slice(openingParenthesis + 1, -1)]);
         return;
       }
+      if (node.type === 'boolean_assignment') {
+        booleanVariables.set(node.name, node.value);
+        actions.push({ label: 'Set Boolean variable', summary: `${node.name} = ${node.value}` });
+        timeline.push({ label: 'Set Boolean variable', summary: `${node.name} = ${node.value}` });
+        addFrame();
+        return;
+      }
       if (node.type === 'repeat') {
         for (let iteration = 0; iteration < node.times; iteration += 1) executeNodes(node.body);
         return;
       }
-      const sector = node.sensor === 'rear_distance_m' ? 'rear' : 'forward';
-      const distance = closestObstacleDistance(sector);
-      const operators = {
-        '<': (left, right) => left < right,
-        '<=': (left, right) => left <= right,
-        '>': (left, right) => left > right,
-        '>=': (left, right) => left >= right,
-        '==': (left, right) => left === right,
-        '!=': (left, right) => left !== right,
-      };
-      const selectedThen = operators[node.operator](distance, node.threshold);
-      const selectedBranch = selectedThen ? 'then' : 'else';
-      const side = sector === 'rear' ? 'rear' : 'forward';
-      const summary = `Nearest ${side} obstacle: ${distance.toFixed(2)} m ${node.operator} ${node.threshold} m → ${selectedBranch}`;
-      actions.push({ label: 'Distance condition', summary });
-      timeline.push({ label: 'Distance condition', summary });
+      let selectedThen;
+      let summary;
+      if (node.variable) {
+        if (!booleanVariables.has(node.variable)) {
+          throw new Error(`Boolean variable '${node.variable}' was not assigned before simulation.`);
+        }
+        selectedThen = booleanVariables.get(node.variable);
+        summary = `${node.variable} is ${selectedThen} → ${selectedThen ? 'then' : 'else'}`;
+      } else {
+        const sector = node.sensor === 'rear_distance_m' ? 'rear' : 'forward';
+        const distance = closestObstacleDistance(sector);
+        const operators = {
+          '<': (left, right) => left < right,
+          '<=': (left, right) => left <= right,
+          '>': (left, right) => left > right,
+          '>=': (left, right) => left >= right,
+          '==': (left, right) => left === right,
+          '!=': (left, right) => left !== right,
+        };
+        selectedThen = operators[node.operator](distance, node.threshold);
+        const side = sector === 'rear' ? 'rear' : 'forward';
+        summary = `Nearest ${side} obstacle: ${distance.toFixed(2)} m ${node.operator} ${node.threshold} m → ${selectedThen ? 'then' : 'else'}`;
+      }
+      const label = node.variable ? 'Boolean condition' : 'Distance condition';
+      actions.push({ label, summary });
+      timeline.push({ label, summary });
       addFrame();
       executeNodes(selectedThen ? node.then : node.else);
     });

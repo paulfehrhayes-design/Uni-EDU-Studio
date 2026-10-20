@@ -19,7 +19,7 @@ test('mock connection runs catalog robot commands and expands bounded loops', as
   );
   await assert.rejects(
     connection.run('if robot.front_distance_m() < 1:\n    robot.walk(1)'),
-    /require the authenticated G1 SDK backend and a live MID-360 sensor/,
+    /Conditional programs require the authenticated G1 SDK backend/,
   );
 });
 
@@ -39,12 +39,20 @@ test('SDK adapter wraps the existing API and rejects unsupported commands before
     + 'else:\n'
     + '    robot.turn("left", 90)',
   );
+  await connection.run(
+    'obstacle_detected = True\n'
+    + 'if obstacle_detected:\n'
+    + '    robot.walk(1)\n'
+    + 'else:\n'
+    + '    robot.stand()',
+  );
   await connection.stop();
   await assert.rejects(connection.run('robot.kickleft("mid")'), /not supported by the SDK connection/);
 
   assert.deepEqual(requests.map(([url]) => url), [
     '/api/robot/connect',
     '/api/robot/status',
+    '/api/run',
     '/api/run',
     '/api/run',
     '/api/stop',
@@ -55,6 +63,10 @@ test('SDK adapter wraps the existing API and rejects unsupported commands before
     code: 'robot.walk(1)\nrobot.wait(1)\nrobot.say("Hello, G1", 1)\nrobot.getvolume()',
   });
   assert.match(JSON.parse(requests[3][1].body).code, /else:/);
+  assert.equal(
+    JSON.parse(requests[4][1].body).code,
+    'obstacle_detected = True\nif obstacle_detected:\n    robot.walk(1)\nelse:\n    robot.stand()',
+  );
 });
 
 test('SDK status request can test LiDAR without running a robot command', async () => {
@@ -97,6 +109,10 @@ test('WebRTC adapter does not infer command support from an encoder alone', asyn
   });
 
   await assert.rejects(connection.run('robot.walk(1)'), /not supported by the WebRTC connection/);
+  await assert.rejects(
+    connection.run('flag = True\nif flag:\n    robot.walk(1)\nelse:\n    robot.stand()'),
+    /cannot evaluate sensor or Boolean branches/,
+  );
   assert.deepEqual(sentCommands, []);
 });
 

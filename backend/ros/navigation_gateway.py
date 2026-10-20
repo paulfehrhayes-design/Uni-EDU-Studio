@@ -89,6 +89,32 @@ class GatewayConfigurationError(ValueError):
     """Raised for invalid startup configuration."""
 
 
+def validate_estop_health(
+    healthy: bool | None,
+    age_seconds: float | None,
+    max_age_seconds: float,
+) -> dict[str, Any]:
+    if healthy is None or age_seconds is None:
+        return {"ready": False, "age_ms": None, "error": "E-stop health has not been reported."}
+    if (
+        not math.isfinite(age_seconds)
+        or age_seconds < 0
+        or age_seconds > max_age_seconds
+    ):
+        return {
+            "ready": False,
+            "age_ms": round(max(0.0, age_seconds) * 1000) if math.isfinite(age_seconds) else None,
+            "error": "E-stop health signal is stale.",
+        }
+    if not healthy:
+        return {
+            "ready": False,
+            "age_ms": round(age_seconds * 1000),
+            "error": "E-stop is engaged or the safety circuit is unhealthy.",
+        }
+    return {"ready": True, "age_ms": round(age_seconds * 1000), "error": None}
+
+
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     raw = os.getenv(name, str(default))
     try:
@@ -146,6 +172,10 @@ def _configuration() -> dict[str, Any]:
         "pointcloud_topic": pointcloud_topic,
         "map_frame": map_frame,
         "base_frame": base_frame,
+        "robot_healthy_topic": os.getenv("G1_NAV_ROBOT_HEALTHY_TOPIC", "").strip(),
+        "robot_health_max_age_seconds": _env_int("G1_NAV_ROBOT_HEALTH_MAX_AGE_MS", 1000, 100, 5000) / 1000,
+        "estop_healthy_topic": os.getenv("G1_NAV_ESTOP_HEALTHY_TOPIC", "").strip(),
+        "estop_max_age_seconds": _env_int("G1_NAV_ESTOP_MAX_AGE_MS", 1000, 100, 5000) / 1000,
         "map_id": map_id,
         "occupied_threshold": threshold,
     }
@@ -198,6 +228,7 @@ def _make_ros_node(config: dict[str, Any]):
     from rclpy.time import Time
     from sensor_msgs.msg import PointCloud2
     from sensor_msgs_py import point_cloud2
+    from std_msgs.msg import Bool
     from tf2_ros import Buffer, TransformException, TransformListener
 
     class NavigationGatewayNode(Node):
@@ -221,6 +252,10 @@ def _make_ros_node(config: dict[str, Any]):
             self.active_scan_id: str | None = None
             self.pointcloud_received_monotonic: float | None = None
             self.pointcloud_frame_id: str | None = None
+            self.estop_healthy: bool | None = None
+            self.estop_received_monotonic: float | None = None
+            self.robot_healthy: bool | None = None
+            self.robot_health_received_monotonic: float | None = None
             self.action_client = ActionClient(self, NavigateThroughPoses, config["action_name"])
             self.spin_action_client = ActionClient(self, Spin, config["spin_action_name"])
             self.plan_action_client = ActionClient(
@@ -235,7 +270,65 @@ def _make_ros_node(config: dict[str, Any]):
             self.pointcloud_subscription = self.create_subscription(
                 PointCloud2, config["pointcloud_topic"], self._pointcloud_callback, 10
             )
+            self.estop_subscription = (
+                self.create_subscription(
+                    Bool, config["estop_healthy_topic"], self._estop_callback, 10
+                )
+                if config["estop_healthy_topic"] else None
+            )
+            self.robot_health_subscription = (
+                self.create_subscription(
+                    Bool, config["robot_healthy_topic"], self._robot_health_callback, 10
+                )
+                if config["robot_healthy_topic"] else None
+            )
             self.scan_health_timer = self.create_timer(0.05, self._scan_health_tick)
+
+        def _estop_callback(self, message):
+            with self.lock:
+                self.estop_healthy = bool(message.data)
+                self.estop_received_monotonic = time.monotonic()
+
+        def _robot_health_callback(self, message):
+            with self.lock:
+                self.robot_healthy = bool(message.data)
+                self.robot_health_received_monotonic = time.monotonic()
+
+        def _estop_snapshot(self) -> dict[str, Any]:
+            with self.lock:
+                healthy = self.estop_healthy
+                received_monotonic = self.estop_received_monotonic
+            if not self.config["estop_healthy_topic"]:
+                return {"ready": False, "age_ms": None, "error": "E-stop health topic is not configured."}
+            age_seconds = time.monotonic() - received_monotonic if received_monotonic is not None else None
+            return validate_estop_health(
+                healthy,
+                age_seconds,
+                self.config["estop_max_age_seconds"],
+            )
+
+        def _robot_health_snapshot(self) -> dict[str, Any]:
+            with self.lock:
+                healthy = self.robot_healthy
+                received_monotonic = self.robot_health_received_monotonic
+            if not self.config["robot_healthy_topic"]:
+                return {"ready": False, "age_ms": None, "error": "Robot-control health topic is not configured."}
+            age_seconds = time.monotonic() - received_monotonic if received_monotonic is not None else None
+            return validate_estop_health(
+                healthy,
+                age_seconds,
+                self.config["robot_health_max_age_seconds"],
+            )
+
+        def _motion_health_snapshot(self) -> dict[str, Any]:
+            estop = self._estop_snapshot()
+            robot = self._robot_health_snapshot()
+            return {
+                "ready": estop["ready"] and robot["ready"],
+                "estop": estop,
+                "robot": robot,
+                "error": estop["error"] or robot["error"],
+            }
 
         @staticmethod
         def _rotate_point(point: tuple[float, float, float], rotation: Any) -> tuple[float, float, float]:
@@ -334,6 +427,28 @@ def _make_ros_node(config: dict[str, Any]):
                 scan["updated_at"] = _utc_now()
 
         def _scan_health_tick(self):
+            motion_health = self._motion_health_snapshot()
+            if not motion_health["ready"]:
+                with self.lock:
+                    operation_id = self.active_operation_id
+                    operation = self.operations.get(operation_id) if operation_id else None
+                    scan_id = self.active_scan_id
+                    scan = self.scans.get(scan_id) if scan_id else None
+                reason = motion_health["error"] or "Robot motion health is unavailable."
+                if operation and operation["state"] not in TERMINAL_STATES:
+                    try:
+                        self.cancel_operation(operation_id)
+                    except GatewayHTTPError as error:
+                        self.get_logger().error(
+                            f"E-stop health failed during navigation; cancellation is unconfirmed and locomotion remains locked: {error}"
+                        )
+                if (
+                    scan
+                    and scan["state"] == "scanning"
+                    and scan.get("rotation_status") not in {"cancel_requested", "uncertain"}
+                ):
+                    self._abort_scan(scan_id, f"{reason} Scan rotation cancellation requested.")
+                    return
             with self.lock:
                 scan_id = self.active_scan_id
                 scan = self.scans.get(scan_id) if scan_id else None
@@ -541,6 +656,9 @@ def _make_ros_node(config: dict[str, Any]):
 
         def start_scan(self) -> dict[str, Any]:
             with self.lock:
+                motion_health = self._motion_health_snapshot()
+                if not motion_health["ready"]:
+                    raise GatewayHTTPError(503, motion_health["error"] or "Robot motion health is unavailable.")
                 if self.grid is None:
                     raise GatewayHTTPError(503, "A valid SLAM OccupancyGrid is required before scanning.")
                 if (
@@ -836,6 +954,7 @@ def _make_ros_node(config: dict[str, Any]):
 
         def status_snapshot(self) -> dict[str, Any]:
             localization = self._localization_snapshot()
+            motion_health = self._motion_health_snapshot()
             with self.lock:
                 grid = self.grid
                 grid_age = (
@@ -851,9 +970,13 @@ def _make_ros_node(config: dict[str, Any]):
             pointcloud_ready = pointcloud_age <= SCAN_SENSOR_MAX_AGE_SECONDS
             action_ready = self.action_client.server_is_ready()
             ready = bool(map_ready and pointcloud_ready and localization["ready"] and action_ready)
+            motion_ready = bool(ready and motion_health["ready"])
             return {
                 "ready": ready,
                 "status": "ready" if ready else "unavailable",
+                "motion_ready": motion_ready,
+                "estop": motion_health["estop"],
+                "robot_health": motion_health["robot"],
                 "planner_ready": bool(map_ready and action_ready),
                 "action_server_ready": action_ready,
                 "map_ready": map_ready,
@@ -1129,6 +1252,9 @@ def _make_ros_node(config: dict[str, Any]):
                     scan = self.scans.get(self.active_scan_id)
                     if scan and scan["state"] not in {"completed", "failed", "canceled"}:
                         raise GatewayHTTPError(409, "A 360-degree LiDAR scan owns locomotion.")
+                motion_health = self._motion_health_snapshot()
+                if not motion_health["ready"]:
+                    raise GatewayHTTPError(503, motion_health["error"] or "Robot motion health is unavailable.")
                 if not self.action_client.server_is_ready():
                     raise GatewayHTTPError(503, "Nav2 NavigateThroughPoses action server is not ready.")
 

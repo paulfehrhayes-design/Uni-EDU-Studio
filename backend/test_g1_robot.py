@@ -12,6 +12,7 @@ try:
 except ImportError:
     import g1_robot
     from g1_robot import CommandValidationError, parse_robot_program
+    from g1_robot import CommandValidationError, parse_robot_program
 
 
 class G1RobotProgramTests(unittest.TestCase):
@@ -64,6 +65,64 @@ class G1RobotProgramTests(unittest.TestCase):
                 "else": [{"method": "turn", "direction": "left", "degrees": 90}],
             }],
         )
+
+    def test_boolean_condition_parses_as_a_structured_branch(self):
+        nodes = parse_robot_program(
+            "obstacle_detected = True\n"
+            "if obstacle_detected:\n"
+            "    robot.stand()\n"
+            "else:\n"
+            "    robot.stand_to_squat()"
+        )
+        self.assertEqual(nodes[0], {
+            "type": "boolean_assignment",
+            "name": "obstacle_detected",
+            "value": True,
+        })
+        self.assertEqual(nodes[1]["variable"], "obstacle_detected")
+        self.assertEqual(nodes[1]["then"][0]["method"], "stand")
+        self.assertEqual(nodes[1]["else"][0]["method"], "stand_to_squat")
+
+    def test_boolean_condition_executes_only_the_selected_supported_branch(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.fsm_ids = []
+
+            def SetFsmId(self, fsm_id):
+                self.fsm_ids.append(fsm_id)
+                return 0
+
+        program = (
+            "obstacle_detected = True\n"
+            "if obstacle_detected:\n"
+            "    robot.stand()\n"
+            "else:\n"
+            "    robot.stand_to_squat()"
+        )
+        original_client = g1_robot._client
+        client = FakeLocoClient()
+        g1_robot._client = client
+        try:
+            result = g1_robot.execute_robot_program(program)
+            self.assertEqual(client.fsm_ids, [500])
+            self.assertEqual(result["conditionsEvaluated"][0]["branch"], "then")
+
+            client.fsm_ids.clear()
+            result = g1_robot.execute_robot_program(program.replace("= True", "= False"))
+            self.assertEqual(client.fsm_ids, [706])
+            self.assertEqual(result["conditionsEvaluated"][0]["branch"], "else")
+        finally:
+            g1_robot._client = original_client
+
+    def test_boolean_condition_rejects_unassigned_names_and_dynamic_expressions(self):
+        for code in (
+            "if obstacle_detected:\n    robot.stand()",
+            "obstacle_detected = robot.getfsm()\nrobot.stand()",
+            "obstacle_detected = True\nif robot.getfsm():\n    robot.stand()",
+            "obstacle_detected = True\nif not obstacle_detected:\n    robot.stand()",
+        ):
+            with self.subTest(code=code), self.assertRaises(CommandValidationError):
+                parse_robot_program(code)
 
     def test_distance_condition_loops_remain_structured_and_are_bounded(self):
         nodes = parse_robot_program(
@@ -201,6 +260,44 @@ class G1RobotProgramTests(unittest.TestCase):
 
         self.assertEqual(result["conditionsEvaluated"][0]["branch"], "else")
         self.assertTrue(result["conditionsEvaluated"][0]["clear"])
+
+    def test_clear_sector_aborts_ambiguous_distance_threshold_and_requests_stop(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.stop_count = 0
+
+            def SetFsmId(self, fsm_id):
+                return 0
+
+            def StopMove(self):
+                self.stop_count += 1
+                return 0
+
+        client = FakeLocoClient()
+        original_client = g1_robot._client
+        g1_robot._client = client
+        try:
+            with patch.object(
+                g1_robot,
+                "get_front_distance_sample",
+                return_value={
+                    "distance_m": None,
+                    "clear": True,
+                    "max_range_m": 39.5,
+                    "age_ms": 15,
+                    "timestamp": "sample",
+                },
+            ), self.assertRaisesRegex(HTTPException, "comparison < 40 m is ambiguous"):
+                g1_robot.execute_robot_program(
+                    "if robot.front_distance_m() < 40:\n"
+                    "    robot.stand()\n"
+                    "else:\n"
+                    "    robot.stand_to_squat()"
+                )
+        finally:
+            g1_robot._client = original_client
+
+        self.assertEqual(client.stop_count, 1)
 
     def test_invalid_distance_requests_sdk_stop_and_aborts_without_else(self):
         class FakeLocoClient:

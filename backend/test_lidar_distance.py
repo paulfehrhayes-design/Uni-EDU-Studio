@@ -20,7 +20,11 @@ class LidarDistanceTests(unittest.TestCase):
             "distance_m": 0.85,
             "timestamp": (self.now - timedelta(milliseconds=100)).isoformat(),
             "sensor_id": "mid360-front",
-            "frame_id": "lidar_link",
+            "sensor_frame_id": "livox_frame",
+            "frame_id": "base_link",
+            "measurement": "footprint_clearance",
+            "calibrated": True,
+            "max_range_m": 39.5,
         }
         self.environment = patch.dict(
             "os.environ",
@@ -29,7 +33,9 @@ class LidarDistanceTests(unittest.TestCase):
                 "G1_DISTANCE_REAR_PROVIDER_URL": "http://127.0.0.1:8181/distance/rear",
                 "G1_DISTANCE_PROVIDER_TOKEN": "test-token",
                 "G1_DISTANCE_SENSOR_ID": "mid360-front",
-                "G1_DISTANCE_FRAME_ID": "lidar_link",
+                "G1_DISTANCE_FRAME_ID": "livox_frame",
+                "G1_DISTANCE_BASE_FRAME": "base_link",
+                "G1_DISTANCE_CALIBRATION_CONFIRMED": "1",
                 "G1_LIDAR_AXIS_CONFIRMED": "1",
             },
         )
@@ -44,6 +50,8 @@ class LidarDistanceTests(unittest.TestCase):
         self.assertEqual(sample["distance_m"], 0.85)
         self.assertEqual(sample["age_ms"], 100)
         self.assertEqual(sample["sensor_id"], "mid360-front")
+        self.assertEqual(sample["frame_id"], "base_link")
+        self.assertTrue(sample["calibrated"])
         request.assert_called_once_with(
             "http://127.0.0.1:8181/distance/front",
             headers={"Authorization": "Bearer test-token", "Accept": "application/json"},
@@ -117,6 +125,28 @@ class LidarDistanceTests(unittest.TestCase):
                     get_front_distance_sample(now=self.now)
         request.assert_not_called()
 
+    def test_unconfirmed_transform_or_footprint_calibration_disables_conditions(self):
+        with patch.dict("os.environ", {"G1_DISTANCE_CALIBRATION_CONFIRMED": "0"}):
+            with patch.object(lidar_distance.httpx, "get") as request:
+                with self.assertRaisesRegex(DistanceSensorError, "transform and footprint calibration are unconfirmed"):
+                    get_front_distance_sample(now=self.now)
+        request.assert_not_called()
+
+    def test_provider_must_report_calibrated_base_frame_clearance(self):
+        invalid_payloads = (
+            {**self.payload, "frame_id": "odom"},
+            {**self.payload, "sensor_frame_id": "other_lidar"},
+            {**self.payload, "calibrated": False},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), patch.object(
+                lidar_distance.httpx,
+                "get",
+                return_value=SimpleNamespace(status_code=200, json=lambda payload=payload: payload),
+            ):
+                with self.assertRaises(DistanceSensorError):
+                    get_front_distance_sample(now=self.now)
+
     def test_rear_provider_requires_a_fresh_rear_sample(self):
         payload = {**self.payload, "sector": "rear", "distance_m": 1.2}
         response = SimpleNamespace(status_code=200, json=lambda: payload)
@@ -159,7 +189,7 @@ class LidarDistanceTests(unittest.TestCase):
                 {**self.payload, "timestamp": (self.now + timedelta(seconds=1)).isoformat()},
                 "in the future",
             ),
-            ({**self.payload, "distance_m": 0}, "greater than 0"),
+            ({**self.payload, "distance_m": -0.1}, "at least 0"),
             ({**self.payload, "distance_m": True}, "numeric meters"),
         ):
             with self.subTest(payload=payload), patch.object(
@@ -169,6 +199,16 @@ class LidarDistanceTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(DistanceSensorError, expected):
                     get_front_distance_sample(now=self.now)
+
+    def test_zero_footprint_clearance_is_a_valid_contact_measurement(self):
+        payload = {**self.payload, "distance_m": 0.0}
+        with patch.object(
+            lidar_distance.httpx,
+            "get",
+            return_value=SimpleNamespace(status_code=200, json=lambda: payload),
+        ):
+            sample = get_front_distance_sample(now=self.now)
+        self.assertEqual(sample["distance_m"], 0.0)
 
     def test_sensor_status_reports_provider_unavailable_explicitly(self):
         with patch.object(

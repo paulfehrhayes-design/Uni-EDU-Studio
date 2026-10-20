@@ -11,7 +11,212 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
 
 MAX_SAMPLE_AGE_SECONDS = 0.5
+MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
+
+
+def transform_point_to_base(
+    point: tuple[float, float, float],
+    translation: tuple[float, float, float],
+    rotation: tuple[float, float, float, float],
+) -> tuple[float, float, float]:
+    x, y, z = point
+    tx, ty, tz = translation
+    qx, qy, qz, qw = rotation
+    values = (x, y, z, tx, ty, tz, qx, qy, qz, qw)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("LiDAR-to-base transform values must be finite.")
+    quaternion_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if quaternion_norm <= 1e-9:
+        raise ValueError("LiDAR-to-base rotation quaternion is invalid.")
+    qx, qy, qz, qw = (value / quaternion_norm for value in (qx, qy, qz, qw))
+    cross_x = 2 * (qy * z - qz * y)
+    cross_y = 2 * (qz * x - qx * z)
+    cross_z = 2 * (qx * y - qy * x)
+    return (
+        x + qw * cross_x + qy * cross_z - qz * cross_y + tx,
+        y + qw * cross_y + qz * cross_x - qx * cross_z + ty,
+        z + qw * cross_z + qx * cross_y - qy * cross_x + tz,
+    )
+
+
+def footprint_clearance_m(
+    x: float,
+    y: float,
+    front_extent_m: float,
+    rear_extent_m: float,
+    half_width_m: float,
+) -> float | None:
+    values = (x, y, front_extent_m, rear_extent_m, half_width_m)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Robot footprint and point coordinates must be finite.")
+    if min(front_extent_m, rear_extent_m, half_width_m) <= 0:
+        raise ValueError("Robot footprint extents must be greater than zero.")
+    radius = math.hypot(x, y)
+    if radius == 0 or x == 0:
+        return None
+    longitudinal_extent = front_extent_m if x > 0 else rear_extent_m
+    boundary_candidates = [longitudinal_extent * radius / abs(x)]
+    if y != 0:
+        boundary_candidates.append(half_width_m * radius / abs(y))
+    return max(0.0, radius - min(boundary_candidates))
+
+
+def footprint_clear_range_m(
+    front_extent_m: float,
+    rear_extent_m: float,
+    half_width_m: float,
+    sensor_origin_x: float,
+    sensor_origin_y: float,
+    sector: str,
+) -> float:
+    values = (front_extent_m, rear_extent_m, half_width_m, sensor_origin_x, sensor_origin_y)
+    if sector not in {"forward", "rear"} or not all(math.isfinite(value) for value in values):
+        raise ValueError("Footprint clearance configuration is invalid.")
+    if min(front_extent_m, rear_extent_m, half_width_m) <= 0:
+        raise ValueError("Robot footprint extents must be greater than zero.")
+    edge_x = front_extent_m if sector == "forward" else -rear_extent_m
+    farthest_corner = max(
+        math.hypot(edge_x - sensor_origin_x, edge_y - sensor_origin_y)
+        for edge_y in (-half_width_m, half_width_m)
+    )
+    return max(0.0, MAX_DISTANCE_METERS - farthest_corner)
+
+
+def pointcloud_ranges_array(points: object):
+    import numpy as np
+
+    values = np.asarray(points)
+    fields = values.dtype.names
+    if fields and all(axis in fields for axis in ("x", "y", "z")):
+        return np.hypot(values["x"], values["y"])
+    if values.ndim == 2 and values.shape[1] >= 3:
+        return np.hypot(values[:, 0], values[:, 1])
+    raise ValueError("Point cloud XYZ data must contain x, y, and z fields.")
+
+
+def validate_pointcloud_timestamp(
+    seconds: int,
+    nanoseconds: int,
+    now_seconds: float | None = None,
+) -> datetime:
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or isinstance(nanoseconds, bool)
+        or not isinstance(nanoseconds, int)
+        or seconds < 0
+        or not 0 <= nanoseconds < 1_000_000_000
+    ):
+        raise ValueError("LiDAR point-cloud timestamp is invalid.")
+    timestamp_seconds = seconds + nanoseconds / 1_000_000_000
+    if timestamp_seconds <= 0:
+        raise ValueError("LiDAR point-cloud timestamp is missing.")
+    current_seconds = time.time() if now_seconds is None else now_seconds
+    age_seconds = current_seconds - timestamp_seconds
+    if age_seconds < -MAX_FUTURE_SKEW_SECONDS:
+        raise ValueError("LiDAR point-cloud timestamp is too far in the future.")
+    if age_seconds > MAX_SAMPLE_AGE_SECONDS:
+        raise ValueError(
+            f"LiDAR point cloud is stale ({age_seconds * 1000:.0f} ms old; "
+            f"maximum is {MAX_SAMPLE_AGE_SECONDS * 1000:.0f} ms)."
+        )
+    return datetime.fromtimestamp(timestamp_seconds, timezone.utc)
+
+
+def _rotation_matrix(rotation: tuple[float, float, float, float]) -> tuple[tuple[float, float, float], ...]:
+    qx, qy, qz, qw = rotation
+    if not all(math.isfinite(value) for value in rotation):
+        raise ValueError("LiDAR-to-base rotation quaternion must be finite.")
+    quaternion_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if quaternion_norm <= 1e-9:
+        raise ValueError("LiDAR-to-base rotation quaternion is invalid.")
+    qx, qy, qz, qw = (value / quaternion_norm for value in rotation)
+    return (
+        (1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)),
+        (2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)),
+        (2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)),
+    )
+
+
+def transform_points_to_base_array(
+    points: object,
+    translation: tuple[float, float, float],
+    rotation: tuple[float, float, float, float],
+):
+    import numpy as np
+
+    values = np.asarray(points)
+    fields = values.dtype.names
+    if fields and all(axis in fields for axis in ("x", "y", "z")):
+        xyz = np.column_stack((values["x"], values["y"], values["z"]))
+    elif values.ndim == 2 and values.shape[1] >= 3:
+        xyz = values[:, :3]
+    else:
+        raise ValueError("Point cloud XYZ data must contain x, y, and z fields.")
+    if not all(math.isfinite(value) for value in translation):
+        raise ValueError("LiDAR-to-base translation must be finite.")
+    matrix = np.asarray(_rotation_matrix(rotation), dtype=float)
+    return xyz @ matrix.T + np.asarray(translation, dtype=float)
+
+
+def select_footprint_distances_array(
+    points: object,
+    half_angle_degrees: float,
+    minimum_height_m: float,
+    maximum_height_m: float,
+    front_extent_m: float,
+    rear_extent_m: float,
+    half_width_m: float,
+    sensor_ranges_m: object | None = None,
+) -> tuple[float | None, float | None, int]:
+    import numpy as np
+
+    if not 1 <= half_angle_degrees <= 45 or minimum_height_m >= maximum_height_m:
+        raise ValueError("LiDAR sector and height limits are invalid.")
+    if min(front_extent_m, rear_extent_m, half_width_m) <= 0 or not all(
+        math.isfinite(value)
+        for value in (front_extent_m, rear_extent_m, half_width_m)
+    ):
+        raise ValueError("Calibrated robot footprint extents must be finite and greater than zero.")
+    xyz = np.asarray(points)
+    if xyz.ndim != 2 or xyz.shape[1] < 3:
+        raise ValueError("Transformed point cloud must contain XYZ columns.")
+    x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    valid_count = int(np.count_nonzero(finite))
+    if valid_count == 0:
+        raise ValueError("Point cloud contains no finite XYZ returns.")
+
+    radius = np.hypot(x, y)
+    sensor_ranges = radius if sensor_ranges_m is None else np.asarray(sensor_ranges_m)
+    if sensor_ranges.shape != radius.shape or not np.all(np.isfinite(sensor_ranges[finite])):
+        raise ValueError("Point cloud sensor ranges are invalid.")
+    tangent = math.tan(math.radians(half_angle_degrees))
+    in_height = finite & (z >= minimum_height_m) & (z <= maximum_height_m)
+    in_range = sensor_ranges <= MAX_DISTANCE_METERS
+    front = in_height & in_range & (x > 0) & (np.abs(y) <= x * tangent)
+    rear = in_height & in_range & (x < 0) & (np.abs(y) <= -x * tangent)
+    half_width = max(half_width_m, 1e-9)
+    lateral_boundary = np.divide(
+        half_width * radius,
+        np.abs(y),
+        out=np.full_like(radius, np.inf, dtype=float),
+        where=np.abs(y) > 1e-9,
+    )
+    front_boundary = np.minimum(front_extent_m * radius / np.maximum(x, 1e-9), lateral_boundary)
+    rear_boundary = np.minimum(rear_extent_m * radius / np.maximum(-x, 1e-9), lateral_boundary)
+    clearance = np.minimum(
+        MAX_DISTANCE_METERS,
+        np.maximum(0.0, radius - np.minimum(front_boundary, rear_boundary)),
+    )
+    front_distances = clearance[front]
+    rear_distances = clearance[rear]
+    return (
+        float(np.min(front_distances)) if front_distances.size else None,
+        float(np.min(rear_distances)) if rear_distances.size else None,
+        valid_count,
+    )
 
 
 def select_sector_distances(
@@ -95,14 +300,26 @@ def _point_values(point: object) -> tuple[float, float, float]:
 
 
 class SampleCache:
-    def __init__(self, sensor_id: str, frame_id: str):
+    def __init__(
+        self,
+        sensor_id: str,
+        frame_id: str,
+        max_ranges_m: dict[str, float] | None = None,
+    ):
         self.sensor_id = sensor_id
         self.frame_id = frame_id
+        self.max_ranges_m = max_ranges_m or {
+            "forward": MAX_DISTANCE_METERS,
+            "rear": MAX_DISTANCE_METERS,
+        }
         self._lock = threading.Lock()
         self._distances_m: dict[str, float | None] = {"forward": None, "rear": None}
         self._received_at: datetime | None = None
         self._received_monotonic: float | None = None
         self._sample_frame_id: str | None = None
+        self._sensor_frame_id: str | None = None
+        self._calibrated = False
+        self._last_error: str | None = None
         self._cloud_count = 0
 
     def update(self, points: Iterable[object], frame_id: str, half_angle: float, min_z: float, max_z: float) -> None:
@@ -119,13 +336,30 @@ class SampleCache:
         front_distance: float | None,
         rear_distance: float | None,
         frame_id: str,
+        sensor_frame_id: str | None = None,
+        captured_at: datetime | None = None,
+        calibrated: bool = False,
+        max_ranges_m: dict[str, float] | None = None,
     ) -> None:
         with self._lock:
             self._distances_m = {"forward": front_distance, "rear": rear_distance}
-            self._received_at = datetime.now(timezone.utc)
-            self._received_monotonic = time.monotonic()
+            self._received_at = captured_at or datetime.now(timezone.utc)
+            acquisition_age = max(
+                0.0,
+                (datetime.now(timezone.utc) - self._received_at).total_seconds(),
+            )
+            self._received_monotonic = time.monotonic() - acquisition_age
             self._sample_frame_id = frame_id
+            self._sensor_frame_id = sensor_frame_id or frame_id
+            self._calibrated = calibrated
+            if max_ranges_m is not None:
+                self.max_ranges_m = max_ranges_m
+            self._last_error = None
             self._cloud_count += 1
+
+    def mark_unavailable(self, reason: str) -> None:
+        with self._lock:
+            self._last_error = reason
 
     def unavailable_reason(self) -> str:
         with self._lock:
@@ -133,6 +367,9 @@ class SampleCache:
             received_monotonic = self._received_monotonic
             frame_id = self._sample_frame_id
             cloud_count = self._cloud_count
+            last_error = self._last_error
+        if last_error:
+            return last_error
         if cloud_count == 0 or received_at is None or received_monotonic is None:
             return "Provider has not received a point cloud yet."
         if frame_id != self.frame_id:
@@ -155,7 +392,11 @@ class SampleCache:
             received_at = self._received_at
             received_monotonic = self._received_monotonic
             frame_id = self._sample_frame_id
-        if received_at is None or received_monotonic is None or frame_id != self.frame_id:
+            sensor_frame_id = self._sensor_frame_id
+            calibrated = self._calibrated
+            max_range_m = self.max_ranges_m[sector]
+            last_error = self._last_error
+        if last_error or received_at is None or received_monotonic is None or frame_id != self.frame_id:
             return None
         age = time.monotonic() - received_monotonic
         if age < 0 or age > MAX_SAMPLE_AGE_SECONDS:
@@ -165,10 +406,14 @@ class SampleCache:
             "sector": sector,
             "distance_m": distance,
             "clear": distance is None,
-            "max_range_m": MAX_DISTANCE_METERS,
+            "max_range_m": max_range_m,
             "timestamp": received_at.isoformat(),
+            "age_ms": max(0, round(age * 1000)),
             "sensor_id": self.sensor_id,
             "frame_id": frame_id,
+            "sensor_frame_id": sensor_frame_id,
+            "measurement": "footprint_clearance" if calibrated else "sensor_frame_range",
+            "calibrated": calibrated,
         }
 
 
@@ -215,30 +460,62 @@ def serve_http(cache: SampleCache, host: str, port: int, token: str) -> Threadin
 
 def main() -> None:
     import rclpy
+    from geometry_msgs.msg import TransformStamped
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs_py import point_cloud2
     from sensor_msgs.msg import PointCloud2
+    from rclpy.duration import Duration
+    from rclpy.time import Time
+    from tf2_ros import Buffer, TransformException, TransformListener
 
     topic = os.environ.get("G1_LIDAR_TOPIC", "/mid360/livox/lidar")
     sensor_id = os.environ["G1_DISTANCE_SENSOR_ID"]
-    frame_id = os.environ["G1_DISTANCE_FRAME_ID"]
+    sensor_frame_id = os.environ["G1_DISTANCE_FRAME_ID"].strip()
+    base_frame_id = os.environ.get("G1_DISTANCE_BASE_FRAME", "").strip()
     token = os.environ["G1_DISTANCE_PROVIDER_TOKEN"]
     host = os.environ.get("G1_DISTANCE_PROVIDER_BIND_HOST", "127.0.0.1")
     port = int(os.environ.get("G1_DISTANCE_PROVIDER_PORT", "8181"))
     half_angle = float(os.environ.get("G1_LIDAR_FORWARD_HALF_ANGLE_DEGREES", "15"))
     minimum_height = float(os.environ.get("G1_LIDAR_MINIMUM_HEIGHT_M", "-0.5"))
     maximum_height = float(os.environ.get("G1_LIDAR_MAXIMUM_HEIGHT_M", "1.5"))
+    calibration_error = None
+    if os.getenv("G1_LIDAR_AXIS_CONFIRMED", "0").strip() != "1":
+        calibration_error = "MID-360 axis alignment is not confirmed."
+    if os.getenv("G1_DISTANCE_CALIBRATION_CONFIRMED", "0").strip() != "1":
+        calibration_error = "MID-360-to-robot transform and footprint calibration are not confirmed."
+    try:
+        footprint = {
+            key: float(os.environ[f"G1_DISTANCE_FOOTPRINT_{key.upper()}_M"])
+            for key in ("front", "rear", "half_width")
+        }
+        if any(not math.isfinite(value) or value <= 0 for value in footprint.values()):
+            raise ValueError("Robot footprint extents must be finite and greater than zero.")
+    except (KeyError, ValueError) as error:
+        footprint = None
+        calibration_error = f"Calibrated robot footprint is not configured: {error}."
+    if not base_frame_id:
+        calibration_error = "G1_DISTANCE_BASE_FRAME is required for calibrated distance measurements."
+    if not sensor_frame_id:
+        calibration_error = "G1_DISTANCE_FRAME_ID is required for calibrated distance measurements."
     if not 1 <= half_angle <= 45 or minimum_height >= maximum_height:
         raise ValueError("Invalid LiDAR forward-sector or height configuration.")
-
     class LidarNode(Node):
         def __init__(self) -> None:
             super().__init__("uni_edu_lidar_distance_provider")
-            self.cache = SampleCache(sensor_id, frame_id)
+            self.cache = SampleCache(
+                sensor_id,
+                base_frame_id or "unconfigured_base_frame",
+            )
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
             self.received_first_cloud = False
             self.processed_clouds = 0
+            self.last_diagnostic_cloud_count = 0
             self.last_diagnostic_at = time.monotonic()
+            if calibration_error:
+                self.cache.mark_unavailable(calibration_error)
+                self.get_logger().error(calibration_error)
             self.create_subscription(PointCloud2, topic, self.on_cloud, qos_profile_sensor_data)
 
         def on_cloud(self, message: PointCloud2) -> None:
@@ -249,31 +526,99 @@ def main() -> None:
                     f"points={message.width * message.height}."
                 )
                 self.received_first_cloud = True
+            if calibration_error or footprint is None:
+                self.cache.mark_unavailable(calibration_error or "Robot footprint calibration is unavailable.")
+                return
+            source_frame = str(message.header.frame_id).strip()
+            if source_frame != sensor_frame_id:
+                reason = f"Received point-cloud frame {source_frame!r}; expected {sensor_frame_id!r}."
+                self.cache.mark_unavailable(reason)
+                return
             try:
+                captured_at = validate_pointcloud_timestamp(
+                    int(message.header.stamp.sec),
+                    int(message.header.stamp.nanosec),
+                )
+                if source_frame == base_frame_id:
+                    translation = (0.0, 0.0, 0.0)
+                    rotation = (0.0, 0.0, 0.0, 1.0)
+                else:
+                    transform: TransformStamped = self.tf_buffer.lookup_transform(
+                        base_frame_id,
+                        source_frame,
+                        Time.from_msg(message.header.stamp),
+                        timeout=Duration(seconds=0.05),
+                    )
+                    vector = transform.transform.translation
+                    quaternion = transform.transform.rotation
+                    translation = (float(vector.x), float(vector.y), float(vector.z))
+                    rotation = (
+                        float(quaternion.x),
+                        float(quaternion.y),
+                        float(quaternion.z),
+                        float(quaternion.w),
+                    )
                 points = point_cloud2.read_points(
                     message,
                     field_names=("x", "y", "z"),
                     skip_nans=False,
                 )
-                front_distance, rear_distance, valid_points = select_sector_distances_array(
-                    points,
+                sensor_ranges = pointcloud_ranges_array(points)
+                base_points = transform_points_to_base_array(points, translation, rotation)
+                front_distance, rear_distance, valid_points = select_footprint_distances_array(
+                    base_points,
                     half_angle,
                     minimum_height,
                     maximum_height,
+                    footprint["front"],
+                    footprint["rear"],
+                    footprint["half_width"],
+                    sensor_ranges,
                 )
-            except ValueError as error:
-                self.get_logger().warning(f"Rejected invalid point cloud: {error}")
+            except (TransformException, TypeError, ValueError, IndexError) as error:
+                reason = f"LiDAR sample could not be transformed/calibrated: {error}"
+                self.cache.mark_unavailable(reason)
+                self.get_logger().warning(reason)
                 return
-            self.cache.update_distances(front_distance, rear_distance, message.header.frame_id)
+            self.cache.update_distances(
+                front_distance,
+                rear_distance,
+                base_frame_id,
+                sensor_frame_id,
+                captured_at,
+                calibrated=True,
+                max_ranges_m={
+                    "forward": footprint_clear_range_m(
+                        footprint["front"],
+                        footprint["rear"],
+                        footprint["half_width"],
+                        translation[0],
+                        translation[1],
+                        "forward",
+                    ),
+                    "rear": footprint_clear_range_m(
+                        footprint["front"],
+                        footprint["rear"],
+                        footprint["half_width"],
+                        translation[0],
+                        translation[1],
+                        "rear",
+                    ),
+                },
+            )
             self.processed_clouds += 1
             now = time.monotonic()
-            if now - self.last_diagnostic_at >= 5:
+            diagnostic_elapsed = now - self.last_diagnostic_at
+            if diagnostic_elapsed >= 5:
                 callback_ms = (now - callback_started) * 1000
+                cloud_rate_hz = (self.processed_clouds - self.last_diagnostic_cloud_count) / diagnostic_elapsed
                 self.get_logger().info(
                     f"Processed {self.processed_clouds} point clouds; latest has "
-                    f"{valid_points} finite XYZ returns; callback took {callback_ms:.1f} ms."
+                    f"{valid_points} finite XYZ returns; rate={cloud_rate_hz:.1f} Hz; "
+                    f"callback took {callback_ms:.1f} ms."
                 )
                 self.last_diagnostic_at = now
+                self.last_diagnostic_cloud_count = self.processed_clouds
 
     rclpy.init()
     node = LidarNode()

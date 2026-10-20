@@ -17,6 +17,7 @@ SCAN_POINTCLOUD_TIMEOUT_SECONDS = 15.0
 NAVIGATION_PLAN_TIMEOUT_SECONDS = 65.0
 MAX_LOCALIZATION_AGE_SECONDS = 1.0
 MAX_POINTCLOUD_AGE_SECONDS = 1.5
+MAX_ESTOP_AGE_MS = 5_000
 MAX_MAP_CELLS = 100_000_000
 MAX_PREVIEW_MAP_CELLS = 250_000
 MAX_NAVIGATION_WAYPOINTS = 20
@@ -173,8 +174,47 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
     pointcloud_ready = payload.get("pointcloud_ready") is True
     planner_ready = payload.get("planner_ready") is True
     bridge_ready = payload.get("ready") is True
+    estop = payload.get("estop")
+    estop_age_ms = estop.get("age_ms") if isinstance(estop, dict) else None
+    valid_estop_age = (
+        isinstance(estop_age_ms, (int, float))
+        and not isinstance(estop_age_ms, bool)
+        and math.isfinite(float(estop_age_ms))
+        and 0 <= estop_age_ms <= MAX_ESTOP_AGE_MS
+    )
+    estop_ready = (
+        isinstance(estop, dict)
+        and estop.get("ready") is True
+        and estop.get("error") is None
+        and valid_estop_age
+    )
+    estop_error = (
+        estop.get("error") if isinstance(estop, dict) and estop.get("error")
+        else None if estop_ready
+        else "E-stop health is missing, stale, or invalid."
+    )
+    robot_health = payload.get("robot_health")
+    robot_age_ms = robot_health.get("age_ms") if isinstance(robot_health, dict) else None
+    valid_robot_age = (
+        isinstance(robot_age_ms, (int, float))
+        and not isinstance(robot_age_ms, bool)
+        and math.isfinite(float(robot_age_ms))
+        and 0 <= robot_age_ms <= MAX_ESTOP_AGE_MS
+    )
+    robot_ready = (
+        isinstance(robot_health, dict)
+        and robot_health.get("ready") is True
+        and robot_health.get("error") is None
+        and valid_robot_age
+    )
+    robot_error = (
+        robot_health.get("error") if isinstance(robot_health, dict) and robot_health.get("error")
+        else None if robot_ready
+        else "Robot-control health is missing, stale, or invalid."
+    )
     return {
         "ready": bridge_ready and localization_ready and planner_ready and pointcloud_ready,
+        "motionReady": bridge_ready and localization_ready and planner_ready and pointcloud_ready and estop_ready and robot_ready,
         "bridgeReady": bridge_ready,
         "pointcloudReady": pointcloud_ready,
         "pointcloudAgeMs": round(float(pointcloud_age_ms)),
@@ -186,6 +226,16 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             "age_ms": max(0, round(age_seconds * 1000)),
         },
         "plannerReady": planner_ready,
+        "estop": {
+            "ready": estop_ready,
+            "age_ms": round(float(estop_age_ms)) if valid_estop_age else None,
+            "error": estop_error,
+        },
+        "robotHealth": {
+            "ready": robot_ready,
+            "age_ms": round(float(robot_age_ms)) if valid_robot_age else None,
+            "error": robot_error,
+        },
     }
 
 
@@ -309,6 +359,8 @@ def navigation_start_route(
     snapshot = navigation_map_snapshot(now=now)
     if not snapshot.get("ready"):
         raise NavigationBridgeError(snapshot.get("error") or "Navigation map is not ready.")
+    if not snapshot.get("motion_ready"):
+        raise NavigationBridgeError(snapshot.get("motion_error") or "Physical navigation is disabled because robot and e-stop health are not confirmed.")
     route = _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
     base_url, token = _bridge_configuration()
     requested_operation_id = _navigation_operation_id(operation_id)
@@ -572,6 +624,9 @@ def navigation_bridge_status(now: datetime | None = None) -> dict[str, Any]:
         return {
             "status": "ready" if status["ready"] else "unavailable",
             **status,
+            "estop": status["estop"],
+            "robotHealth": status["robotHealth"],
+            "motionReady": status["motionReady"],
             "map": map_metadata,
             "error": None if status["ready"] else (
                 "MID-360 point-cloud stream is not fresh."
@@ -583,7 +638,10 @@ def navigation_bridge_status(now: datetime | None = None) -> dict[str, Any]:
         return {
             "status": "unavailable",
             "ready": False,
+            "motionReady": False,
             "bridgeReady": False,
+            "estop": {"ready": False, "age_ms": None, "error": str(error)},
+            "robotHealth": {"ready": False, "age_ms": None, "error": str(error)},
             "localization": {"ready": False},
             "plannerReady": False,
             "map": None,
@@ -606,6 +664,12 @@ def navigation_map_snapshot(now: datetime | None = None) -> dict[str, Any]:
         payload = _get_json(base_url, token, "/api/v1/map")
         metadata = _validate_map(payload, status["localization"]["frame_id"])
         data = _validate_occupancy(payload, metadata)
-        return {"ready": True, "map": metadata, "data": data}
+        return {
+            "ready": True,
+            "map": metadata,
+            "data": data,
+            "motion_ready": status["motionReady"],
+            "motion_error": status["estop"]["error"] or status["robotHealth"]["error"],
+        }
     except NavigationBridgeError as error:
         return {"ready": False, "map": None, "data": [], "error": str(error)}

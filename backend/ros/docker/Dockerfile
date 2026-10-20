@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-launch-ros \
     ros-humble-pcl-conversions \
     ros-humble-sensor-msgs-py \
+    ros-humble-std-msgs \
+    ros-humble-tf2-ros \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-SDK2 \

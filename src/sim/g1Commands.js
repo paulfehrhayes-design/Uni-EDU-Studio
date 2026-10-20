@@ -338,7 +338,7 @@ function parseDistanceCondition(text, lineNumber) {
   };
 }
 
-function parseLines(lines, startIndex, indentLevel, depth) {
+function parseLines(lines, startIndex, indentLevel, depth, booleanVariables = new Set()) {
   if (depth > 5) throw new Error('Programs may be nested at most five levels.');
   const nodes = [];
   let index = startIndex;
@@ -351,13 +351,41 @@ function parseLines(lines, startIndex, indentLevel, depth) {
     if (indent < indentLevel) break;
     if (indent > indentLevel) throw new Error(`Unexpected indentation on line ${lineNumber}.`);
 
-    const condition = parseDistanceCondition(text, lineNumber);
+    const booleanAssignment = text.match(/^([A-Za-z_]\w*)\s*=\s*(True|False)\s*;?$/);
+    if (booleanAssignment) {
+      const [, name, rawValue] = booleanAssignment;
+      booleanVariables.add(name);
+      nodes.push({
+        type: 'boolean_assignment',
+        name,
+        value: rawValue === 'True',
+        code: `${name} = ${rawValue}`,
+      });
+      index += 1;
+      continue;
+    }
+
+    let condition = parseDistanceCondition(text, lineNumber);
+    const booleanCondition = !condition && text.match(/^if\s+([A-Za-z_]\w*)\s*:\s*$/);
+    if (booleanCondition) {
+      const variable = booleanCondition[1];
+      if (!booleanVariables.has(variable)) {
+        throw new Error(`Boolean condition on line ${lineNumber} uses '${variable}' before it is assigned a boolean value.`);
+      }
+      condition = {
+        type: 'condition',
+        variable,
+        code: variable,
+      };
+    }
     if (condition) {
       let bodyStart = nextProgramLine(lines, index + 1);
       if (bodyStart >= lines.length || lines[bodyStart].indent <= indentLevel) {
         throw new Error(`Conditional on line ${lineNumber} has no body.`);
       }
-      const [thenBody, nextIndex] = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+      const [thenBody, nextIndex] = parseLines(
+        lines, bodyStart, lines[bodyStart].indent, depth + 1, new Set(booleanVariables),
+      );
       if (!thenBody.length) throw new Error(`Conditional on line ${lineNumber} has no body.`);
       index = nextProgramLine(lines, nextIndex);
       let elseBody = [];
@@ -367,7 +395,9 @@ function parseLines(lines, startIndex, indentLevel, depth) {
         if (bodyStart >= lines.length || lines[bodyStart].indent <= indentLevel) {
           throw new Error(`Else branch on line ${elseLineNumber} has no body.`);
         }
-        const parsedElse = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+        const parsedElse = parseLines(
+          lines, bodyStart, lines[bodyStart].indent, depth + 1, new Set(booleanVariables),
+        );
         [elseBody, index] = parsedElse;
         if (!elseBody.length) throw new Error(`Else branch on line ${elseLineNumber} has no body.`);
       }
@@ -381,14 +411,16 @@ function parseLines(lines, startIndex, indentLevel, depth) {
       if (times < 1 || times > 20) throw new Error(`Loop count on line ${lineNumber} must be between 1 and 20.`);
       index = nextProgramLine(lines, index + 1);
       if (index >= lines.length || lines[index].indent <= indentLevel) throw new Error(`Loop on line ${lineNumber} has no body.`);
-      const [body, nextIndex] = parseLines(lines, index, lines[index].indent, depth + 1);
+      const bodyVariables = new Set(booleanVariables);
+      const [body, nextIndex] = parseLines(lines, index, lines[index].indent, depth + 1, bodyVariables);
       nodes.push({ type: 'repeat', times, body });
+      bodyVariables.forEach((name) => booleanVariables.add(name));
       index = nextIndex;
       continue;
     }
 
     const call = text.match(/^robot\.([A-Za-z]\w*)\((.*)\);?$/);
-    if (!call) throw new Error(`Unsupported statement on line ${lineNumber}. Use a robot command, bounded for/range loop, or distance condition.`);
+    if (!call) throw new Error(`Unsupported statement on line ${lineNumber}. Use a robot command, bounded for/range loop, boolean variable assignment, or supported condition.`);
     nodes.push({ type: 'command', ...normalizeCommand(call[1], call[2]) });
     index += 1;
   }
@@ -400,13 +432,14 @@ export function parseG1Program(code = '') {
     const indent = raw.match(/^\s*/)[0].replace(/\t/g, '  ').length;
     return { indent, text: raw.trim(), lineNumber: index + 1 };
   });
-  const [nodes, endIndex] = parseLines(lines, 0, 0, 0);
+  const [nodes, endIndex] = parseLines(lines, 0, 0, 0, new Set());
   if (endIndex < lines.length && lines.slice(endIndex).some(({ text }) => text && !text.startsWith('#'))) {
     throw new Error(`Invalid indentation on line ${lines[endIndex].lineNumber}.`);
   }
   const normalized = nodes;
   const commandCount = (programNodes) => programNodes.reduce((total, node) => {
     if (node.type === 'command') return total + 1;
+    if (node.type === 'boolean_assignment') return total;
     if (node.type === 'repeat') return total + node.times * commandCount(node.body);
     return total + Math.max(commandCount(node.then), commandCount(node.else));
   }, 0);
@@ -425,6 +458,7 @@ export function flattenG1Commands(nodes, result = []) {
     if (node.type === 'condition') {
       throw new Error('Programs with distance conditions cannot be flattened without sensor data.');
     }
+    if (node.type === 'boolean_assignment') return;
     for (let count = 0; count < node.times; count += 1) flattenG1Commands(node.body, result);
   });
   return result;
@@ -434,6 +468,7 @@ export function formatG1Program(nodes, indent = 0) {
   const padding = ' '.repeat(indent);
   return nodes.map((node) => {
     if (node.type === 'command') return `${padding}${node.code}`;
+    if (node.type === 'boolean_assignment') return `${padding}${node.code}`;
     if (node.type === 'repeat') {
       return `${padding}for _ in range(${node.times}):\n${formatG1Program(node.body, indent + 4)}`;
     }

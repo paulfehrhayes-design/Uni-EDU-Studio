@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,25 +20,30 @@ class DistanceSensorError(RuntimeError):
     pass
 
 
-def _provider_configuration(sector: str) -> tuple[str, str, str, str]:
+def _provider_configuration(sector: str) -> tuple[str, str, str, str, str]:
     if sector not in {"forward", "rear"}:
         raise ValueError("Distance sector must be forward or rear.")
-    if os.getenv("G1_LIDAR_AXIS_CONFIRMED", "1").strip() != "1":
+    if os.getenv("G1_LIDAR_AXIS_CONFIRMED", "0").strip() != "1":
         raise DistanceSensorError(
             "MID-360 axis alignment is unconfirmed; physical distance conditions are disabled."
+        )
+    if os.getenv("G1_DISTANCE_CALIBRATION_CONFIRMED", "0").strip() != "1":
+        raise DistanceSensorError(
+            "MID-360-to-robot transform and footprint calibration are unconfirmed; physical distance conditions are disabled."
         )
     url_variable = "G1_DISTANCE_PROVIDER_URL" if sector == "forward" else "G1_DISTANCE_REAR_PROVIDER_URL"
     url = os.getenv(url_variable, "").strip()
     token = os.getenv("G1_DISTANCE_PROVIDER_TOKEN", "").strip()
     sensor_id = os.getenv("G1_DISTANCE_SENSOR_ID", "").strip()
-    frame_id = os.getenv("G1_DISTANCE_FRAME_ID", "").strip()
-    if not all((url, token, sensor_id, frame_id)):
+    sensor_frame_id = os.getenv("G1_DISTANCE_FRAME_ID", "").strip()
+    base_frame_id = os.getenv("G1_DISTANCE_BASE_FRAME", "").strip()
+    if not all((url, token, sensor_id, sensor_frame_id, base_frame_id)):
         raise DistanceSensorError(
-            f"MID-360 {sector}-sector distance provider is not configured; set its URL, service token, sensor ID, and frame ID."
+            f"MID-360 {sector}-sector distance provider is not configured; set its URL, service token, sensor ID, sensor frame, and robot base frame."
         )
     if not url.startswith(("http://", "https://")):
         raise DistanceSensorError("MID-360 distance provider URL must use HTTP or HTTPS.")
-    return url, token, sensor_id, frame_id
+    return url, token, sensor_id, sensor_frame_id, base_frame_id
 
 
 def _parse_timestamp(value: Any) -> datetime:
@@ -53,7 +59,7 @@ def _parse_timestamp(value: Any) -> datetime:
 
 
 def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, Any]:
-    url, token, expected_sensor_id, expected_frame_id = _provider_configuration(sector)
+    url, token, expected_sensor_id, expected_sensor_frame_id, expected_base_frame_id = _provider_configuration(sector)
     expected_provider_sector = "forward" if sector == "forward" else "rear"
     try:
         response = httpx.get(
@@ -97,20 +103,33 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
         raise DistanceSensorError(f"MID-360 provider sample is not from the configured {sector} sector.")
     if payload.get("sensor_id") != expected_sensor_id:
         raise DistanceSensorError("MID-360 sample sensor ID does not match the configured sensor.")
-    if payload.get("frame_id") != expected_frame_id:
-        raise DistanceSensorError("MID-360 sample frame does not match the configured frame.")
+    if payload.get("sensor_frame_id") != expected_sensor_frame_id:
+        raise DistanceSensorError("MID-360 sample sensor frame does not match the configured frame.")
+    if payload.get("frame_id") != expected_base_frame_id:
+        raise DistanceSensorError("MID-360 measurement frame does not match the configured robot base frame.")
+    if payload.get("measurement") != "footprint_clearance" or payload.get("calibrated") is not True:
+        raise DistanceSensorError("MID-360 provider did not report a calibrated robot-footprint clearance.")
 
+    maximum_range = payload.get("max_range_m")
+    if (
+        isinstance(maximum_range, bool)
+        or not isinstance(maximum_range, (int, float))
+        or not math.isfinite(float(maximum_range))
+        or not 0 < float(maximum_range) <= MAX_DISTANCE_METERS
+    ):
+        raise DistanceSensorError("MID-360 sample maximum measurement range is invalid.")
+    maximum_range_m = float(maximum_range)
     distance = payload.get("distance_m")
     clear = payload.get("clear") is True
-    if distance is None and clear and payload.get("max_range_m") == MAX_DISTANCE_METERS:
+    if distance is None and clear:
         distance_m = None
     else:
         if isinstance(distance, bool) or not isinstance(distance, (int, float)):
             raise DistanceSensorError("MID-360 sample distance must be numeric meters.")
         distance_m = float(distance)
-        if not 0 < distance_m <= MAX_DISTANCE_METERS or clear:
+        if not 0 <= distance_m <= MAX_DISTANCE_METERS or clear:
             raise DistanceSensorError(
-                f"MID-360 sample distance must be greater than 0 and at most {MAX_DISTANCE_METERS:g} meters."
+                f"MID-360 footprint clearance must be at least 0 and at most {MAX_DISTANCE_METERS:g} meters."
             )
 
     timestamp = _parse_timestamp(payload.get("timestamp"))
@@ -129,11 +148,14 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
         "sector": sector,
         "distance_m": distance_m,
         "clear": clear,
-        "max_range_m": MAX_DISTANCE_METERS,
+        "max_range_m": maximum_range_m,
         "timestamp": timestamp.isoformat(),
         "age_ms": max(0, round(age_seconds * 1000)),
         "sensor_id": expected_sensor_id,
-        "frame_id": expected_frame_id,
+        "sensor_frame_id": expected_sensor_frame_id,
+        "frame_id": expected_base_frame_id,
+        "measurement": "footprint_clearance",
+        "calibrated": True,
     }
 
 

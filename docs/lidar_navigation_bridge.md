@@ -44,6 +44,11 @@ Humble and the SLAM/Nav2 workspace. The host must provide:
   `/mid360/livox/lidar`, with a time-valid TF transform from the cloud's frame
   into the configured `map` frame;
 - a fresh TF transform from `map` to `base_link`;
+- a `std_msgs/Bool` heartbeat on `G1_NAV_ESTOP_HEALTHY_TOPIC`; `true` must mean
+  the independent physical e-stop is released and the verified safety chain is
+  healthy, not merely that the bridge process is alive;
+- a `std_msgs/Bool` heartbeat on `G1_NAV_ROBOT_HEALTHY_TOPIC`; `true` must mean
+  the active G1 controller link is established and accepts commands;
 - the specified Unitree `/cmd_vel` bridge connected to the robot.
 
 The gateway listens on `127.0.0.1:8282` by default. For a separate app server,
@@ -55,10 +60,16 @@ environment variables are `G1_NAV_GATEWAY_HOST`, `G1_NAV_GATEWAY_PORT`,
 `G1_NAV_PLAN_TIMEOUT_SECONDS`, `G1_NAV_SPIN_ACTION_NAME`,
 `G1_NAV_SCAN_ROTATION_TIMEOUT_SECONDS` (30–300 seconds, default 180),
 `G1_NAV_MAP_TOPIC`, `G1_NAV_POINTCLOUD_TOPIC`, `G1_NAV_MAP_FRAME`,
-`G1_NAV_BASE_FRAME`, `G1_NAV_MAP_ID`, and `G1_NAV_OCCUPIED_THRESHOLD`.
+`G1_NAV_BASE_FRAME`, `G1_NAV_MAP_ID`, `G1_NAV_OCCUPIED_THRESHOLD`,
+`G1_NAV_ESTOP_HEALTHY_TOPIC`, `G1_NAV_ESTOP_MAX_AGE_MS`,
+`G1_NAV_ROBOT_HEALTHY_TOPIC`, and `G1_NAV_ROBOT_HEALTH_MAX_AGE_MS` (100–5000 ms,
+both freshness defaults are 1000). There are no default health topics because
+their meaning and wiring must be verified for the actual bridge and hardware.
+Motion remains disabled if either topic is unset, false, or stale; map viewing
+and route preview remain available.
 The ROS host also needs the Python ROS packages used by the gateway:
 `rclpy`, `nav2_msgs`, `nav_msgs`, `geometry_msgs`, `action_msgs`, `tf2_ros`,
-`sensor_msgs`, and `sensor_msgs_py`.
+`sensor_msgs`, `sensor_msgs_py`, and `std_msgs`.
 
 This gateway is not a replacement for SLAM, Nav2, or the Unitree velocity
 bridge. It does not publish `/cmd_vel`, install sensor drivers, build a 2D

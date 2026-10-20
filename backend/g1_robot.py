@@ -309,14 +309,20 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
             for node in nodes
         )
 
-    def visit(statements: list[ast.stmt], depth: int = 0) -> list[dict[str, Any]]:
+    def visit(
+        statements: list[ast.stmt],
+        depth: int = 0,
+        boolean_variables: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         if depth > 5:
             raise CommandValidationError("Programs may be nested at most five levels.")
+        assigned_booleans = set() if boolean_variables is None else boolean_variables
         nodes: list[dict[str, Any]] = []
         for statement in statements:
             if isinstance(statement, ast.For):
                 count = _loop_count(statement)
-                nested = visit(statement.body, depth + 1)
+                loop_variables = set(assigned_booleans)
+                nested = visit(statement.body, depth + 1, loop_variables)
                 if not nested:
                     raise CommandValidationError("Loops must contain at least one supported command.")
                 if contains_condition(nested):
@@ -324,65 +330,98 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
                 else:
                     for _ in range(count):
                         nodes.extend(nested)
-            elif isinstance(statement, ast.If):
+                assigned_booleans.update(loop_variables)
+            elif isinstance(statement, ast.Assign):
                 if (
-                    not isinstance(statement.test, ast.Compare)
-                    or len(statement.test.ops) != 1
-                    or len(statement.test.comparators) != 1
+                    len(statement.targets) != 1
+                    or not isinstance(statement.targets[0], ast.Name)
+                    or not isinstance(statement.value, ast.Constant)
+                    or not isinstance(statement.value.value, bool)
                 ):
-                    raise CommandValidationError(
-                        "Conditions must compare robot.front_distance_m() or robot.rear_distance_m() with one numeric threshold."
-                    )
-                comparison = statement.test
-                sensor = comparison.left
-                if (
-                    not isinstance(sensor, ast.Call)
-                    or not isinstance(sensor.func, ast.Attribute)
-                    or not isinstance(sensor.func.value, ast.Name)
-                    or sensor.func.value.id != "robot"
-                    or sensor.func.attr not in {"front_distance_m", "rear_distance_m"}
-                    or sensor.args
-                    or sensor.keywords
-                ):
-                    raise CommandValidationError("Conditions may only read robot.front_distance_m() or robot.rear_distance_m().")
-                operator_map = {
-                    ast.Lt: "<",
-                    ast.LtE: "<=",
-                    ast.Gt: ">",
-                    ast.GtE: ">=",
-                    ast.Eq: "==",
-                    ast.NotEq: "!=",
-                }
-                operator = operator_map.get(type(comparison.ops[0]))
-                threshold = comparison.comparators[0]
-                if operator is None:
-                    raise CommandValidationError(
-                        "Distance conditions support <, <=, >, >=, ==, and != comparisons only."
-                    )
-                if (
-                    not isinstance(threshold, ast.Constant)
-                    or isinstance(threshold.value, bool)
-                    or not isinstance(threshold.value, (int, float))
-                    or not math.isfinite(float(threshold.value))
-                    or not 0.1 <= float(threshold.value) <= 40
-                ):
-                    raise CommandValidationError(
-                        "Distance thresholds must be numeric literals between 0.1 and 40 meters."
-                    )
-                if not statement.body:
-                    raise CommandValidationError("Distance condition then-branches must contain at least one command.")
-                if any(isinstance(item, ast.If) for item in statement.orelse):
-                    raise CommandValidationError("elif is not supported; use a single if/else distance condition.")
-                then_nodes = visit(statement.body, depth + 1)
-                else_nodes = visit(statement.orelse, depth + 1)
+                    raise CommandValidationError("Only assignments of True or False to one Boolean variable are supported.")
+                name = statement.targets[0].id
+                assigned_booleans.add(name)
                 nodes.append({
-                    "type": "condition",
-                    "sensor": sensor.func.attr,
-                    "operator": operator,
-                    "threshold": float(threshold.value),
-                    "then": then_nodes,
-                    "else": else_nodes,
+                    "type": "boolean_assignment",
+                    "name": name,
+                    "value": statement.value.value,
                 })
+            elif isinstance(statement, ast.If):
+                variable = None
+                sensor_name = None
+                operator = None
+                threshold_value = None
+                if isinstance(statement.test, ast.Name):
+                    variable = statement.test.id
+                    if variable not in assigned_booleans:
+                        raise CommandValidationError(
+                            f"Boolean variable {variable!r} must be assigned True or False before use."
+                        )
+                else:
+                    if (
+                        not isinstance(statement.test, ast.Compare)
+                        or len(statement.test.ops) != 1
+                        or len(statement.test.comparators) != 1
+                    ):
+                        raise CommandValidationError(
+                            "Conditions must use an assigned Boolean variable or compare a robot distance sensor with one numeric threshold."
+                        )
+                    comparison = statement.test
+                    sensor = comparison.left
+                    if (
+                        not isinstance(sensor, ast.Call)
+                        or not isinstance(sensor.func, ast.Attribute)
+                        or not isinstance(sensor.func.value, ast.Name)
+                        or sensor.func.value.id != "robot"
+                        or sensor.func.attr not in {"front_distance_m", "rear_distance_m"}
+                        or sensor.args
+                        or sensor.keywords
+                    ):
+                        raise CommandValidationError(
+                            "Distance conditions may only read robot.front_distance_m() or robot.rear_distance_m()."
+                        )
+                    operator_map = {
+                        ast.Lt: "<",
+                        ast.LtE: "<=",
+                        ast.Gt: ">",
+                        ast.GtE: ">=",
+                        ast.Eq: "==",
+                        ast.NotEq: "!=",
+                    }
+                    operator = operator_map.get(type(comparison.ops[0]))
+                    threshold = comparison.comparators[0]
+                    if operator is None:
+                        raise CommandValidationError(
+                            "Distance conditions support <, <=, >, >=, ==, and != comparisons only."
+                        )
+                    if (
+                        not isinstance(threshold, ast.Constant)
+                        or isinstance(threshold.value, bool)
+                        or not isinstance(threshold.value, (int, float))
+                        or not math.isfinite(float(threshold.value))
+                        or not 0.1 <= float(threshold.value) <= 40
+                    ):
+                        raise CommandValidationError(
+                            "Distance thresholds must be numeric literals between 0.1 and 40 meters."
+                        )
+                    sensor_name = sensor.func.attr
+                    threshold_value = float(threshold.value)
+                if not statement.body:
+                    raise CommandValidationError("Condition then-branches must contain at least one supported statement.")
+                if any(isinstance(item, ast.If) for item in statement.orelse):
+                    raise CommandValidationError("elif is not supported; use a single if/else condition.")
+                then_nodes = visit(statement.body, depth + 1, set(assigned_booleans))
+                else_nodes = visit(statement.orelse, depth + 1, set(assigned_booleans))
+                condition = {"type": "condition", "then": then_nodes, "else": else_nodes}
+                if variable is not None:
+                    condition["variable"] = variable
+                else:
+                    condition.update({
+                        "sensor": sensor_name,
+                        "operator": operator,
+                        "threshold": threshold_value,
+                    })
+                nodes.append(condition)
             else:
                 nodes.append(_validate_call(statement))
         return nodes
@@ -394,6 +433,8 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
     def path_command_count(program_nodes: list[dict[str, Any]]) -> int:
         count = 0
         for node in program_nodes:
+            if node.get("type") == "boolean_assignment":
+                continue
             if node.get("type") not in {"repeat", "condition"}:
                 count += 1
             elif node["type"] == "repeat":
@@ -406,6 +447,8 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
         return count
 
     command_count = path_command_count(nodes)
+    if command_count == 0:
+        raise CommandValidationError("Program contains no robot commands.")
     if command_count > _MAX_EXPANDED_COMMANDS:
         raise CommandValidationError(f"Programs may contain at most {_MAX_EXPANDED_COMMANDS} expanded commands.")
     return nodes
@@ -569,6 +612,39 @@ def _require_locomotion_ready() -> None:
         )
 
 
+def _distance_condition_result(sample: dict[str, Any], operator: str, threshold: float) -> bool:
+    operators = {
+        "<": lambda measured, target: measured < target,
+        "<=": lambda measured, target: measured <= target,
+        ">": lambda measured, target: measured > target,
+        ">=": lambda measured, target: measured >= target,
+        "==": lambda measured, target: measured == target,
+        "!=": lambda measured, target: measured != target,
+    }
+    if not sample.get("clear"):
+        return operators[operator](float(sample["distance_m"]), threshold)
+
+    minimum_clearance = float(sample["max_range_m"])
+    if not math.isfinite(minimum_clearance) or minimum_clearance <= 0:
+        raise DistanceSensorError("Clear LiDAR sample did not include a valid minimum clearance.")
+    if operator == "<" and minimum_clearance >= threshold:
+        return False
+    if operator == "<=" and minimum_clearance > threshold:
+        return False
+    if operator == ">" and minimum_clearance > threshold:
+        return True
+    if operator == ">=" and minimum_clearance >= threshold:
+        return True
+    if operator == "==" and minimum_clearance > threshold:
+        return False
+    if operator == "!=" and minimum_clearance > threshold:
+        return True
+    raise DistanceSensorError(
+        f"No-return LiDAR sample only confirms clearance of at least {minimum_clearance:.2f} m; "
+        f"comparison {operator} {threshold:g} m is ambiguous."
+    )
+
+
 def execute_robot_program(code: str) -> dict[str, Any]:
     try:
         commands = parse_robot_program(code)
@@ -582,6 +658,7 @@ def execute_robot_program(code: str) -> dict[str, Any]:
     _stop_requested.clear()
     results: list[dict[str, Any]] = []
     conditions_evaluated: list[dict[str, Any]] = []
+    boolean_variables: dict[str, bool] = {}
     executed_count = 0
     try:
         _log_event("program_started", command_count=len(commands), commands=commands)
@@ -689,6 +766,27 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                     for _ in range(node["times"]):
                         execute_nodes(node["body"])
                     continue
+                if node_type == "boolean_assignment":
+                    boolean_variables[node["name"]] = node["value"]
+                    _log_event("boolean_variable_assigned", name=node["name"], value=node["value"])
+                    continue
+                if node.get("variable") is not None:
+                    variable = node["variable"]
+                    if variable not in boolean_variables:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Boolean variable {variable!r} was not assigned before use.",
+                        )
+                    selected_then = boolean_variables[variable]
+                    decision = {
+                        "variable": variable,
+                        "value": selected_then,
+                        "branch": "then" if selected_then else "else",
+                    }
+                    conditions_evaluated.append(decision)
+                    _log_event("boolean_condition_evaluated", **decision)
+                    execute_nodes(node["then"] if selected_then else node["else"])
+                    continue
                 try:
                     sensor = node["sensor"]
                     sample = (
@@ -715,18 +813,28 @@ def execute_robot_program(code: str) -> dict[str, Any]:
                 if _stop_requested.is_set():
                     raise HTTPException(status_code=409, detail="Robot program stopped by teacher.")
 
-                operators = {
-                    "<": lambda measured, target: measured < target,
-                    "<=": lambda measured, target: measured <= target,
-                    ">": lambda measured, target: measured > target,
-                    ">=": lambda measured, target: measured >= target,
-                    "==": lambda measured, target: measured == target,
-                    "!=": lambda measured, target: measured != target,
-                }
-                measured_distance = (
-                    float("inf") if sample.get("clear") else sample["distance_m"]
-                )
-                selected_then = operators[node["operator"]](measured_distance, node["threshold"])
+                try:
+                    selected_then = _distance_condition_result(
+                        sample,
+                        node["operator"],
+                        node["threshold"],
+                    )
+                except DistanceSensorError as error:
+                    _log_event("distance_condition_failed", sensor=node["sensor"], error=str(error), condition=node)
+                    _stop_requested.set()
+                    try:
+                        _sdk_result(_client.StopMove(), "StopMove")
+                    except Exception as stop_error:
+                        _log_event("safety_stop_failed", reason=str(error), error=str(stop_error))
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Distance condition failed: {error}. The G1 stop request also failed: {stop_error}",
+                        ) from stop_error
+                    _log_event("safety_stop_requested", reason="ambiguous_distance_condition")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Distance condition aborted safely: {error}. G1 locomotion stop was requested.",
+                    ) from error
                 decision = {
                     "sensor": sensor,
                     "operator": node["operator"],

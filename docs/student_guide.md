@@ -63,6 +63,18 @@ else:
 
 `front_distance_m()` and `rear_distance_m()` read the closest valid obstacle in the forward or rear MID-360 sector. The simulator uses the closest scene obstacle in the selected sector; the physical backend obtains readings from the configured, read-only ROS 2 sensor provider. Physical readings must be valid, match the configured sensor and frame, and be no older than 500 ms. If the selected provider is unavailable or its reading is invalid or stale, the backend aborts the program and requests a locomotion stop; it does not silently run the `else` branch. Rear checks assume the sensor frame's x-axis is aligned with the robot's forward direction and require valid LiDAR returns behind the robot. A teacher should use **Test LiDAR** to check both sectors before running a physical conditional program.
 
+Boolean variables can also control a branch when you want to test simple program logic:
+
+```python
+obstacle_detected = True
+if obstacle_detected:
+    robot.walk(1)
+else:
+    robot.stand()
+```
+
+Boolean conditions are simulated from the assigned value. Physical execution accepts only literal `True`/`False` assignments and previously assigned Boolean names; unsupported expressions are rejected by the backend.
+
 Use `rear_distance_m()` to base a branch on obstacles behind the robot:
 
 ```python
@@ -72,7 +84,7 @@ else:
     robot.backward(1)
 ```
 
-The backend provider uses `G1_DISTANCE_PROVIDER_URL` for the forward sector and `G1_DISTANCE_REAR_PROVIDER_URL` for the rear sector, with shared `G1_DISTANCE_PROVIDER_TOKEN`, `G1_DISTANCE_SENSOR_ID`, and `G1_DISTANCE_FRAME_ID` settings. The separately deployed ROS 2 provider serves current JSON samples with `valid: true`, `sector` (`"forward"` or `"rear"`), `distance_m`, ISO-8601 `timestamp`, `sensor_id`, and `frame_id` fields. Keep the provider on the trusted robot network; its service token must not be exposed to the browser. This provider supplies sensor readings only and must not issue locomotion commands.
+The backend provider uses `G1_DISTANCE_PROVIDER_URL` for the forward sector and `G1_DISTANCE_REAR_PROVIDER_URL` for the rear sector, with shared `G1_DISTANCE_PROVIDER_TOKEN`, `G1_DISTANCE_SENSOR_ID`, `G1_DISTANCE_FRAME_ID`, and `G1_DISTANCE_BASE_FRAME` settings. It transforms each timestamped cloud into the robot base frame and reports clearance from the configured front/rear/side footprint boundary, not raw range from the sensor origin. Physical conditions stay disabled until axis alignment and the LiDAR-to-base transform/footprint are confirmed and known-distance targets have been checked. No-return samples use the provider's conservative footprint-adjusted maximum clearance; stale or invalid transforms abort the program and request a locomotion stop. The separately deployed ROS 2 provider serves current JSON samples with `valid: true`, `sector` (`"forward"` or `"rear"`), `distance_m`, `max_range_m`, ISO-8601 `timestamp`, `sensor_id`, `sensor_frame_id`, base-frame `frame_id`, `measurement: "footprint_clearance"`, and `calibrated: true` fields. Keep the provider on the trusted robot network; its service token must not be exposed to the browser. This provider supplies sensor readings only and must not issue locomotion commands.
 
 `stand()` sets the robot ready to move (SDK FSM 500). `squat_to_stand()` and `stand_to_squat()` use SDK FSM 706; `lie_to_stand()` uses FSM 702. The robot confirms each request, but the app does not know when the movement is finished. Simulator poses are approximate. `HighStand`, `LowStand`, and `Damp` are not included because their effects have not been confirmed for this setup.
 

@@ -307,6 +307,22 @@ function isNavigationWaypointInFreeSpace(waypoint, snapshot) {
   return isWorldPointInKnownFreeSpace(waypoint.x, waypoint.y, snapshot);
 }
 
+function formatLidarDistanceSample(sample, label) {
+  if (!sample?.ready) return `${label} unavailable • ${sample?.error || 'provider status not reported'}`;
+  if (sample.calibrated !== true || sample.measurement !== 'footprint_clearance') {
+    return `${label} unavailable • provider sample is not calibrated to the robot footprint`;
+  }
+  if (sample.clear) return `${label} clear within ${sample.max_range_m} m`;
+  return `${label} clearance ${sample.distance_m.toFixed(2)} m from robot footprint • ${sample.age_ms} ms old`;
+}
+
+function formatLidarDistanceStatus(sensor) {
+  return [
+    formatLidarDistanceSample(sensor, 'Front'),
+    formatLidarDistanceSample(sensor?.rear, 'Rear'),
+  ].join(' • ');
+}
+
 const SAFE_COMMAND_LIMITS = {
   SPEED: { min: 0.5, max: 2 },
   STEPS: { min: 1, max: 10 },
@@ -755,6 +771,7 @@ export default function App() {
   const [robotConnectionStatus, setRobotConnectionStatus] = useState('Not connected');
   const [lidarTestStatus, setLidarTestStatus] = useState('Not tested');
   const [navigationBridgeStatus, setNavigationBridgeStatus] = useState('Not checked');
+  const [isNavigationMotionReady, setIsNavigationMotionReady] = useState(false);
   const [isNavigationBridgeChecking, setIsNavigationBridgeChecking] = useState(false);
   const [navigationMapSnapshot, setNavigationMapSnapshot] = useState(null);
   const [navigationMapStatus, setNavigationMapStatus] = useState('Map not loaded');
@@ -867,11 +884,7 @@ export default function App() {
           .then((status) => {
             setIsRobotConnected(status.sdkAvailable);
             if (status.sdkAvailable) {
-              const sensorText = status.distanceSensor?.ready
-                ? status.distanceSensor.clear
-                  ? `MID-360 raw scan • no forward-sector returns within ${status.distanceSensor.max_range_m} m • not calibrated`
-                  : `MID-360 raw estimate (${status.distanceSensor.distance_m.toFixed(2)} m, ${status.distanceSensor.age_ms} ms) • not calibrated`
-                : `MID-360 unavailable (${status.distanceSensor?.error || 'provider status not reported'})`;
+              const sensorText = `MID-360 ${status.distanceSensor?.ready ? 'calibrated' : 'unavailable'} • ${formatLidarDistanceStatus(status.distanceSensor)}`;
               setRobotConnectionStatus(`SDK connected on ${status.interface} • ${sensorText}`);
             } else {
               setRobotConnectionStatus('Disconnected • backend must run on the G1 computer • LiDAR is checked after Connect');
@@ -932,6 +945,7 @@ export default function App() {
       setLiveLidarScanPoints([]);
       setSharedLidarMap(null);
       setNavigationLiveStatus('Live updates disconnected');
+      setIsNavigationMotionReady(false);
       sharedMapVersionRef.current = null;
       sharedMapLoadedRef.current = false;
       liveNavigationMapVersionRef.current = null;
@@ -973,9 +987,10 @@ export default function App() {
           );
         }
         setSharedLidarOverlayEnabled(update.shared_overlay_enabled === true);
+        setIsNavigationMotionReady(update.navigation?.motion_ready === true);
         setNavigationLiveStatus(
           update.navigation?.ready
-            ? `Live • ${update.navigation.map?.map_id} ${update.navigation.map?.version} • ${update.navigation.localization?.age_ms ?? '—'} ms localization • MID-360 ${update.navigation.pointcloud_age_ms ?? '—'} ms old`
+            ? `Live • ${update.navigation.map?.map_id} ${update.navigation.map?.version} • ${update.navigation.localization?.age_ms ?? '—'} ms localization • MID-360 ${update.navigation.pointcloud_age_ms ?? '—'} ms old • ${update.navigation.motion_ready ? 'robot link and e-stop healthy' : [update.navigation.robot_health?.error, update.navigation.estop?.error].filter(Boolean).join(' • ') || 'robot/e-stop health unverified'}`
             : `Live • navigation unavailable${update.navigation?.error ? ` • ${update.navigation.error}` : ''}`,
         );
         const sharedVersion = update.shared_map_version || null;
@@ -1244,11 +1259,7 @@ export default function App() {
         throw new Error('Backend did not confirm a connected robot.');
       }
       setIsRobotConnected(true);
-      const sensorText = connection.distanceSensor?.ready
-        ? connection.distanceSensor.clear
-          ? `MID-360 raw scan • no forward-sector returns within ${connection.distanceSensor.max_range_m} m • not calibrated`
-          : `MID-360 raw estimate (${connection.distanceSensor.distance_m.toFixed(2)} m, ${connection.distanceSensor.age_ms} ms) • not calibrated`
-        : `MID-360 unavailable (${connection.distanceSensor?.error || 'provider status not reported'})`;
+      const sensorText = `MID-360 ${connection.distanceSensor?.ready ? 'calibrated' : 'unavailable'} • ${formatLidarDistanceStatus(connection.distanceSensor)}`;
       setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
     } catch (error) {
       setIsRobotConnected(false);
@@ -1296,16 +1307,7 @@ export default function App() {
       const sensor = status.distanceSensor;
       if (sensor?.ready) {
         const sampleTime = sensor.timestamp ? ` • ${new Date(sensor.timestamp).toLocaleTimeString()}` : '';
-        const rear = sensor.rear?.ready
-          ? sensor.rear.clear
-            ? `Rear raw scan has no returns within ${sensor.rear.max_range_m} m`
-            : `Rear raw estimate • ${sensor.rear.distance_m.toFixed(2)} m • ${sensor.rear.age_ms} ms old`
-          : `Rear unavailable • ${sensor.rear?.error || 'provider status not reported'}`;
-        setLidarTestStatus(
-          `${sensor.clear
-            ? `Front raw scan has no returns within ${sensor.max_range_m} m`
-            : `Front raw estimate • ${sensor.distance_m.toFixed(2)} m • ${sensor.age_ms} ms old`} • ${sensor.frame_id}${sampleTime} • ${rear} • distances are not calibrated to robot position`,
-        );
+        setLidarTestStatus(`${formatLidarDistanceStatus(sensor)} • ${sensor.frame_id} base frame • ${sensor.sensor_frame_id} sensor frame${sampleTime}`);
       } else {
         const rear = sensor?.rear?.ready
           ? sensor.rear.clear
@@ -1327,9 +1329,11 @@ export default function App() {
       return;
     }
     setIsNavigationBridgeChecking(true);
-    setNavigationBridgeStatus('Checking bridge, fresh MID-360 data, localization, and map metadata…');
+    setIsNavigationMotionReady(false);
+    setNavigationBridgeStatus('Checking bridge, fresh MID-360 data, localization, map metadata, and e-stop health…');
     try {
       const result = await apiFetch('/api/navigation/status');
+      setIsNavigationMotionReady(result.motionReady === true);
       if (result.activeOperation) {
         setNavigationOperation(result.activeOperation);
         setNavigationExecutionStatus(
@@ -1346,9 +1350,13 @@ export default function App() {
       setNavigationBridgeStatus(
         `Ready • map ${map.map_id} • version ${map.version} • ${map.frame_id} • `
         + `pose ${localization.pose.x.toFixed(2)}, ${localization.pose.y.toFixed(2)} m `
-        + `(${localization.age_ms} ms old) • MID-360 ${result.pointcloudAgeMs} ms old`,
+        + `(${localization.age_ms} ms old) • MID-360 ${result.pointcloudAgeMs} ms old • `
+        + (result.motionReady
+          ? `robot link and e-stop healthy (${result.robotHealth.age_ms}/${result.estop.age_ms} ms old)`
+          : [result.robotHealth?.error, result.estop?.error].filter(Boolean).join(' • ') || 'robot/e-stop health unverified; motion locked'),
       );
     } catch (error) {
+      setIsNavigationMotionReady(false);
       setNavigationBridgeStatus(`Check failed • ${error.message}`);
     } finally {
       setIsNavigationBridgeChecking(false);
@@ -1403,6 +1411,10 @@ export default function App() {
 
   const handleStartLidarScan = async () => {
     if (session?.user?.role !== 'teacher') return;
+    if (!isNavigationMotionReady) {
+      setLidarScanStatus('Scan blocked • check bridge status and verify fresh healthy robot-link and e-stop signals first.');
+      return;
+    }
     const confirmed = window.confirm(
       'The G1 will rotate in place through 360° while the LiDAR captures the room. Continue only after confirming the robot is stable, the rotation area is clear, a teacher is supervising, and the independent emergency stop is immediately available.',
     );
@@ -1515,7 +1527,10 @@ export default function App() {
     const jobId = lidarScanJob?.job_id;
     if (!jobId || lidarScanJob.status !== 'scanning' || session?.user?.role !== 'teacher') return undefined;
     let active = true;
+    let requestInFlight = false;
     const pollScan = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
       try {
         const result = await apiFetch(`/api/lidar/scan/${jobId}`);
         if (!active) return;
@@ -1533,10 +1548,12 @@ export default function App() {
         );
       } catch (error) {
         if (active) setLidarScanStatus(`Scan status unavailable • ${error.message}`);
+      } finally {
+        requestInFlight = false;
       }
     };
     pollScan();
-    const timer = window.setInterval(pollScan, 1200);
+    const timer = window.setInterval(pollScan, 100);
     return () => {
       active = false;
       window.clearInterval(timer);
@@ -1617,6 +1634,10 @@ export default function App() {
   const handleStartNavigation = async () => {
     if (!session || session.user.role !== 'teacher') {
       setNavigationExecutionStatus('Teacher login is required to start navigation.');
+      return;
+    }
+    if (!isNavigationMotionReady) {
+      setNavigationExecutionStatus('Physical start blocked • check bridge status and verify a fresh healthy e-stop signal first.');
       return;
     }
     if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
@@ -1779,6 +1800,7 @@ export default function App() {
         <block type="g1_rear_distance_m"></block>
         <block type="math_number"><field name="NUM">1</field></block>
       </category>
+      <category name="${language === 'zh' ? '变量' : 'Variables'}" custom="VARIABLE"></category>
       <sep></sep>
       <category name="${cats.loops}" colour="120">
         <block type="controls_repeat_ext"><value name="TIMES"><shadow type="math_number"><field name="NUM">10</field></shadow></value></block>
@@ -2064,7 +2086,11 @@ export default function App() {
         const result = await robotConnection.run(generatedCode);
         const output = result.results?.length ? ` SDK output: ${JSON.stringify(result.results)}` : '';
         const conditionOutput = result.conditionsEvaluated?.length
-          ? ` Distance branches: ${result.conditionsEvaluated.map(({ distance_m, clear, max_range_m, operator, threshold_m, branch }) => `${clear ? `clear within ${max_range_m} m` : `${distance_m.toFixed(2)} m`} ${operator} ${threshold_m} m → ${branch}`).join('; ')}.`
+          ? ` Condition branches: ${result.conditionsEvaluated.map((decision) => (
+            decision.variable
+              ? `${decision.variable} is ${decision.value} → ${decision.branch}`
+              : `${decision.clear ? `clear within ${decision.max_range_m} m` : `${decision.distance_m.toFixed(2)} m`} ${decision.operator} ${decision.threshold_m} m → ${decision.branch}`
+          )).join('; ')}.`
           : '';
         setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${output}`);
       } catch (error) {
@@ -2147,6 +2173,8 @@ export default function App() {
               mutation.setAttribute('else', '1');
               block.domToMutation(mutation);
             }
+          } else if (node.type === 'boolean_assignment') {
+            block = workspace.newBlock('variables_set');
           } else {
             block = workspace.newBlock(node.method === 'arm_action'
               ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
@@ -2159,21 +2187,40 @@ export default function App() {
             repeatCount.render();
             block.getInput('TIMES').connection.connect(repeatCount.outputConnection);
           } else if (node.type === 'condition') {
-            const comparison = workspace.newBlock('logic_compare');
-            const distance = workspace.newBlock(node.sensor === 'rear_distance_m'
-              ? 'g1_rear_distance_m'
-              : 'g1_front_distance_m');
-            const threshold = workspace.newBlock('math_number');
-            const operatorFields = { '<': 'LT', '<=': 'LTE', '>': 'GT', '>=': 'GTE', '==': 'EQ', '!=': 'NEQ' };
-            comparison.setFieldValue(operatorFields[node.operator], 'OP');
-            threshold.setFieldValue(String(node.threshold), 'NUM');
-            [distance, threshold, comparison].forEach((conditionBlock) => {
-              conditionBlock.initSvg();
-              conditionBlock.render();
-            });
-            comparison.getInput('A').connection.connect(distance.outputConnection);
-            comparison.getInput('B').connection.connect(threshold.outputConnection);
-            block.getInput('IF0').connection.connect(comparison.outputConnection);
+            if (node.variable) {
+              const variableMap = workspace.getVariableMap();
+              const variable = variableMap.getVariable(node.variable) || variableMap.createVariable(node.variable);
+              const variableBlock = workspace.newBlock('variables_get');
+              variableBlock.setFieldValue(variable.getId(), 'VAR');
+              variableBlock.initSvg();
+              variableBlock.render();
+              block.getInput('IF0').connection.connect(variableBlock.outputConnection);
+            } else {
+              const comparison = workspace.newBlock('logic_compare');
+              const distance = workspace.newBlock(node.sensor === 'rear_distance_m'
+                ? 'g1_rear_distance_m'
+                : 'g1_front_distance_m');
+              const threshold = workspace.newBlock('math_number');
+              const operatorFields = { '<': 'LT', '<=': 'LTE', '>': 'GT', '>=': 'GTE', '==': 'EQ', '!=': 'NEQ' };
+              comparison.setFieldValue(operatorFields[node.operator], 'OP');
+              threshold.setFieldValue(String(node.threshold), 'NUM');
+              [distance, threshold, comparison].forEach((conditionBlock) => {
+                conditionBlock.initSvg();
+                conditionBlock.render();
+              });
+              comparison.getInput('A').connection.connect(distance.outputConnection);
+              comparison.getInput('B').connection.connect(threshold.outputConnection);
+              block.getInput('IF0').connection.connect(comparison.outputConnection);
+            }
+          } else if (node.type === 'boolean_assignment') {
+            const variableMap = workspace.getVariableMap();
+            const variable = variableMap.getVariable(node.name) || variableMap.createVariable(node.name);
+            const valueBlock = workspace.newBlock('logic_boolean');
+            valueBlock.setFieldValue(node.value ? 'TRUE' : 'FALSE', 'BOOL');
+            valueBlock.initSvg();
+            valueBlock.render();
+            block.setFieldValue(variable.getId(), 'VAR');
+            block.getInput('VALUE').connection.connect(valueBlock.outputConnection);
           } else {
             const definition = G1_COMMANDS.find((entry) => entry.method === node.method);
             definition.args.forEach((argument, index) => {
@@ -2498,6 +2545,17 @@ export default function App() {
       return `${local.x},${local.y}`;
     }).join(' ');
   }, [navigationMapSnapshot, navigationRoutePreview]);
+  const navigationLiveScanPreview = useMemo(() => {
+    const map = navigationMapSnapshot?.map;
+    if (!map || !Array.isArray(liveLidarScanPoints) || lidarScanJob?.frame_id !== map.frame_id) return [];
+    const mapWidth = map.width * map.resolution_m;
+    const mapHeight = map.height * map.resolution_m;
+    return liveLidarScanPoints.flatMap((point) => {
+      const local = worldToMapLocal(point.x, point.y, map);
+      if (local.x < 0 || local.y < 0 || local.x >= mapWidth || local.y >= mapHeight) return [];
+      return [{ ...point, mapX: local.x, mapY: local.y }];
+    });
+  }, [lidarScanJob?.frame_id, liveLidarScanPoints, navigationMapSnapshot]);
   const sharedOccupiedCellsPath = useMemo(() => {
     const snapshot = sharedLidarMap?.map;
     if (!snapshot?.data?.length || !snapshot.map) return '';
@@ -2854,6 +2912,21 @@ export default function App() {
               </div>
             </div>
             <div className="flex-1 bg-slate-900 p-0 overflow-hidden"><textarea className="w-full h-full p-6 font-mono text-sm bg-slate-900 text-green-400 resize-none focus:outline-none" value={configText || ''} onChange={(e) => setConfigText(e.target.value)} spellCheck={false} /></div>
+            {currentUser.role === 'teacher' && (
+              <div className="flex items-center justify-between gap-3 border-t bg-white px-5 py-3">
+                <div>
+                  <p className="text-sm font-semibold text-gray-800">Shared LiDAR map</p>
+                  <p className="text-xs text-gray-500">Show the teacher-approved room map on student grids.</p>
+                </div>
+                <input
+                  type="checkbox"
+                  aria-label="Show shared LiDAR map overlay in Settings"
+                  checked={sharedLidarOverlayEnabled}
+                  onChange={(event) => handleSharedLidarOverlayToggle(event.target.checked)}
+                  className="h-5 w-5 accent-cyan-700"
+                />
+              </div>
+            )}
             <div className="p-4 border-t bg-white flex justify-end gap-3"><button onClick={() => setShowConfigEditor(false)} className="px-5 py-2 text-sm text-gray-600 font-medium hover:bg-gray-100 rounded-lg">{t.closeBtn}</button><button onClick={handleApplyConfig} className="flex items-center gap-2 px-6 py-2 text-sm bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md"><Check size={16} /> {t.applyBtn}</button></div>
           </div>
         </div>
@@ -3809,6 +3882,20 @@ export default function App() {
                             >
                               <path d={navigationOccupiedCellsPath} fill="#ef4444" fillOpacity="0.72" />
                             </g>
+                            {session?.user?.role === 'teacher' && lidarScanJob?.status === 'scanning' && (
+                              <g data-testid="navigation-live-lidar-scan-overlay" pointerEvents="none">
+                                {navigationLiveScanPreview.map((point, index) => (
+                                  <circle
+                                    key={`planner-scan-${index}-${point.x}-${point.y}`}
+                                    cx={point.mapX}
+                                    cy={point.mapY}
+                                    r={navigationMapSnapshot.map.resolution_m * 0.35}
+                                    fill={point.z < 0.25 ? '#2563eb' : point.z < 1.2 ? '#16a34a' : point.z < 2.2 ? '#f59e0b' : '#a855f7'}
+                                    fillOpacity="0.85"
+                                  />
+                                ))}
+                              </g>
+                            )}
                             {navigationRoutePreviewPoints && (
                               <polyline
                                 data-testid="navigation-route-preview"
@@ -3890,7 +3977,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={handleStartNavigation}
-                            disabled={isNavigationStarting || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                            disabled={isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
                             className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
                           >
                             {isNavigationStarting ? 'Starting…' : 'Start Nav2'}

@@ -18,4 +18,6 @@ source "$G1_LIDAR_ROS_WS/install/setup.bash"
 set -u
 exec ros2 launch "$PROJECT_DIR/backend/ros/mid360_launch.py" \
   "config_path:=$G1_LIDAR_CONFIG_PATH" \
-  "frame_id:=$G1_DISTANCE_FRAME_ID"
+  "frame_id:=$G1_DISTANCE_FRAME_ID" \
+  "pointcloud_topic:=$G1_LIDAR_TOPIC" \
+  "publish_freq:=${G1_LIDAR_PUBLISH_FREQ:-20.0}"

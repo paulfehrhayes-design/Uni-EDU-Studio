@@ -1,14 +1,34 @@
 import unittest
 import json
+import math
+from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 try:
     from . import ros_lidar_provider
-    from .ros_lidar_provider import SampleCache, select_forward_distance
+    from .ros_lidar_provider import (
+        SampleCache,
+        footprint_clear_range_m,
+        footprint_clearance_m,
+        select_forward_distance,
+        select_footprint_distances_array,
+        transform_point_to_base,
+        transform_points_to_base_array,
+        validate_pointcloud_timestamp,
+    )
 except ImportError:
     import ros_lidar_provider
-    from ros_lidar_provider import SampleCache, select_forward_distance
+    from ros_lidar_provider import (
+        SampleCache,
+        footprint_clear_range_m,
+        footprint_clearance_m,
+        select_forward_distance,
+        select_footprint_distances_array,
+        transform_point_to_base,
+        transform_points_to_base_array,
+        validate_pointcloud_timestamp,
+    )
 
 try:
     import numpy
@@ -17,6 +37,95 @@ except ImportError:
 
 
 class RosLidarProviderTests(unittest.TestCase):
+    def test_transforms_lidar_point_into_base_frame(self):
+        point = transform_point_to_base(
+            (1.0, 0.0, 0.0),
+            (0.2, -0.1, 0.3),
+            (0.0, 0.0, 2 ** -0.5, 2 ** -0.5),
+        )
+
+        for actual, expected in zip(point, (0.2, 0.9, 0.3)):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_distance_is_measured_from_robot_footprint_boundary(self):
+        self.assertAlmostEqual(footprint_clearance_m(1.0, 0.0, 0.4, 0.3, 0.2), 0.6)
+        self.assertAlmostEqual(footprint_clearance_m(-0.8, 0.0, 0.4, 0.3, 0.2), 0.5)
+        self.assertEqual(footprint_clearance_m(0.1, 0.1, 0.4, 0.3, 0.2), 0.0)
+        self.assertIsNone(footprint_clearance_m(0.0, 1.0, 0.4, 0.3, 0.2))
+        self.assertAlmostEqual(
+            footprint_clear_range_m(0.4, 0.3, 0.2, 0.0, 0.0, "forward"),
+            40 - math.hypot(0.4, 0.2),
+        )
+
+    def test_transform_rejects_invalid_quaternion(self):
+        with self.assertRaisesRegex(ValueError, "quaternion is invalid"):
+            transform_point_to_base((1.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0))
+
+    def test_pointcloud_timestamp_rejects_stale_missing_and_future_stamps(self):
+        now = 1_800_000_000.0
+        self.assertEqual(
+            validate_pointcloud_timestamp(1_799_999_999, 800_000_000, now).timestamp(),
+            1_799_999_999.8,
+        )
+        for seconds, nanoseconds, expected in (
+            (0, 0, "missing"),
+            (1_799_999_999, 0, "stale"),
+            (1_800_000_001, 0, "future"),
+        ):
+            with self.subTest(seconds=seconds, nanoseconds=nanoseconds):
+                with self.assertRaisesRegex(ValueError, expected):
+                    validate_pointcloud_timestamp(seconds, nanoseconds, now)
+
+    @unittest.skipIf(numpy is None, "NumPy is provided by the ROS runtime, not the backend test environment.")
+    def test_vectorized_transform_and_footprint_clearance_use_base_frame(self):
+        points = numpy.array([(1.0, 0.0, 0.0), (-0.8, 0.0, 0.0)])
+        transformed = transform_points_to_base_array(
+            points,
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 2 ** -0.5, 2 ** -0.5),
+        )
+        self.assertAlmostEqual(transformed[0, 1], 1.0)
+        front, rear, valid_points = select_footprint_distances_array(
+            transformed,
+            45,
+            -0.5,
+            1.5,
+            0.4,
+            0.3,
+            0.2,
+        )
+        self.assertIsNone(front)
+        self.assertIsNone(rear)
+        self.assertEqual(valid_points, 2)
+
+    @unittest.skipIf(numpy is None, "NumPy is provided by the ROS runtime, not the backend test environment.")
+    def test_vectorized_front_and_rear_ranges_are_footprint_relative(self):
+        front, rear, _ = select_footprint_distances_array(
+            numpy.array([(1.0, 0.0, 0.0), (-0.8, 0.0, 0.0)]),
+            15,
+            -0.5,
+            1.5,
+            0.4,
+            0.3,
+            0.2,
+        )
+        self.assertAlmostEqual(front, 0.6)
+        self.assertAlmostEqual(rear, 0.5)
+
+    @unittest.skipIf(numpy is None, "NumPy is provided by the ROS runtime, not the backend test environment.")
+    def test_sensor_range_limit_uses_raw_point_before_base_translation(self):
+        front, _, _ = select_footprint_distances_array(
+            numpy.array([(40.5, 0.0, 0.0)]),
+            15,
+            -0.5,
+            1.5,
+            0.4,
+            0.3,
+            0.2,
+            sensor_ranges_m=numpy.array([39.5]),
+        )
+        self.assertEqual(front, 40.0)
+
     def test_selects_nearest_point_inside_forward_sector_and_height(self):
         distance = select_forward_distance(
             [
@@ -80,6 +189,33 @@ class RosLidarProviderTests(unittest.TestCase):
         self.assertIsNone(cache.current_sample())
         self.assertIsNone(cache.current_sample("rear"))
 
+    def test_sample_cache_freshness_is_anchored_to_capture_time(self):
+        cache = SampleCache("mid360-front", "base_link")
+        captured_at = datetime.now(timezone.utc) - timedelta(milliseconds=300)
+        cache.update_distances(
+            0.8,
+            None,
+            "base_link",
+            "livox_frame",
+            captured_at,
+            calibrated=True,
+        )
+        sample = cache.current_sample()
+        self.assertIsNotNone(sample)
+        self.assertGreaterEqual(sample["age_ms"], 280)
+        self.assertLess(sample["age_ms"], 500)
+
+        stale_cache = SampleCache("mid360-front", "base_link")
+        stale_cache.update_distances(
+            0.8,
+            None,
+            "base_link",
+            "livox_frame",
+            datetime.now(timezone.utc) - timedelta(milliseconds=600),
+            calibrated=True,
+        )
+        self.assertIsNone(stale_cache.current_sample())
+
     def test_fresh_cloud_with_no_points_in_sector_is_reported_as_clear(self):
         cache = SampleCache("mid360-front", "livox_frame")
         cache.update([], "livox_frame", 15, -0.5, 1.5)
@@ -87,6 +223,8 @@ class RosLidarProviderTests(unittest.TestCase):
         sample = cache.current_sample("forward")
 
         self.assertTrue(sample["valid"])
+        self.assertFalse(sample["calibrated"])
+        self.assertEqual(sample["measurement"], "sensor_frame_range")
         self.assertTrue(sample["clear"])
         self.assertIsNone(sample["distance_m"])
         self.assertEqual(sample["max_range_m"], 40.0)
@@ -141,6 +279,7 @@ class RosLidarProviderTests(unittest.TestCase):
     def test_unavailable_reason_distinguishes_no_cloud_and_wrong_frame(self):
         cache = SampleCache("mid360-front", "livox_frame")
         self.assertIn("has not received a point cloud", cache.unavailable_reason())
+        self.assertIsNone(cache.current_sample())
 
         cache.update([(1.0, 0.0, 0.0)], "other_frame", 15, -0.5, 1.5)
         self.assertIn("expected 'livox_frame'", cache.unavailable_reason())

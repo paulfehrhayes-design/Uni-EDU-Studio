@@ -218,6 +218,31 @@ test('rear distance conditions round-trip through the same structured parser', (
   assert.ok(getG1BlocklyConditionBlocks().some((block) => block.type === 'g1_rear_distance_m'));
 });
 
+test('Boolean variables preserve if/then/else branches and select the same simulation branch', () => {
+  const code = 'obstacle_detected = True\n'
+    + 'if obstacle_detected:\n'
+    + '    robot.walk(1)\n'
+    + 'else:\n'
+    + '    robot.turn("left", 90)';
+  const nodes = parseG1Program(code);
+  const frames = buildG1SimulationFrames(code);
+
+  assert.deepEqual(nodes.map((node) => node.type), ['boolean_assignment', 'condition']);
+  assert.equal(nodes[0].name, 'obstacle_detected');
+  assert.equal(nodes[0].value, true);
+  assert.equal(nodes[1].variable, 'obstacle_detected');
+  assert.equal(formatG1Program(nodes), code);
+  assert.ok(frames.at(-1).x > 0.3);
+  assert.equal(frames.at(-1).heading, 0);
+  assert.ok(frames.some((frame) => frame.timeline.some((entry) => (
+    entry.summary === 'obstacle_detected is true → then'
+  ))));
+
+  const falseFrames = buildG1SimulationFrames(code.replace('= True', '= False'));
+  assert.equal(falseFrames.at(-1).heading, 90);
+  assert.throws(() => parseG1Program('if obstacle_detected:\n    robot.stand()'), /before it is assigned/);
+});
+
 test('distance condition Blockly value block is a numeric expression', () => {
   const [distanceBlock] = getG1BlocklyConditionBlocks();
   const definition = { ...distanceBlock };
@@ -240,6 +265,30 @@ test('distance condition Blockly value block is a numeric expression', () => {
     pythonGenerator.forBlock.g1_front_distance_m = () => ['robot.front_distance_m()', pythonGenerator.ORDER_ATOMIC];
     const generated = pythonGenerator.workspaceToCode(workspace);
     assert.match(generated, /robot\.front_distance_m\(\)\s*<\s*1/);
+  } finally {
+    workspace.dispose();
+  }
+});
+
+test('Blockly Boolean variables generate literal assignments and branching conditions', () => {
+  const workspace = new Blockly.Workspace();
+  const variable = workspace.getVariableMap().createVariable('obstacle_detected');
+  try {
+    const assignment = workspace.newBlock('variables_set');
+    assignment.setFieldValue(variable.getId(), 'VAR');
+    const value = workspace.newBlock('logic_boolean');
+    value.setFieldValue('TRUE', 'BOOL');
+    assignment.getInput('VALUE').connection.connect(value.outputConnection);
+
+    const condition = workspace.newBlock('controls_if');
+    const variableRead = workspace.newBlock('variables_get');
+    variableRead.setFieldValue(variable.getId(), 'VAR');
+    condition.getInput('IF0').connection.connect(variableRead.outputConnection);
+    assignment.nextConnection.connect(condition.previousConnection);
+
+    const generated = pythonGenerator.workspaceToCode(workspace);
+    assert.match(generated, /obstacle_detected\s*=\s*True/);
+    assert.match(generated, /if\s+obstacle_detected\s*:/);
   } finally {
     workspace.dispose();
   }

@@ -63,9 +63,23 @@ fi
 
 SAVED_HOST_IP=""
 SAVED_DEVICE_IP=""
+SAVED_BASE_FRAME=""
+SAVED_FRONT_EXTENT=""
+SAVED_REAR_EXTENT=""
+SAVED_HALF_WIDTH=""
+SAVED_LIDAR_TOPIC=""
+SAVED_SENSOR_FRAME=""
+SAVED_PUBLISH_FREQ=""
 if [[ -f "$ENV_FILE" ]]; then
   SAVED_HOST_IP="$(awk -F= '$1 == "G1_LIDAR_HOST_IP" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_DEVICE_IP="$(awk -F= '$1 == "G1_LIDAR_DEVICE_IP" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_BASE_FRAME="$(awk -F= '$1 == "G1_DISTANCE_BASE_FRAME" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_FRONT_EXTENT="$(awk -F= '$1 == "G1_DISTANCE_FOOTPRINT_FRONT_M" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_REAR_EXTENT="$(awk -F= '$1 == "G1_DISTANCE_FOOTPRINT_REAR_M" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_HALF_WIDTH="$(awk -F= '$1 == "G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_LIDAR_TOPIC="$(awk -F= '$1 == "G1_LIDAR_TOPIC" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_SENSOR_FRAME="$(awk -F= '$1 == "G1_DISTANCE_FRAME_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_PUBLISH_FREQ="$(awk -F= '$1 == "G1_LIDAR_PUBLISH_FREQ" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
 fi
 DEFAULT_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-192.168.123.164}}"
 DEFAULT_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-192.168.123.120}}"
@@ -87,12 +101,75 @@ read_ipv4() {
 
 G1_LIDAR_HOST_IP="$(read_ipv4 "IPv4 address of the PC2 NIC physically connected to MID-360" "$DEFAULT_HOST_IP")"
 G1_LIDAR_DEVICE_IP="$(read_ipv4 "MID-360 IPv4 address on that sensor network" "$DEFAULT_DEVICE_IP")"
+G1_LIDAR_TOPIC="${G1_LIDAR_TOPIC:-${SAVED_LIDAR_TOPIC:-/mid360/livox/lidar}}"
+read -r -p "Actual MID-360 PointCloud2 topic [$G1_LIDAR_TOPIC]: " LIDAR_TOPIC_INPUT
+G1_LIDAR_TOPIC="${LIDAR_TOPIC_INPUT:-$G1_LIDAR_TOPIC}"
+if [[ ! "$G1_LIDAR_TOPIC" =~ ^/[A-Za-z0-9_/-]+$ ]]; then
+  echo "LiDAR topic must be a fully qualified ROS topic name." >&2
+  exit 1
+fi
+G1_DISTANCE_FRAME_ID="${G1_DISTANCE_FRAME_ID:-${SAVED_SENSOR_FRAME:-livox_frame}}"
+read -r -p "Actual MID-360 PointCloud2 frame ID [$G1_DISTANCE_FRAME_ID]: " SENSOR_FRAME_INPUT
+G1_DISTANCE_FRAME_ID="${SENSOR_FRAME_INPUT:-$G1_DISTANCE_FRAME_ID}"
+if [[ ! "$G1_DISTANCE_FRAME_ID" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
+  echo "LiDAR frame ID must be a valid ROS frame name." >&2
+  exit 1
+fi
+G1_LIDAR_PUBLISH_FREQ="${G1_LIDAR_PUBLISH_FREQ:-${SAVED_PUBLISH_FREQ:-20.0}}"
+if ! python3 -c 'import math, sys; value = float(sys.argv[1]); sys.exit(0 if math.isfinite(value) and 0.5 <= value <= 100 else 1)' "$G1_LIDAR_PUBLISH_FREQ" >/dev/null 2>&1; then
+  echo "G1_LIDAR_PUBLISH_FREQ must be a finite value between 0.5 and 100 Hz." >&2
+  exit 1
+fi
+G1_DISTANCE_BASE_FRAME="${G1_DISTANCE_BASE_FRAME:-${SAVED_BASE_FRAME:-base_link}}"
+read -r -p "Robot base frame used by the verified TF tree [$G1_DISTANCE_BASE_FRAME]: " BASE_FRAME_INPUT
+G1_DISTANCE_BASE_FRAME="${BASE_FRAME_INPUT:-$G1_DISTANCE_BASE_FRAME}"
+if [[ ! "$G1_DISTANCE_BASE_FRAME" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
+  echo "Robot base frame must be a valid ROS frame name." >&2
+  exit 1
+fi
 read -r -p "Is the LiDAR x-axis aligned with the robot's forward direction? [y/N] " FORWARD_AXIS_CONFIRMED
 if [[ "$FORWARD_AXIS_CONFIRMED" == "y" || "$FORWARD_AXIS_CONFIRMED" == "Y" ]]; then
   AXIS_CONFIRMED=1
 else
   AXIS_CONFIRMED=0
   echo "Axis alignment is unconfirmed. The driver will be installed for sensor diagnostics, but the distance provider and physical distance conditions will remain disabled." >&2
+fi
+read -r -p "Have you verified the LiDAR-to-base TF and measured the G1 footprint from that base frame against known-distance targets? [y/N] " DISTANCE_CALIBRATION_CONFIRMED_INPUT
+if [[ "$DISTANCE_CALIBRATION_CONFIRMED_INPUT" == "y" || "$DISTANCE_CALIBRATION_CONFIRMED_INPUT" == "Y" ]]; then
+  CALIBRATION_CONFIRMED=1
+else
+  CALIBRATION_CONFIRMED=0
+  echo "Distance calibration is unconfirmed. The LiDAR driver will remain available for diagnostics, but physical distance conditions will be disabled." >&2
+fi
+read_positive_meter() {
+  local prompt="$1"
+  local default="$2"
+  local value
+  while true; do
+    if [[ -n "$default" ]]; then
+      read -r -p "$prompt [$default]: " value
+    else
+      read -r -p "$prompt: " value
+    fi
+    value="${value:-$default}"
+    if [[ -z "$value" ]]; then
+      echo "A measured positive value is required after confirming calibration." >&2
+      continue
+    fi
+    if python3 -c 'import math, sys; value = float(sys.argv[1]); sys.exit(0 if math.isfinite(value) and value > 0 else 1)' "$value" >/dev/null 2>&1; then
+      printf '%s' "$value"
+      return 0
+    fi
+    echo "Enter a finite measured value greater than zero, in meters." >&2
+  done
+}
+FRONT_EXTENT_M="${G1_DISTANCE_FOOTPRINT_FRONT_M:-$SAVED_FRONT_EXTENT}"
+REAR_EXTENT_M="${G1_DISTANCE_FOOTPRINT_REAR_M:-$SAVED_REAR_EXTENT}"
+HALF_WIDTH_M="${G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M:-$SAVED_HALF_WIDTH}"
+if [[ "$CALIBRATION_CONFIRMED" == "1" ]]; then
+  FRONT_EXTENT_M="$(read_positive_meter "Measured base-frame distance to the front of the robot footprint (m)" "$FRONT_EXTENT_M")"
+  REAR_EXTENT_M="$(read_positive_meter "Measured base-frame distance to the rear of the robot footprint (m)" "$REAR_EXTENT_M")"
+  HALF_WIDTH_M="$(read_positive_meter "Measured half-width of the robot footprint from the base frame (m)" "$HALF_WIDTH_M")"
 fi
 python3 - "$G1_LIDAR_HOST_IP" "$G1_LIDAR_DEVICE_IP" <<'PY'
 import ipaddress
@@ -174,6 +251,8 @@ else
   sudo apt-get install -y "ros-${ROS_DISTRO_REQUIRED}-ros-base" \
     "ros-${ROS_DISTRO_REQUIRED}-rmw-cyclonedds-cpp" \
     "ros-${ROS_DISTRO_REQUIRED}-sensor-msgs-py" \
+    "ros-${ROS_DISTRO_REQUIRED}-std-msgs" \
+    "ros-${ROS_DISTRO_REQUIRED}-tf2-ros" \
     python3-colcon-common-extensions git cmake build-essential
 
   if [[ ! -d "$HOME/Livox-SDK2/.git" ]]; then
@@ -236,16 +315,22 @@ cat > "$ENV_FILE" <<EOF
 G1_DISTANCE_PROVIDER_URL=http://127.0.0.1:8181/distance/front
 G1_DISTANCE_REAR_PROVIDER_URL=http://127.0.0.1:8181/distance/rear
 G1_LIDAR_AXIS_CONFIRMED=$AXIS_CONFIRMED
+G1_DISTANCE_CALIBRATION_CONFIRMED=$CALIBRATION_CONFIRMED
 G1_DISTANCE_PROVIDER_TOKEN=$TOKEN
 G1_DISTANCE_SENSOR_ID=mid360-front
-G1_DISTANCE_FRAME_ID=livox_frame
-G1_LIDAR_TOPIC=/mid360/livox/lidar
+G1_DISTANCE_FRAME_ID=$G1_DISTANCE_FRAME_ID
+G1_DISTANCE_BASE_FRAME=$G1_DISTANCE_BASE_FRAME
+G1_DISTANCE_FOOTPRINT_FRONT_M=$FRONT_EXTENT_M
+G1_DISTANCE_FOOTPRINT_REAR_M=$REAR_EXTENT_M
+G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M=$HALF_WIDTH_M
+G1_LIDAR_TOPIC=$G1_LIDAR_TOPIC
 G1_LIDAR_CONFIG_PATH=$CONFIG_FILE
 G1_LIDAR_ROS_WS=$ROS_WS
 G1_LIDAR_ROS_DISTRO=$ROS_DISTRO_REQUIRED
 G1_LIDAR_ROS_RUNTIME=$ROS_RUNTIME
 G1_LIDAR_HOST_IP=$G1_LIDAR_HOST_IP
 G1_LIDAR_DEVICE_IP=$G1_LIDAR_DEVICE_IP
+G1_LIDAR_PUBLISH_FREQ=$G1_LIDAR_PUBLISH_FREQ
 G1_DISTANCE_PROVIDER_PORT=8181
 G1_LIDAR_FORWARD_HALF_ANGLE_DEGREES=15
 G1_LIDAR_MINIMUM_HEIGHT_M=-0.5
@@ -275,7 +360,7 @@ Requires=docker.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-driver --network host --env-file $ENV_FILE -v $CONFIG_FILE:/config/MID360_config.json:ro uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/mid360_launch.py config_path:=/config/MID360_config.json frame_id:=livox_frame
+  ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-driver --network host --env-file $ENV_FILE -v $CONFIG_FILE:/config/MID360_config.json:ro uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/mid360_launch.py config_path:=/config/MID360_config.json frame_id:=$G1_DISTANCE_FRAME_ID pointcloud_topic:=$G1_LIDAR_TOPIC publish_freq:=$G1_LIDAR_PUBLISH_FREQ
 ExecStop=/usr/bin/docker stop --time 10 uni-edu-lidar-driver
 Restart=on-failure
 RestartSec=3
@@ -303,7 +388,7 @@ EOF
   sudo systemctl daemon-reload
   sudo systemctl enable uni-edu-lidar-driver.service
   sudo systemctl restart uni-edu-lidar-driver.service
-  if [[ "$AXIS_CONFIRMED" == "1" ]]; then
+  if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
     sudo systemctl enable uni-edu-lidar-provider.service
     sudo systemctl restart uni-edu-lidar-provider.service
   else
@@ -361,10 +446,10 @@ fi
 touch "$INSTALL_MARKER"
 chmod 600 "$INSTALL_MARKER"
 echo "MID-360 driver is configured using ROS 2 $ROS_DISTRO_REQUIRED ($ROS_RUNTIME)."
-if [[ "$AXIS_CONFIRMED" == "1" ]]; then
-  echo "The read-only distance provider is enabled."
+if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
+  echo "The calibrated read-only distance provider is enabled using $G1_DISTANCE_BASE_FRAME and the measured footprint extents."
 else
-  echo "The distance provider and physical distance conditions are disabled until the sensor axis is verified."
+  echo "The distance provider and physical distance conditions are disabled until both axis alignment and metric calibration are verified."
 fi
 echo "Review $CONFIG_FILE and verify the NIC/device addresses before relying on sensor data."
 echo "The installer enables sensor data only; it does not install or start a ROS locomotion bridge."

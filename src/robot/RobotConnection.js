@@ -5,6 +5,14 @@ const MAX_EXPANDED_COMMANDS = 100;
 
 function getPhysicalCommands(code, adapter, isSupported) {
   const commands = [];
+  const program = parseG1Program(code);
+  const containsCondition = (nodes) => nodes.some((node) => (
+    node.type === 'condition'
+    || (node.type === 'repeat' && containsCondition(node.body))
+  ));
+  if (adapter !== 'SDK' && containsCondition(program)) {
+    throw new Error(`Conditional programs require the authenticated G1 SDK backend; ${adapter} cannot evaluate sensor or Boolean branches.`);
+  }
   const visit = (nodes) => {
     let pathCommandCount = 0;
     for (const node of nodes) {
@@ -20,13 +28,14 @@ function getPhysicalCommands(code, adapter, isSupported) {
         pathCommandCount += Math.max(visit(node.then), visit(node.else));
         continue;
       }
+      if (node.type === 'boolean_assignment') continue;
       for (let iteration = 0; iteration < node.times; iteration += 1) {
         pathCommandCount += visit(node.body);
       }
     }
     return pathCommandCount;
   };
-  const expandedCommandCount = visit(parseG1Program(code));
+  const expandedCommandCount = visit(program);
   if (expandedCommandCount > MAX_EXPANDED_COMMANDS) {
     throw new Error(`Programs may contain at most ${MAX_EXPANDED_COMMANDS} expanded commands.`);
   }
@@ -88,14 +97,6 @@ export class MockRobotConnection {
   }
 
   async run(code) {
-    const containsCondition = (nodes) => nodes.some((node) => {
-      if (node.type === 'condition') return true;
-      if (node.type === 'repeat') return containsCondition(node.body);
-      return false;
-    });
-    if (containsCondition(parseG1Program(code))) {
-      throw new Error('Distance conditions require the authenticated G1 SDK backend and a live MID-360 sensor.');
-    }
     if (!this.connected) throw new Error('Connect the mock robot before running a program.');
     const commands = getPhysicalCommands(code, 'mock', (method) => (
       commandDefinitions.get(method)?.adapters.sdk === true

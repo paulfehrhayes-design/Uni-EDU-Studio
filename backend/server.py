@@ -1528,6 +1528,9 @@ async def lidar_live_updates(websocket: WebSocket):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "navigation": {
                     "ready": bridge_status["ready"],
+                    "motion_ready": bridge_status.get("motionReady", False),
+                    "estop": bridge_status.get("estop"),
+                    "robot_health": bridge_status.get("robotHealth"),
                     "status": bridge_status["status"],
                     "map": bridge_status.get("map"),
                     "localization": bridge_status.get("localization"),

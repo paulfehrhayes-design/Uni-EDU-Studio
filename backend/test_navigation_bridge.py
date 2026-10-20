@@ -34,6 +34,8 @@ class NavigationBridgeTests(unittest.TestCase):
             "planner_ready": True,
             "pointcloud_ready": True,
             "pointcloud_age_ms": 80,
+            "estop": {"ready": True, "age_ms": 40, "error": None},
+            "robot_health": {"ready": True, "age_ms": 30, "error": None},
             "localization": {
                 "ready": True,
                 "frame_id": "map",
@@ -83,10 +85,48 @@ class NavigationBridgeTests(unittest.TestCase):
             result = navigation_bridge_status(now=self.now)
         self.assertEqual(result["status"], "ready")
         self.assertTrue(result["ready"])
+        self.assertTrue(result["motionReady"])
+        self.assertTrue(result["estop"]["ready"])
+        self.assertTrue(result["robotHealth"]["ready"])
         self.assertEqual(result["localization"]["frame_id"], "map")
         self.assertEqual(result["localization"]["age_ms"], 80)
         self.assertEqual(result["map"]["version"], "v4")
         self.assertEqual(result["map"]["width"], 200)
+
+    def test_missing_estop_signal_keeps_preview_ready_but_disables_motion(self):
+        status_without_estop = {key: value for key, value in self.status.items() if key != "estop"}
+        with self.mock_bridge(status=status_without_estop):
+            result = navigation_bridge_status(now=self.now)
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["motionReady"])
+        self.assertFalse(result["estop"]["ready"])
+        self.assertIn("missing, stale, or invalid", result["estop"]["error"])
+
+    def test_stale_or_invalid_estop_age_disables_motion_but_keeps_map_readiness(self):
+        for estop in (
+            {"ready": True, "age_ms": 5_001, "error": None},
+            {"ready": True, "age_ms": float("nan"), "error": None},
+            {"ready": True, "age_ms": True, "error": None},
+            {"ready": True, "age_ms": 50, "error": "safety circuit unhealthy"},
+        ):
+            with self.subTest(estop=estop), self.mock_bridge(status={
+                **self.status,
+                "estop": estop,
+            }):
+                result = navigation_bridge_status(now=self.now)
+            self.assertTrue(result["ready"])
+            self.assertFalse(result["motionReady"])
+            self.assertFalse(result["estop"]["ready"])
+
+    def test_missing_robot_health_keeps_preview_ready_but_disables_motion(self):
+        status_without_robot_health = {
+            key: value for key, value in self.status.items() if key != "robot_health"
+        }
+        with self.mock_bridge(status=status_without_robot_health):
+            result = navigation_bridge_status(now=self.now)
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["motionReady"])
+        self.assertFalse(result["robotHealth"]["ready"])
 
     def test_bridge_requests_are_authenticated_and_do_not_redirect(self):
         with self.mock_bridge(), patch.object(navigation_bridge.httpx, "get", wraps=navigation_bridge.httpx.get) as request:
@@ -265,6 +305,16 @@ class NavigationBridgeTests(unittest.TestCase):
                     "classroom", "v4", "map", [{"x": 0.025, "y": 0.025}],
                     operation_id, now=self.now,
                 )
+
+        status_without_estop = {key: value for key, value in self.status.items() if key != "estop"}
+        with self.mock_bridge(status=status_without_estop), patch.dict(
+            os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}
+        ), patch.object(navigation_bridge.httpx, "post") as motion_request:
+            with self.assertRaisesRegex(NavigationBridgeError, "E-stop health is missing, stale, or invalid"):
+                navigation_start_route(
+                    "classroom", "v4", "map", route, operation_id, now=self.now
+                )
+        motion_request.assert_not_called()
 
     def test_route_preview_validates_targets_and_returns_bounded_map_frame_path(self):
         plan = {

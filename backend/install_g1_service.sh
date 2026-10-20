@@ -86,9 +86,10 @@ environment = Path(environment_file).read_text(encoding="utf-8").splitlines()
 settings = dict(line.split("=", 1) for line in environment if "=" in line)
 runtime = settings.get("G1_LIDAR_ROS_RUNTIME", "")
 axis_confirmed = settings.get("G1_LIDAR_AXIS_CONFIRMED") == "1"
+calibration_confirmed = settings.get("G1_DISTANCE_CALIBRATION_CONFIRMED") == "1"
 if lidar_setup_succeeded and runtime == "host":
     dependencies = "uni-edu-lidar-driver.service"
-    if axis_confirmed:
+  if axis_confirmed and calibration_confirmed:
         dependencies += " uni-edu-lidar-provider.service"
     unit = unit.replace(
         "Wants=network-online.target\n",
@@ -107,16 +108,18 @@ systemctl --user daemon-reload
 if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
   AXIS_SETTING="$(grep '^G1_LIDAR_AXIS_CONFIRMED=' "$LIDAR_ENV_FILE" || printf 'G1_LIDAR_AXIS_CONFIRMED=1')"
   AXIS_CONFIRMED="${AXIS_SETTING#*=}"
+  CALIBRATION_SETTING="$(grep '^G1_DISTANCE_CALIBRATION_CONFIRMED=' "$LIDAR_ENV_FILE" || printf 'G1_DISTANCE_CALIBRATION_CONFIRMED=0')"
+  CALIBRATION_CONFIRMED="${CALIBRATION_SETTING#*=}"
   if grep -q '^G1_LIDAR_ROS_RUNTIME=host$' "$LIDAR_ENV_FILE"; then
     systemctl --user enable --now uni-edu-lidar-driver.service
-    if [[ "$AXIS_CONFIRMED" == "1" ]]; then
+    if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
       systemctl --user enable --now uni-edu-lidar-provider.service
     else
       systemctl --user disable --now uni-edu-lidar-provider.service >/dev/null 2>&1 || true
     fi
   fi
-  if [[ "$AXIS_CONFIRMED" != "1" ]]; then
-    echo "MID-360 driver installed for diagnostics; distance provider/conditions remain disabled pending axis verification."
+  if [[ "$AXIS_CONFIRMED" != "1" || "$CALIBRATION_CONFIRMED" != "1" ]]; then
+    echo "MID-360 driver installed for diagnostics; distance provider/conditions remain disabled pending axis and metric calibration verification."
   else
     echo "LiDAR services installed. Fresh sensor data will be checked only after a teacher clicks Connect."
   fi
