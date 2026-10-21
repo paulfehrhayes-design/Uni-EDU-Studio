@@ -45,22 +45,6 @@ if [[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]]; then
   exit 1
 fi
 
-if [[ "$ROS_RUNTIME" == "host" && -e "$ROS_WS" && ! -f "$ROS_WS/.uni-edu-lidar-workspace" ]]; then
-  if [[ -n "$(find "$ROS_WS" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-    echo "Refusing to use non-empty ROS workspace without this installer's ownership marker: $ROS_WS" >&2
-    echo "Set G1_LIDAR_ROS_WS to a new, dedicated workspace directory." >&2
-    exit 1
-  fi
-fi
-if [[ "$ROS_RUNTIME" == "host" ]]; then
-  mkdir -p "$ROS_WS/src"
-  touch "$ROS_WS/.uni-edu-lidar-workspace"
-  if [[ -n "$(find "$ROS_WS/src" -mindepth 1 -maxdepth 1 ! -name livox_ros_driver2 -print -quit)" ]]; then
-    echo "The dedicated LiDAR workspace contains another ROS package; refusing to let the Livox build script clear its build/install directories." >&2
-    exit 1
-  fi
-fi
-
 SAVED_HOST_IP=""
 SAVED_DEVICE_IP=""
 SAVED_BASE_FRAME=""
@@ -69,7 +53,10 @@ SAVED_REAR_EXTENT=""
 SAVED_HALF_WIDTH=""
 SAVED_LIDAR_TOPIC=""
 SAVED_SENSOR_FRAME=""
+SAVED_SENSOR_ID=""
 SAVED_PUBLISH_FREQ=""
+SAVED_AXIS_CONFIRMED=""
+SAVED_CALIBRATION_CONFIRMED=""
 if [[ -f "$ENV_FILE" ]]; then
   SAVED_HOST_IP="$(awk -F= '$1 == "G1_LIDAR_HOST_IP" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_DEVICE_IP="$(awk -F= '$1 == "G1_LIDAR_DEVICE_IP" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
@@ -79,141 +66,173 @@ if [[ -f "$ENV_FILE" ]]; then
   SAVED_HALF_WIDTH="$(awk -F= '$1 == "G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_LIDAR_TOPIC="$(awk -F= '$1 == "G1_LIDAR_TOPIC" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_SENSOR_FRAME="$(awk -F= '$1 == "G1_DISTANCE_FRAME_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_SENSOR_ID="$(awk -F= '$1 == "G1_DISTANCE_SENSOR_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_PUBLISH_FREQ="$(awk -F= '$1 == "G1_LIDAR_PUBLISH_FREQ" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_AXIS_CONFIRMED="$(awk -F= '$1 == "G1_LIDAR_AXIS_CONFIRMED" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_CALIBRATION_CONFIRMED="$(awk -F= '$1 == "G1_DISTANCE_CALIBRATION_CONFIRMED" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
 fi
-DEFAULT_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-192.168.123.164}}"
-DEFAULT_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-192.168.123.120}}"
+DISCOVERY_STATUS=0
+if DISCOVERY_JSON="$(python3 "$PROJECT_DIR/backend/sensor_discovery.py")"; then
+  :
+else
+  DISCOVERY_STATUS=$?
+fi
+if [[ -z "$DISCOVERY_JSON" ]]; then
+  echo "Sensor discovery failed before producing diagnostics." >&2
+  exit 1
+fi
+discovery_value() {
+  printf '%s' "$DISCOVERY_JSON" | python3 -c '
+import json
+import sys
 
-read_ipv4() {
-  local prompt="$1"
-  local default="$2"
-  local input
-  while true; do
-    read -r -p "$prompt [$default]: " input
-    input="${input:-$default}"
-    if python3 -c 'import ipaddress, sys; ipaddress.IPv4Address(sys.argv[1])' "$input" >/dev/null 2>&1; then
-      printf '%s' "$input"
-      return 0
-    fi
-    echo "Invalid IPv4 address '$input'. Enter only the numeric address (for example, 192.168.123.164)." >&2
-  done
+value = json.load(sys.stdin)
+for key in sys.argv[1].split("."):
+    value = value.get(key) if isinstance(value, dict) else None
+if isinstance(value, bool):
+    print("1" if value else "0")
+elif value is not None:
+    print(value)
+' "$1"
 }
-
-G1_LIDAR_HOST_IP="$(read_ipv4 "IPv4 address of the PC2 NIC physically connected to MID-360" "$DEFAULT_HOST_IP")"
-G1_LIDAR_DEVICE_IP="$(read_ipv4 "MID-360 IPv4 address on that sensor network" "$DEFAULT_DEVICE_IP")"
-G1_LIDAR_TOPIC="${G1_LIDAR_TOPIC:-${SAVED_LIDAR_TOPIC:-/mid360/livox/lidar}}"
-read -r -p "Actual MID-360 PointCloud2 topic [$G1_LIDAR_TOPIC]: " LIDAR_TOPIC_INPUT
-G1_LIDAR_TOPIC="${LIDAR_TOPIC_INPUT:-$G1_LIDAR_TOPIC}"
-if [[ ! "$G1_LIDAR_TOPIC" =~ ^/[A-Za-z0-9_/-]+$ ]]; then
-  echo "LiDAR topic must be a fully qualified ROS topic name." >&2
-  exit 1
-fi
-G1_DISTANCE_FRAME_ID="${G1_DISTANCE_FRAME_ID:-${SAVED_SENSOR_FRAME:-livox_frame}}"
-read -r -p "Actual MID-360 PointCloud2 frame ID [$G1_DISTANCE_FRAME_ID]: " SENSOR_FRAME_INPUT
-G1_DISTANCE_FRAME_ID="${SENSOR_FRAME_INPUT:-$G1_DISTANCE_FRAME_ID}"
-if [[ ! "$G1_DISTANCE_FRAME_ID" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
-  echo "LiDAR frame ID must be a valid ROS frame name." >&2
-  exit 1
-fi
+CONNECTION_METHOD="$(discovery_value connection.method)"
+CONNECTION_REASON="$(discovery_value connection.reason)"
+DRIVER_REQUIRED="$(discovery_value connection.driver_required)"
+DISCOVERED_TOPIC="$(discovery_value connection.topic)"
+DISCOVERED_FRAME="$(discovery_value connection.frame_id)"
+DISCOVERED_SENSOR_ID="$(discovery_value connection.sensor_id)"
+G1_LIDAR_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-$(discovery_value network.host_ip)}}"
+G1_LIDAR_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-$(discovery_value network.device_ip)}}"
+G1_LIDAR_TOPIC="${G1_LIDAR_TOPIC:-${SAVED_LIDAR_TOPIC:-$DISCOVERED_TOPIC}}"
+G1_DISTANCE_FRAME_ID="${G1_DISTANCE_FRAME_ID:-${SAVED_SENSOR_FRAME:-$DISCOVERED_FRAME}}"
+G1_DISTANCE_SENSOR_ID="${G1_DISTANCE_SENSOR_ID:-${DISCOVERED_SENSOR_ID:-${SAVED_SENSOR_ID:-mid360-front}}}"
+G1_DISTANCE_BASE_FRAME="${G1_DISTANCE_BASE_FRAME:-$SAVED_BASE_FRAME}"
 G1_LIDAR_PUBLISH_FREQ="${G1_LIDAR_PUBLISH_FREQ:-${SAVED_PUBLISH_FREQ:-20.0}}"
+AXIS_CONFIRMED="${G1_LIDAR_AXIS_CONFIRMED:-${SAVED_AXIS_CONFIRMED:-0}}"
+CALIBRATION_CONFIRMED="${G1_DISTANCE_CALIBRATION_CONFIRMED:-${SAVED_CALIBRATION_CONFIRMED:-0}}"
+FRONT_EXTENT_M="${G1_DISTANCE_FOOTPRINT_FRONT_M:-$SAVED_FRONT_EXTENT}"
+REAR_EXTENT_M="${G1_DISTANCE_FOOTPRINT_REAR_M:-$SAVED_REAR_EXTENT}"
+HALF_WIDTH_M="${G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M:-$SAVED_HALF_WIDTH}"
+
+echo "Sensor discovery method: $CONNECTION_METHOD"
+echo "Sensor discovery: $CONNECTION_REASON"
+python3 - "$DISCOVERY_JSON" <<'PY'
+import json
+import sys
+
+report = json.loads(sys.argv[1])
+for diagnostic in report["diagnostics"]:
+    print("Discovery diagnostic: {}".format(diagnostic), file=sys.stderr)
+for topic in report["ros"]["pointclouds"]:
+    state = "fresh" if topic["fresh"] else "unavailable"
+    print(
+        "PointCloud2 {}: topic={}, type={}, frame={}, age_ms={}, diagnostic={}".format(
+            state,
+            topic["name"],
+            topic["type"],
+            topic["frame_id"],
+            topic["age_ms"],
+            topic["error"],
+        )
+    )
+PY
+
+if [[ "$CONNECTION_METHOD" != "direct_livox" &&
+      "$CONNECTION_METHOD" != "existing_ros_pointcloud" &&
+      "$CONNECTION_METHOD" != "unitree_ros_pointcloud" &&
+      "$CONNECTION_METHOD" != "existing_driver" ]]; then
+  echo "LiDAR setup stopped: $CONNECTION_REASON" >&2
+  if [[ "$DISCOVERY_STATUS" != "0" ]]; then
+    echo "Run backend/sensor_discovery.py for full diagnostics." >&2
+  fi
+  exit 1
+fi
+if [[ "$CONNECTION_METHOD" == "existing_driver" &&
+      ( -z "$G1_LIDAR_TOPIC" || -z "$G1_DISTANCE_FRAME_ID" ) ]]; then
+  echo "An existing driver is active, but its saved PointCloud2 topic/frame are unavailable. No second driver will be started." >&2
+  exit 1
+fi
+if [[ "$CONNECTION_METHOD" == "direct_livox" ]]; then
+  if [[ -z "$G1_LIDAR_HOST_IP" || -z "$G1_LIDAR_DEVICE_IP" ]]; then
+    echo "Direct Livox setup requires verified host and device addresses. Set G1_LIDAR_HOST_IP and G1_LIDAR_DEVICE_IP; defaults will not be guessed." >&2
+    exit 1
+  fi
+  if [[ "$ROS_RUNTIME" == "host" && -e "$ROS_WS" && ! -f "$ROS_WS/.uni-edu-lidar-workspace" ]]; then
+    if [[ -n "$(find "$ROS_WS" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+      echo "Refusing to use non-empty ROS workspace without this installer's ownership marker: $ROS_WS" >&2
+      echo "Set G1_LIDAR_ROS_WS to a new, dedicated workspace directory." >&2
+      exit 1
+    fi
+  fi
+  if [[ "$ROS_RUNTIME" == "host" ]]; then
+    mkdir -p "$ROS_WS/src"
+    touch "$ROS_WS/.uni-edu-lidar-workspace"
+    if [[ -n "$(find "$ROS_WS/src" -mindepth 1 -maxdepth 1 ! -name livox_ros_driver2 -print -quit)" ]]; then
+      echo "The dedicated LiDAR workspace contains another ROS package; refusing to let the Livox build script clear its build/install directories." >&2
+      exit 1
+    fi
+  fi
+elif [[ -z "$G1_LIDAR_TOPIC" || -z "$G1_DISTANCE_FRAME_ID" ]]; then
+  echo "A compatible existing LiDAR stream was detected, but its topic or frame is not available. No duplicate Livox driver will be started." >&2
+  exit 1
+fi
+
+if [[ ! "$G1_LIDAR_TOPIC" =~ ^/[A-Za-z0-9_/-]+$ ]]; then
+  echo "Discovered/configured LiDAR topic is not a valid fully qualified ROS topic name." >&2
+  exit 1
+fi
+for address in "$G1_LIDAR_HOST_IP" "$G1_LIDAR_DEVICE_IP"; do
+  if [[ -n "$address" ]] &&
+     ! python3 -c 'import ipaddress, sys; ipaddress.IPv4Address(sys.argv[1])' "$address" >/dev/null 2>&1; then
+    echo "Configured sensor-network addresses must be valid IPv4 addresses." >&2
+    exit 1
+  fi
+done
+if [[ ! "$G1_DISTANCE_FRAME_ID" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
+  echo "Discovered/configured LiDAR frame ID is not a valid ROS frame name." >&2
+  exit 1
+fi
+if [[ -n "$G1_DISTANCE_BASE_FRAME" && ! "$G1_DISTANCE_BASE_FRAME" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
+  echo "Configured robot base frame is not a valid ROS frame name." >&2
+  exit 1
+fi
+if [[ ! "$G1_DISTANCE_SENSOR_ID" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+  echo "Configured sensor ID contains invalid characters." >&2
+  exit 1
+fi
+if [[ "$AXIS_CONFIRMED" != "0" && "$AXIS_CONFIRMED" != "1" ]] ||
+   [[ "$CALIBRATION_CONFIRMED" != "0" && "$CALIBRATION_CONFIRMED" != "1" ]]; then
+  echo "Calibration confirmation settings must be either 0 or 1." >&2
+  exit 1
+fi
+for value in "$FRONT_EXTENT_M" "$REAR_EXTENT_M" "$HALF_WIDTH_M"; do
+  if [[ -n "$value" ]] &&
+     ! python3 -c 'import math, sys; value = float(sys.argv[1]); sys.exit(0 if math.isfinite(value) and value > 0 else 1)' "$value" >/dev/null 2>&1; then
+    echo "Configured footprint dimensions must be finite positive meters." >&2
+    exit 1
+  fi
+done
+if [[ "$CALIBRATION_CONFIRMED" == "1" ]]; then
+  if [[ "$AXIS_CONFIRMED" != "1" || -z "$G1_DISTANCE_BASE_FRAME" ]]; then
+    echo "Distance calibration cannot be enabled without confirmed axis alignment and an explicit base frame." >&2
+    exit 1
+  fi
+  for value in "$FRONT_EXTENT_M" "$REAR_EXTENT_M" "$HALF_WIDTH_M"; do
+    if ! python3 -c 'import math, sys; value = float(sys.argv[1]); sys.exit(0 if math.isfinite(value) and value > 0 else 1)' "$value" >/dev/null 2>&1; then
+      echo "Confirmed distance calibration requires saved or explicit positive footprint dimensions in meters; no measurements are guessed." >&2
+      exit 1
+    fi
+  done
+fi
 if ! python3 -c 'import math, sys; value = float(sys.argv[1]); sys.exit(0 if math.isfinite(value) and 0.5 <= value <= 100 else 1)' "$G1_LIDAR_PUBLISH_FREQ" >/dev/null 2>&1; then
   echo "G1_LIDAR_PUBLISH_FREQ must be a finite value between 0.5 and 100 Hz." >&2
   exit 1
 fi
-G1_DISTANCE_BASE_FRAME="${G1_DISTANCE_BASE_FRAME:-${SAVED_BASE_FRAME:-base_link}}"
-read -r -p "Robot base frame used by the verified TF tree [$G1_DISTANCE_BASE_FRAME]: " BASE_FRAME_INPUT
-G1_DISTANCE_BASE_FRAME="${BASE_FRAME_INPUT:-$G1_DISTANCE_BASE_FRAME}"
-if [[ ! "$G1_DISTANCE_BASE_FRAME" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
-  echo "Robot base frame must be a valid ROS frame name." >&2
+if [[ "$ROS_RUNTIME" == "container" && "$DRIVER_REQUIRED" == "1" &&
+      "$PROJECT_DIR$CONFIG_FILE$ENV_FILE" =~ [[:space:]] ]]; then
+  echo "Container setup requires project and configuration paths without whitespace." >&2
   exit 1
 fi
-read -r -p "Is the LiDAR x-axis aligned with the robot's forward direction? [y/N] " FORWARD_AXIS_CONFIRMED
-if [[ "$FORWARD_AXIS_CONFIRMED" == "y" || "$FORWARD_AXIS_CONFIRMED" == "Y" ]]; then
-  AXIS_CONFIRMED=1
-else
-  AXIS_CONFIRMED=0
-  echo "Axis alignment is unconfirmed. The driver will be installed for sensor diagnostics, but the distance provider and physical distance conditions will remain disabled." >&2
-fi
-read -r -p "Have you verified the LiDAR-to-base TF and measured the G1 footprint from that base frame against known-distance targets? [y/N] " DISTANCE_CALIBRATION_CONFIRMED_INPUT
-if [[ "$DISTANCE_CALIBRATION_CONFIRMED_INPUT" == "y" || "$DISTANCE_CALIBRATION_CONFIRMED_INPUT" == "Y" ]]; then
-  CALIBRATION_CONFIRMED=1
-else
-  CALIBRATION_CONFIRMED=0
-  echo "Distance calibration is unconfirmed. The LiDAR driver will remain available for diagnostics, but physical distance conditions will be disabled." >&2
-fi
-read_positive_meter() {
-  local prompt="$1"
-  local default="$2"
-  local value
-  while true; do
-    if [[ -n "$default" ]]; then
-      read -r -p "$prompt [$default]: " value
-    else
-      read -r -p "$prompt: " value
-    fi
-    value="${value:-$default}"
-    if [[ -z "$value" ]]; then
-      echo "A measured positive value is required after confirming calibration." >&2
-      continue
-    fi
-    if python3 -c 'import math, sys; value = float(sys.argv[1]); sys.exit(0 if math.isfinite(value) and value > 0 else 1)' "$value" >/dev/null 2>&1; then
-      printf '%s' "$value"
-      return 0
-    fi
-    echo "Enter a finite measured value greater than zero, in meters." >&2
-  done
-}
-FRONT_EXTENT_M="${G1_DISTANCE_FOOTPRINT_FRONT_M:-$SAVED_FRONT_EXTENT}"
-REAR_EXTENT_M="${G1_DISTANCE_FOOTPRINT_REAR_M:-$SAVED_REAR_EXTENT}"
-HALF_WIDTH_M="${G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M:-$SAVED_HALF_WIDTH}"
-if [[ "$CALIBRATION_CONFIRMED" == "1" ]]; then
-  FRONT_EXTENT_M="$(read_positive_meter "Measured base-frame distance to the front of the robot footprint (m)" "$FRONT_EXTENT_M")"
-  REAR_EXTENT_M="$(read_positive_meter "Measured base-frame distance to the rear of the robot footprint (m)" "$REAR_EXTENT_M")"
-  HALF_WIDTH_M="$(read_positive_meter "Measured half-width of the robot footprint from the base frame (m)" "$HALF_WIDTH_M")"
-fi
-python3 - "$G1_LIDAR_HOST_IP" "$G1_LIDAR_DEVICE_IP" <<'PY'
-import ipaddress
-import re
-import subprocess
-import sys
-
-try:
-    host = ipaddress.IPv4Address(sys.argv[1])
-    device = ipaddress.IPv4Address(sys.argv[2])
-except ipaddress.AddressValueError as error:
-    raise SystemExit(f"The Livox host and device addresses must be valid IPv4 addresses: {error}")
-
-try:
-    addresses = subprocess.run(
-        ["ip", "-4", "-o", "address", "show", "up"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-except (OSError, subprocess.CalledProcessError) as error:
-    raise SystemExit(f"Could not inspect active host network addresses with ip: {error}")
-
-host_networks = []
-for line in addresses.splitlines():
-    match = re.search(r"\binet\s+(\S+)", line)
-    if not match:
-        continue
-    interface = ipaddress.IPv4Interface(match.group(1))
-    if interface.ip == host:
-        host_networks.append(interface.network)
-
-if not host_networks:
-    raise SystemExit(
-        f"Host address {host} is not assigned to an active local interface. "
-        "Configure and activate the MID-360 NIC before installing the driver."
-    )
-if not any(device in network for network in host_networks):
-    networks = ", ".join(map(str, host_networks))
-    raise SystemExit(
-        f"MID-360 address {device} is not in the subnet of host address {host} "
-        f"({networks}). Verify the NIC and sensor network settings."
-    )
-PY
 
 if [[ "$ROS_RUNTIME" == "container" ]]; then
   if ! command -v docker >/dev/null 2>&1; then
@@ -232,7 +251,7 @@ if [[ "$ROS_RUNTIME" == "container" ]]; then
     echo "At least 8 GiB of free space is required on Docker's storage filesystem at $DOCKER_ROOT." >&2
     exit 1
   fi
-  echo "Building the native-architecture ROS 2 Humble container with the Livox MID-360 driver."
+  echo "Building the native-architecture ROS 2 Humble sensor runtime."
   sudo docker build --quiet --pull=false -t uni-edu-lidar-humble:local \
     -f "$PROJECT_DIR/backend/ros/docker/Dockerfile" "$PROJECT_DIR"
 else
@@ -255,44 +274,47 @@ else
     "ros-${ROS_DISTRO_REQUIRED}-tf2-ros" \
     python3-colcon-common-extensions git cmake build-essential
 
-  if [[ ! -d "$HOME/Livox-SDK2/.git" ]]; then
-    git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git "$HOME/Livox-SDK2"
-  fi
-  cmake -S "$HOME/Livox-SDK2" -B "$HOME/Livox-SDK2/build"
-  cmake --build "$HOME/Livox-SDK2/build" --parallel
-  sudo cmake --install "$HOME/Livox-SDK2/build"
-  sudo ldconfig
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    if [[ ! -d "$HOME/Livox-SDK2/.git" ]]; then
+      git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git "$HOME/Livox-SDK2"
+    fi
+    cmake -S "$HOME/Livox-SDK2" -B "$HOME/Livox-SDK2/build"
+    cmake --build "$HOME/Livox-SDK2/build" --parallel
+    sudo cmake --install "$HOME/Livox-SDK2/build"
+    sudo ldconfig
 
-  if [[ ! -d "$ROS_WS/src/livox_ros_driver2/.git" ]]; then
-    git clone --depth 1 https://github.com/Livox-SDK/livox_ros_driver2.git \
-      "$ROS_WS/src/livox_ros_driver2"
+    if [[ ! -d "$ROS_WS/src/livox_ros_driver2/.git" ]]; then
+      git clone --depth 1 https://github.com/Livox-SDK/livox_ros_driver2.git \
+        "$ROS_WS/src/livox_ros_driver2"
+    fi
+    (
+      set +u
+      source "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash"
+      set -u
+      cd "$ROS_WS/src/livox_ros_driver2"
+      ./build.sh humble
+    )
   fi
-  (
-    set +u
-    source "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash"
-    set -u
-    cd "$ROS_WS/src/livox_ros_driver2"
-    ./build.sh humble
-  )
 fi
 
 mkdir -p "$CONFIG_DIR" "$USER_UNIT_DIR"
 chmod 700 "$CONFIG_DIR"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  if [[ "$ROS_RUNTIME" == "container" ]]; then
-    CONFIG_TEMP="$CONFIG_FILE.tmp.$$"
-    if ! sudo docker run --rm uni-edu-lidar-humble:local \
-      cat /opt/livox_ws/src/livox_ros_driver2/config/MID360_config.json > "$CONFIG_TEMP"; then
-      rm -f "$CONFIG_TEMP"
-      exit 1
+if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    if [[ "$ROS_RUNTIME" == "container" ]]; then
+      CONFIG_TEMP="$CONFIG_FILE.tmp.$$"
+      if ! sudo docker run --rm uni-edu-lidar-humble:local \
+        cat /opt/livox_ws/src/livox_ros_driver2/config/MID360_config.json > "$CONFIG_TEMP"; then
+        rm -f "$CONFIG_TEMP"
+        exit 1
+      fi
+      mv "$CONFIG_TEMP" "$CONFIG_FILE"
+    else
+      cp "$ROS_WS/src/livox_ros_driver2/config/MID360_config.json" "$CONFIG_FILE"
     fi
-    mv "$CONFIG_TEMP" "$CONFIG_FILE"
-  else
-    cp "$ROS_WS/src/livox_ros_driver2/config/MID360_config.json" "$CONFIG_FILE"
   fi
-fi
-G1_LIDAR_HOST_IP="$G1_LIDAR_HOST_IP" G1_LIDAR_DEVICE_IP="$G1_LIDAR_DEVICE_IP" \
-  CONFIG_FILE="$CONFIG_FILE" python3 - <<'PY'
+  G1_LIDAR_HOST_IP="$G1_LIDAR_HOST_IP" G1_LIDAR_DEVICE_IP="$G1_LIDAR_DEVICE_IP" \
+    CONFIG_FILE="$CONFIG_FILE" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -307,7 +329,8 @@ for field in ("cmd_data_ip", "push_msg_ip", "point_data_ip", "imu_data_ip"):
 config["lidar_configs"][0]["ip"] = device
 path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 PY
-chmod 600 "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+fi
 
 TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 umask 077
@@ -317,7 +340,7 @@ G1_DISTANCE_REAR_PROVIDER_URL=http://127.0.0.1:8181/distance/rear
 G1_LIDAR_AXIS_CONFIRMED=$AXIS_CONFIRMED
 G1_DISTANCE_CALIBRATION_CONFIRMED=$CALIBRATION_CONFIRMED
 G1_DISTANCE_PROVIDER_TOKEN=$TOKEN
-G1_DISTANCE_SENSOR_ID=mid360-front
+G1_DISTANCE_SENSOR_ID=$G1_DISTANCE_SENSOR_ID
 G1_DISTANCE_FRAME_ID=$G1_DISTANCE_FRAME_ID
 G1_DISTANCE_BASE_FRAME=$G1_DISTANCE_BASE_FRAME
 G1_DISTANCE_FOOTPRINT_FRONT_M=$FRONT_EXTENT_M
@@ -328,6 +351,8 @@ G1_LIDAR_CONFIG_PATH=$CONFIG_FILE
 G1_LIDAR_ROS_WS=$ROS_WS
 G1_LIDAR_ROS_DISTRO=$ROS_DISTRO_REQUIRED
 G1_LIDAR_ROS_RUNTIME=$ROS_RUNTIME
+G1_LIDAR_DRIVER_REQUIRED=$DRIVER_REQUIRED
+G1_LIDAR_CONNECTION_METHOD=$CONNECTION_METHOD
 G1_LIDAR_HOST_IP=$G1_LIDAR_HOST_IP
 G1_LIDAR_DEVICE_IP=$G1_LIDAR_DEVICE_IP
 G1_LIDAR_PUBLISH_FREQ=$G1_LIDAR_PUBLISH_FREQ
@@ -340,18 +365,19 @@ EOF
 chmod 600 "$ENV_FILE"
 
 if [[ "$ROS_RUNTIME" == "container" ]]; then
-  for service in uni-edu-lidar-driver.service uni-edu-lidar-provider.service; do
-    if [[ -f "$USER_UNIT_DIR/$service" ]]; then
-      if systemctl --user is-active --quiet "$service"; then
-        systemctl --user stop "$service"
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    for service in uni-edu-lidar-driver.service uni-edu-lidar-provider.service; do
+      if [[ -f "$USER_UNIT_DIR/$service" ]]; then
+        if systemctl --user is-active --quiet "$service"; then
+          systemctl --user stop "$service"
+        fi
+        if systemctl --user is-enabled --quiet "$service"; then
+          systemctl --user disable "$service"
+        fi
       fi
-      if systemctl --user is-enabled --quiet "$service"; then
-        systemctl --user disable "$service"
-      fi
-    fi
-  done
-  systemctl --user daemon-reload
-  sudo tee /etc/systemd/system/uni-edu-lidar-driver.service >/dev/null <<EOF
+    done
+    systemctl --user daemon-reload
+    sudo tee /etc/systemd/system/uni-edu-lidar-driver.service >/dev/null <<EOF
 [Unit]
 Description=Uni EDU MID-360 ROS 2 Humble container
 After=network-online.target docker.service
@@ -368,12 +394,20 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+  fi
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    PROVIDER_DEPENDENCIES="After=network-online.target docker.service uni-edu-lidar-driver.service
+Wants=network-online.target
+Requires=docker.service uni-edu-lidar-driver.service"
+  else
+    PROVIDER_DEPENDENCIES="After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service"
+  fi
   sudo tee /etc/systemd/system/uni-edu-lidar-provider.service >/dev/null <<EOF
 [Unit]
 Description=Uni EDU read-only MID-360 distance provider container
-After=network-online.target docker.service uni-edu-lidar-driver.service
-Wants=network-online.target
-Requires=docker.service uni-edu-lidar-driver.service
+$PROVIDER_DEPENDENCIES
 
 [Service]
 Type=simple
@@ -386,8 +420,12 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
   sudo systemctl daemon-reload
-  sudo systemctl enable uni-edu-lidar-driver.service
-  sudo systemctl restart uni-edu-lidar-driver.service
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    sudo systemctl enable uni-edu-lidar-driver.service
+    sudo systemctl restart uni-edu-lidar-driver.service
+  else
+    echo "Reusing the detected ROS point-cloud source; no Livox driver service will be started."
+  fi
   if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
     sudo systemctl enable uni-edu-lidar-provider.service
     sudo systemctl restart uni-edu-lidar-provider.service
@@ -396,18 +434,19 @@ EOF
     sudo systemctl stop uni-edu-lidar-provider.service >/dev/null 2>&1 || true
   fi
 else
-  for service in uni-edu-lidar-driver.service uni-edu-lidar-provider.service; do
-    if [[ -f "/etc/systemd/system/$service" ]]; then
-      if sudo systemctl is-active --quiet "$service"; then
-        sudo systemctl stop "$service"
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    for service in uni-edu-lidar-driver.service uni-edu-lidar-provider.service; do
+      if [[ -f "/etc/systemd/system/$service" ]]; then
+        if sudo systemctl is-active --quiet "$service"; then
+          sudo systemctl stop "$service"
+        fi
+        if sudo systemctl is-enabled --quiet "$service"; then
+          sudo systemctl disable "$service"
+        fi
       fi
-      if sudo systemctl is-enabled --quiet "$service"; then
-        sudo systemctl disable "$service"
-      fi
-    fi
-  done
-  sudo systemctl daemon-reload
-  cat > "$USER_UNIT_DIR/uni-edu-lidar-driver.service" <<EOF
+    done
+    sudo systemctl daemon-reload
+    cat > "$USER_UNIT_DIR/uni-edu-lidar-driver.service" <<EOF
 [Unit]
 Description=Uni EDU MID-360 ROS 2 driver
 After=network-online.target
@@ -424,11 +463,17 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 EOF
+  fi
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    PROVIDER_DEPENDENCIES="Requires=uni-edu-lidar-driver.service
+After=uni-edu-lidar-driver.service"
+  else
+    PROVIDER_DEPENDENCIES="After=network-online.target"
+  fi
   cat > "$USER_UNIT_DIR/uni-edu-lidar-provider.service" <<EOF
 [Unit]
 Description=Uni EDU read-only MID-360 distance provider
-Requires=uni-edu-lidar-driver.service
-After=uni-edu-lidar-driver.service
+$PROVIDER_DEPENDENCIES
 
 [Service]
 Type=simple
@@ -441,15 +486,25 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 EOF
+  systemctl --user daemon-reload
+  if [[ "$AXIS_CONFIRMED" != "1" || "$CALIBRATION_CONFIRMED" != "1" ]]; then
+    systemctl --user disable --now uni-edu-lidar-provider.service >/dev/null 2>&1 || true
+  fi
 fi
 
 touch "$INSTALL_MARKER"
 chmod 600 "$INSTALL_MARKER"
-echo "MID-360 driver is configured using ROS 2 $ROS_DISTRO_REQUIRED ($ROS_RUNTIME)."
+if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+  echo "Direct MID-360 Livox driver is configured using ROS 2 $ROS_DISTRO_REQUIRED ($ROS_RUNTIME)."
+else
+  echo "Using the detected existing ROS point-cloud source; no Livox driver was installed or started."
+fi
 if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
   echo "The calibrated read-only distance provider is enabled using $G1_DISTANCE_BASE_FRAME and the measured footprint extents."
 else
-  echo "The distance provider and physical distance conditions are disabled until both axis alignment and metric calibration are verified."
+  echo "Physical distance conditions remain disabled until axis alignment, base transform, and metric footprint calibration are explicitly verified."
 fi
-echo "Review $CONFIG_FILE and verify the NIC/device addresses before relying on sensor data."
+if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+  echo "The configured network was validated, but hardware presence still needs on-device verification. Review $CONFIG_FILE."
+fi
 echo "The installer enables sensor data only; it does not install or start a ROS locomotion bridge."

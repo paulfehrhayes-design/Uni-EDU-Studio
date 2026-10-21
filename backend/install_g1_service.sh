@@ -18,9 +18,10 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 LIDAR_CONFIGURED=0
-LIDAR_ENV_FILE="$HOME/.config/uni-edu-studio/lidar.env"
+LIDAR_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uni-edu-studio"
+LIDAR_ENV_FILE="$LIDAR_CONFIG_DIR/lidar.env"
 LIDAR_PREVIOUSLY_INSTALLED=0
-if [[ -f "$HOME/.config/uni-edu-studio/lidar-installed" && -f "$LIDAR_ENV_FILE" ]]; then
+if [[ -f "$LIDAR_CONFIG_DIR/lidar-installed" && -f "$LIDAR_ENV_FILE" ]]; then
   LIDAR_PREVIOUSLY_INSTALLED=1
 fi
 if [[ "${INSTALL_G1_LIDAR:-0}" == "1" ]]; then
@@ -34,7 +35,7 @@ if [[ "${INSTALL_G1_LIDAR:-0}" == "1" ]]; then
       echo "Distance-condition programs will remain fail-closed until LiDAR setup succeeds." >&2
     fi
   fi
-elif [[ -f "$HOME/.config/uni-edu-studio/lidar-installed" ]]; then
+elif [[ -f "$LIDAR_CONFIG_DIR/lidar-installed" ]]; then
   LIDAR_CONFIGURED=1
 fi
 
@@ -85,20 +86,25 @@ unit = unit_path.read_text(encoding="utf-8")
 environment = Path(environment_file).read_text(encoding="utf-8").splitlines()
 settings = dict(line.split("=", 1) for line in environment if "=" in line)
 runtime = settings.get("G1_LIDAR_ROS_RUNTIME", "")
+driver_required = settings.get("G1_LIDAR_DRIVER_REQUIRED", "1") == "1"
 axis_confirmed = settings.get("G1_LIDAR_AXIS_CONFIRMED") == "1"
 calibration_confirmed = settings.get("G1_DISTANCE_CALIBRATION_CONFIRMED") == "1"
 if lidar_setup_succeeded and runtime == "host":
-    dependencies = "uni-edu-lidar-driver.service"
+    dependencies = []
+    if driver_required:
+        dependencies.append("uni-edu-lidar-driver.service")
     if axis_confirmed and calibration_confirmed:
-        dependencies += " uni-edu-lidar-provider.service"
-    unit = unit.replace(
-        "Wants=network-online.target\n",
-        f"Wants=network-online.target {dependencies}\n",
-    )
-    unit = unit.replace(
-        "After=network-online.target\n",
-        f"After=network-online.target {dependencies}\n",
-    )
+        dependencies.append("uni-edu-lidar-provider.service")
+    if dependencies:
+        dependency_list = " ".join(dependencies)
+        unit = unit.replace(
+            "Wants=network-online.target\n",
+            f"Wants=network-online.target {dependency_list}\n",
+        )
+        unit = unit.replace(
+            "After=network-online.target\n",
+            f"After=network-online.target {dependency_list}\n",
+        )
 unit = unit.replace("[Service]\n", f"[Service]\nEnvironmentFile={environment_file}\n")
 unit_path.write_text(unit, encoding="utf-8")
 PY
@@ -110,8 +116,14 @@ if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
   AXIS_CONFIRMED="${AXIS_SETTING#*=}"
   CALIBRATION_SETTING="$(grep '^G1_DISTANCE_CALIBRATION_CONFIRMED=' "$LIDAR_ENV_FILE" || printf 'G1_DISTANCE_CALIBRATION_CONFIRMED=0')"
   CALIBRATION_CONFIRMED="${CALIBRATION_SETTING#*=}"
+  DRIVER_SETTING="$(grep '^G1_LIDAR_DRIVER_REQUIRED=' "$LIDAR_ENV_FILE" || printf 'G1_LIDAR_DRIVER_REQUIRED=1')"
+  DRIVER_REQUIRED="${DRIVER_SETTING#*=}"
   if grep -q '^G1_LIDAR_ROS_RUNTIME=host$' "$LIDAR_ENV_FILE"; then
-    systemctl --user enable --now uni-edu-lidar-driver.service
+    if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+      systemctl --user enable --now uni-edu-lidar-driver.service
+    else
+      echo "Reusing the discovered ROS point-cloud stream; no Livox driver service will be started."
+    fi
     if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
       systemctl --user enable --now uni-edu-lidar-provider.service
     else
@@ -119,9 +131,13 @@ if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
     fi
   fi
   if [[ "$AXIS_CONFIRMED" != "1" || "$CALIBRATION_CONFIRMED" != "1" ]]; then
-    echo "MID-360 driver installed for diagnostics; distance provider/conditions remain disabled pending axis and metric calibration verification."
+    if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+      echo "MID-360 driver installed for diagnostics; distance provider/conditions remain disabled pending axis and metric calibration verification."
+    else
+      echo "Existing sensor stream is available for diagnostics; physical distance conditions remain disabled pending verified calibration."
+    fi
   else
-    echo "LiDAR services installed. Fresh sensor data will be checked only after a teacher clicks Connect."
+    echo "Sensor provider service is installed. Fresh sensor data will be checked only after a teacher clicks Connect."
   fi
 elif [[ -f "$LIDAR_ENV_FILE" ]]; then
   echo "LiDAR setup did not complete; reusing the saved provider configuration for diagnostics."

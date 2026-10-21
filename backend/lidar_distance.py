@@ -8,6 +8,11 @@ from typing import Any
 
 import httpx
 
+try:
+    from .sensor_calibration import calibration_status
+except ImportError:
+    from sensor_calibration import calibration_status
+
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
@@ -43,6 +48,13 @@ def _provider_configuration(sector: str) -> tuple[str, str, str, str, str]:
         )
     if not url.startswith(("http://", "https://")):
         raise DistanceSensorError("MID-360 distance provider URL must use HTTP or HTTPS.")
+    calibration = calibration_status()
+    if calibration.get("ready") is not True:
+        status = calibration.get("status", "unverified")
+        reason = calibration.get("reason", "Calibration evidence is incomplete.")
+        raise DistanceSensorError(
+            f"MID-360 calibration is {status}: {reason} Physical distance conditions are disabled."
+        )
     return url, token, sensor_id, sensor_frame_id, base_frame_id
 
 

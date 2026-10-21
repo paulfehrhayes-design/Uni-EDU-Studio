@@ -11,8 +11,10 @@ import threading
 import time
 import uuid
 import zlib
+import logging
+import subprocess
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -24,7 +26,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 try:
     from .g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from .camera_discovery import discover_camera_sources
     from .lidar_distance import distance_sensor_status
+    from .sensor_calibration import calibration_status
+    from .sensor_discovery import discover_sensors
     from .navigation_bridge import (
         NavigationBridgeError,
         navigation_bridge_status,
@@ -42,7 +47,10 @@ try:
     )
 except ImportError:
     from g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from camera_discovery import discover_camera_sources
     from lidar_distance import distance_sensor_status
+    from sensor_calibration import calibration_status
+    from sensor_discovery import discover_sensors
     from navigation_bridge import (
         NavigationBridgeError,
         navigation_bridge_status,
@@ -69,6 +77,7 @@ PROJECT_ROOT = os.path.dirname(BASE_DIR)
 G1_URDF_PATH = os.path.join(PROJECT_ROOT, "g1_23dof.urdf.txt")
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 # 允许跨域（方便开发调试）
 app.add_middleware(
@@ -126,6 +135,11 @@ class LidarScanStartRequest(BaseModel):
 
 class SharedLidarSettingsRequest(BaseModel):
     show_shared_overlay: bool
+
+
+class SensorServiceRequest(BaseModel):
+    sensor_id: Literal["lidar_driver", "lidar_provider"]
+    operation: Literal["start", "stop", "restart", "repair"]
 
 
 class LidarMapPublishRequest(BaseModel):
@@ -1214,6 +1228,100 @@ def get_robot_status(response: Response, user: dict = Depends(auth_required)):
     if not status["sdkAvailable"]:
         return status
     return {**status, "distanceSensor": distance_sensor_status()}
+
+
+def _require_teacher(user):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+
+
+def _sensor_diagnostics():
+    return {
+        "lidar": {
+            "discovery": discover_sensors(),
+            "distance": distance_sensor_status(),
+            "calibration": calibration_status(),
+        },
+        "cameras": discover_camera_sources(),
+    }
+
+
+@app.get("/api/sensors/status")
+def get_sensor_status(response: Response, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return _sensor_diagnostics()
+
+
+@app.post("/api/sensors/discover")
+def run_sensor_discovery(response: Response, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return _sensor_diagnostics()
+
+
+@app.post("/api/sensors/service")
+def operate_sensor_service(request: SensorServiceRequest, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    service_names = {
+        "lidar_driver": "uni-edu-lidar-driver.service",
+        "lidar_provider": "uni-edu-lidar-provider.service",
+    }
+    operation = "restart" if request.operation == "repair" else request.operation
+    command = ["systemctl"]
+    if os.getenv("G1_LIDAR_ROS_RUNTIME", "host") == "host":
+        command.append("--user")
+    command.extend([operation, service_names[request.sensor_id]])
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as error:
+        logger.warning(
+            "Sensor service operation timed out: user=%s sensor=%s operation=%s",
+            user["username"],
+            request.sensor_id,
+            request.operation,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail="The managed sensor service operation timed out.",
+        ) from error
+    except OSError as error:
+        logger.error("Could not execute managed sensor service operation: %s", error)
+        raise HTTPException(
+            status_code=503,
+            detail="The managed sensor service controller is unavailable.",
+        ) from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        logger.warning(
+            "Sensor service operation failed: user=%s sensor=%s operation=%s status=%s",
+            user["username"],
+            request.sensor_id,
+            request.operation,
+            result.returncode,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=detail or "The managed sensor service operation failed.",
+        )
+    logger.info(
+        "Sensor service operation completed: user=%s sensor=%s operation=%s",
+        user["username"],
+        request.sensor_id,
+        request.operation,
+    )
+    return {
+        "status": "accepted",
+        "sensor_id": request.sensor_id,
+        "operation": request.operation,
+        "service": service_names[request.sensor_id],
+    }
 
 
 @app.get("/api/navigation/status")
