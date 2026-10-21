@@ -14,6 +14,7 @@ class CameraDiscoveryTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.now = 1_800_000_000.0
+        self.echo_commands = []
 
     def write_usb_device(self, path_name, fields):
         device_dir = os.path.join(self.temp_dir.name, path_name)
@@ -34,15 +35,21 @@ class CameraDiscoveryTests(unittest.TestCase):
             if command[1:4] == ["topic", "list", "-t"]:
                 stdout = topics
             elif "echo" in command:
-                topic = command[command.index("--once") + 1]
-                field = command[command.index("--field") + 1]
-                if field == "header":
-                    stdout = (headers or {}).get(topic, fresh_header)
-                else:
-                    stdout = (intrinsics or {}).get(
+                self.echo_commands.append(command)
+                self.assertNotIn("--once", command)
+                self.assertNotIn("--field", command)
+                topic = command[command.index("echo") + 1]
+                stdout = (headers or {}).get(topic, fresh_header)
+                if "camera_info" in topic:
+                    matrix = (intrinsics or {}).get(
                         topic,
-                        "- 600.0\n- 0.0\n- 320.0\n- 0.0\n- 600.0\n- 240.0\n- 0.0\n- 0.0\n- 1.0\n",
+                        "600.0\n0.0\n320.0\n0.0\n600.0\n240.0\n0.0\n0.0\n1.0\n",
                     )
+                    stdout += "k:\n" + "\n".join(
+                        "- {}".format(value)
+                        for value in matrix.splitlines()
+                        if value.strip()
+                    ) + "\n"
             else:
                 raise AssertionError("Unexpected camera discovery command: {!r}".format(command))
             return subprocess.CompletedProcess(command, 0, stdout, "")
@@ -96,6 +103,7 @@ class CameraDiscoveryTests(unittest.TestCase):
         )
         self.assertTrue(report["sources"]["realsense"]["intrinsics_available"])
         self.assertEqual(report["sources"]["realsense"]["intrinsics"]["fx_px"], 600.0)
+        self.assertEqual(len(self.echo_commands), 4)
 
     def test_unavailable_camera_does_not_affect_other_source(self):
         topics = (

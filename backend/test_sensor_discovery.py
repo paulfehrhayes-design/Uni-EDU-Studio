@@ -1,13 +1,17 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 try:
     from . import sensor_discovery
+    from .sensor_discovery import _read_topic_sample
 except ImportError:
     import sensor_discovery
+    from sensor_discovery import _read_topic_sample
 
 
 class SensorDiscoveryTests(unittest.TestCase):
@@ -19,6 +23,7 @@ class SensorDiscoveryTests(unittest.TestCase):
             output.write('ID="ubuntu"\nVERSION_ID="22.04"\n')
         self.now = 1_800_000_000.0
         self.env = {"XDG_CONFIG_HOME": self.temp_dir.name}
+        self.echo_commands = []
 
     def run_discovery(self, responses, **kwargs):
         def runner(command, **_options):
@@ -43,7 +48,10 @@ class SensorDiscoveryTests(unittest.TestCase):
             elif command[1:4] == ["topic", "list", "-t"]:
                 stdout = responses.get("topics", "")
             elif "echo" in command:
-                topic = command[command.index("--once") + 1]
+                self.echo_commands.append(command)
+                self.assertNotIn("--once", command)
+                self.assertNotIn("--field", command)
+                topic = command[command.index("echo") + 1]
                 stdout = responses.get("headers", {}).get(topic, "")
             elif "systemctl" in command[0]:
                 stdout = responses.get("service", "inactive")
@@ -68,6 +76,27 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertIn("will be guessed", report["connection"]["reason"])
         self.assertIsNone(report["network"]["host_ip"])
         self.assertIsNone(report["network"]["device_ip"])
+
+    def test_topic_echo_reads_one_header_without_ros_cli_flags(self):
+        message = (
+            "header:\n"
+            "  stamp:\n"
+            "    sec: 1799999999\n"
+            "    nanosec: 900000000\n"
+            "  frame_id: livox_frame\n"
+        )
+        script = "import sys,time; print({!r}, flush=True); time.sleep(5)".format(message)
+        started_at = time.monotonic()
+
+        output, error = _read_topic_sample(
+            [sys.executable, "-u", "-c", script],
+            "/mid360/points",
+            timeout=1.0,
+        )
+
+        self.assertIsNone(error)
+        self.assertIn("frame_id: livox_frame", output)
+        self.assertLess(time.monotonic() - started_at, 1.0)
 
     def test_configured_direct_livox_network_is_validated(self):
         self.env.update(
@@ -133,6 +162,10 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertFalse(report["connection"]["driver_required"])
         self.assertEqual(report["connection"]["topic"], "/rt/utlidar/cloud")
         self.assertEqual(report["connection"]["frame_id"], "utlidar_lidar")
+        self.assertEqual(
+            self.echo_commands,
+            [["/usr/bin/ros2", "topic", "echo", "/rt/utlidar/cloud"]],
+        )
 
     def test_stale_pointcloud_is_not_reported_as_ready(self):
         report = self.run_discovery(
