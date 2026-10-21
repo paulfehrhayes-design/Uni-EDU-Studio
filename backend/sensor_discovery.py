@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import re
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -12,8 +13,10 @@ import time
 
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
+MAX_TOPIC_SAMPLE_BYTES = 65536
 LIDAR_NAME_PATTERN = re.compile(r"lidar|livox|mid.?360|utlidar|point.?cloud|cloud", re.IGNORECASE)
 POINTCLOUD_TYPE = "sensor_msgs/msg/PointCloud2"
+ROS_TOPIC_PATTERN = re.compile(r"^/[A-Za-z0-9_/]+$")
 
 
 def _run(command, timeout=2.0, runner=None):
@@ -34,6 +37,85 @@ def _run(command, timeout=2.0, runner=None):
         detail = (result.stderr or result.stdout or "").strip()
         return None, detail or "command exited unsuccessfully"
     return result.stdout, None
+
+
+def _topic_sample_complete(text, include_camera_intrinsics=False):
+    header_complete = all(
+        re.search(pattern, text, re.MULTILINE)
+        for pattern in (
+            r"^\s*frame_id:\s*.*$",
+            r"^\s*sec:\s*-?\d+\s*$",
+            r"^\s*nanosec:\s*-?\d+\s*$",
+        )
+    )
+    if not header_complete or not include_camera_intrinsics:
+        return header_complete
+    matrix = re.search(
+        r"^\s*k:\s*\n((?:\s*-\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?\s*\n){9})",
+        text,
+        re.MULTILINE,
+    )
+    return matrix is not None
+
+
+def _read_topic_sample(ros_prefix, topic_name, runner=None, timeout=2.0, include_camera_intrinsics=False):
+    """Read only the first useful portion of a ROS topic echo without CLI flags."""
+    if not ROS_TOPIC_PATTERN.fullmatch(topic_name):
+        return None, "ROS topic name is invalid."
+    command = ros_prefix + ["topic", "echo", topic_name]
+    if runner is not None:
+        return _run(command, timeout=timeout, runner=runner)
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    except OSError as error:
+        return None, str(error)
+
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while time.monotonic() < deadline and len(output) < MAX_TOPIC_SAMPLE_BYTES:
+            events = selector.select(max(0, deadline - time.monotonic()))
+            if not events:
+                break
+            chunk = os.read(process.stdout.fileno(), min(4096, MAX_TOPIC_SAMPLE_BYTES - len(output)))
+            if not chunk:
+                break
+            output.extend(chunk)
+            text = output.decode("utf-8", errors="replace")
+            if _topic_sample_complete(text, include_camera_intrinsics):
+                return text, None
+    finally:
+        selector.close()
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        if process.stdout:
+            process.stdout.close()
+
+    text = output.decode("utf-8", errors="replace")
+    if _topic_sample_complete(text, include_camera_intrinsics):
+        return text, None
+    if len(output) >= MAX_TOPIC_SAMPLE_BYTES:
+        return None, "ROS topic sample exceeded the bounded read size before its header was complete."
+    return None, "No complete ROS topic sample arrived before the discovery timeout."
 
 
 def _read_os_release(path="/etc/os-release"):
@@ -330,11 +412,11 @@ def discover_sensors(
                     or not LIDAR_NAME_PATTERN.search(topic["name"])
                 ):
                     continue
-                header_output, header_error = _run(
-                    ros_prefix
-                    + ["topic", "echo", "--once", topic["name"], "--field", "header"],
-                    timeout=2.0,
+                header_output, header_error = _read_topic_sample(
+                    ros_prefix,
+                    topic["name"],
                     runner=runner,
+                    timeout=2.0,
                 )
                 sample = (
                     _parse_pointcloud_header(header_output, current_time)

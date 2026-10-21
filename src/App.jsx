@@ -341,7 +341,7 @@ function isNavigationWaypointInFreeSpace(waypoint, snapshot) {
 }
 
 function formatLidarDistanceSample(sample, label) {
-  if (!sample?.ready) return `${label} unavailable • ${sample?.error || 'provider status not reported'}`;
+  if (!sample?.ready) return `${label} distance conditions disabled • ${sample?.error || 'provider status not reported'}`;
   if (sample.calibrated !== true || sample.measurement !== 'footprint_clearance') {
     return `${label} unavailable • provider sample is not calibrated to the robot footprint`;
   }
@@ -929,7 +929,7 @@ export default function App() {
           .then((status) => {
             setIsRobotConnected(status.sdkAvailable);
             if (status.sdkAvailable) {
-              const sensorText = `MID-360 ${status.distanceSensor?.ready ? 'calibrated' : 'unavailable'} • ${formatLidarDistanceStatus(status.distanceSensor)}`;
+              const sensorText = `MID-360 distance conditions ${status.distanceSensor?.ready ? 'ready' : 'disabled'} • ${formatLidarDistanceStatus(status.distanceSensor)}`;
               setRobotConnectionStatus(`SDK connected on ${status.interface} • ${sensorText}`);
             } else {
               setRobotConnectionStatus('Disconnected • backend must run on the G1 computer • LiDAR status is available without SDK motion');
@@ -1308,7 +1308,7 @@ export default function App() {
         throw new Error('Backend did not confirm a connected robot.');
       }
       setIsRobotConnected(true);
-      const sensorText = `MID-360 ${connection.distanceSensor?.ready ? 'calibrated' : 'unavailable'} • ${formatLidarDistanceStatus(connection.distanceSensor)}`;
+      const sensorText = `MID-360 distance conditions ${connection.distanceSensor?.ready ? 'ready' : 'disabled'} • ${formatLidarDistanceStatus(connection.distanceSensor)}`;
       setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
     } catch (error) {
       setIsRobotConnected(false);
@@ -1355,10 +1355,10 @@ export default function App() {
       } else {
         const rear = sensor?.rear?.ready
           ? sensor.rear.clear
-            ? `Rear raw scan has no returns within ${sensor.rear.max_range_m} m`
-            : `Rear raw estimate • ${sensor.rear.distance_m.toFixed(2)} m`
-          : `Rear unavailable • ${sensor?.rear?.error || 'provider status not reported'}`;
-        setLidarTestStatus(`Front unavailable • ${sensor?.error || 'Backend did not report LiDAR status.'} • ${rear}`);
+            ? `Rear distance conditions ready; no returns within ${sensor.rear.max_range_m} m`
+            : `Rear footprint clearance • ${sensor.rear.distance_m.toFixed(2)} m`
+          : `Rear distance conditions disabled • ${sensor?.rear?.error || 'provider status not reported'}`;
+        setLidarTestStatus(`Front distance conditions disabled • ${sensor?.error || 'Backend did not report LiDAR status.'} • ${rear}`);
       }
     } catch (error) {
       setLidarTestStatus(`Test failed • ${error.message}`);

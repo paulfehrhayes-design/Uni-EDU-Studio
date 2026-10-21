@@ -1137,6 +1137,39 @@ test('teacher can test LiDAR status without issuing a robot motion command', asy
   })).toContainText('Rear clearance 1.14 m from robot footprint • 46 ms old');
 });
 
+test('teacher LiDAR status distinguishes disabled distance conditions from sensor connectivity', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'teacher', username: 'teacher-lidar-calibration-test' },
+    }));
+  });
+  const error = 'MID-360-to-robot transform and footprint calibration are unconfirmed; physical distance conditions are disabled.';
+  await page.route('**/api/robot/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sdkAvailable: false,
+        distanceSensor: {
+          ready: false,
+          error,
+          rear: { ready: false, error },
+        },
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await page.getByRole('button', { name: 'Test LiDAR' }).click();
+  const status = page.getByRole('status').filter({
+    hasText: 'Front distance conditions disabled',
+  });
+  await expect(status).toContainText('Rear distance conditions disabled');
+  await expect(status).not.toContainText('Front unavailable');
+});
+
 test('object library items keep distinct shapes when added to the scene', async ({ page }) => {
   test.setTimeout(90000);
   await page.addInitScript(() => {

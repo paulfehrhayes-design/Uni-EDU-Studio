@@ -10,6 +10,7 @@ try:
     from .sensor_discovery import (
         MAX_FUTURE_SKEW_SECONDS,
         MAX_SAMPLE_AGE_SECONDS,
+        _read_topic_sample,
         _ros_prefix,
         _run,
     )
@@ -17,6 +18,7 @@ except ImportError:
     from sensor_discovery import (
         MAX_FUTURE_SKEW_SECONDS,
         MAX_SAMPLE_AGE_SECONDS,
+        _read_topic_sample,
         _ros_prefix,
         _run,
     )
@@ -125,8 +127,16 @@ def _camera_header_sample(text, now_seconds):
 
 
 def _camera_intrinsics(text):
+    matrix_match = re.search(
+        r"^\s*k:\s*\n((?:\s*-\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?\s*\n){9})",
+        text,
+        re.MULTILINE,
+    )
+    if not matrix_match:
+        return None
     values = re.findall(
-        r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", text
+        r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
+        matrix_match.group(1),
     )
     try:
         matrix = [float(value) for value in values]
@@ -170,29 +180,24 @@ def _camera_topics(ros_prefix, runner, now_seconds):
             "intrinsics": None,
             "error": None,
         }
-        header, header_error = _run(
-            ros_prefix
-            + ["topic", "echo", "--once", topic["name"], "--field", "header"],
-            timeout=2.0,
+        message, message_error = _read_topic_sample(
+            ros_prefix,
+            topic["name"],
             runner=runner,
+            timeout=2.0,
+            include_camera_intrinsics=topic["type"] == CAMERA_INFO_TYPE,
         )
-        if header_error:
-            sample["error"] = "Could not read camera topic header: {}".format(header_error)
+        if message_error:
+            sample["error"] = "Could not read camera topic sample: {}".format(message_error)
         else:
-            sample.update(_camera_header_sample(header, now_seconds))
+            sample.update(_camera_header_sample(message, now_seconds))
         if topic["type"] == CAMERA_INFO_TYPE:
-            matrix_text, matrix_error = _run(
-                ros_prefix
-                + ["topic", "echo", "--once", topic["name"], "--field", "k"],
-                timeout=2.0,
-                runner=runner,
-            )
-            if matrix_error:
+            if message_error:
                 sample["error"] = sample["error"] or (
-                    "Could not read CameraInfo intrinsics: {}".format(matrix_error)
+                    "Could not read CameraInfo sample: {}".format(message_error)
                 )
             else:
-                sample["intrinsics"] = _camera_intrinsics(matrix_text)
+                sample["intrinsics"] = _camera_intrinsics(message)
                 if sample["intrinsics"] is None:
                     sample["error"] = sample["error"] or (
                         "CameraInfo has no valid finite 3x3 intrinsic matrix."
