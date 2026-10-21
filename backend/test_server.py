@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -503,6 +504,155 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn('distanceSensor', response.json())
         sensor_status.assert_not_called()
+
+    def test_sensor_status_and_discovery_are_teacher_only(self):
+        client = TestClient(app)
+        teacher = client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        student = client.post(
+            '/api/classroom/login',
+            json={'username': 'student1', 'password': 'student1'},
+        ).json()
+        teacher_headers = {'Authorization': 'Bearer ' + teacher['token']}
+        student_headers = {'Authorization': 'Bearer ' + student['token']}
+        diagnostics = {
+            'lidar': {'calibration': {'ready': False}},
+            'cameras': {'available': False},
+        }
+
+        with patch.object(server, '_sensor_diagnostics', return_value=diagnostics) as discover:
+            status = client.get('/api/sensors/status', headers=teacher_headers)
+            refreshed = client.post('/api/sensors/discover', headers=teacher_headers)
+            denied = client.get('/api/sensors/status', headers=student_headers)
+            anonymous = client.post('/api/sensors/discover')
+
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json(), diagnostics)
+        self.assertEqual(status.headers['cache-control'], 'no-store, max-age=0')
+        self.assertEqual(refreshed.status_code, 200)
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(anonymous.status_code, 401)
+        self.assertEqual(discover.call_count, 2)
+
+    def test_sensor_diagnostics_integrate_independent_backend_reports(self):
+        discovery = {'connection': {'method': 'unitree_ros_pointcloud', 'ready': True}}
+        distance = {'ready': False, 'error': 'MID-360 calibration is unconfirmed.'}
+        calibration = {'ready': False, 'status': 'unverified'}
+        cameras = {
+            'available': True,
+            'sources': {
+                'unitree': {'ready': True},
+                'realsense': {'ready': False},
+            },
+        }
+
+        with patch.object(server, 'discover_sensors', return_value=discovery), patch.object(
+            server, 'distance_sensor_status', return_value=distance
+        ), patch.object(server, 'calibration_status', return_value=calibration), patch.object(
+            server, 'discover_camera_sources', return_value=cameras
+        ):
+            result = server._sensor_diagnostics()
+
+        self.assertEqual(
+            result,
+            {
+                'lidar': {
+                    'discovery': discovery,
+                    'distance': distance,
+                    'calibration': calibration,
+                },
+                'cameras': cameras,
+            },
+        )
+
+    def test_sensor_service_operations_are_allowlisted_and_teacher_only(self):
+        client = TestClient(app)
+        teacher = client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        student = client.post(
+            '/api/classroom/login',
+            json={'username': 'student1', 'password': 'student1'},
+        ).json()
+        teacher_headers = {'Authorization': 'Bearer ' + teacher['token']}
+        student_headers = {'Authorization': 'Bearer ' + student['token']}
+        success = subprocess.CompletedProcess(
+            ['systemctl'], 0, '', ''
+        )
+
+        with patch.dict(os.environ, {'G1_LIDAR_ROS_RUNTIME': 'host'}), patch.object(
+            server.subprocess, 'run', return_value=success
+        ) as run:
+            response = client.post(
+                '/api/sensors/service',
+                headers=teacher_headers,
+                json={'sensor_id': 'lidar_driver', 'operation': 'repair'},
+            )
+            denied = client.post(
+                '/api/sensors/service',
+                headers=student_headers,
+                json={'sensor_id': 'lidar_driver', 'operation': 'stop'},
+            )
+            invalid = client.post(
+                '/api/sensors/service',
+                headers=teacher_headers,
+                json={'sensor_id': 'anything.service', 'operation': 'restart'},
+            )
+            unsupported_camera_service = client.post(
+                '/api/sensors/service',
+                headers=teacher_headers,
+                json={'sensor_id': 'realsense_camera', 'operation': 'restart'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['service'], 'uni-edu-lidar-driver.service')
+        self.assertEqual(run.call_args.args[0], [
+            'systemctl', '--user', 'restart', 'uni-edu-lidar-driver.service'
+        ])
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(unsupported_camera_service.status_code, 422)
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(run.call_args.kwargs.get('shell', False))
+
+    def test_sensor_service_rejects_command_strings_and_surfaces_service_failures(self):
+        client = TestClient(app)
+        teacher = client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        headers = {'Authorization': 'Bearer ' + teacher['token']}
+        failed = subprocess.CompletedProcess(
+            ['systemctl'], 1, '', 'service failed'
+        )
+
+        with patch.object(server.subprocess, 'run', return_value=failed) as run:
+            injection = client.post(
+                '/api/sensors/service',
+                headers=headers,
+                json={
+                    'sensor_id': 'lidar_driver',
+                    'operation': 'restart; touch /tmp/should-not-run',
+                },
+            )
+            failure = client.post(
+                '/api/sensors/service',
+                headers=headers,
+                json={'sensor_id': 'lidar_driver', 'operation': 'restart'},
+            )
+
+        self.assertEqual(injection.status_code, 422)
+        self.assertEqual(failure.status_code, 409)
+        self.assertEqual(failure.json()['detail'], 'service failed')
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            run.call_args.args[0],
+            ['systemctl', '--user', 'restart', 'uni-edu-lidar-driver.service'],
+        )
+        self.assertFalse(run.call_args.kwargs.get('shell', False))
 
     def test_classroom_login_and_queue_flow(self):
         client = TestClient(app)

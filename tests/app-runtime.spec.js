@@ -157,6 +157,185 @@ test('student view does not expose teacher account management', async ({ page })
   await expect(page.getByLabel('New student username')).toHaveCount(0);
 });
 
+test('device camera preview remains local and stops when leaving Vision to Motion', async ({ page }) => {
+  const apiRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-camera-preview-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+    let stopCount = 0;
+    window.cameraPreviewTestState = {
+      requestCount: 0,
+      stopCount: () => stopCount,
+    };
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: async () => {
+          window.cameraPreviewTestState.requestCount += 1;
+          return {
+            getTracks: () => [{ stop: () => { stopCount += 1; } }],
+          };
+        },
+      },
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+      configurable: true,
+      get() { return this.testSrcObject; },
+      set(value) { this.testSrcObject = value; },
+    });
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+  });
+  await page.route('**/api/**', async (route) => {
+    apiRequests.push(new URL(route.request().url()).pathname);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Vision to Motion' }).click();
+  await expect(page.getByText('Camera-to-motion pose inference is not implemented.', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Start preview' }).click();
+  await expect(page.getByRole('button', { name: 'Stop preview' })).toBeVisible();
+  expect(await page.evaluate(() => window.cameraPreviewTestState.requestCount)).toBe(1);
+  expect(apiRequests.some((path) => path.includes('camera'))).toBe(false);
+
+  await page.getByRole('button', { name: 'Blocks', exact: true }).last().click();
+  await expect.poll(() => page.evaluate(() => window.cameraPreviewTestState.stopCount())).toBe(1);
+  expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => /camera|video/i.test(key)))).toEqual([]);
+});
+
+test('device camera preview stops when switching to a robot camera source', async ({ page }) => {
+  const apiRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-camera-source-test-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+    let stopCount = 0;
+    window.cameraSourceTestState = {
+      stopCount: () => stopCount,
+    };
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop: () => { stopCount += 1; } }],
+        }),
+      },
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+      configurable: true,
+      get() { return this.testSrcObject; },
+      set(value) { this.testSrcObject = value; },
+    });
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+  });
+  await page.route('**/api/**', async (route) => {
+    apiRequests.push(new URL(route.request().url()).pathname);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Vision to Motion' }).click();
+  await page.getByRole('button', { name: 'Start preview' }).click();
+  await expect(page.getByRole('button', { name: 'Stop preview' })).toBeVisible();
+  await page.getByLabel('Camera source').selectOption('unitree');
+
+  await expect.poll(() => page.evaluate(() => window.cameraSourceTestState.stopCount())).toBe(1);
+  await expect(page.getByText('ROS camera topics can be discovered, but this app does not yet provide a browser stream for the G1 camera.')).toBeVisible();
+  expect(apiRequests.some((path) => path.includes('camera'))).toBe(false);
+  expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => /camera|video/i.test(key)))).toEqual([]);
+});
+
+test('student queue does not expose teacher sensor diagnostics or call sensor APIs', async ({ page }) => {
+  const sensorRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'student-sensor-visibility-test-token',
+      user: { role: 'student', username: 'student1' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.startsWith('/api/sensors/')) sensorRequests.push(path);
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Library' }).click();
+  await expect(page.getByText('My Saved Code')).toBeVisible();
+  await expect(page.getByText('Sensors and diagnostics')).toHaveCount(0);
+  expect(sensorRequests).toEqual([]);
+});
+
+test('teacher sensor diagnostics distinguish a LiDAR path from unverified calibration', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-sensor-diagnostics-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  const diagnostics = {
+    lidar: {
+      discovery: {
+        connection: {
+          method: 'direct_livox',
+          reason: 'Validated direct Livox network path; sensor stream not yet verified.',
+        },
+        diagnostics: [],
+      },
+      calibration: {
+        status: 'configured_unverified',
+        reason: 'No live transform comparison or independent calibration validation is available.',
+        candidate_mounts: {
+          mid360: {
+            available: true,
+            parent_frame: 'torso_link',
+            sensor_frame: 'mid360_link',
+            translation_m: [0.01, 0.02, 0.4],
+          },
+        },
+      },
+      distance: {
+        ready: false,
+        error: 'MID-360 calibration is unconfirmed.',
+        rear: { ready: false, error: 'MID-360 calibration is unconfirmed.' },
+      },
+    },
+    cameras: { sources: {} },
+  };
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url());
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(
+        url.pathname === '/api/sensors/discover' ? diagnostics : {},
+      ),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await page.getByRole('button', { name: 'Discover sensors' }).click();
+  await expect(page.getByText(/direct_livox.*configured_unverified/)).toBeVisible();
+  await expect(page.getByText(/Unverified model mount candidate/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Restart managed LiDAR driver' })).toBeVisible();
+});
+
 test('student IDE multiline commands render as Blocks and generate code', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));

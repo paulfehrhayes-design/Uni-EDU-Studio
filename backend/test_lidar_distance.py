@@ -41,6 +41,13 @@ class LidarDistanceTests(unittest.TestCase):
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        self.calibration = patch.object(
+            lidar_distance,
+            "calibration_status",
+            return_value={"ready": True, "status": "validated", "reason": "test fixture"},
+        )
+        self.calibration.start()
+        self.addCleanup(self.calibration.stop)
 
     def test_valid_provider_sample_has_normalized_age_and_units(self):
         response = SimpleNamespace(status_code=200, json=lambda: self.payload)
@@ -130,6 +137,31 @@ class LidarDistanceTests(unittest.TestCase):
             with patch.object(lidar_distance.httpx, "get") as request:
                 with self.assertRaisesRegex(DistanceSensorError, "transform and footprint calibration are unconfirmed"):
                     get_front_distance_sample(now=self.now)
+        request.assert_not_called()
+
+    def test_unverified_calibration_blocks_even_confirmed_flags_and_fresh_provider_data(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "G1_DISTANCE_FOOTPRINT_FRONT_M": "0.4",
+                "G1_DISTANCE_FOOTPRINT_REAR_M": "0.3",
+                "G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M": "0.2",
+            },
+        ), patch.object(
+            lidar_distance,
+            "calibration_status",
+            return_value={
+                "ready": False,
+                "status": "configured_unverified",
+                "reason": "No live transform comparison is available.",
+            },
+        ), patch.object(lidar_distance.httpx, "get") as request:
+            with self.assertRaisesRegex(
+                DistanceSensorError,
+                "calibration is configured_unverified.*Physical distance conditions are disabled",
+            ):
+                get_front_distance_sample(now=self.now)
+
         request.assert_not_called()
 
     def test_provider_must_report_calibrated_base_frame_clearance(self):

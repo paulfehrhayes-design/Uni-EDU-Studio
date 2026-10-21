@@ -840,6 +840,17 @@ export default function App() {
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [isRobotConnecting, setIsRobotConnecting] = useState(false);
   const [isLidarTesting, setIsLidarTesting] = useState(false);
+  const [sensorDiagnostics, setSensorDiagnostics] = useState(null);
+  const [isSensorDiscovering, setIsSensorDiscovering] = useState(false);
+  const [sensorOperationStatus, setSensorOperationStatus] = useState('');
+  const [sensorOperationBusy, setSensorOperationBusy] = useState('');
+  const [cameraInputSource, setCameraInputSource] = useState('device');
+  const [deviceCameraStatus, setDeviceCameraStatus] = useState('Camera is off');
+  const [isDeviceCameraActive, setIsDeviceCameraActive] = useState(false);
+  const [deviceCameraError, setDeviceCameraError] = useState('');
+  const deviceCameraVideoRef = useRef(null);
+  const deviceCameraStreamRef = useRef(null);
+  const deviceCameraRequestRef = useRef(0);
   const [safetyNotice, setSafetyNotice] = useState('');
   const [blockSyncError, setBlockSyncError] = useState('');
 
@@ -1353,6 +1364,105 @@ export default function App() {
       setLidarTestStatus(`Test failed • ${error.message}`);
     } finally {
       setIsLidarTesting(false);
+    }
+  };
+
+  const stopDeviceCamera = useCallback(() => {
+    deviceCameraRequestRef.current += 1;
+    deviceCameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    deviceCameraStreamRef.current = null;
+    if (deviceCameraVideoRef.current) {
+      deviceCameraVideoRef.current.srcObject = null;
+    }
+    setIsDeviceCameraActive(false);
+    setDeviceCameraStatus('Camera is off');
+  }, []);
+
+  useEffect(() => {
+    if (mainTab !== 'camera' || cameraInputSource !== 'device') {
+      stopDeviceCamera();
+    }
+    return () => stopDeviceCamera();
+  }, [mainTab, cameraInputSource, stopDeviceCamera]);
+
+  const startDeviceCamera = async () => {
+    setDeviceCameraError('');
+    if (!window.isSecureContext && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+      setDeviceCameraError('Safari requires a trusted HTTPS connection before it can open this device camera.');
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setDeviceCameraError('This browser does not provide camera access. Check Safari permissions and secure-context support.');
+      return;
+    }
+    stopDeviceCamera();
+    const requestId = deviceCameraRequestRef.current;
+    setDeviceCameraStatus('Requesting camera permission…');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'user' } },
+      });
+      if (
+        requestId !== deviceCameraRequestRef.current
+        || mainTab !== 'camera'
+        || cameraInputSource !== 'device'
+      ) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      deviceCameraStreamRef.current = stream;
+      if (deviceCameraVideoRef.current) {
+        deviceCameraVideoRef.current.srcObject = stream;
+        await deviceCameraVideoRef.current.play();
+      }
+      setIsDeviceCameraActive(true);
+      setDeviceCameraStatus('Live preview active; frames are not recorded or uploaded.');
+    } catch (error) {
+      if (requestId !== deviceCameraRequestRef.current) return;
+      stopDeviceCamera();
+      setDeviceCameraError(`Could not open this device camera: ${error.message}`);
+    }
+  };
+
+  const handleDiscoverSensors = async () => {
+    if (currentUser.role !== 'teacher') return;
+    setIsSensorDiscovering(true);
+    setSensorOperationStatus('Checking available sensors…');
+    try {
+      const diagnostics = await apiFetch('/api/sensors/discover', { method: 'POST' });
+      setSensorDiagnostics(diagnostics);
+      setSensorOperationStatus('Discovery finished. Each sensor is reported independently.');
+    } catch (error) {
+      setSensorOperationStatus(`Discovery failed: ${error.message}`);
+    } finally {
+      setIsSensorDiscovering(false);
+    }
+  };
+
+  const handleSensorServiceOperation = async (sensorId, operation) => {
+    if (currentUser.role !== 'teacher') return;
+    const operationKey = `${sensorId}:${operation}`;
+    setSensorOperationBusy(operationKey);
+    setSensorOperationStatus(`${operation} requested for ${sensorId}…`);
+    try {
+      await apiFetch('/api/sensors/service', {
+        method: 'POST',
+        body: JSON.stringify({ sensor_id: sensorId, operation }),
+      });
+      setSensorOperationStatus(`${operation} completed for ${sensorId}.`);
+      try {
+        const diagnostics = await apiFetch('/api/sensors/status', { cache: 'no-store' });
+        setSensorDiagnostics(diagnostics);
+      } catch (error) {
+        setSensorOperationStatus(
+          `${operation} completed for ${sensorId}, but diagnostics could not be refreshed: ${error.message}`,
+        );
+      }
+    } catch (error) {
+      setSensorOperationStatus(`${operation} failed for ${sensorId}: ${error.message}`);
+    } finally {
+      setSensorOperationBusy('');
     }
   };
 
@@ -2452,7 +2562,7 @@ export default function App() {
     ].join('\n');
 
     if (generatedCode && generatedCode.trim()) {
-      const confirmed = window.confirm('Recording motion capture will overwrite the current blocks and IDE code. Continue?');
+      const confirmed = window.confirm('Inserting the example program will overwrite the current blocks and IDE code. Continue?');
       if (!confirmed) return;
     }
 
@@ -3098,6 +3208,106 @@ export default function App() {
                   </div>
                   <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.</p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
+                </div>
+
+                <div className="rounded-xl border border-cyan-200 bg-cyan-50 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-[10px] uppercase tracking-wide text-cyan-800 font-semibold">Sensors and diagnostics</p>
+                      <p className="mt-1 text-[10px] text-slate-600">Teacher-only controls; no network, topic, frame, or route editing.</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleDiscoverSensors}
+                      disabled={isSensorDiscovering}
+                      className="rounded-lg bg-cyan-700 px-2.5 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+                    >
+                      {isSensorDiscovering ? 'Discovering…' : 'Discover sensors'}
+                    </button>
+                  </div>
+                  <p role="status" aria-live="polite" className="mt-2 text-[10px] text-slate-700">
+                    {sensorOperationStatus || 'Run discovery to check each source independently.'}
+                  </p>
+                  {sensorDiagnostics && (
+                    <div className="mt-2 space-y-2">
+                      <div className="rounded-lg border border-cyan-100 bg-white p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-slate-800">MID-360</span>
+                          <span className="text-[10px] text-slate-600">
+                            {sensorDiagnostics.lidar?.discovery?.connection?.method || 'unknown'}
+                            {' · '}
+                            {sensorDiagnostics.lidar?.calibration?.status || 'unverified'}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[10px] text-slate-600">
+                          {sensorDiagnostics.lidar?.calibration?.reason
+                            || sensorDiagnostics.lidar?.discovery?.connection?.reason
+                            || 'No LiDAR diagnostic reported.'}
+                        </p>
+                        {sensorDiagnostics.lidar?.calibration?.candidate_mounts?.mid360?.available && (
+                          <p className="mt-1 text-[10px] text-amber-700">
+                            Unverified model mount candidate ({sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.parent_frame} → {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.sensor_frame}): {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.translation_m.map((value) => Number(value).toFixed(3)).join(', ')} m
+                          </p>
+                        )}
+                        <p className="mt-1 text-[10px] text-slate-600">
+                          Forward distance: {sensorDiagnostics.lidar?.distance?.ready ? 'ready' : sensorDiagnostics.lidar?.distance?.error || 'unavailable'}
+                          {' · '}
+                          Rear distance: {sensorDiagnostics.lidar?.distance?.rear?.ready ? 'ready' : sensorDiagnostics.lidar?.distance?.rear?.error || 'unavailable'}
+                        </p>
+                        {['direct_livox', 'existing_driver'].includes(
+                          sensorDiagnostics.lidar?.discovery?.connection?.method,
+                        ) && (
+                          <button
+                            type="button"
+                            onClick={() => handleSensorServiceOperation('lidar_driver', 'repair')}
+                            disabled={Boolean(sensorOperationBusy)}
+                            className="mt-2 rounded-md border border-cyan-300 bg-white px-2 py-1 text-[10px] font-semibold text-cyan-900 disabled:opacity-50"
+                          >
+                            {sensorOperationBusy === 'lidar_driver:repair' ? 'Repairing…' : 'Restart managed LiDAR driver'}
+                          </button>
+                        )}
+                      </div>
+                      {Object.entries(sensorDiagnostics.cameras?.sources || {}).map(([sourceId, source]) => {
+                        return (
+                          <div key={sourceId} className="rounded-lg border border-cyan-100 bg-white p-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-semibold text-slate-800">
+                                {sourceId === 'unitree' ? 'Unitree camera' : 'USB RealSense'}
+                              </span>
+                              <span className={`text-[10px] ${source.ready ? 'text-emerald-700' : 'text-amber-700'}`}>
+                                {source.status}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-[10px] text-slate-600">{source.reason}</p>
+                            {[...(source.image_topics || []), ...(source.camera_info_topics || [])].map((topic) => (
+                              <p key={`${topic.name}:${topic.type}`} className="mt-1 break-all text-[10px] text-slate-500">
+                                {topic.name} · {topic.type}
+                                {topic.frame_id ? ` · frame ${topic.frame_id}` : ''}
+                                {topic.age_ms != null ? ` · ${Math.round(topic.age_ms)} ms old` : ''}
+                              </p>
+                            ))}
+                            {source.intrinsics && (
+                              <p className="mt-1 text-[10px] text-slate-500">
+                                Intrinsics: fx {source.intrinsics.fx_px}, fy {source.intrinsics.fy_px}, cx {source.intrinsics.cx_px}, cy {source.intrinsics.cy_px} px
+                              </p>
+                            )}
+                            {source.devices?.map((device) => (
+                              <p key={device.usb_path} className="mt-1 text-[10px] text-slate-500">
+                                {device.product || device.usb_path}
+                                {device.serial ? ` · serial ${device.serial}` : ''}
+                              </p>
+                            ))}
+                          </div>
+                        );
+                      })}
+                      {(sensorDiagnostics.lidar?.discovery?.diagnostics || []).map((diagnostic) => (
+                        <p key={diagnostic} className="break-words text-[10px] text-amber-800">{diagnostic}</p>
+                      ))}
+                    </div>
+                  )}
+                  <p className="mt-2 text-[9px] text-slate-500">
+                    Camera frames are transient only. No video is recorded or saved. Registered LiDAR-camera fusion requires verified transforms and time alignment.
+                  </p>
                 </div>
 
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
@@ -4216,16 +4426,78 @@ export default function App() {
                 {mainTab === 'camera' && (
                   <div className="space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Live pose</p>
-                      <div className="mt-2 flex items-center justify-between">
-                        <span className="text-sm text-slate-200">Pose recognized</span>
-                        <span className="rounded-full bg-emerald-500/20 px-2 py-1 text-[10px] font-semibold text-emerald-300">Ready</span>
-                      </div>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Camera preview</p>
+                      <label className="mt-2 block text-xs text-slate-300">
+                        Camera source
+                        <select
+                          value={cameraInputSource}
+                          onChange={(event) => setCameraInputSource(event.target.value)}
+                          className="mt-1 block w-full rounded-md border border-slate-600 bg-slate-800 px-2 py-2 text-xs text-white"
+                        >
+                          <option value="device">This device (private preview)</option>
+                          <option value="unitree">G1 Unitree camera</option>
+                          <option value="realsense">G1 USB RealSense</option>
+                        </select>
+                      </label>
+                      {cameraInputSource === 'device' ? (
+                        <>
+                          <video
+                            ref={deviceCameraVideoRef}
+                            autoPlay
+                            playsInline
+                            muted
+                            aria-label="Private live camera preview from this device"
+                            className="mt-3 aspect-video w-full rounded-lg bg-black object-contain"
+                          />
+                          <div className="mt-2 flex items-center justify-between gap-2">
+                            <span role="status" aria-live="polite" className="text-[10px] text-slate-300">
+                              {deviceCameraStatus}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={isDeviceCameraActive ? stopDeviceCamera : startDeviceCamera}
+                              disabled={deviceCameraStatus === 'Requesting camera permission…'}
+                              className="shrink-0 rounded-md bg-cyan-600 px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              {deviceCameraStatus === 'Requesting camera permission…'
+                                ? 'Requesting…'
+                                : isDeviceCameraActive ? 'Stop preview' : 'Start preview'}
+                            </button>
+                          </div>
+                          {deviceCameraError && (
+                            <p role="alert" className="mt-2 text-[10px] text-rose-300">{deviceCameraError}</p>
+                          )}
+                          <p className="mt-2 text-[10px] text-slate-400">
+                            The preview stays in this browser tab. Frames are not sent to Uni-EDU-Studio, recorded, or saved. Safari requires HTTPS except on localhost.
+                          </p>
+                        </>
+                      ) : (
+                        (() => {
+                          const sourceId = cameraInputSource === 'unitree' ? 'unitree' : 'realsense';
+                          const source = sensorDiagnostics?.cameras?.sources?.[sourceId];
+                          return (
+                            <div className="mt-3 rounded-lg border border-slate-700 bg-slate-800 p-3">
+                              <p className="text-xs font-semibold text-slate-200">
+                                {source?.status || 'Not discovered'}
+                              </p>
+                              <p className="mt-1 text-[10px] text-slate-400">
+                                {source?.reason || 'A teacher must run sensor discovery before this source can be diagnosed.'}
+                              </p>
+                              <p className="mt-2 text-[10px] text-amber-300">
+                                ROS camera topics can be discovered, but this app does not yet provide a browser stream for the G1 camera.
+                              </p>
+                            </div>
+                          );
+                        })()
+                      )}
+                      <p className="mt-3 text-[10px] text-amber-300">
+                        Camera-to-motion pose inference is not implemented. No pose is recognized or derived from these frames.
+                      </p>
                     </div>
                     <div className="rounded-xl border border-amber-200/50 bg-amber-500/10 p-3 text-amber-100">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Overwrite warning</p>
-                      <p className="mt-2 text-xs">Recording will replace the current code in the Blocks and IDE tabs.</p>
-                      <button type="button" onClick={handleRecordMotionCapture} className="mt-3 w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500">Record motion + update tabs</button>
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-300">Example program</p>
+                      <p className="mt-2 text-xs">This inserts a fixed example program; it does not use camera frames. Saving is a separate, explicit action.</p>
+                      <button type="button" onClick={handleRecordMotionCapture} className="mt-3 w-full rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-500">Insert example program</button>
                     </div>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
