@@ -649,7 +649,13 @@ def main() -> None:
                         float(mount_rotation.w),
                     ],
                 }
-                mount_comparison = compare_transforms(sensor_mount, observed_mount)
+                candidate_mount = {
+                    **sensor_mount,
+                    "sensor_frame": source_frame,
+                }
+                mount_comparison = compare_transforms(
+                    candidate_mount, observed_mount
+                )
                 if not mount_comparison["matches"]:
                     reason = mount_comparison["reason"]
                     self.cache.mark_unavailable(reason)
@@ -723,7 +729,7 @@ def main() -> None:
                     "ready": True,
                     "status": "verified",
                     "reason": (
-                        "Live MID-360 transform matches the supported G1 model; "
+                        "Live sensor transform matches the supported G1 mount geometry; "
                         "footprint was derived automatically from the G1 collision model."
                     ),
                     "model_fingerprint": calibration_model["model_fingerprint"],

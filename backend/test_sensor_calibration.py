@@ -187,6 +187,26 @@ class SensorCalibrationTests(unittest.TestCase):
         self.assertTrue(status["calibration_confirmed"])
         self.assertEqual(status["live_transform"]["translation_error_m"], 0.001)
 
+    def test_driver_sensor_frame_alias_is_accepted_only_with_matching_mount_geometry(self):
+        model = automatic_calibration_model()
+        status = calibration_status(
+            env={},
+            live_report={
+                "ready": True,
+                "status": "verified",
+                "model_fingerprint": model["model_fingerprint"],
+                "transform": {
+                    "parent_frame": model["mount"]["parent_frame"],
+                    "sensor_frame": "utlidar_lidar",
+                    "translation_error_m": 0.001,
+                    "rotation_error_rad": 0.001,
+                },
+                "footprint": model["footprint"],
+            },
+        )
+
+        self.assertTrue(status["ready"])
+
     def test_calibration_rejects_evidence_from_a_different_model(self):
         status = calibration_status(
             env={},

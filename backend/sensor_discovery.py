@@ -14,7 +14,9 @@ import time
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_TOPIC_SAMPLE_BYTES = 65536
-LIDAR_NAME_PATTERN = re.compile(r"lidar|livox|mid.?360|utlidar|point.?cloud|cloud", re.IGNORECASE)
+LIDAR_NAME_PATTERN = re.compile(
+    r"lidar|livox|mid.?360|utlidar|point.?cloud", re.IGNORECASE
+)
 POINTCLOUD_TYPE = "sensor_msgs/msg/PointCloud2"
 ROS_TOPIC_PATTERN = re.compile(r"^/[A-Za-z0-9_/]+$")
 
@@ -62,7 +64,15 @@ def _read_topic_sample(ros_prefix, topic_name, runner=None, timeout=2.0, include
     """Read only the first useful portion of a ROS topic echo without CLI flags."""
     if not ROS_TOPIC_PATTERN.fullmatch(topic_name):
         return None, "ROS topic name is invalid."
-    command = ros_prefix + ["topic", "echo", topic_name]
+    command = ros_prefix + [
+        "topic",
+        "echo",
+        topic_name,
+        "--qos-reliability",
+        "best_effort",
+        "--qos-durability",
+        "volatile",
+    ]
     if runner is not None:
         return _run(command, timeout=timeout, runner=runner)
 

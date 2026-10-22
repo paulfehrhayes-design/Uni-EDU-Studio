@@ -145,6 +145,23 @@ if [[ "$LIDAR_CONFIGURED" == "1" ]]; then
   fi
 elif [[ -f "$LIDAR_ENV_FILE" ]]; then
   echo "LiDAR setup did not complete; reusing the saved provider configuration for diagnostics."
+  SAVED_ROS_RUNTIME="$(awk -F= '$1 == "G1_LIDAR_ROS_RUNTIME" {sub(/^[^=]*=/, ""); print; exit}' "$LIDAR_ENV_FILE")"
+  if [[ "$SAVED_ROS_RUNTIME" == "container" ]]; then
+    PROVIDER_SERVICE_MANAGER=(sudo systemctl)
+  elif [[ "$SAVED_ROS_RUNTIME" == "host" ]]; then
+    PROVIDER_SERVICE_MANAGER=(systemctl --user)
+  else
+    PROVIDER_SERVICE_MANAGER=()
+  fi
+  if [[ "${#PROVIDER_SERVICE_MANAGER[@]}" -gt 0 ]] &&
+     "${PROVIDER_SERVICE_MANAGER[@]}" cat uni-edu-lidar-provider.service >/dev/null 2>&1; then
+    echo "Starting the previously configured LiDAR provider for diagnostics; distance remains fail-closed without fresh validated data."
+    if ! "${PROVIDER_SERVICE_MANAGER[@]}" restart uni-edu-lidar-provider.service; then
+      echo "WARNING: The existing LiDAR provider could not be restarted; inspect its service logs." >&2
+    fi
+  else
+    echo "No existing LiDAR provider service is available to start; sensor diagnostics will report it unavailable." >&2
+  fi
 fi
 systemctl --user enable uni-edu-studio.service
 systemctl --user restart uni-edu-studio.service

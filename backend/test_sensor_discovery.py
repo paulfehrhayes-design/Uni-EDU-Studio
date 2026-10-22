@@ -77,7 +77,7 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertIsNone(report["network"]["host_ip"])
         self.assertIsNone(report["network"]["device_ip"])
 
-    def test_topic_echo_reads_one_header_without_ros_cli_flags(self):
+    def test_topic_echo_uses_sensor_data_qos_and_reads_one_header(self):
         message = (
             "header:\n"
             "  stamp:\n"
@@ -145,7 +145,12 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.now = 1_800_000_000.0
         report = self.run_discovery(
             {
-                "topics": "/rt/utlidar/cloud [sensor_msgs/msg/PointCloud2]\n",
+                "topics": (
+                    "/collision_clouds [sensor_msgs/msg/PointCloud2]\n"
+                    "/grid_clouds [sensor_msgs/msg/PointCloud2]\n"
+                    "/safe_clouds [sensor_msgs/msg/PointCloud2]\n"
+                    "/rt/utlidar/cloud [sensor_msgs/msg/PointCloud2]\n"
+                ),
                 "headers": {
                     "/rt/utlidar/cloud": (
                         "stamp:\n"
@@ -164,7 +169,18 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertEqual(report["connection"]["frame_id"], "utlidar_lidar")
         self.assertEqual(
             self.echo_commands,
-            [["/usr/bin/ros2", "topic", "echo", "/rt/utlidar/cloud"]],
+            [
+                [
+                    "/usr/bin/ros2",
+                    "topic",
+                    "echo",
+                    "/rt/utlidar/cloud",
+                    "--qos-reliability",
+                    "best_effort",
+                    "--qos-durability",
+                    "volatile",
+                ]
+            ],
         )
 
     def test_stale_pointcloud_is_not_reported_as_ready(self):

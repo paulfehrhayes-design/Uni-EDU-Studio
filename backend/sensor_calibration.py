@@ -364,10 +364,9 @@ def _live_report_matches_model(model, report):
     if not isinstance(transform, dict):
         return False
     mount = model["mount"]
-    if (
-        transform.get("parent_frame") != mount["parent_frame"]
-        or transform.get("sensor_frame") != mount["sensor_frame"]
-    ):
+    if transform.get("parent_frame") != mount["parent_frame"] or not isinstance(
+        transform.get("sensor_frame"), str
+    ) or not transform["sensor_frame"].strip():
         return False
     translation_error = transform.get("translation_error_m")
     rotation_error = transform.get("rotation_error_rad")
