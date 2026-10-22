@@ -46,9 +46,13 @@ CYCLONEDDS_HOME="$HOME/cyclonedds/install" "$PYTHON" -c \
 echo "Installing backend dependencies"
 "$PYTHON" -m pip install -r "$PROJECT_DIR/backend/requirements.txt"
 
-echo "Building the hosted frontend"
+echo "Preparing hosted frontend dependencies (cached packages are preferred)"
 cd "$PROJECT_DIR"
-npm install
+if ! npm install --prefer-offline --no-audit --no-fund; then
+  echo "Frontend dependency installation failed; see npm output above." >&2
+  exit 1
+fi
+echo "Building the hosted frontend bundle"
 npm run build
 
 UNIT_DIR="$HOME/.config/systemd/user"
