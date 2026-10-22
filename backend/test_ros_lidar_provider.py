@@ -11,6 +11,7 @@ try:
         SampleCache,
         footprint_clear_range_m,
         footprint_clearance_m,
+        format_tf_calibration_error,
         select_forward_distance,
         select_footprint_distances_array,
         transform_point_to_base,
@@ -23,6 +24,7 @@ except ImportError:
         SampleCache,
         footprint_clear_range_m,
         footprint_clearance_m,
+        format_tf_calibration_error,
         select_forward_distance,
         select_footprint_distances_array,
         transform_point_to_base,
@@ -37,6 +39,19 @@ except ImportError:
 
 
 class RosLidarProviderTests(unittest.TestCase):
+    def test_missing_live_tf_error_identifies_required_frames_and_safe_action(self):
+        message = format_tf_calibration_error(
+            RuntimeError('"torso_link" passed to lookupTransform argument target_frame does not exist'),
+            "torso_link",
+            "livox_frame",
+            "base_link",
+        )
+
+        self.assertIn("G1 TF/joint-state publisher is active", message)
+        self.assertIn("torso_link -> livox_frame", message)
+        self.assertIn("base_link <- livox_frame", message)
+        self.assertIn("Do not substitute an assumed static transform", message)
+
     def test_transforms_lidar_point_into_base_frame(self):
         point = transform_point_to_base(
             (1.0, 0.0, 0.0),

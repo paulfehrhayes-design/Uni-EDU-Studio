@@ -15,6 +15,26 @@ MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
 
 
+def format_tf_calibration_error(
+    error: Exception,
+    mount_parent_frame: str,
+    sensor_frame: str,
+    base_frame: str,
+) -> str:
+    return (
+        "LiDAR sample could not be transformed/calibrated: {}. Live ROS TF must "
+        "provide timestamp-valid transforms for the G1 mount ({} -> {}) and robot "
+        "base ({} <- {}) at the point-cloud timestamp; verify a G1 TF/joint-state "
+        "publisher is active. Do not substitute an assumed static transform."
+    ).format(
+        error,
+        mount_parent_frame,
+        sensor_frame,
+        base_frame,
+        sensor_frame,
+    )
+
+
 def transform_point_to_base(
     point: tuple[float, float, float],
     translation: tuple[float, float, float],
@@ -709,7 +729,27 @@ def main() -> None:
                     footprint["half_width"],
                     sensor_ranges,
                 )
-            except (TransformException, TypeError, ValueError, IndexError) as error:
+            except TransformException as error:
+                reason = format_tf_calibration_error(
+                    error,
+                    sensor_mount["parent_frame"],
+                    source_frame,
+                    base_frame_id,
+                )
+                self.cache.mark_unavailable(reason)
+                self.cache.update_calibration_status(
+                    {
+                        "ready": False,
+                        "status": "unavailable",
+                        "reason": reason,
+                        "model_fingerprint": calibration_model["model_fingerprint"],
+                        "footprint": footprint,
+                        "transform": None,
+                    }
+                )
+                self.get_logger().warning(reason)
+                return
+            except (TypeError, ValueError, IndexError) as error:
                 reason = f"LiDAR sample could not be transformed/calibrated: {error}"
                 self.cache.mark_unavailable(reason)
                 self.cache.update_calibration_status(

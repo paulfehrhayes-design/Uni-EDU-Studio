@@ -242,10 +242,33 @@ def _model_fingerprint(urdf_path, geometry_path):
 
 
 def automatic_calibration_model(urdf_path=None, geometry_path=None):
-    urdf_path = urdf_path or os.getenv("G1_SENSOR_URDF_PATH", DEFAULT_URDF_PATH)
-    geometry_path = geometry_path or os.getenv(
+    configured_urdf = urdf_path or os.getenv("G1_SENSOR_URDF_PATH", DEFAULT_URDF_PATH)
+    configured_geometry = geometry_path or os.getenv(
         "G1_SENSOR_GEOMETRY_PATH", DEFAULT_GEOMETRY_PATH
     )
+    path_warnings = []
+    urdf_path = configured_urdf
+    geometry_path = configured_geometry
+    if (
+        not os.path.isfile(urdf_path)
+        and os.path.normpath(urdf_path) == "/opt/uni-edu/g1_23dof.urdf.txt"
+        and os.path.isfile(DEFAULT_URDF_PATH)
+    ):
+        urdf_path = DEFAULT_URDF_PATH
+        path_warnings.append(
+            "Configured container URDF path is unavailable on this host; using the "
+            "bundled G1 URDF."
+        )
+    if (
+        not os.path.isfile(geometry_path)
+        and os.path.normpath(geometry_path) == "/opt/uni-edu/g1.xml"
+        and os.path.isfile(DEFAULT_GEOMETRY_PATH)
+    ):
+        geometry_path = DEFAULT_GEOMETRY_PATH
+        path_warnings.append(
+            "Configured container geometry path is unavailable on this host; using "
+            "the bundled G1 collision model."
+        )
     mounts = load_candidate_sensor_mounts(urdf_path)
     footprint = derive_g1_footprint(geometry_path)
     mount = mounts.get("mid360")
@@ -255,6 +278,7 @@ def automatic_calibration_model(urdf_path=None, geometry_path=None):
         "model_fingerprint": _model_fingerprint(urdf_path, geometry_path),
         "mount": mount,
         "footprint": footprint,
+        "path_warnings": path_warnings,
     }
 
 
@@ -419,6 +443,7 @@ def calibration_status(
     if model_error:
         reason = model_error
     else:
+        path_warnings = model["path_warnings"]
         if live_report is None:
             live_report, report_error = _live_provider_calibration_report(environment)
         else:
@@ -445,6 +470,8 @@ def calibration_status(
                 "reason",
                 "Waiting for a fresh LiDAR sample and a matching live G1 sensor transform.",
             )
+        if path_warnings:
+            reason = "{} {}".format(reason, " ".join(path_warnings))
     ready = bool(model and report_verified)
     mounts = {} if not model else {"mid360": model["mount"]}
     missing_footprint = [] if model else ["automatic G1 footprint geometry"]
@@ -455,6 +482,7 @@ def calibration_status(
         "model": os.path.basename(urdf_path),
         "candidate_mounts": mounts,
         "footprint": None if not model else model["footprint"],
+        "model_path_warnings": [] if not model else model["path_warnings"],
         "model_fingerprint": None if not model else model["model_fingerprint"],
         "axis_confirmed": ready,
         "calibration_confirmed": ready,

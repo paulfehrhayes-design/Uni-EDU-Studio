@@ -79,6 +79,36 @@ class SensorCalibrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Could not read supported G1"):
                 load_candidate_sensor_mounts(invalid)
 
+    def test_host_uses_bundled_models_when_container_paths_are_unavailable(self):
+        original_isfile = os.path.isfile
+
+        def isfile(path):
+            if path in {"/opt/uni-edu/g1_23dof.urdf.txt", "/opt/uni-edu/g1.xml"}:
+                return False
+            return original_isfile(path)
+
+        with patch.dict(
+            os.environ,
+            {
+                "G1_SENSOR_URDF_PATH": "/opt/uni-edu/g1_23dof.urdf.txt",
+                "G1_SENSOR_GEOMETRY_PATH": "/opt/uni-edu/g1.xml",
+            },
+        ), patch.object(calibration_module.os.path, "isfile", side_effect=isfile):
+            model = automatic_calibration_model()
+            status = calibration_status(
+                live_report={
+                    "ready": False,
+                    "status": "waiting_for_live_transform",
+                    "reason": "Waiting for live TF.",
+                    "model_fingerprint": model["model_fingerprint"],
+                }
+            )
+
+        self.assertEqual(len(model["path_warnings"]), 2)
+        self.assertEqual(len(status["model_path_warnings"]), 2)
+        self.assertIn("bundled G1 URDF", status["reason"])
+        self.assertFalse(status["ready"])
+
     def test_live_transform_must_match_frames_and_tolerances(self):
         candidate = {
             "parent_frame": "torso_link",
