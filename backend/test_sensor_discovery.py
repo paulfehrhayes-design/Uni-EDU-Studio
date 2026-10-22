@@ -183,6 +183,37 @@ class SensorDiscoveryTests(unittest.TestCase):
             ],
         )
 
+    def test_saved_topic_without_fresh_samples_is_reused_for_provider_recovery(self):
+        config_dir = os.path.join(self.temp_dir.name, "uni-edu-studio")
+        os.makedirs(config_dir)
+        with open(os.path.join(config_dir, "lidar.env"), "w", encoding="utf-8") as output:
+            output.write(
+                "G1_LIDAR_TOPIC=/mid360/livox/lidar\n"
+                "G1_DISTANCE_FRAME_ID=livox_frame\n"
+                "G1_DISTANCE_SENSOR_ID=mid360-front\n"
+            )
+
+        report = self.run_discovery(
+            {
+                "topics": (
+                    "/collision_clouds [sensor_msgs/msg/PointCloud2]\n"
+                    "/grid_clouds [sensor_msgs/msg/PointCloud2]\n"
+                    "/mid360/livox/lidar [sensor_msgs/msg/PointCloud2]\n"
+                    "/utlidar/cloud_livox_mid360 [sensor_msgs/msg/PointCloud2]\n"
+                ),
+                "headers": {},
+            }
+        )
+
+        self.assertEqual(
+            report["connection"]["method"], "existing_ros_pointcloud_unverified"
+        )
+        self.assertFalse(report["connection"]["ready"])
+        self.assertFalse(report["connection"]["driver_required"])
+        self.assertEqual(report["connection"]["topic"], "/mid360/livox/lidar")
+        self.assertEqual(report["connection"]["frame_id"], "livox_frame")
+        self.assertIn("distance remains unavailable", report["connection"]["reason"])
+
     def test_stale_pointcloud_is_not_reported_as_ready(self):
         report = self.run_discovery(
             {

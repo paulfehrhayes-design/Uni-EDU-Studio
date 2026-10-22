@@ -161,6 +161,7 @@ PY
 
 if [[ "$CONNECTION_METHOD" != "direct_livox" &&
       "$CONNECTION_METHOD" != "existing_ros_pointcloud" &&
+      "$CONNECTION_METHOD" != "existing_ros_pointcloud_unverified" &&
       "$CONNECTION_METHOD" != "unitree_ros_pointcloud" &&
       "$CONNECTION_METHOD" != "existing_driver" ]]; then
   echo "LiDAR setup stopped: $CONNECTION_REASON" >&2

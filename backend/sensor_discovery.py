@@ -456,6 +456,17 @@ def discover_sensors(
     pointcloud_topics = [
         topic for topic in topics if topic["type"] == POINTCLOUD_TYPE
     ]
+    saved_topic_name = saved.get("G1_LIDAR_TOPIC", "").strip()
+    saved_sensor_frame = saved.get("G1_DISTANCE_FRAME_ID", "").strip()
+    saved_pointcloud = next(
+        (
+            topic
+            for topic in sensor_named_topics
+            if topic["name"] == saved_topic_name
+            and topic["type"] == POINTCLOUD_TYPE
+        ),
+        None,
+    )
 
     if len(fresh_pointclouds) == 1:
         selected = fresh_pointclouds[0]
@@ -477,6 +488,21 @@ def discover_sensors(
             "ready": False,
             "driver_required": False,
             "reason": "Multiple fresh LiDAR PointCloud2 streams were detected; select the intended source explicitly.",
+        }
+    elif saved_pointcloud and saved_sensor_frame:
+        connection = {
+            "method": "existing_ros_pointcloud_unverified",
+            "ready": False,
+            "driver_required": False,
+            "sensor_id": saved.get("G1_DISTANCE_SENSOR_ID", "mid360-front"),
+            "topic": saved_pointcloud["name"],
+            "message_type": saved_pointcloud["type"],
+            "frame_id": saved_sensor_frame,
+            "reason": (
+                "The saved LiDAR PointCloud2 topic still exists, but no complete fresh "
+                "message was received. The existing source can be reused for diagnostics; "
+                "distance remains unavailable until live data and calibration are verified."
+            ),
         }
     elif sensor_named_topics or pointcloud_topics:
         topic = sensor_named_topics[0] if sensor_named_topics else pointcloud_topics[0]
