@@ -98,6 +98,22 @@ class SensorCalibrationTests(unittest.TestCase):
         observed["parent_frame"] = "base_link"
         self.assertIn("frame labels", compare_transforms(candidate, observed)["reason"])
 
+    def test_driver_frame_alias_can_match_model_mount_geometry(self):
+        model = automatic_calibration_model()
+        candidate = {
+            **model["mount"],
+            "sensor_frame": "livox_frame",
+        }
+        observed = {
+            **candidate,
+            "translation_m": list(candidate["translation_m"]),
+            "rotation_xyzw": list(candidate["rotation_xyzw"]),
+        }
+
+        comparison = compare_transforms(candidate, observed)
+
+        self.assertTrue(comparison["matches"])
+
     def test_live_transform_rejects_zero_quaternion_and_non_finite_values(self):
         candidate = {
             "parent_frame": "torso_link",

@@ -234,7 +234,10 @@ def _parse_pointcloud_header(text, now_seconds):
         }
     age = now_seconds - timestamp
     if age < -MAX_FUTURE_SKEW_SECONDS:
-        error = "PointCloud2 acquisition timestamp is in the future."
+        error = (
+            "PointCloud2 acquisition timestamp is more than {:.0f} ms ahead of the "
+            "host wall clock; verify G1, ROS, and LiDAR time synchronization."
+        ).format(-age * 1000)
     elif age > MAX_SAMPLE_AGE_SECONDS:
         error = "PointCloud2 sample is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
             age * 1000,

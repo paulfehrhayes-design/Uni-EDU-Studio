@@ -115,7 +115,12 @@ def validate_pointcloud_timestamp(
     current_seconds = time.time() if now_seconds is None else now_seconds
     age_seconds = current_seconds - timestamp_seconds
     if age_seconds < -MAX_FUTURE_SKEW_SECONDS:
-        raise ValueError("LiDAR point-cloud timestamp is too far in the future.")
+        raise ValueError(
+            "LiDAR point-cloud timestamp is more than {:.0f} ms ahead of the host "
+            "wall clock; verify G1, ROS, and LiDAR time synchronization.".format(
+                -age_seconds * 1000
+            )
+        )
     if age_seconds > MAX_SAMPLE_AGE_SECONDS:
         raise ValueError(
             f"LiDAR point cloud is stale ({age_seconds * 1000:.0f} ms old; "
@@ -544,11 +549,6 @@ def main() -> None:
         calibration_error = "G1_DISTANCE_BASE_FRAME is required for automatic distance calibration."
     if not sensor_frame_id:
         calibration_error = "G1_DISTANCE_FRAME_ID is required for automatic distance calibration."
-    if sensor_mount and sensor_frame_id != sensor_mount["sensor_frame"]:
-        calibration_error = (
-            f"LiDAR frame {sensor_frame_id!r} does not match the supported G1 model frame "
-            f"{sensor_mount['sensor_frame']!r}; automatic calibration cannot verify this sensor."
-        )
     if not 1 <= half_angle <= 45 or minimum_height >= maximum_height:
         raise ValueError("Invalid LiDAR forward-sector or height configuration.")
     class LidarNode(Node):

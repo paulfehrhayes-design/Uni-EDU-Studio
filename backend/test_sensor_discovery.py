@@ -233,6 +233,26 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertFalse(report["connection"]["ready"])
         self.assertIn("stale", " ".join(report["diagnostics"]))
 
+    def test_future_pointcloud_timestamp_reports_clock_sync_diagnostic(self):
+        report = self.run_discovery(
+            {
+                "topics": "/mid360/points [sensor_msgs/msg/PointCloud2]\n",
+                "headers": {
+                    "/mid360/points": (
+                        "stamp:\n"
+                        "  sec: 1800000001\n"
+                        "  nanosec: 0\n"
+                        "frame_id: livox_frame\n"
+                    )
+                },
+            }
+        )
+
+        self.assertIn(
+            "verify G1, ROS, and LiDAR time synchronization",
+            " ".join(report["diagnostics"]),
+        )
+
     def test_invalid_pointcloud_header_is_not_reported_as_ready(self):
         report = self.run_discovery(
             {

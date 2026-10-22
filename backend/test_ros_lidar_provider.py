@@ -70,7 +70,7 @@ class RosLidarProviderTests(unittest.TestCase):
         for seconds, nanoseconds, expected in (
             (0, 0, "missing"),
             (1_799_999_999, 0, "stale"),
-            (1_800_000_001, 0, "future"),
+            (1_800_000_001, 0, "time synchronization"),
         ):
             with self.subTest(seconds=seconds, nanoseconds=nanoseconds):
                 with self.assertRaisesRegex(ValueError, expected):
