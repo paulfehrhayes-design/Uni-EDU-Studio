@@ -37,6 +37,9 @@ RUN mkdir -p /opt/livox_ws/src \
 
 COPY backend/ros/mid360_launch.py /opt/uni-edu/ros/mid360_launch.py
 COPY backend/ros_lidar_provider.py /opt/uni-edu/ros_lidar_provider.py
+COPY backend/sensor_calibration.py /opt/uni-edu/sensor_calibration.py
+COPY backend/static/g1/g1.xml /opt/uni-edu/g1.xml
+COPY g1_23dof.urdf.txt /opt/uni-edu/g1_23dof.urdf.txt
 COPY backend/ros/docker/entrypoint.sh /usr/local/bin/uni-edu-ros-entrypoint
 
 RUN chmod 755 /usr/local/bin/uni-edu-ros-entrypoint

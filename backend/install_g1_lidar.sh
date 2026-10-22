@@ -104,15 +104,37 @@ DISCOVERED_SENSOR_ID="$(discovery_value connection.sensor_id)"
 G1_LIDAR_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-$(discovery_value network.host_ip)}}"
 G1_LIDAR_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-$(discovery_value network.device_ip)}}"
 G1_LIDAR_TOPIC="${G1_LIDAR_TOPIC:-${SAVED_LIDAR_TOPIC:-$DISCOVERED_TOPIC}}"
-G1_DISTANCE_FRAME_ID="${G1_DISTANCE_FRAME_ID:-${SAVED_SENSOR_FRAME:-$DISCOVERED_FRAME}}"
 G1_DISTANCE_SENSOR_ID="${G1_DISTANCE_SENSOR_ID:-${DISCOVERED_SENSOR_ID:-${SAVED_SENSOR_ID:-mid360-front}}}"
-G1_DISTANCE_BASE_FRAME="${G1_DISTANCE_BASE_FRAME:-$SAVED_BASE_FRAME}"
+G1_DISTANCE_BASE_FRAME="${G1_DISTANCE_BASE_FRAME:-${SAVED_BASE_FRAME:-base_link}}"
 G1_LIDAR_PUBLISH_FREQ="${G1_LIDAR_PUBLISH_FREQ:-${SAVED_PUBLISH_FREQ:-20.0}}"
-AXIS_CONFIRMED="${G1_LIDAR_AXIS_CONFIRMED:-${SAVED_AXIS_CONFIRMED:-0}}"
-CALIBRATION_CONFIRMED="${G1_DISTANCE_CALIBRATION_CONFIRMED:-${SAVED_CALIBRATION_CONFIRMED:-0}}"
-FRONT_EXTENT_M="${G1_DISTANCE_FOOTPRINT_FRONT_M:-$SAVED_FRONT_EXTENT}"
-REAR_EXTENT_M="${G1_DISTANCE_FOOTPRINT_REAR_M:-$SAVED_REAR_EXTENT}"
-HALF_WIDTH_M="${G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M:-$SAVED_HALF_WIDTH}"
+CALIBRATION_MODEL_JSON="$(
+  PYTHONPATH="$PROJECT_DIR/backend" python3 -c \
+    'import json; from sensor_calibration import automatic_calibration_model; print(json.dumps(automatic_calibration_model()))'
+)"
+model_value() {
+  printf '%s' "$CALIBRATION_MODEL_JSON" | python3 -c '
+import json
+import sys
+
+value = json.load(sys.stdin)
+for key in sys.argv[1].split("."):
+    value = value.get(key) if isinstance(value, dict) else None
+if value is None:
+    raise SystemExit("Automatic G1 calibration model is missing " + sys.argv[1])
+print(value)
+' "$1"
+}
+MODEL_SENSOR_FRAME="$(model_value mount.sensor_frame)"
+if [[ "$CONNECTION_METHOD" == "direct_livox" ]]; then
+  G1_DISTANCE_FRAME_ID="${G1_DISTANCE_FRAME_ID:-$MODEL_SENSOR_FRAME}"
+else
+  G1_DISTANCE_FRAME_ID="${G1_DISTANCE_FRAME_ID:-${DISCOVERED_FRAME:-${SAVED_SENSOR_FRAME:-$MODEL_SENSOR_FRAME}}}"
+fi
+AXIS_CONFIRMED=1
+CALIBRATION_CONFIRMED=1
+FRONT_EXTENT_M="$(model_value footprint.front)"
+REAR_EXTENT_M="$(model_value footprint.rear)"
+HALF_WIDTH_M="$(model_value footprint.half_width)"
 
 echo "Sensor discovery method: $CONNECTION_METHOD"
 echo "Sensor discovery: $CONNECTION_REASON"
@@ -333,6 +355,13 @@ PY
 fi
 
 TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+if [[ "$ROS_RUNTIME" == "container" ]]; then
+  SENSOR_URDF_PATH="/opt/uni-edu/g1_23dof.urdf.txt"
+  SENSOR_GEOMETRY_PATH="/opt/uni-edu/g1.xml"
+else
+  SENSOR_URDF_PATH="$PROJECT_DIR/g1_23dof.urdf.txt"
+  SENSOR_GEOMETRY_PATH="$PROJECT_DIR/backend/static/g1/g1.xml"
+fi
 umask 077
 cat > "$ENV_FILE" <<EOF
 G1_DISTANCE_PROVIDER_URL=http://127.0.0.1:8181/distance/front
@@ -346,6 +375,8 @@ G1_DISTANCE_BASE_FRAME=$G1_DISTANCE_BASE_FRAME
 G1_DISTANCE_FOOTPRINT_FRONT_M=$FRONT_EXTENT_M
 G1_DISTANCE_FOOTPRINT_REAR_M=$REAR_EXTENT_M
 G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M=$HALF_WIDTH_M
+G1_SENSOR_URDF_PATH=$SENSOR_URDF_PATH
+G1_SENSOR_GEOMETRY_PATH=$SENSOR_GEOMETRY_PATH
 G1_LIDAR_TOPIC=$G1_LIDAR_TOPIC
 G1_LIDAR_CONFIG_PATH=$CONFIG_FILE
 G1_LIDAR_ROS_WS=$ROS_WS
@@ -487,8 +518,15 @@ RestartSec=3
 WantedBy=default.target
 EOF
   systemctl --user daemon-reload
-  if [[ "$AXIS_CONFIRMED" != "1" || "$CALIBRATION_CONFIRMED" != "1" ]]; then
-    systemctl --user disable --now uni-edu-lidar-provider.service >/dev/null 2>&1 || true
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    systemctl --user enable uni-edu-lidar-driver.service
+    systemctl --user restart uni-edu-lidar-driver.service
+  fi
+  if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
+    systemctl --user enable uni-edu-lidar-provider.service
+    systemctl --user restart uni-edu-lidar-provider.service
+  else
+    systemctl --user disable --now uni-edu-lidar-provider.service
   fi
 fi
 
@@ -500,7 +538,7 @@ else
   echo "Using the detected existing ROS point-cloud source; no Livox driver was installed or started."
 fi
 if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
-  echo "The calibrated read-only distance provider is enabled using $G1_DISTANCE_BASE_FRAME and the measured footprint extents."
+  echo "The read-only distance provider will derive the G1 footprint automatically and wait for live TF verification from $G1_DISTANCE_BASE_FRAME."
 else
   echo "Physical distance conditions remain disabled until axis alignment, base transform, and metric footprint calibration are explicitly verified."
 fi

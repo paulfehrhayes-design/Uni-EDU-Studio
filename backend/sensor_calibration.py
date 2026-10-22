@@ -2,12 +2,23 @@
 
 import math
 import os
+import hashlib
 import xml.etree.ElementTree as ET
+import json
+import urllib.error
+import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 
 
 DEFAULT_URDF_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "g1_23dof.urdf.txt",
+)
+DEFAULT_GEOMETRY_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "static",
+    "g1",
+    "g1.xml",
 )
 SENSOR_LINKS = {
     "mid360": "mid360_link",
@@ -15,6 +26,11 @@ SENSOR_LINKS = {
 }
 TRANSFORM_TRANSLATION_TOLERANCE_M = 0.03
 TRANSFORM_ROTATION_TOLERANCE_RAD = math.radians(3)
+G1_MODEL_FOOTPRINT_ENVELOPE_M = {
+    "front": 0.175,
+    "rear": 0.175,
+    "half_width": 0.225,
+}
 
 
 def _numbers(value, count, label):
@@ -42,6 +58,116 @@ def _quaternion_from_rpy(roll, pitch, yaw):
         cr * cp * sy - sr * sp * cy,
         cr * cp * cy + sr * sp * sy,
     )
+
+
+def _quaternion_multiply(left, right):
+    w, x, y, z = left
+    other_w, other_x, other_y, other_z = right
+    return (
+        w * other_w - x * other_x - y * other_y - z * other_z,
+        w * other_x + x * other_w + y * other_z - z * other_y,
+        w * other_y - x * other_z + y * other_w + z * other_x,
+        w * other_z + x * other_y - y * other_x + z * other_w,
+    )
+
+
+def _rotate_point(rotation, point):
+    w, x, y, z = rotation
+    px, py, pz = point
+    return (
+        (1 - 2 * (y * y + z * z)) * px + 2 * (x * y - z * w) * py + 2 * (x * z + y * w) * pz,
+        2 * (x * y + z * w) * px + (1 - 2 * (x * x + z * z)) * py + 2 * (y * z - x * w) * pz,
+        2 * (x * z - y * w) * px + 2 * (y * z + x * w) * py + (1 - 2 * (x * x + y * y)) * pz,
+    )
+
+
+def _mjcf_body_pose(body):
+    position = _numbers(body.get("pos", "0 0 0"), 3, "G1 body position")
+    if body.get("quat"):
+        quaternion = _numbers(body.get("quat"), 4, "G1 body quaternion")
+        norm = math.sqrt(sum(value * value for value in quaternion))
+        if norm <= 1e-9:
+            raise ValueError("G1 body quaternion has zero magnitude.")
+        return position, tuple(value / norm for value in quaternion)
+    if body.get("euler"):
+        roll, pitch, yaw = _numbers(body.get("euler"), 3, "G1 body Euler rotation")
+        return position, _quaternion_from_rpy(roll, pitch, yaw)
+    return position, (1.0, 0.0, 0.0, 0.0)
+
+
+def derive_g1_footprint(geometry_path=DEFAULT_GEOMETRY_PATH):
+    """Derive a conservative G1 footprint from model foot collisions."""
+    try:
+        root = ET.parse(geometry_path).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise ValueError("Could not read supported G1 collision model: {}".format(error)) from error
+    world = root.find("worldbody")
+    pelvis = (
+        next(
+            (body for body in world.findall("body") if body.get("name") == "pelvis"),
+            None,
+        )
+        if world is not None
+        else None
+    )
+    if pelvis is None:
+        raise ValueError("Supported G1 collision model has no pelvis root.")
+
+    bounds = []
+
+    def visit(body, parent_position, parent_rotation):
+        local_position, local_rotation = _mjcf_body_pose(body)
+        rotated_position = _rotate_point(parent_rotation, local_position)
+        position = tuple(a + b for a, b in zip(parent_position, rotated_position))
+        rotation = _quaternion_multiply(parent_rotation, local_rotation)
+        for geom in body.findall("geom"):
+            name = geom.get("name", "")
+            if not name.startswith(("left_foot", "right_foot")) or "collision" not in name:
+                continue
+            if geom.get("type") != "capsule" or not geom.get("fromto"):
+                raise ValueError("G1 foot collision {} is not a supported capsule.".format(name))
+            endpoints = _numbers(geom.get("fromto"), 6, "G1 foot collision endpoints")
+            radius = _numbers(geom.get("size"), 1, "G1 foot collision radius")[0]
+            if radius <= 0:
+                raise ValueError("G1 foot collision {} has a non-positive radius.".format(name))
+            for offset in (0, 3):
+                endpoint = tuple(endpoints[offset : offset + 3])
+                local_geom_position = _numbers(
+                    geom.get("pos", "0 0 0"), 3, "G1 foot collision position"
+                )
+                endpoint = tuple(a + b for a, b in zip(endpoint, local_geom_position))
+                point = _rotate_point(rotation, endpoint)
+                bounds.append(
+                    {
+                        "x_min": position[0] + point[0] - radius,
+                        "x_max": position[0] + point[0] + radius,
+                        "y_min": position[1] + point[1] - radius,
+                        "y_max": position[1] + point[1] + radius,
+                    }
+                )
+        for child in body.findall("body"):
+            visit(child, position, rotation)
+
+    visit(pelvis, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
+    if not bounds:
+        raise ValueError("Supported G1 collision model has no foot collision geometry.")
+    model_bounds = {
+        "front": max(bound["x_max"] for bound in bounds),
+        "rear": max(-bound["x_min"] for bound in bounds),
+        "half_width": max(
+            max(abs(bound["y_min"]), abs(bound["y_max"])) for bound in bounds
+        ),
+    }
+    footprint = {
+        key: max(model_bounds[key], minimum)
+        for key, minimum in G1_MODEL_FOOTPRINT_ENVELOPE_M.items()
+    }
+    return {
+        **footprint,
+        "source": os.path.basename(geometry_path),
+        "model_bounds_m": model_bounds,
+        "method": "G1 foot collision geometry with a conservative G1 EDU footprint envelope",
+    }
 
 
 def load_candidate_sensor_mounts(urdf_path=DEFAULT_URDF_PATH):
@@ -104,6 +230,73 @@ def load_candidate_sensor_mounts(urdf_path=DEFAULT_URDF_PATH):
     return mounts
 
 
+def _model_fingerprint(urdf_path, geometry_path):
+    digest = hashlib.sha256()
+    for path in (urdf_path, geometry_path):
+        try:
+            with open(path, "rb") as source:
+                digest.update(source.read())
+        except OSError as error:
+            raise ValueError("Could not fingerprint G1 calibration model: {}".format(error)) from error
+    return digest.hexdigest()
+
+
+def automatic_calibration_model(urdf_path=None, geometry_path=None):
+    urdf_path = urdf_path or os.getenv("G1_SENSOR_URDF_PATH", DEFAULT_URDF_PATH)
+    geometry_path = geometry_path or os.getenv(
+        "G1_SENSOR_GEOMETRY_PATH", DEFAULT_GEOMETRY_PATH
+    )
+    mounts = load_candidate_sensor_mounts(urdf_path)
+    footprint = derive_g1_footprint(geometry_path)
+    mount = mounts.get("mid360")
+    if not mount or not mount.get("available"):
+        raise ValueError("Supported G1 model has no usable MID-360 mount.")
+    return {
+        "model_fingerprint": _model_fingerprint(urdf_path, geometry_path),
+        "mount": mount,
+        "footprint": footprint,
+    }
+
+
+def _live_provider_calibration_report(environment, timeout=0.5):
+    provider_url = environment.get("G1_DISTANCE_PROVIDER_URL", "").strip()
+    token = environment.get("G1_DISTANCE_PROVIDER_TOKEN", "").strip()
+    if not provider_url or not token:
+        return None, "Automatic calibration is waiting for the configured LiDAR provider."
+    parsed_url = urlsplit(provider_url)
+    provider_path = parsed_url.path.rstrip("/")
+    distance_suffixes = ("/distance/front", "/distance/rear")
+    distance_suffix = next(
+        (suffix for suffix in distance_suffixes if provider_path.endswith(suffix)),
+        None,
+    )
+    if not distance_suffix:
+        return None, "LiDAR provider URL must end in /distance/front or /distance/rear."
+    calibration_path = provider_path[: -len(distance_suffix)] + "/calibration"
+    request = urllib.request.Request(
+        urlunsplit(
+            (
+                parsed_url.scheme,
+                parsed_url.netloc,
+                calibration_path,
+                "",
+                "",
+            )
+        ),
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return None, "Could not read live automatic calibration status: {}".format(error)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return None, "LiDAR provider returned invalid calibration status: {}".format(error)
+    if not isinstance(payload, dict):
+        return None, "LiDAR provider calibration status must be a JSON object."
+    return payload, None
+
+
 def compare_transforms(candidate, observed):
     """Compare finite transforms expressed with the same parent/child frame labels."""
     if not isinstance(candidate, dict) or not isinstance(observed, dict):
@@ -162,57 +355,120 @@ def compare_transforms(candidate, observed):
     }
 
 
-def calibration_status(env=None, urdf_path=DEFAULT_URDF_PATH):
+def _live_report_matches_model(model, report):
+    if not isinstance(report, dict) or report.get("ready") is not True:
+        return False
+    if report.get("model_fingerprint") != model["model_fingerprint"]:
+        return False
+    transform = report.get("transform")
+    if not isinstance(transform, dict):
+        return False
+    mount = model["mount"]
+    if (
+        transform.get("parent_frame") != mount["parent_frame"]
+        or transform.get("sensor_frame") != mount["sensor_frame"]
+    ):
+        return False
+    translation_error = transform.get("translation_error_m")
+    rotation_error = transform.get("rotation_error_rad")
+    if (
+        isinstance(translation_error, bool)
+        or not isinstance(translation_error, (int, float))
+        or not math.isfinite(translation_error)
+        or isinstance(rotation_error, bool)
+        or not isinstance(rotation_error, (int, float))
+        or not math.isfinite(rotation_error)
+        or translation_error > TRANSFORM_TRANSLATION_TOLERANCE_M
+        or rotation_error > TRANSFORM_ROTATION_TOLERANCE_RAD
+    ):
+        return False
+    footprint = report.get("footprint")
+    if not isinstance(footprint, dict):
+        return False
+    return all(
+        not isinstance(footprint.get(key), bool)
+        and isinstance(footprint.get(key), (int, float))
+        and math.isfinite(footprint[key])
+        and math.isclose(
+            footprint[key],
+            model["footprint"][key],
+            rel_tol=0,
+            abs_tol=1e-6,
+        )
+        for key in ("front", "rear", "half_width")
+    )
+
+
+def calibration_status(
+    env=None,
+    urdf_path=None,
+    geometry_path=None,
+    live_report=None,
+):
     environment = os.environ if env is None else env
+    urdf_path = urdf_path or environment.get("G1_SENSOR_URDF_PATH", DEFAULT_URDF_PATH)
+    geometry_path = geometry_path or environment.get(
+        "G1_SENSOR_GEOMETRY_PATH", DEFAULT_GEOMETRY_PATH
+    )
     try:
-        mounts = load_candidate_sensor_mounts(urdf_path)
+        model = automatic_calibration_model(urdf_path, geometry_path)
         model_error = None
     except ValueError as error:
-        mounts = {}
+        model = None
         model_error = str(error)
-    axis_confirmed = environment.get("G1_LIDAR_AXIS_CONFIRMED", "0").strip() == "1"
-    calibration_confirmed = (
-        environment.get("G1_DISTANCE_CALIBRATION_CONFIRMED", "0").strip() == "1"
-    )
-    required_footprint = (
-        "G1_DISTANCE_FOOTPRINT_FRONT_M",
-        "G1_DISTANCE_FOOTPRINT_REAR_M",
-        "G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M",
-    )
-    missing_footprint = [
-        name for name in required_footprint if not environment.get(name, "").strip()
-    ]
-    configuration_present = (
-        axis_confirmed and calibration_confirmed and not missing_footprint
-    )
+    report_verified = False
     if model_error:
         reason = model_error
-    elif not axis_confirmed:
-        reason = "LiDAR axis/coordinate convention has not been verified."
-    elif not calibration_confirmed:
-        reason = (
-            "Sensor-to-base transform and footprint have not passed calibration validation."
-        )
-    elif missing_footprint:
-        reason = "Verified robot footprint dimensions are missing: {}.".format(
-            ", ".join(missing_footprint)
-        )
     else:
-        reason = (
-            "Saved calibration flags and footprint are present, but no live transform "
-            "comparison or independent calibration validation is available."
-        )
+        if live_report is None:
+            live_report, report_error = _live_provider_calibration_report(environment)
+        else:
+            report_error = None
+        if report_error:
+            reason = report_error
+        elif not isinstance(live_report, dict):
+            reason = "LiDAR provider calibration status must be a JSON object."
+        elif live_report.get("model_fingerprint") != model["model_fingerprint"]:
+            reason = "Live calibration evidence was produced by a different G1 model."
+        elif live_report.get("ready") is True and _live_report_matches_model(model, live_report):
+            report_verified = True
+            reason = live_report.get(
+                "reason",
+                "Live sensor transform matches the G1 model and the footprint was derived automatically.",
+            )
+        elif live_report.get("ready") is True:
+            reason = (
+                "LiDAR provider marked calibration ready without a matching live transform "
+                "and model-derived footprint."
+            )
+        else:
+            reason = live_report.get(
+                "reason",
+                "Waiting for a fresh LiDAR sample and a matching live G1 sensor transform.",
+            )
+    ready = bool(model and report_verified)
+    mounts = {} if not model else {"mid360": model["mount"]}
+    missing_footprint = [] if model else ["automatic G1 footprint geometry"]
     return {
-        "status": "configured_unverified" if configuration_present else "unverified",
-        "ready": False,
-        "configuration_present": configuration_present,
+        "status": "verified" if ready else ("unavailable" if model_error else "awaiting_live_validation"),
+        "ready": ready,
+        "configuration_present": model is not None,
         "model": os.path.basename(urdf_path),
         "candidate_mounts": mounts,
-        "axis_confirmed": axis_confirmed,
-        "calibration_confirmed": calibration_confirmed,
+        "footprint": None if not model else model["footprint"],
+        "model_fingerprint": None if not model else model["model_fingerprint"],
+        "axis_confirmed": ready,
+        "calibration_confirmed": ready,
         "missing_footprint": missing_footprint,
         "reason": reason,
         "verification_note": (
-            "No model candidate or saved flag alone validates installed hardware."
+            "Calibration is automatic and remains ready only while a fresh live ROS transform matches the supported G1 model."
+        ),
+        "live_transform": (
+            live_report.get("transform") if isinstance(live_report, dict) else None
         ),
     }
+
+
+if __name__ == "__main__":
+    print(json.dumps(automatic_calibration_model(), indent=2, sort_keys=True))

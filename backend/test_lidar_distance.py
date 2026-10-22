@@ -125,19 +125,37 @@ class LidarDistanceTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once_with(lidar_distance.PROVIDER_RETRY_DELAY_SECONDS)
 
-    def test_unconfirmed_lidar_axis_disables_distance_conditions(self):
-        with patch.dict("os.environ", {"G1_LIDAR_AXIS_CONFIRMED": "0"}):
-            with patch.object(lidar_distance.httpx, "get") as request:
-                with self.assertRaisesRegex(DistanceSensorError, "axis alignment is unconfirmed"):
-                    get_front_distance_sample(now=self.now)
+    def test_legacy_flags_cannot_replace_live_automatic_calibration_evidence(self):
+        with patch.object(
+            lidar_distance,
+            "calibration_status",
+            return_value={
+                "ready": False,
+                "status": "awaiting_live_validation",
+                "reason": "No fresh matching live transform.",
+            },
+        ), patch.object(lidar_distance.httpx, "get") as request:
+            with self.assertRaisesRegex(
+                DistanceSensorError,
+                "calibration is awaiting_live_validation.*No fresh matching live transform",
+            ):
+                get_front_distance_sample(now=self.now)
         request.assert_not_called()
 
-    def test_unconfirmed_transform_or_footprint_calibration_disables_conditions(self):
-        with patch.dict("os.environ", {"G1_DISTANCE_CALIBRATION_CONFIRMED": "0"}):
-            with patch.object(lidar_distance.httpx, "get") as request:
-                with self.assertRaisesRegex(DistanceSensorError, "transform and footprint calibration are unconfirmed"):
-                    get_front_distance_sample(now=self.now)
-        request.assert_not_called()
+    def test_live_automatic_calibration_replaces_legacy_confirmation_flags(self):
+        response = SimpleNamespace(status_code=200, json=lambda: self.payload)
+        with patch.dict(
+            "os.environ",
+            {
+                "G1_LIDAR_AXIS_CONFIRMED": "0",
+                "G1_DISTANCE_CALIBRATION_CONFIRMED": "0",
+            },
+        ), patch.object(
+            lidar_distance.httpx, "get", return_value=response
+        ):
+            sample = get_front_distance_sample(now=self.now)
+
+        self.assertEqual(sample["distance_m"], 0.85)
 
     def test_unverified_calibration_blocks_even_confirmed_flags_and_fresh_provider_data(self):
         with patch.dict(

@@ -1,22 +1,61 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 try:
+    from . import sensor_calibration as calibration_module
     from .sensor_calibration import (
+        _live_provider_calibration_report,
+        automatic_calibration_model,
         calibration_status,
         compare_transforms,
+        derive_g1_footprint,
         load_candidate_sensor_mounts,
     )
 except ImportError:
+    import sensor_calibration as calibration_module
     from sensor_calibration import (
+        _live_provider_calibration_report,
+        automatic_calibration_model,
         calibration_status,
         compare_transforms,
+        derive_g1_footprint,
         load_candidate_sensor_mounts,
     )
 
 
 class SensorCalibrationTests(unittest.TestCase):
+    def test_live_provider_status_uses_sibling_calibration_endpoint(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return b'{"ready":false,"status":"waiting"}'
+
+        with patch.object(
+            calibration_module.urllib.request, "urlopen", return_value=Response()
+        ) as open_url:
+            report, error = _live_provider_calibration_report(
+                {
+                    "G1_DISTANCE_PROVIDER_URL": (
+                        "http://127.0.0.1:8181/distance/front"
+                    ),
+                    "G1_DISTANCE_PROVIDER_TOKEN": "test-token",
+                }
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(report["status"], "waiting")
+        self.assertEqual(
+            open_url.call_args.args[0].full_url,
+            "http://127.0.0.1:8181/calibration",
+        )
+
     def test_loads_sensor_mounts_as_unverified_model_candidates(self):
         mounts = load_candidate_sensor_mounts()
 
@@ -82,20 +121,25 @@ class SensorCalibrationTests(unittest.TestCase):
         self.assertFalse(non_finite_result["matches"])
         self.assertIn("finite values", non_finite_result["reason"])
 
-    def test_model_candidate_and_saved_flags_do_not_hide_missing_footprint(self):
-        status = calibration_status(
-            {
-                "G1_LIDAR_AXIS_CONFIRMED": "1",
-                "G1_DISTANCE_CALIBRATION_CONFIRMED": "1",
-            }
+    def test_derives_footprint_from_g1_model_without_user_measurements(self):
+        footprint = derive_g1_footprint()
+
+        self.assertEqual(
+            {key: footprint[key] for key in ("front", "rear", "half_width")},
+            {"front": 0.175, "rear": 0.175, "half_width": 0.225},
+        )
+        self.assertGreaterEqual(footprint["front"], footprint["model_bounds_m"]["front"])
+        self.assertGreaterEqual(footprint["rear"], footprint["model_bounds_m"]["rear"])
+        self.assertGreaterEqual(
+            footprint["half_width"], footprint["model_bounds_m"]["half_width"]
+        )
+        self.assertEqual(
+            automatic_calibration_model()["mount"]["sensor_frame"],
+            "mid360_link",
         )
 
-        self.assertFalse(status["ready"])
-        self.assertEqual(status["status"], "unverified")
-        self.assertEqual(len(status["missing_footprint"]), 3)
-        self.assertIn("missing", status["reason"])
-
-    def test_saved_configuration_is_never_claimed_as_live_hardware_validation(self):
+    def test_model_geometry_and_saved_flags_are_not_live_calibration_evidence(self):
+        model = automatic_calibration_model()
         status = calibration_status(
             {
                 "G1_LIDAR_AXIS_CONFIRMED": "1",
@@ -103,14 +147,71 @@ class SensorCalibrationTests(unittest.TestCase):
                 "G1_DISTANCE_FOOTPRINT_FRONT_M": "0.4",
                 "G1_DISTANCE_FOOTPRINT_REAR_M": "0.3",
                 "G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M": "0.2",
-            }
+            },
+            live_report={
+                "ready": False,
+                "status": "waiting_for_live_transform",
+                "reason": "No fresh matching live transform.",
+                "model_fingerprint": model["model_fingerprint"],
+            },
         )
 
         self.assertFalse(status["ready"])
         self.assertTrue(status["configuration_present"])
-        self.assertEqual(status["status"], "configured_unverified")
-        self.assertIn("live transform comparison", status["reason"])
-        self.assertIn("No model candidate or saved flag", status["verification_note"])
+        self.assertEqual(status["status"], "awaiting_live_validation")
+        self.assertIn("No fresh matching live transform", status["reason"])
+        self.assertEqual(status["missing_footprint"], [])
+
+    def test_calibration_becomes_ready_only_for_fresh_matching_model_evidence(self):
+        model = automatic_calibration_model()
+        status = calibration_status(
+            env={},
+            live_report={
+                "ready": True,
+                "status": "verified",
+                "reason": "Live transform matches.",
+                "model_fingerprint": model["model_fingerprint"],
+                "transform": {
+                    "parent_frame": model["mount"]["parent_frame"],
+                    "sensor_frame": model["mount"]["sensor_frame"],
+                    "translation_error_m": 0.001,
+                    "rotation_error_rad": 0.001,
+                },
+                "footprint": model["footprint"],
+            },
+        )
+
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["status"], "verified")
+        self.assertTrue(status["axis_confirmed"])
+        self.assertTrue(status["calibration_confirmed"])
+        self.assertEqual(status["live_transform"]["translation_error_m"], 0.001)
+
+    def test_calibration_rejects_evidence_from_a_different_model(self):
+        status = calibration_status(
+            env={},
+            live_report={
+                "ready": True,
+                "model_fingerprint": "not-the-current-model",
+            },
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertIn("different G1 model", status["reason"])
+
+    def test_provider_ready_flag_without_transform_evidence_is_rejected(self):
+        model = automatic_calibration_model()
+        status = calibration_status(
+            env={},
+            live_report={
+                "ready": True,
+                "model_fingerprint": model["model_fingerprint"],
+                "footprint": model["footprint"],
+            },
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertIn("without a matching live transform", status["reason"])
 
 
 if __name__ == "__main__":

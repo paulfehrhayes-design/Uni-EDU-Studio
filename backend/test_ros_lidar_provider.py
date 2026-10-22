@@ -267,8 +267,27 @@ class RosLidarProviderTests(unittest.TestCase):
         self.assertEqual(rear_payload["sector"], "rear")
         self.assertEqual(rear_payload["distance_m"], 1.2)
 
+        cache.update_calibration_status(
+            {
+                "ready": True,
+                "status": "verified",
+                "model_fingerprint": "test-model",
+                "reason": "Transform matches the model.",
+            }
+        )
+        calibration_request = Request(
+            base_url.replace("/distance/front", "/calibration"),
+            headers={"Authorization": "Bearer provider-secret"},
+        )
+        with urlopen(calibration_request, timeout=2) as response:
+            calibration = json.load(response)
+        self.assertTrue(calibration["ready"])
+        self.assertEqual(calibration["model_fingerprint"], "test-model")
+
         with cache._lock:
             cache._received_monotonic -= 1
+        self.assertFalse(cache.current_calibration_status()["ready"])
+        self.assertEqual(cache.current_calibration_status()["status"], "stale")
         with self.assertRaises(HTTPError) as stale:
             urlopen(request, timeout=2)
         self.assertEqual(stale.exception.code, 503)

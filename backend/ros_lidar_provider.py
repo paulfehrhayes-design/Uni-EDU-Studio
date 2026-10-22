@@ -321,6 +321,11 @@ class SampleCache:
         self._calibrated = False
         self._last_error: str | None = None
         self._cloud_count = 0
+        self._calibration_status: dict[str, object] = {
+            "ready": False,
+            "status": "waiting_for_live_transform",
+            "reason": "Provider has not verified a live sensor transform.",
+        }
 
     def update(self, points: Iterable[object], frame_id: str, half_angle: float, min_z: float, max_z: float) -> None:
         front_distance, rear_distance = select_sector_distances(
@@ -360,6 +365,29 @@ class SampleCache:
     def mark_unavailable(self, reason: str) -> None:
         with self._lock:
             self._last_error = reason
+
+    def update_calibration_status(self, status: dict[str, object]) -> None:
+        with self._lock:
+            self._calibration_status = dict(status)
+
+    def current_calibration_status(self) -> dict[str, object]:
+        with self._lock:
+            status = dict(self._calibration_status)
+            received_monotonic = self._received_monotonic
+            last_error = self._last_error
+        if status.get("ready") is True:
+            if last_error:
+                status.update(ready=False, status="unavailable", reason=last_error)
+            elif (
+                received_monotonic is None
+                or time.monotonic() - received_monotonic > MAX_SAMPLE_AGE_SECONDS
+            ):
+                status.update(
+                    ready=False,
+                    status="stale",
+                    reason="Live LiDAR calibration evidence is stale.",
+                )
+        return status
 
     def unavailable_reason(self) -> str:
         with self._lock:
@@ -420,13 +448,27 @@ class SampleCache:
 def serve_http(cache: SampleCache, host: str, port: int, token: str) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path not in {"/distance/front", "/distance/rear", "/healthz"}:
+            if self.path not in {
+                "/distance/front",
+                "/distance/rear",
+                "/healthz",
+                "/calibration",
+            }:
                 self.send_error(404)
                 return
             supplied = self.headers.get("Authorization", "")
             expected = f"Bearer {token}"
             if not hmac.compare_digest(supplied, expected):
                 self.send_error(401)
+                return
+            if self.path == "/calibration":
+                payload = cache.current_calibration_status()
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             sector = "rear" if self.path == "/distance/rear" else "forward"
             sample = cache.current_sample(sector)
@@ -468,6 +510,12 @@ def main() -> None:
     from rclpy.duration import Duration
     from rclpy.time import Time
     from tf2_ros import Buffer, TransformException, TransformListener
+    from sensor_calibration import (
+        DEFAULT_GEOMETRY_PATH,
+        DEFAULT_URDF_PATH,
+        automatic_calibration_model,
+        compare_transforms,
+    )
 
     topic = os.environ.get("G1_LIDAR_TOPIC", "/mid360/livox/lidar")
     sensor_id = os.environ["G1_DISTANCE_SENSOR_ID"]
@@ -480,24 +528,27 @@ def main() -> None:
     minimum_height = float(os.environ.get("G1_LIDAR_MINIMUM_HEIGHT_M", "-0.5"))
     maximum_height = float(os.environ.get("G1_LIDAR_MAXIMUM_HEIGHT_M", "1.5"))
     calibration_error = None
-    if os.getenv("G1_LIDAR_AXIS_CONFIRMED", "0").strip() != "1":
-        calibration_error = "MID-360 axis alignment is not confirmed."
-    if os.getenv("G1_DISTANCE_CALIBRATION_CONFIRMED", "0").strip() != "1":
-        calibration_error = "MID-360-to-robot transform and footprint calibration are not confirmed."
     try:
-        footprint = {
-            key: float(os.environ[f"G1_DISTANCE_FOOTPRINT_{key.upper()}_M"])
-            for key in ("front", "rear", "half_width")
-        }
-        if any(not math.isfinite(value) or value <= 0 for value in footprint.values()):
-            raise ValueError("Robot footprint extents must be finite and greater than zero.")
-    except (KeyError, ValueError) as error:
+        calibration_model = automatic_calibration_model(
+            os.getenv("G1_SENSOR_URDF_PATH", DEFAULT_URDF_PATH),
+            os.getenv("G1_SENSOR_GEOMETRY_PATH", DEFAULT_GEOMETRY_PATH),
+        )
+        footprint = calibration_model["footprint"]
+        sensor_mount = calibration_model["mount"]
+    except ValueError as error:
+        calibration_model = None
+        sensor_mount = None
         footprint = None
-        calibration_error = f"Calibrated robot footprint is not configured: {error}."
+        calibration_error = f"Automatic G1 calibration model is unavailable: {error}."
     if not base_frame_id:
-        calibration_error = "G1_DISTANCE_BASE_FRAME is required for calibrated distance measurements."
+        calibration_error = "G1_DISTANCE_BASE_FRAME is required for automatic distance calibration."
     if not sensor_frame_id:
-        calibration_error = "G1_DISTANCE_FRAME_ID is required for calibrated distance measurements."
+        calibration_error = "G1_DISTANCE_FRAME_ID is required for automatic distance calibration."
+    if sensor_mount and sensor_frame_id != sensor_mount["sensor_frame"]:
+        calibration_error = (
+            f"LiDAR frame {sensor_frame_id!r} does not match the supported G1 model frame "
+            f"{sensor_mount['sensor_frame']!r}; automatic calibration cannot verify this sensor."
+        )
     if not 1 <= half_angle <= 45 or minimum_height >= maximum_height:
         raise ValueError("Invalid LiDAR forward-sector or height configuration.")
     class LidarNode(Node):
@@ -506,6 +557,19 @@ def main() -> None:
             self.cache = SampleCache(
                 sensor_id,
                 base_frame_id or "unconfigured_base_frame",
+            )
+            self.cache.update_calibration_status(
+                {
+                    "ready": False,
+                    "status": "waiting_for_live_transform",
+                    "reason": calibration_error
+                    or "Waiting for a fresh point cloud and live G1 sensor transform.",
+                    "model_fingerprint": (
+                        calibration_model["model_fingerprint"] if calibration_model else None
+                    ),
+                    "footprint": footprint,
+                    "transform": None,
+                }
             )
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -527,18 +591,82 @@ def main() -> None:
                 )
                 self.received_first_cloud = True
             if calibration_error or footprint is None:
-                self.cache.mark_unavailable(calibration_error or "Robot footprint calibration is unavailable.")
+                reason = calibration_error or "Automatic G1 footprint geometry is unavailable."
+                self.cache.mark_unavailable(reason)
+                self.cache.update_calibration_status(
+                    {
+                        "ready": False,
+                        "status": "unavailable",
+                        "reason": reason,
+                        "model_fingerprint": (
+                            calibration_model["model_fingerprint"] if calibration_model else None
+                        ),
+                        "footprint": footprint,
+                        "transform": None,
+                    }
+                )
                 return
             source_frame = str(message.header.frame_id).strip()
             if source_frame != sensor_frame_id:
                 reason = f"Received point-cloud frame {source_frame!r}; expected {sensor_frame_id!r}."
                 self.cache.mark_unavailable(reason)
+                self.cache.update_calibration_status(
+                    {
+                        "ready": False,
+                        "status": "frame_mismatch",
+                        "reason": reason,
+                        "model_fingerprint": calibration_model["model_fingerprint"],
+                        "footprint": footprint,
+                        "transform": None,
+                    }
+                )
                 return
             try:
                 captured_at = validate_pointcloud_timestamp(
                     int(message.header.stamp.sec),
                     int(message.header.stamp.nanosec),
                 )
+                mount_transform: TransformStamped = self.tf_buffer.lookup_transform(
+                    sensor_mount["parent_frame"],
+                    source_frame,
+                    Time.from_msg(message.header.stamp),
+                    timeout=Duration(seconds=0.05),
+                )
+                mount_translation = mount_transform.transform.translation
+                mount_rotation = mount_transform.transform.rotation
+                observed_mount = {
+                    "parent_frame": mount_transform.header.frame_id,
+                    "sensor_frame": mount_transform.child_frame_id,
+                    "translation_m": [
+                        float(mount_translation.x),
+                        float(mount_translation.y),
+                        float(mount_translation.z),
+                    ],
+                    "rotation_xyzw": [
+                        float(mount_rotation.x),
+                        float(mount_rotation.y),
+                        float(mount_rotation.z),
+                        float(mount_rotation.w),
+                    ],
+                }
+                mount_comparison = compare_transforms(sensor_mount, observed_mount)
+                if not mount_comparison["matches"]:
+                    reason = mount_comparison["reason"]
+                    self.cache.mark_unavailable(reason)
+                    self.cache.update_calibration_status(
+                        {
+                            "ready": False,
+                            "status": "transform_mismatch",
+                            "reason": reason,
+                            "model_fingerprint": calibration_model["model_fingerprint"],
+                            "footprint": footprint,
+                            "transform": {
+                                "translation_error_m": mount_comparison.get("translation_error_m"),
+                                "rotation_error_rad": mount_comparison.get("rotation_error_rad"),
+                            },
+                        }
+                    )
+                    return
                 if source_frame == base_frame_id:
                     translation = (0.0, 0.0, 0.0)
                     rotation = (0.0, 0.0, 0.0, 1.0)
@@ -578,8 +706,38 @@ def main() -> None:
             except (TransformException, TypeError, ValueError, IndexError) as error:
                 reason = f"LiDAR sample could not be transformed/calibrated: {error}"
                 self.cache.mark_unavailable(reason)
+                self.cache.update_calibration_status(
+                    {
+                        "ready": False,
+                        "status": "unavailable",
+                        "reason": reason,
+                        "model_fingerprint": calibration_model["model_fingerprint"],
+                        "footprint": footprint,
+                        "transform": None,
+                    }
+                )
                 self.get_logger().warning(reason)
                 return
+            self.cache.update_calibration_status(
+                {
+                    "ready": True,
+                    "status": "verified",
+                    "reason": (
+                        "Live MID-360 transform matches the supported G1 model; "
+                        "footprint was derived automatically from the G1 collision model."
+                    ),
+                    "model_fingerprint": calibration_model["model_fingerprint"],
+                    "footprint": footprint,
+                    "transform": {
+                        "parent_frame": observed_mount["parent_frame"],
+                        "sensor_frame": observed_mount["sensor_frame"],
+                        "translation_m": observed_mount["translation_m"],
+                        "rotation_xyzw": observed_mount["rotation_xyzw"],
+                        "translation_error_m": mount_comparison["translation_error_m"],
+                        "rotation_error_rad": mount_comparison["rotation_error_rad"],
+                    },
+                }
+            )
             self.cache.update_distances(
                 front_distance,
                 rear_distance,

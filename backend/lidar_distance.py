@@ -28,14 +28,6 @@ class DistanceSensorError(RuntimeError):
 def _provider_configuration(sector: str) -> tuple[str, str, str, str, str]:
     if sector not in {"forward", "rear"}:
         raise ValueError("Distance sector must be forward or rear.")
-    if os.getenv("G1_LIDAR_AXIS_CONFIRMED", "0").strip() != "1":
-        raise DistanceSensorError(
-            "MID-360 axis alignment is unconfirmed; physical distance conditions are disabled."
-        )
-    if os.getenv("G1_DISTANCE_CALIBRATION_CONFIRMED", "0").strip() != "1":
-        raise DistanceSensorError(
-            "MID-360-to-robot transform and footprint calibration are unconfirmed; physical distance conditions are disabled."
-        )
     url_variable = "G1_DISTANCE_PROVIDER_URL" if sector == "forward" else "G1_DISTANCE_REAR_PROVIDER_URL"
     url = os.getenv(url_variable, "").strip()
     token = os.getenv("G1_DISTANCE_PROVIDER_TOKEN", "").strip()
