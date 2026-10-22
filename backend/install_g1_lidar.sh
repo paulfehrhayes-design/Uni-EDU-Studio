@@ -356,13 +356,8 @@ PY
 fi
 
 TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-if [[ "$ROS_RUNTIME" == "container" ]]; then
-  SENSOR_URDF_PATH="/opt/uni-edu/g1_23dof.urdf.txt"
-  SENSOR_GEOMETRY_PATH="/opt/uni-edu/g1.xml"
-else
-  SENSOR_URDF_PATH="$PROJECT_DIR/g1_23dof.urdf.txt"
-  SENSOR_GEOMETRY_PATH="$PROJECT_DIR/backend/static/g1/g1.xml"
-fi
+SENSOR_URDF_PATH="$PROJECT_DIR/g1_23dof.urdf.txt"
+SENSOR_GEOMETRY_PATH="$PROJECT_DIR/backend/static/g1/g1.xml"
 umask 077
 cat > "$ENV_FILE" <<EOF
 G1_DISTANCE_PROVIDER_URL=http://127.0.0.1:8181/distance/front
@@ -443,7 +438,7 @@ $PROVIDER_DEPENDENCIES
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --env-file $ENV_FILE uni-edu-lidar-humble:local python3 /opt/uni-edu/ros_lidar_provider.py
+ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --env-file $ENV_FILE --env G1_SENSOR_URDF_PATH=/opt/uni-edu/g1_23dof.urdf.txt --env G1_SENSOR_GEOMETRY_PATH=/opt/uni-edu/g1.xml uni-edu-lidar-humble:local python3 /opt/uni-edu/ros_lidar_provider.py
 ExecStop=/usr/bin/docker stop --time 10 uni-edu-lidar-provider
 Restart=on-failure
 RestartSec=3
