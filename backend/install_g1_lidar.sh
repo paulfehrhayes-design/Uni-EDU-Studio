@@ -298,8 +298,13 @@ if [[ "$ROS_RUNTIME" == "container" ]]; then
     echo "At least 8 GiB of free space is required on Docker's storage filesystem at $DOCKER_ROOT." >&2
     exit 1
   fi
-  echo "Building the native-architecture ROS 2 Humble sensor runtime. This may take several minutes; build-step output will be shown, and Docker will cache completed layers for future installs."
-  sudo docker build --pull=false -t uni-edu-lidar-humble:local \
+  if [[ "$DRIVER_REQUIRED" == "1" ]]; then
+    echo "Building the ROS 2 Humble runtime and required Livox driver; the first build may take several minutes."
+  else
+    echo "Building the lightweight ROS 2 Humble sensor runtime; reusing the detected ROS point-cloud source without building a Livox driver."
+  fi
+  sudo docker build --pull=false --build-arg "INSTALL_LIVOX_DRIVER=$DRIVER_REQUIRED" \
+    -t uni-edu-lidar-humble:local \
     -f "$PROJECT_DIR/backend/ros/docker/Dockerfile" "$PROJECT_DIR"
 else
   if [[ ! -f "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash" ]]; then

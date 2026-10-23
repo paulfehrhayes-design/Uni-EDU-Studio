@@ -2,7 +2,9 @@
 set -eo pipefail
 
 source /opt/ros/humble/setup.bash
-source /opt/livox_ws/install/setup.bash
+if [[ -f /opt/livox_ws/install/setup.bash ]]; then
+  source /opt/livox_ws/install/setup.bash
+fi
 source /opt/g1_state_ws/install/setup.bash
 
 set -u

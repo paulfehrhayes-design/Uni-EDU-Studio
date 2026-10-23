@@ -22,26 +22,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-tf2-ros \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-SDK2 \
-    && cmake -S /tmp/Livox-SDK2 -B /tmp/Livox-SDK2/build \
-    && cmake --build /tmp/Livox-SDK2/build --parallel 2 \
-    && cmake --install /tmp/Livox-SDK2/build \
-    && ldconfig \
-    && ldconfig -p | grep -F 'liblivox_lidar_sdk_shared.so' \
-    && rm -rf /tmp/Livox-SDK2
-
-RUN mkdir -p /opt/livox_ws/src \
-    && git clone --depth 1 https://github.com/Livox-SDK/livox_ros_driver2.git \
-        /opt/livox_ws/src/livox_ros_driver2 \
-    && cd /opt/livox_ws/src/livox_ros_driver2 \
-    && source /opt/ros/humble/setup.bash \
-    && bash -e ./build.sh humble \
-    && rm -rf /opt/livox_ws/src/livox_ros_driver2/.git
-
 COPY backend/ros/unitree_hg /opt/g1_state_ws/src/unitree_hg
 RUN source /opt/ros/humble/setup.bash \
     && cd /opt/g1_state_ws \
     && colcon build --packages-select unitree_hg
+
+ARG INSTALL_LIVOX_DRIVER=0
+RUN if [[ "$INSTALL_LIVOX_DRIVER" == "1" ]]; then \
+      mkdir -p /opt/livox_ws/src \
+      && git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-SDK2 \
+      && cmake -S /tmp/Livox-SDK2 -B /tmp/Livox-SDK2/build \
+      && cmake --build /tmp/Livox-SDK2/build --parallel 2 \
+      && cmake --install /tmp/Livox-SDK2/build \
+      && ldconfig \
+      && ldconfig -p | grep -F 'liblivox_lidar_sdk_shared.so' \
+      && rm -rf /tmp/Livox-SDK2 \
+      && git clone --depth 1 https://github.com/Livox-SDK/livox_ros_driver2.git \
+        /opt/livox_ws/src/livox_ros_driver2 \
+      && cd /opt/livox_ws/src/livox_ros_driver2 \
+      && source /opt/ros/humble/setup.bash \
+      && bash -e ./build.sh humble \
+      && rm -rf /opt/livox_ws/src/livox_ros_driver2/.git; \
+    else \
+      echo "Skipping Livox driver build; an existing ROS point-cloud source is being reused."; \
+    fi
 
 COPY backend/ros/mid360_launch.py /opt/uni-edu/ros/mid360_launch.py
 COPY backend/ros/g1_sensor_runtime.launch.py /opt/uni-edu/ros/g1_sensor_runtime.launch.py
