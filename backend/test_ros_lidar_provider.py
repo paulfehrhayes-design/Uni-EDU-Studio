@@ -12,6 +12,7 @@ try:
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
+        should_log_tf_warning,
         select_forward_distance,
         select_footprint_distances_array,
         transform_point_to_base,
@@ -25,6 +26,7 @@ except ImportError:
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
+        should_log_tf_warning,
         select_forward_distance,
         select_footprint_distances_array,
         transform_point_to_base,
@@ -48,9 +50,15 @@ class RosLidarProviderTests(unittest.TestCase):
         )
 
         self.assertIn("G1 TF/joint-state publisher is active", message)
+        self.assertNotIn(". .", message)
         self.assertIn("torso_link -> livox_frame", message)
         self.assertIn("base_link <- livox_frame", message)
         self.assertIn("Do not substitute an assumed static transform", message)
+
+    def test_tf_warning_logging_is_throttled(self):
+        self.assertTrue(should_log_tf_warning(None, 10.0))
+        self.assertFalse(should_log_tf_warning(10.0, 14.9))
+        self.assertTrue(should_log_tf_warning(10.0, 15.0))
 
     def test_transforms_lidar_point_into_base_frame(self):
         point = transform_point_to_base(

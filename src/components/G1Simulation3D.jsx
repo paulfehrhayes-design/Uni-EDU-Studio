@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { ChevronDown, ChevronUp, Pause, Play, RotateCcw } from 'lucide-react';
 import { buildG1SimulationFrames, G1_EDU_23_ENV } from '../sim/g1Edu23Env';
+import { simulateDuetG1Edu23Program } from '../sim/duetG1Edu23Env';
 import { getSceneObjectScale } from '../sim/sceneObjects';
 
 const JOINT_AXES = {
@@ -501,7 +502,7 @@ async function loadG1MeshRig() {
   return { robot, joints };
 }
 
-export default function G1Simulation3D({ code, simulatorState, obstacles = [], waypoints = [], onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
+export default function G1Simulation3D({ code, simulatorState, controllerVersion = 'legacy', obstacles = [], waypoints = [], onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const rendererRef = useRef(null);
@@ -601,11 +602,13 @@ export default function G1Simulation3D({ code, simulatorState, obstacles = [], w
   }, [waypoints]);
 
   useEffect(() => {
-    framesRef.current = buildG1SimulationFrames(code, {
-      obstacles,
-      challenge: simulatorState?.goal ? { goal: simulatorState.goal } : null,
-    });
-  }, [code, obstacles, simulatorState?.goal]);
+    framesRef.current = controllerVersion === 'duet'
+      ? simulateDuetG1Edu23Program(code)
+      : buildG1SimulationFrames(code, {
+        obstacles,
+        challenge: simulatorState?.goal ? { goal: simulatorState.goal } : null,
+      });
+  }, [code, controllerVersion, obstacles, simulatorState?.goal]);
 
   useEffect(() => {
     const group = obstacleGroupRef.current;

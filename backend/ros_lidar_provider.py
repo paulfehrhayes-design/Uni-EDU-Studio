@@ -13,6 +13,11 @@ from typing import Iterable
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
+TF_WARNING_INTERVAL_SECONDS = 5.0
+
+
+def should_log_tf_warning(last_warning_at: float | None, now: float) -> bool:
+    return last_warning_at is None or now - last_warning_at >= TF_WARNING_INTERVAL_SECONDS
 
 
 def format_tf_calibration_error(
@@ -21,13 +26,14 @@ def format_tf_calibration_error(
     sensor_frame: str,
     base_frame: str,
 ) -> str:
+    error_message = str(error).rstrip(" .")
     return (
         "LiDAR sample could not be transformed/calibrated: {}. Live ROS TF must "
         "provide timestamp-valid transforms for the G1 mount ({} -> {}) and robot "
         "base ({} <- {}) at the point-cloud timestamp; verify a G1 TF/joint-state "
         "publisher is active. Do not substitute an assumed static transform."
     ).format(
-        error,
+        error_message,
         mount_parent_frame,
         sensor_frame,
         base_frame,
@@ -597,6 +603,7 @@ def main() -> None:
             self.processed_clouds = 0
             self.last_diagnostic_cloud_count = 0
             self.last_diagnostic_at = time.monotonic()
+            self.last_tf_warning_at = None
             if calibration_error:
                 self.cache.mark_unavailable(calibration_error)
                 self.get_logger().error(calibration_error)
@@ -747,7 +754,10 @@ def main() -> None:
                         "transform": None,
                     }
                 )
-                self.get_logger().warning(reason)
+                warning_at = time.monotonic()
+                if should_log_tf_warning(self.last_tf_warning_at, warning_at):
+                    self.get_logger().warning(reason)
+                    self.last_tf_warning_at = warning_at
                 return
             except (TypeError, ValueError, IndexError) as error:
                 reason = f"LiDAR sample could not be transformed/calibrated: {error}"

@@ -26,6 +26,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 try:
     from .g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from .duet_robot import (
+        DuetControllerError,
+        DuetProgramValidationError,
+        connect_controller as connect_duet_controller,
+        controller_owns_motion as duet_controller_owns_motion,
+        controller_status as duet_controller_status,
+        disconnect_controller as disconnect_duet_controller,
+        execute_program as execute_duet_program,
+        stop_controller as stop_duet_controller,
+    )
     from .camera_discovery import discover_camera_sources
     from .lidar_distance import distance_sensor_status
     from .sensor_calibration import calibration_status
@@ -47,6 +57,16 @@ try:
     )
 except ImportError:
     from g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from duet_robot import (
+        DuetControllerError,
+        DuetProgramValidationError,
+        connect_controller as connect_duet_controller,
+        controller_owns_motion as duet_controller_owns_motion,
+        controller_status as duet_controller_status,
+        disconnect_controller as disconnect_duet_controller,
+        execute_program as execute_duet_program,
+        stop_controller as stop_duet_controller,
+    )
     from camera_discovery import discover_camera_sources
     from lidar_distance import distance_sensor_status
     from sensor_calibration import calibration_status
@@ -101,6 +121,11 @@ async def prevent_stale_frontend_index(request, call_next):
 class CodeRequest(BaseModel):
     code: str
 
+
+class DuetProgramRequest(BaseModel):
+    code: str
+
+
 class ConnectRobotRequest(BaseModel):
     interface: Optional[str] = None
 
@@ -116,11 +141,17 @@ class SaveCodeRequest(BaseModel):
     name: str
     code: str
 
+
+class QueueSubmissionRequest(SaveCodeRequest):
+    controller_version: Literal["legacy", "duet"] = "legacy"
+
+
 class ProjectSaveRequest(BaseModel):
     name: str = "default"
     sceneObjects: List[dict] = []
     plannerWaypoints: List[dict] = []
     generatedCode: str = ""
+    duetCode: Optional[str] = None
 
 class NavigationStartRequest(BaseModel):
     map_id: str
@@ -417,6 +448,10 @@ def active_lidar_scan():
 
 
 def ensure_sdk_motion_available() -> None:
+    duet_owns_motion, duet_ownership_error = duet_controller_owns_motion()
+    if duet_owns_motion:
+        detail = duet_ownership_error or "DUET owns the G1 motion controller; disconnect DUET before using SDK or ROS motion."
+        raise HTTPException(status_code=409, detail=detail)
     operation = active_navigation_operation()
     if operation:
         raise HTTPException(
@@ -630,10 +665,18 @@ def init_db():
             name TEXT NOT NULL,
             code TEXT NOT NULL,
             status TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            controller_version TEXT NOT NULL DEFAULT 'legacy'
         )
         """
     )
+    queue_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(queue)").fetchall()
+    }
+    if "controller_version" not in queue_columns:
+        conn.execute(
+            "ALTER TABLE queue ADD COLUMN controller_version TEXT NOT NULL DEFAULT 'legacy'"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -643,11 +686,17 @@ def init_db():
             scene_objects TEXT NOT NULL DEFAULT '[]',
             planner_waypoints TEXT NOT NULL DEFAULT '[]',
             generated_code TEXT NOT NULL DEFAULT '',
+            duet_code TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(username, name)
         )
         """
     )
+    project_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()
+    }
+    if "duet_code" not in project_columns:
+        conn.execute("ALTER TABLE projects ADD COLUMN duet_code TEXT")
     for user in DEFAULT_USERS.values():
         conn.execute(
             "INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
@@ -698,7 +747,8 @@ def get_saved_codes_for_user(username: str):
 def list_queue_items():
     conn = get_db_connection()
     rows = conn.execute(
-        "SELECT id, student, name, code, status, created_at FROM queue ORDER BY created_at ASC"
+        "SELECT id, student, name, code, status, created_at, controller_version "
+        "FROM queue ORDER BY created_at ASC"
     ).fetchall()
     conn.close()
     return [
@@ -709,6 +759,7 @@ def list_queue_items():
             "code": row["code"],
             "status": row["status"],
             "created_at": row["created_at"],
+            "controller_version": row["controller_version"],
         }
         for row in rows
     ]
@@ -729,17 +780,31 @@ def upsert_program(username: str, name: str, code: str):
     conn.close()
 
 
-def insert_queue_item(student: str, name: str, code: str):
+def insert_queue_item(
+    student: str,
+    name: str,
+    code: str,
+    controller_version: Literal["legacy", "duet"] = "legacy",
+):
     item_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     conn = get_db_connection()
     conn.execute(
-        "INSERT INTO queue (id, student, name, code, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (item_id, student, name, code, "queued", now),
+        "INSERT INTO queue (id, student, name, code, status, created_at, controller_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (item_id, student, name, code, "queued", now, controller_version),
     )
     conn.commit()
     conn.close()
-    return {"id": item_id, "student": student, "name": name, "code": code, "status": "queued", "created_at": now}
+    return {
+        "id": item_id,
+        "student": student,
+        "name": name,
+        "code": code,
+        "status": "queued",
+        "created_at": now,
+        "controller_version": controller_version,
+    }
 
 
 def delete_queue_item_by_id(item_id: str):
@@ -761,7 +826,7 @@ def clear_queue_items():
 def list_projects_for_user(username: str):
     conn = get_db_connection()
     rows = conn.execute(
-        "SELECT username, name, scene_objects, planner_waypoints, generated_code FROM projects WHERE username = ? ORDER BY updated_at DESC",
+        "SELECT username, name, scene_objects, planner_waypoints, generated_code, duet_code FROM projects WHERE username = ? ORDER BY updated_at DESC",
         (username,),
     ).fetchall()
     conn.close()
@@ -772,6 +837,7 @@ def list_projects_for_user(username: str):
             "sceneObjects": __safe_json_load(row["scene_objects"]),
             "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
             "generatedCode": row["generated_code"],
+            "duetCode": row["duet_code"] or "",
         }
         for row in rows
     ]
@@ -780,7 +846,7 @@ def list_projects_for_user(username: str):
 def list_all_projects_for_teacher():
     conn = get_db_connection()
     rows = conn.execute(
-        "SELECT username, name, scene_objects, planner_waypoints, generated_code FROM projects ORDER BY updated_at DESC"
+        "SELECT username, name, scene_objects, planner_waypoints, generated_code, duet_code FROM projects ORDER BY updated_at DESC"
     ).fetchall()
     conn.close()
     return [
@@ -790,6 +856,7 @@ def list_all_projects_for_teacher():
             "sceneObjects": __safe_json_load(row["scene_objects"]),
             "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
             "generatedCode": row["generated_code"],
+            "duetCode": row["duet_code"] or "",
         }
         for row in rows
     ]
@@ -807,7 +874,7 @@ def __safe_json_load(value: Optional[str]):
 def get_project_for_user(username: str, name: str = "default"):
     conn = get_db_connection()
     row = conn.execute(
-        "SELECT name, scene_objects, planner_waypoints, generated_code FROM projects WHERE username = ? AND name = ?",
+        "SELECT name, scene_objects, planner_waypoints, generated_code, duet_code FROM projects WHERE username = ? AND name = ?",
         (username, name),
     ).fetchone()
     conn.close()
@@ -818,6 +885,7 @@ def get_project_for_user(username: str, name: str = "default"):
         "sceneObjects": __safe_json_load(row["scene_objects"]),
         "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
         "generatedCode": row["generated_code"],
+        "duetCode": row["duet_code"] or "",
     }
 
 
@@ -826,12 +894,13 @@ def save_project_for_user(username: str, payload: dict):
     conn = get_db_connection()
     conn.execute(
         """
-        INSERT INTO projects (username, name, scene_objects, planner_waypoints, generated_code)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO projects (username, name, scene_objects, planner_waypoints, generated_code, duet_code)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(username, name)
         DO UPDATE SET scene_objects = excluded.scene_objects,
                       planner_waypoints = excluded.planner_waypoints,
                       generated_code = excluded.generated_code,
+                      duet_code = COALESCE(excluded.duet_code, projects.duet_code),
                       updated_at = CURRENT_TIMESTAMP
         """,
         (
@@ -840,6 +909,7 @@ def save_project_for_user(username: str, payload: dict):
             json.dumps(payload.get("sceneObjects", [])),
             json.dumps(payload.get("plannerWaypoints", [])),
             payload.get("generatedCode", ""),
+            payload.get("duetCode"),
         ),
     )
     conn.commit()
@@ -1021,10 +1091,15 @@ def save_code(user: dict = Depends(auth_required), request: SaveCodeRequest = No
 
 
 @app.post("/api/classroom/submit-code")
-def submit_code(user: dict = Depends(auth_required), request: SaveCodeRequest = None):
+def submit_code(user: dict = Depends(auth_required), request: QueueSubmissionRequest = None):
     if not request:
         raise HTTPException(status_code=400, detail="Missing code payload")
-    item = insert_queue_item(user["username"], request.name, request.code)
+    item = insert_queue_item(
+        user["username"],
+        request.name,
+        request.code,
+        request.controller_version,
+    )
     return {"status": "submitted", "item": item}
 
 
@@ -1046,6 +1121,14 @@ def run_next(user: dict = Depends(auth_required)):
         queue = list_queue_items()
         for item in queue:
             if item["status"] == "queued":
+                if item["controller_version"] != "legacy":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Queue item {item['name']} targets the DUET controller. "
+                            "DUET queue execution is not enabled; it will not be sent to the legacy SDK."
+                        ),
+                    )
                 set_queue_item_status(item["id"], "running")
                 item["status"] = "running"
                 try:
@@ -1230,6 +1313,91 @@ def get_robot_status(response: Response, user: dict = Depends(auth_required)):
     return {**status, "distanceSensor": distance_sensor_status()}
 
 
+@app.post("/api/duet/connect")
+def duet_connect(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
+    try:
+        current = duet_controller_status()
+        if current.get("controlLease") and current.get("ready") and current.get("motionOwner") == "duet":
+            return current
+        if current.get("motionOwner") == "unknown":
+            raise HTTPException(status_code=409, detail=current.get("error") or "DUET controller ownership is unknown.")
+        if robot_status().get("running"):
+            raise HTTPException(status_code=409, detail="Stop the active SDK robot program before connecting DUET.")
+        if active_navigation_operation():
+            raise HTTPException(status_code=409, detail="ROS navigation owns locomotion; stop it before connecting DUET.")
+        scan = active_lidar_scan()
+        if scan:
+            raise HTTPException(
+                status_code=409,
+                detail=f"LiDAR scan {scan['job_id']} is capturing the room; stop it before connecting DUET.",
+            )
+        return connect_duet_controller()
+    except DuetProgramValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except DuetControllerError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.post("/api/duet/disconnect")
+def duet_disconnect(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    try:
+        return disconnect_duet_controller()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.get("/api/duet/status")
+def get_duet_status(response: Response, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return duet_controller_status()
+
+
+@app.post("/api/duet/run")
+def run_duet_code(request: DuetProgramRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
+    try:
+        if active_navigation_operation():
+            raise HTTPException(status_code=409, detail="ROS navigation owns locomotion; stop it before running DUET.")
+        scan = active_lidar_scan()
+        if scan:
+            raise HTTPException(
+                status_code=409,
+                detail=f"LiDAR scan {scan['job_id']} is capturing the room; stop it before running DUET.",
+            )
+        if robot_status().get("running"):
+            raise HTTPException(status_code=409, detail="An SDK robot program is already running.")
+        return execute_duet_program(request.code)
+    except DuetProgramValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except DuetControllerError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.post("/api/duet/stop")
+def stop_duet_code(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    try:
+        return stop_duet_controller()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
 def _require_teacher(user):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
@@ -1382,6 +1550,7 @@ def start_lidar_scan(
     if not _MOTION_START_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
     try:
+        ensure_sdk_motion_available()
         if robot_status()["running"]:
             raise HTTPException(status_code=409, detail="Stop SDK motion before starting a room scan.")
         if active_navigation_operation():

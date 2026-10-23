@@ -24,7 +24,16 @@ import {
 } from './navigation/mapCoordinates.js';
 import { compileMotionPrompt } from './sim/textToMotion';
 import { flattenG1Commands, formatG1Program, G1_ARM_PRESET_DESCRIPTIONS, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './sim/g1Commands';
+import {
+  DUET_COMMANDS,
+  compileDuetMotionPrompt,
+  formatDuetProgram,
+  getDuetBlocklyCommandBlocks,
+  parseDuetProgram,
+} from './sim/duetCommands.js';
+import { simulateDuetG1Edu23Program } from './sim/duetG1Edu23Env.js';
 import { createRobotConnection } from './robot/RobotConnection';
+import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -742,11 +751,18 @@ export default function App() {
   const resizeObserverRef = useRef(null);
   const fileInputRef = useRef(null);
   const compiledPlannerCodeRef = useRef(null);
+  const applyGeneratedCodeRef = useRef(null);
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
   const [generatedCode, setGeneratedCode] = useState('');
   const generatedCodeRef = useRef('');
+  const [controllerVersion, setControllerVersion] = useState('legacy');
+  const controllerVersionRef = useRef('legacy');
+  controllerVersionRef.current = controllerVersion;
+  const codeByVersionRef = useRef({ legacy: '', duet: '' });
+  const duetProgramActiveRef = useRef(false);
+  const [isDuetProgramActive, setIsDuetProgramActive] = useState(false);
   const [configText, setConfigText] = useState(JSON.stringify(DEFAULT_ROBOT_CONFIG_EN, null, 2));
   
   const [activeMenu, setActiveMenu] = useState(null);
@@ -859,7 +875,8 @@ export default function App() {
 
   useEffect(() => {
     generatedCodeRef.current = generatedCode;
-  }, [generatedCode]);
+    codeByVersionRef.current[controllerVersion] = generatedCode;
+  }, [generatedCode, controllerVersion]);
   const overlayTabs = [
     { id: 'blocks', label: 'Blocks' },
     { id: 'ide', label: 'IDE' },
@@ -880,7 +897,9 @@ export default function App() {
     const data = text ? JSON.parse(text) : {};
 
     if (!res.ok) {
-      throw new Error(data.detail || data.message || 'Request failed');
+      const error = new Error(data.detail || data.message || 'Request failed');
+      error.status = res.status;
+      throw error;
     }
     return data;
   }, [session?.token]);
@@ -889,6 +908,11 @@ export default function App() {
     () => createRobotConnection('sdk', { request: apiFetch }),
     [apiFetch],
   );
+  const duetRobotConnection = useMemo(
+    () => new DuetRobotConnection(apiFetch),
+    [apiFetch],
+  );
+  const activeRobotConnection = controllerVersion === 'duet' ? duetRobotConnection : robotConnection;
 
   const refreshClassroomData = useCallback(async () => {
     if (!session?.token) return;
@@ -949,7 +973,24 @@ export default function App() {
             setPlannerWaypoints(response.project.plannerWaypoints);
           }
           if (response.project && typeof response.project.generatedCode === 'string') {
-            applyGeneratedCode(response.project.generatedCode, { syncBlocks: true });
+            codeByVersionRef.current.legacy = response.project.generatedCode;
+          }
+          if (response.project && typeof response.project.duetCode === 'string') {
+            codeByVersionRef.current.duet = response.project.duetCode;
+          }
+          if (response.project) {
+            const selectedCode = controllerVersionRef.current === 'duet'
+              ? codeByVersionRef.current.duet
+              : codeByVersionRef.current.legacy;
+            if (controllerVersionRef.current === 'duet') {
+              try {
+                parseDuetProgram(selectedCode);
+              } catch (error) {
+                setBlockSyncError(`Saved DUET project code is invalid: ${error.message}`);
+                return;
+              }
+            }
+            applyGeneratedCodeRef.current?.(selectedCode, { syncBlocks: true });
           }
         })
         .catch(() => {
@@ -959,6 +1000,41 @@ export default function App() {
       localStorage.removeItem('edu-classroom-session');
     }
   }, [session, refreshClassroomData, sceneObjectsKey, robotConnection, apiFetch]);
+
+  useEffect(() => {
+    if (controllerVersion !== 'duet' || !isDuetProgramActive) return undefined;
+    let active = true;
+    const refreshDuetExecutionStatus = async () => {
+      if (!isDuetProgramActive) return;
+      try {
+        const status = await duetRobotConnection.status();
+        if (!active) return;
+        if (status.motionActive === false) {
+          duetProgramActiveRef.current = false;
+          setIsDuetProgramActive(false);
+          setIsRunning(false);
+          setIsRobotConnected(status.connected === true && status.ready === true);
+          setRobotConnectionStatus(status.connected === true
+            ? 'DUET program finished; controller remains connected.'
+            : 'DUET program finished and controller is disconnected.');
+        } else if (status.motionActive === true) {
+          setRobotConnectionStatus('DUET program is active; stop remains available.');
+        } else {
+          setRobotConnectionStatus(`DUET execution state is unverified; keeping the run locked. ${status.error || ''}`.trim());
+        }
+      } catch (error) {
+        if (active) {
+          setRobotConnectionStatus(`DUET execution status unavailable; keeping the run locked. ${error.message}`);
+        }
+      }
+    };
+    refreshDuetExecutionStatus();
+    const timer = window.setInterval(refreshDuetExecutionStatus, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [controllerVersion, duetRobotConnection, isDuetProgramActive]);
 
   useEffect(() => {
     if (session?.user?.username) {
@@ -975,14 +1051,15 @@ export default function App() {
           name: projectName,
           sceneObjects,
           plannerWaypoints,
-          generatedCode,
+          generatedCode: codeByVersionRef.current.legacy,
+          duetCode: codeByVersionRef.current.duet,
         }),
       }).catch(() => {
         // keep the local app responsive even if the backend sync is delayed
       });
     }, 250);
     return () => clearTimeout(timer);
-  }, [session, projectName, sceneObjects, plannerWaypoints, generatedCode]);
+  }, [session, projectName, sceneObjects, plannerWaypoints, generatedCode, controllerVersion]);
 
   useEffect(() => {
     if (!session?.token) {
@@ -1223,7 +1300,8 @@ export default function App() {
 
   const handleSaveCodeToAccount = async () => {
     if (!session) return;
-    const codeName = `${session.user.username}-program-${new Date().toISOString().slice(0, 10)}`;
+    const versionSuffix = controllerVersion === 'duet' ? '-duet' : '';
+    const codeName = `${session.user.username}-program${versionSuffix}-${new Date().toISOString().slice(0, 10)}`;
     try {
       await apiFetch('/api/classroom/save-code', {
         method: 'POST',
@@ -1299,20 +1377,47 @@ export default function App() {
       alert('Teacher login is required to connect the robot.');
       return;
     }
+    if (controllerVersion === 'duet' && isRobotConnected && isDuetProgramActive) {
+      alert('Stop the active DUET program and wait for confirmed completion before disconnecting.');
+      return;
+    }
 
     setIsRobotConnecting(true);
-    setRobotConnectionStatus('Connecting through the G1 host network interface...');
+    setRobotConnectionStatus(controllerVersion === 'duet'
+      ? 'Connecting to the DUET G1 23-DOF controller gateway...'
+      : 'Connecting through the G1 host network interface...');
     try {
-      const connection = await robotConnection.connect();
-      if (connection.status !== 'connected') {
+      if (controllerVersion === 'duet' && isRobotConnected) {
+        const disconnected = await duetRobotConnection.disconnect();
+        setIsRobotConnected(false);
+        duetProgramActiveRef.current = false;
+        setIsDuetProgramActive(false);
+        setIsRunning(false);
+        setRobotConnectionStatus(disconnected.status === 'released'
+          ? 'DUET lease released; arm pose cleared; joystick input may resume. Stop the DUET process before using legacy SDK.'
+          : 'DUET control lease release was not confirmed.');
+        return;
+      }
+      const connection = await activeRobotConnection.connect();
+      if (connection.status !== 'connected' || (controllerVersion === 'duet' && connection.ready !== true)) {
         throw new Error('Backend did not confirm a connected robot.');
       }
       setIsRobotConnected(true);
-      const sensorText = `MID-360 distance conditions ${connection.distanceSensor?.ready ? 'ready' : 'disabled'} • ${formatLidarDistanceStatus(connection.distanceSensor)}`;
-      setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
+      if (controllerVersion === 'duet') {
+        duetProgramActiveRef.current = connection.motionActive === true;
+        setIsDuetProgramActive(duetProgramActiveRef.current);
+        setIsRunning(duetProgramActiveRef.current);
+        const armCapability = connection.capabilities?.includes('arm_pose')
+          ? 'arm-pose gateway enabled'
+          : 'arm-pose blocks are preview-only (controller acceptance gate disabled)';
+        setRobotConnectionStatus(`Connected • DUET ${connection.policyId} • ${connection.robotModel} • sole lowcmd owner confirmed • ${armCapability}`);
+      } else {
+        const sensorText = `MID-360 distance conditions ${connection.distanceSensor?.ready ? 'ready' : 'disabled'} • ${formatLidarDistanceStatus(connection.distanceSensor)}`;
+        setRobotConnectionStatus(`Connected • SDK on ${connection.interface}, domain ${connection.domain} • ${sensorText}${connection.logFile ? ` • session log: ${connection.logFile}` : ''}`);
+      }
     } catch (error) {
       setIsRobotConnected(false);
-      setRobotConnectionStatus(`Connection failed: ${error.message}`);
+      setRobotConnectionStatus(`${controllerVersion === 'duet' ? 'DUET connection' : 'Connection'} failed: ${error.message}`);
       alert(`Robot connection failed: ${error.message}`);
     } finally {
       setIsRobotConnecting(false);
@@ -1321,21 +1426,41 @@ export default function App() {
 
   const handleTestRobotMotion = async () => {
     if (!isRobotConnected) {
-      alert('Connect the G1 SDK before testing motion.');
+      alert(`Connect the ${controllerVersion === 'duet' ? 'DUET controller' : 'G1 SDK'} before testing motion.`);
       return;
     }
-    if (!window.confirm('Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a 0.5-second slow forward movement (about 10 cm). The app cannot verify physical movement. Continue?')) return;
+    const testDescription = controllerVersion === 'duet'
+      ? 'Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a bounded 0.5-second DUET forward command. The app cannot verify physical movement.'
+      : 'Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a 0.5-second slow forward movement (about 10 cm). The app cannot verify physical movement.';
+    if (!window.confirm(testDescription)) return;
 
     setIsRunning(true);
-    setRobotConnectionStatus('Sending a brief slow-motion test...');
+    setRobotConnectionStatus(controllerVersion === 'duet'
+      ? 'Sending a brief DUET motion test...'
+      : 'Sending a brief slow-motion test...');
+    let keepDuetRunLock = false;
     try {
-      const result = await robotConnection.run('robot.slowwalktime(0.5)');
-      setRobotConnectionStatus(`SDK finished sending the motion test (${result.commandsExecuted} command). Physical movement is not verified.`);
+      const result = await activeRobotConnection.run(controllerVersion === 'duet'
+        ? 'duet.move(0.1, 0, 0, 0.5)'
+        : 'robot.slowwalktime(0.5)');
+      const adapter = controllerVersion === 'duet' ? 'DUET' : 'SDK';
+      if (controllerVersion === 'duet' && result.status === 'accepted') {
+        duetProgramActiveRef.current = true;
+        setIsDuetProgramActive(true);
+        keepDuetRunLock = true;
+        setRobotConnectionStatus('DUET accepted the motion test; waiting for controller completion. Physical movement is not verified.');
+      } else {
+        if (controllerVersion === 'duet') {
+          duetProgramActiveRef.current = false;
+          setIsDuetProgramActive(false);
+        }
+        setRobotConnectionStatus(`${adapter} accepted the motion test (${result.commandsExecuted} command). Physical movement is not verified.`);
+      }
     } catch (error) {
-      setRobotConnectionStatus(`Motion test failed: ${error.message}`);
+      setRobotConnectionStatus(`${controllerVersion === 'duet' ? 'DUET motion' : 'Motion'} test failed: ${error.message}`);
       alert(`Motion test failed: ${error.message}`);
     } finally {
-      setIsRunning(false);
+      if (!keepDuetRunLock) setIsRunning(false);
     }
   };
 
@@ -1437,6 +1562,109 @@ export default function App() {
       setSensorOperationStatus(`Discovery failed: ${error.message}`);
     } finally {
       setIsSensorDiscovering(false);
+    }
+  };
+
+  const handleControllerVersionChange = async (useDuetVersion) => {
+    const nextVersion = useDuetVersion ? 'duet' : 'legacy';
+    if (nextVersion === controllerVersion) return;
+    if (isRunning || isRobotConnecting || isDuetProgramActive) {
+      alert('Wait for the current robot operation or connection attempt to finish before switching versions.');
+      return;
+    }
+    let duetOwnershipUnverified = false;
+    if (
+      controllerVersion === 'duet'
+      && nextVersion === 'legacy'
+      && (isRobotConnected || isDuetProgramActive)
+    ) {
+      setIsRobotConnecting(true);
+      try {
+        let status = await duetRobotConnection.status();
+        if (status.connected === true || status.motionOwner === 'duet') {
+          const disconnected = await duetRobotConnection.disconnect();
+          if (disconnected.status !== 'disconnected' || disconnected.lowcmd_owner !== 'none') {
+            throw new Error('DUET did not confirm release of rt/lowcmd ownership.');
+          }
+          status = await duetRobotConnection.status();
+        }
+        if (status.connected === true || status.ready === true || status.motionOwner !== 'none') {
+          throw new Error(status.error || 'DUET motion ownership is not confirmed released.');
+        }
+      } catch (error) {
+        if (error.status === 401) {
+          duetOwnershipUnverified = true;
+        } else {
+          setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
+          alert(`Cannot switch to legacy mode: ${error.message}`);
+          return;
+        }
+      } finally {
+        setIsRobotConnecting(false);
+      }
+    }
+
+    codeByVersionRef.current[controllerVersion] = generatedCodeRef.current;
+    const nextCode = codeByVersionRef.current[nextVersion] || '';
+    if (nextVersion === 'duet' && nextCode.trim()) {
+      try {
+        parseDuetProgram(nextCode);
+      } catch (error) {
+        alert(`Saved DUET code is invalid and was not loaded: ${error.message}`);
+        return;
+      }
+    }
+    const nextConnection = nextVersion === 'duet' ? duetRobotConnection : robotConnection;
+    controllerVersionRef.current = nextVersion;
+    duetProgramActiveRef.current = false;
+    setIsDuetProgramActive(false);
+    setControllerVersion(nextVersion);
+    generatedCodeRef.current = nextCode;
+    setGeneratedCode(nextCode);
+    setBlockSyncError('');
+    setSafetyNotice('');
+    setIsRobotConnected(false);
+
+    if (duetOwnershipUnverified) {
+      setRobotConnectionStatus(
+        'Legacy preview selected • DUET ownership could not be checked because the session expired. Sign in again before robot connection or motion; the backend ownership interlock remains active.',
+      );
+      return;
+    }
+
+    if (!session || session.user.role !== 'teacher') {
+      setRobotConnectionStatus(nextVersion === 'duet'
+        ? 'DUET preview selected • teacher login required for physical connection.'
+        : 'Legacy version selected.');
+      return;
+    }
+
+    setIsRobotConnecting(true);
+    try {
+      const status = await nextConnection.status();
+      const connected = nextVersion === 'duet'
+        ? status.connected === true && status.ready === true && status.motionOwner === 'duet'
+        : status.sdkAvailable === true;
+      if (nextVersion === 'duet') {
+        const motionActive = status.motionActive === true;
+        duetProgramActiveRef.current = motionActive;
+        setIsDuetProgramActive(motionActive);
+        setIsRunning(motionActive);
+      }
+      setIsRobotConnected(connected);
+      setRobotConnectionStatus(nextVersion === 'duet'
+        ? connected
+          ? `Connected • DUET ${status.policyId} • ${status.robotModel} • sole lowcmd owner confirmed • ${status.capabilities?.includes('arm_pose') ? 'arm-pose gateway enabled' : 'arm-pose blocks are preview-only'}`
+          : `DUET not connected • ${status.error || 'connect the DUET controller before physical execution'}`
+        : connected
+          ? `SDK connected on ${status.interface}`
+          : 'Disconnected • connect the G1 SDK before physical execution');
+    } catch (error) {
+      setRobotConnectionStatus(error.status === 401
+        ? `${nextVersion === 'duet' ? 'DUET' : 'Legacy'} preview selected • session expired. Sign in again before checking robot status or sending physical commands.`
+        : `${nextVersion === 'duet' ? 'DUET' : 'SDK'} status unavailable: ${error.message}`);
+    } finally {
+      setIsRobotConnecting(false);
     }
   };
 
@@ -1933,34 +2161,43 @@ export default function App() {
 
   const generateToolboxXML = useCallback((language) => {
     const cats = UI_TEXT[language].toolbox;
-    const categories = [...new Set(G1_EXECUTABLE_COMMANDS.map((definition) => definition.category))];
+    const isDuetVersion = controllerVersion === 'duet';
+    const commandBlocks = isDuetVersion
+      ? getDuetBlocklyCommandBlocks()
+      : getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS);
+    const categories = [...new Set(commandBlocks.map((definition) => definition.category))];
     const commandCategoriesXml = categories.map((category) => {
-      const blocks = getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS)
+      const blocks = commandBlocks
         .filter((block) => block.category === category)
         .map((block) => `<block type="${block.type}"></block>`)
         .join('');
-      return `<category name="${category}" colour="${category === 'Gestures' ? 280 : 160}">${blocks}</category>`;
+      const colour = category === 'Gestures' || category === 'Arm gestures' || category === 'Arm poses'
+        ? 280
+        : category === 'Control' ? 190 : 160;
+      return `<category name="${category}" colour="${colour}">${blocks}</category>`;
     }).join('');
 
     return `
     <xml xmlns="https://developers.google.com/blockly/xml">
       ${commandCategoriesXml}
-      <category name="${language === 'zh' ? '距离条件' : 'Distance conditions'}" colour="200">
-        <block type="controls_if"></block>
-        <block type="controls_if"><mutation else="1"></mutation></block>
-        <block type="logic_compare"></block>
-        <block type="g1_front_distance_m"></block>
-        <block type="g1_rear_distance_m"></block>
-        <block type="math_number"><field name="NUM">1</field></block>
-      </category>
-      <category name="${language === 'zh' ? '变量' : 'Variables'}" custom="VARIABLE"></category>
+      ${isDuetVersion ? '' : `
+        <category name="${language === 'zh' ? '距离条件' : 'Distance conditions'}" colour="200">
+          <block type="controls_if"></block>
+          <block type="controls_if"><mutation else="1"></mutation></block>
+          <block type="logic_compare"></block>
+          <block type="g1_front_distance_m"></block>
+          <block type="g1_rear_distance_m"></block>
+          <block type="math_number"><field name="NUM">1</field></block>
+        </category>
+        <category name="${language === 'zh' ? '变量' : 'Variables'}" custom="VARIABLE"></category>
+      `}
       <sep></sep>
       <category name="${cats.loops}" colour="120">
         <block type="controls_repeat_ext"><value name="TIMES"><shadow type="math_number"><field name="NUM">10</field></shadow></value></block>
       </category>
     </xml>
     `;
-  }, []);
+  }, [controllerVersion]);
 
   const registerBlocks = useCallback((robotCategories) => {
     if (!Blockly || !pythonGenerator) return;
@@ -1991,11 +2228,13 @@ export default function App() {
     }
 
     const systemCategories = lang === 'zh' ? SYSTEM_CONFIG_ZH : SYSTEM_CONFIG_EN;
-    const allBlocks = [...systemCategories, ...robotCategories].flatMap(cat => cat.blocks);
+    const activeRobotCategories = controllerVersion === 'duet' ? [] : robotCategories;
+    const allBlocks = [...systemCategories, ...activeRobotCategories].flatMap(cat => cat.blocks);
     const commandBlocks = [
       ...ROBOT_IDE_COMMAND_BLOCKS,
       ...getG1BlocklyCommandBlocks(G1_COMMANDS),
       ...getG1BlocklyConditionBlocks(),
+      ...getDuetBlocklyCommandBlocks(),
     ];
     const definitions = [...allBlocks, ...commandBlocks].map((blockDef) => {
       const definition = { ...blockDef };
@@ -2047,13 +2286,13 @@ export default function App() {
           });
         }
 
-        code = sanitizeRobotCode(code).code;
+        if (controllerVersion === 'legacy') code = sanitizeRobotCode(code).code;
         
         if (blockDef.output !== undefined) return [code, pythonGenerator.ORDER_ATOMIC];
         return code;
       };
     });
-  }, [lang]);
+  }, [lang, controllerVersion]);
 
   useEffect(() => {
     if (!isBlocklyLoaded || !blocklyDiv.current) return;
@@ -2104,7 +2343,7 @@ export default function App() {
       const updateCode = () => {
         try {
           const code = generateBlocklyPythonCode(workspaceRef.current);
-          applyGeneratedCode(code, { syncBlocks: false });
+          applyGeneratedCodeRef.current?.(code, { syncBlocks: false });
           setBlockSyncError('');
         } catch (error) {
           setBlockSyncError(`Cannot read the Blocks workspace: ${error.message}`);
@@ -2126,7 +2365,17 @@ export default function App() {
   const handleApplyConfig = () => { try { setRobotConfig(JSON.parse(configText)); setShowConfigEditor(false); } catch (e) { alert("JSON Error: " + e.message); } };
   const handleImportConfig = (e) => { const r = new FileReader(); r.onload = (ev) => setConfigText(ev.target.result); if(e.target.files[0]) r.readAsText(e.target.files[0]); };
   const handleExportConfig = () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([configText], {type: "application/json"})); a.download = "robot_config.json"; a.click(); };
-  const saveProject = () => { if(workspaceRef.current) { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([JSON.stringify(window.Blockly.serialization.workspaces.save(workspaceRef.current))], {type: "application/json"})); a.download = "project.json"; a.click(); }};
+  const saveProject = () => {
+    if (!workspaceRef.current) return;
+    const workspace = window.Blockly.serialization.workspaces.save(workspaceRef.current);
+    const payload = controllerVersion === 'duet'
+      ? { controllerVersion, generatedCode, workspace }
+      : workspace;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(payload)], { type: "application/json" }));
+    a.download = controllerVersion === 'duet' ? 'duet-project.json' : 'project.json';
+    a.click();
+  };
   
   const loadProject = (event) => {
     const file = event.target.files[0];
@@ -2135,6 +2384,17 @@ export default function App() {
     reader.onload = (e) => {
       try {
         const json = JSON.parse(e.target.result);
+        if (controllerVersion === 'duet') {
+          if (json?.controllerVersion !== 'duet' || typeof json.generatedCode !== 'string' || !json.workspace) {
+            throw new Error('This file is not a version-two DUET project. Switch to legacy mode to open a legacy project.');
+          }
+          parseDuetProgram(json.generatedCode);
+          applyGeneratedCode(json.generatedCode, { syncBlocks: true });
+          return;
+        }
+        if (json?.controllerVersion === 'duet') {
+          throw new Error('This is a DUET version-two project. Switch to DUET mode before opening it.');
+        }
         window.Blockly.serialization.workspaces.load(json, workspaceRef.current);
       } catch (err) {
         alert("项目加载失败，文件格式可能错误: " + err.message);
@@ -2165,12 +2425,24 @@ export default function App() {
 
   const loadProjectFromLibrary = (project) => {
     if (!project) return;
+    const legacyCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
+    const duetCode = typeof project.duetCode === 'string' ? project.duetCode : '';
+    const nextCode = controllerVersion === 'duet' ? duetCode : legacyCode;
+    if (controllerVersion === 'duet') {
+      try {
+        parseDuetProgram(nextCode);
+      } catch (error) {
+        alert(`Saved DUET project code is invalid and was not loaded: ${error.message}`);
+        return;
+      }
+    }
     setProjectName(project.name || 'default');
     setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
     setSelectedSceneObjectId(null);
     setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
     setIsWaypointPlacementEnabled(false);
-    const nextCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
+    codeByVersionRef.current.legacy = legacyCode;
+    codeByVersionRef.current.duet = duetCode;
     applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
   };
@@ -2204,6 +2476,10 @@ export default function App() {
   };
 
   const compilePlannerPath = () => {
+    if (controllerVersion === 'duet') {
+      alert('Path planner export is not available in DUET version two yet. Use the DUET Blocks or IDE commands instead.');
+      return;
+    }
     if (plannerWaypoints.length < 2) {
       alert('Add at least two waypoints before compiling a motion path.');
       return;
@@ -2223,20 +2499,50 @@ export default function App() {
   const handleRunCode = async () => {
     if (isRunning) {
       try {
-        const result = await robotConnection.stop();
-        setIsRunning(false);
-        setRobotConnectionStatus(result.status === 'stopping'
-          ? 'Stop requested; locomotion will stop, but an active arm preset may continue.'
-          : 'Robot is not connected');
+        const result = await activeRobotConnection.stop();
+        if (controllerVersion === 'duet') {
+          if (result.status === 'stopped' && result.zeroCommandConfirmed === true) {
+            duetProgramActiveRef.current = false;
+            setIsDuetProgramActive(false);
+            setIsRunning(false);
+          }
+          setRobotConnectionStatus(result.status === 'stopping'
+            ? 'DUET stop requested; waiting for confirmation of zero velocity and cleared arm-pose lease.'
+            : result.status === 'stopped' && result.zeroCommandConfirmed === true
+              ? 'DUET confirmed zero velocity and requested carry/default arm return; physical immobility or pose attainment is not verified.'
+            : 'DUET stop was not confirmed.');
+        } else {
+          setIsRunning(false);
+          setRobotConnectionStatus(result.status === 'stopping' || result.status === 'stopped'
+            ? 'SDK stop requested.'
+            : 'Robot is not connected');
+        }
       } catch (error) {
         alert(`Stop failed: ${error.message}`);
       }
     } else {
       try {
-        if (!isRobotConnected) throw new Error('Connect the G1 SDK before sending a program.');
-        parseG1Program(generatedCode);
+        if (!isRobotConnected) {
+          throw new Error(controllerVersion === 'duet'
+            ? 'Connect the DUET G1 23-DOF controller before sending a program.'
+            : 'Connect the G1 SDK before sending a program.');
+        }
+        if (controllerVersion === 'duet') parseDuetProgram(generatedCode);
+        else parseG1Program(generatedCode);
         setIsRunning(true);
-        const result = await robotConnection.run(generatedCode);
+        const result = await activeRobotConnection.run(generatedCode);
+        let keepDuetRunLock = false;
+        if (controllerVersion === 'duet' && result.status === 'accepted') {
+          duetProgramActiveRef.current = true;
+          setIsDuetProgramActive(true);
+          keepDuetRunLock = true;
+          setRobotConnectionStatus(`DUET accepted ${result.commandsExecuted} command(s); waiting for controller completion. Physical movement is not verified.`);
+        } else {
+          if (controllerVersion === 'duet') {
+            duetProgramActiveRef.current = false;
+            setIsDuetProgramActive(false);
+          }
+        }
         const output = result.results?.length ? ` SDK output: ${JSON.stringify(result.results)}` : '';
         const conditionOutput = result.conditionsEvaluated?.length
           ? ` Condition branches: ${result.conditionsEvaluated.map((decision) => (
@@ -2245,11 +2551,15 @@ export default function App() {
               : `${decision.clear ? `clear within ${decision.max_range_m} m` : `${decision.distance_m.toFixed(2)} m`} ${decision.operator} ${decision.threshold_m} m → ${decision.branch}`
           )).join('; ')}.`
           : '';
-        setRobotConnectionStatus(`SDK finished sending ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${output}`);
+        if (!keepDuetRunLock) {
+          const controllerName = controllerVersion === 'duet' ? 'DUET' : 'SDK';
+          const accepted = controllerVersion === 'duet' ? 'accepted' : 'finished sending';
+          setRobotConnectionStatus(`${controllerName} ${accepted} ${result.commandsExecuted} command(s). Physical movement is not verified.${conditionOutput}${output}`);
+        }
       } catch (error) {
         alert(`Robot run failed: ${error.message}`);
       } finally {
-        setIsRunning(false);
+        if (!duetProgramActiveRef.current) setIsRunning(false);
       }
     }
   };
@@ -2257,12 +2567,23 @@ export default function App() {
   const activeObstacles = useMemo(() => sceneObjects, [sceneObjects]);
 
   const previewPreviewState = useCallback(() => {
-    const state = simulateG1Edu23Program(generatedCode, {
-      mode: simulatorMode,
-      obstacles: activeObstacles,
-    });
-    setSimulatorState(state);
-  }, [generatedCode, simulatorMode, activeObstacles]);
+    try {
+      const state = controllerVersion === 'duet'
+        ? simulateDuetG1Edu23Program(generatedCode).at(-1)
+        : simulateG1Edu23Program(generatedCode, {
+          mode: simulatorMode,
+          obstacles: activeObstacles,
+        });
+      setSimulatorState(state);
+    } catch (error) {
+      setSimulatorState({
+        ...createEmptyG1Edu23State(),
+        status: `Invalid ${controllerVersion === 'duet' ? 'DUET' : 'G1'} program`,
+        actions: [{ label: 'Preview rejected', summary: error.message }],
+        mode: controllerVersion === 'duet' ? 'duet-preview' : simulatorMode,
+      });
+    }
+  }, [controllerVersion, generatedCode, simulatorMode, activeObstacles]);
 
   const startSimulationPreview = () => {
     if (!generatedCode.trim()) {
@@ -2304,7 +2625,9 @@ export default function App() {
     const workspace = workspaceRef.current;
     let nodes;
     try {
-      nodes = parseG1Program(code || '');
+      nodes = controllerVersion === 'duet'
+        ? parseDuetProgram(code || '')
+        : parseG1Program(code || '');
     } catch (error) {
       setBlockSyncError(`Cannot display this code as Blocks: ${error.message}`);
       return false;
@@ -2329,9 +2652,11 @@ export default function App() {
           } else if (node.type === 'boolean_assignment') {
             block = workspace.newBlock('variables_set');
           } else {
-            block = workspace.newBlock(node.method === 'arm_action'
-              ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
-              : `g1_command_${node.method}`);
+            block = controllerVersion === 'duet'
+              ? workspace.newBlock(`duet_command_${node.method}`)
+              : workspace.newBlock(node.method === 'arm_action'
+                ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
+                : `g1_command_${node.method}`);
           }
           if (node.type === 'repeat') {
             const repeatCount = workspace.newBlock('math_number');
@@ -2375,7 +2700,8 @@ export default function App() {
             block.setFieldValue(variable.getId(), 'VAR');
             block.getInput('VALUE').connection.connect(valueBlock.outputConnection);
           } else {
-            const definition = G1_COMMANDS.find((entry) => entry.method === node.method);
+            const definition = (controllerVersion === 'duet' ? DUET_COMMANDS : G1_COMMANDS)
+              .find((entry) => entry.method === node.method);
             definition.args.forEach((argument, index) => {
               if (block.getField(argument.name)) {
                 block.setFieldValue(String(node.values[index]), argument.name);
@@ -2409,7 +2735,7 @@ export default function App() {
     } finally {
       Blockly.Events.enable();
     }
-  }, []);
+  }, [controllerVersion]);
 
   useEffect(() => {
     if (mainTab !== 'blocks' || !workspaceRef.current) return;
@@ -2499,28 +2825,36 @@ export default function App() {
     let boundsChanged = false;
     if (!preserveFormatting && nextCode.trim()) {
       try {
-        boundedCode = formatG1Program(parseG1Program(nextCode));
+        boundedCode = controllerVersion === 'duet'
+          ? formatDuetProgram(parseDuetProgram(nextCode))
+          : formatG1Program(parseG1Program(nextCode));
         boundsChanged = boundedCode.trim() !== nextCode.trim();
       } catch {
-        // Keep in-progress IDE edits intact; physical execution validates the complete program.
+        // Keep in-progress IDE edits intact; execution validates the complete program.
       }
     }
-    const result = sanitizeRobotCode(boundedCode);
+    const result = controllerVersion === 'duet'
+      ? { code: boundedCode, changed: false }
+      : sanitizeRobotCode(boundedCode);
     const safeCode = result.code || boundedCode;
     generatedCodeRef.current = safeCode;
+    codeByVersionRef.current[controllerVersion] = safeCode;
     setGeneratedCode(safeCode);
     setSafetyNotice(result.changed || boundsChanged ? 'Commands were normalized to the shared syntax and safe ranges.' : '');
     if (syncBlocks && workspaceRef.current && window.Blockly) {
       syncBlocksFromGeneratedCode(safeCode);
     }
-  }, [syncBlocksFromGeneratedCode]);
+  }, [controllerVersion, syncBlocksFromGeneratedCode]);
+  applyGeneratedCodeRef.current = applyGeneratedCode;
 
   const updateGeneratedCode = useCallback((nextCode) => {
     applyGeneratedCode(nextCode, { syncBlocks: true });
   }, [applyGeneratedCode]);
 
   const applyMotionPromptResult = (promptText, source) => {
-    const result = compileMotionPrompt(promptText);
+    const result = controllerVersion === 'duet'
+      ? compileDuetMotionPrompt(promptText)
+      : compileMotionPrompt(promptText);
     setMotionPromptResult({ ...result, source });
     if (result.code) updateGeneratedCode(result.code);
   };
@@ -2553,13 +2887,18 @@ export default function App() {
   };
 
   const handleRecordMotionCapture = () => {
-    const sampleScript = [
-      'robot.stand()',
-      'robot.walk(3)',
-      'robot.turn("left", 90)',
-      'robot.walk(2)',
-      'robot.stand()',
-    ].join('\n');
+    const sampleScript = controllerVersion === 'duet'
+      ? [
+        'duet.move(0.15, 0, 0, 1)',
+        'duet.move(0, 0, 0.25, 1)',
+      ].join('\n')
+      : [
+        'robot.stand()',
+        'robot.walk(3)',
+        'robot.turn("left", 90)',
+        'robot.walk(2)',
+        'robot.stand()',
+      ].join('\n');
 
     if (generatedCode && generatedCode.trim()) {
       const confirmed = window.confirm('Inserting the example program will overwrite the current blocks and IDE code. Continue?');
@@ -2571,8 +2910,20 @@ export default function App() {
   };
 
   useEffect(() => {
-    setSimulatorState(simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles }));
-  }, [generatedCode, simulatorMode, activeObstacles]);
+    try {
+      const state = controllerVersion === 'duet'
+        ? simulateDuetG1Edu23Program(generatedCode).at(-1)
+        : simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles });
+      setSimulatorState(state);
+    } catch (error) {
+      setSimulatorState({
+        ...createEmptyG1Edu23State(),
+        status: `Invalid ${controllerVersion === 'duet' ? 'DUET' : 'G1'} program`,
+        actions: [{ label: 'Preview rejected', summary: error.message }],
+        mode: controllerVersion === 'duet' ? 'duet-preview' : simulatorMode,
+      });
+    }
+  }, [controllerVersion, generatedCode, simulatorMode, activeObstacles]);
 
   const addStudentObstacle = (type = 'box') => {
     const preset = OBJECT_LIBRARY.find((item) => item.id === type) || OBJECT_LIBRARY[0];
@@ -3080,6 +3431,24 @@ export default function App() {
                 />
               </div>
             )}
+            {currentUser.role === 'teacher' && (
+              <div className="flex items-center justify-between gap-3 border-t bg-blue-50 px-5 py-3">
+                <div>
+                  <p className="text-sm font-semibold text-gray-800">DUET version two preview</p>
+                  <p className="text-xs text-gray-600">
+                    Switches Blocks, IDE, simulation, and connection to the separate DUET path. Legacy programs stay unchanged. Physical DUET motion remains unavailable until a separately validated controller gateway is installed.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  aria-label="Enable DUET version two"
+                  checked={controllerVersion === 'duet'}
+                  disabled={isRunning || isRobotConnecting}
+                  onChange={(event) => handleControllerVersionChange(event.target.checked)}
+                  className="h-5 w-5 accent-blue-700"
+                />
+              </div>
+            )}
             <div className="p-4 border-t bg-white flex justify-end gap-3"><button onClick={() => setShowConfigEditor(false)} className="px-5 py-2 text-sm text-gray-600 font-medium hover:bg-gray-100 rounded-lg">{t.closeBtn}</button><button onClick={handleApplyConfig} className="flex items-center gap-2 px-6 py-2 text-sm bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md"><Check size={16} /> {t.applyBtn}</button></div>
           </div>
         </div>
@@ -3180,7 +3549,11 @@ export default function App() {
                       disabled={isRobotConnecting || isRunning}
                       className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
                     >
-                      {isRobotConnecting ? 'Connecting…' : isRobotConnected ? 'Reconnect' : 'Connect'}
+                      {isRobotConnecting
+                        ? 'Connecting…'
+                        : controllerVersion === 'duet' && isRobotConnected
+                          ? 'Disconnect DUET'
+                          : isRobotConnected ? 'Reconnect' : 'Connect'}
                     </button>
                     {isRobotConnected && (
                       <button
@@ -3189,7 +3562,7 @@ export default function App() {
                         disabled={isRunning || isRobotConnecting}
                         className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
                       >
-                        {isRunning ? 'Motion test running…' : 'Test motion'}
+                        {isRunning ? 'Motion test running…' : controllerVersion === 'duet' ? 'Test DUET motion' : 'Test motion'}
                       </button>
                     )}
                   </div>
@@ -3206,7 +3579,11 @@ export default function App() {
                       {lidarTestStatus}
                     </span>
                   </div>
-                  <p className="mt-2 text-[10px] text-slate-600">Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.</p>
+                  <p className="mt-2 text-[10px] text-slate-600">
+                    {controllerVersion === 'duet'
+                      ? 'Connect uses the separate DUET controller gateway. The SDK connection path is unchanged and is not used for DUET commands.'
+                      : 'Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.'}
+                  </p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
                 </div>
 
@@ -3711,6 +4088,7 @@ export default function App() {
         <G1Simulation3D
           code={generatedCode}
           simulatorState={simulatorState}
+          controllerVersion={controllerVersion}
           obstacles={activeObstacles}
           waypoints={plannerWaypoints}
           isWaypointPlacementEnabled={isWaypointPlacementEnabled}
@@ -3846,7 +4224,9 @@ export default function App() {
               <div className="min-h-0 flex-1 overflow-auto p-3">
                 <div className={`${mainTab === 'blocks' ? '' : 'hidden'} space-y-3 text-slate-200`}>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Workspace</p>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
+                        {controllerVersion === 'duet' ? 'Workspace • DUET version two' : 'Workspace'}
+                      </p>
                       <div className="mt-3 flex gap-2">
                         <button type="button" onClick={handleRunSimulation} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-500">Run simulation</button>
                         {currentUser.role === 'teacher' && (
@@ -4501,11 +4881,29 @@ export default function App() {
                     </div>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
-                      <div className="mt-2 space-y-2 text-xs text-slate-200">
-                        <button type="button" onClick={() => insertRobotCommand('robot.stand()')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Stand / Ready</button>
-                        <button type="button" onClick={() => insertRobotCommand('robot.walk(3)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Walk Forward (3 steps)</button>
-                        <button type="button" onClick={() => insertRobotCommand('robot.turn("left", 90)')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Turn Left (90°)</button>
-                        <button type="button" onClick={() => insertRobotCommand('robot.arm_action("hands up")')} className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700">Hands Up arm preset</button>
+                      <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-xs text-slate-200">
+                        {(controllerVersion === 'duet'
+                          ? DUET_COMMANDS.map((command) => [
+                            command.label,
+                            `duet.${command.method}(${command.args.map((argument) => argument.kind === 'choice'
+                              ? JSON.stringify(argument.value)
+                              : String(argument.value)).join(', ')})`,
+                          ])
+                          : [
+                            ['Stand / Ready', 'robot.stand()'],
+                            ['Walk Forward (3 steps)', 'robot.walk(3)'],
+                            ['Turn Left (90°)', 'robot.turn("left", 90)'],
+                            ['Hands Up arm preset', 'robot.arm_action("hands up")'],
+                          ]).map(([label, code]) => (
+                          <button
+                            key={code}
+                            type="button"
+                            onClick={() => insertRobotCommand(code)}
+                            className="block w-full rounded-md bg-slate-800 px-2 py-1.5 text-left hover:bg-slate-700"
+                          >
+                            {label}
+                          </button>
+                        ))}
                       </div>
                     </div>
                   </div>
@@ -4514,9 +4912,21 @@ export default function App() {
                 {mainTab === 'ide' && (
                   <div className="space-y-3 text-slate-200">
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Executable robot commands</p>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">
+                        {controllerVersion === 'duet' ? 'Executable DUET commands' : 'Executable robot commands'}
+                      </p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
-                        {G1_EXECUTABLE_COMMANDS.flatMap((command) => {
+                        {(controllerVersion === 'duet' ? DUET_COMMANDS : G1_EXECUTABLE_COMMANDS).flatMap((command) => {
+                          if (controllerVersion === 'duet') {
+                            const args = command.args.map((argument) => argument.kind === 'choice'
+                              ? JSON.stringify(argument.value)
+                              : String(argument.value));
+                            return [{
+                              ...command,
+                              key: command.method,
+                              script: `duet.${command.method}(${args.join(', ')})`,
+                            }];
+                          }
                           if (command.method === 'arm_action') {
                             return command.args[0].choices.map(([presetLabel, preset]) => ({
                               ...command,
@@ -4542,18 +4952,18 @@ export default function App() {
                             <span className="block text-slate-200">{command.label}</span>
                             <code className="text-cyan-300">{command.script}</code>
                             <p className="mt-1 text-slate-400">{command.description}</p>
-                            {command.sdkMethod
+                            {controllerVersion === 'legacy' && command.sdkMethod
                               ? <p className="mt-1 text-emerald-300">Unitree SDK: {command.sdkMethod}</p>
-                              : command.method === 'wait'
+                              : controllerVersion === 'legacy' && command.method === 'wait'
                                 ? <p className="mt-1 text-emerald-300">Runs as a timed pause.</p>
                                 : null}
-                            {command.method === 'arm_action' && <p className="mt-1 text-amber-300">Stop cannot cancel an arm preset; keep the area clear.</p>}
-                            {!command.adapters.simulator && <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>}
+                            {controllerVersion === 'legacy' && command.method === 'arm_action' && <p className="mt-1 text-amber-300">Stop cannot cancel an arm preset; keep the area clear.</p>}
+                            {controllerVersion === 'legacy' && !command.adapters.simulator && <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>}
                           </div>
                         ))}
                         <div className="rounded-md bg-slate-800 px-2 py-1.5">
                           <code className="text-cyan-300">for _ in range(3):</code>
-                          <code className="block pl-3 text-cyan-300">robot.walk(2)</code>
+                          <code className="block pl-3 text-cyan-300">{controllerVersion === 'duet' ? 'duet.move(0.15, 0, 0, 1)' : 'robot.walk(2)'}</code>
                           <p className="mt-1 text-slate-400">Repeat an indented group of commands.</p>
                         </div>
                       </div>
@@ -4572,7 +4982,9 @@ export default function App() {
                     {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
                     {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
                     <p className="text-[10px] text-slate-400">IDE text is synchronized to Blocks when you leave the editor. Incomplete or unsupported lines remain editable here but cannot be shown as Blocks.</p>
-                    <p className="text-[10px] text-slate-400">The IDE and Blocks support front-obstacle distance conditions. Physical conditions require a fresh MID-360 reading (500 ms maximum) from the configured provider; missing or stale readings abort and request a stop.</p>
+                    {controllerVersion === 'duet'
+                      ? <p className="text-[10px] text-amber-300">DUET supports bounded base-velocity commands, fixed carry/forward/box-hold arm poses and sequences built only from those poses, waits, and stop. These are not arbitrary joint targets; physical arm commands require the controller&apos;s separate DUET_ARM_ACCEPT gate. Simulator motion is a preview only.</p>
+                      : <p className="text-[10px] text-slate-400">The IDE and Blocks support front-obstacle distance conditions. Physical conditions require a fresh MID-360 reading (500 ms maximum) from the configured provider; missing or stale readings abort and request a stop.</p>}
                   </div>
                 )}
               </div>
