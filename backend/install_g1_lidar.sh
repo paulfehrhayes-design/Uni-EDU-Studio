@@ -298,8 +298,8 @@ if [[ "$ROS_RUNTIME" == "container" ]]; then
     echo "At least 8 GiB of free space is required on Docker's storage filesystem at $DOCKER_ROOT." >&2
     exit 1
   fi
-  echo "Building the native-architecture ROS 2 Humble sensor runtime."
-  sudo docker build --quiet --pull=false -t uni-edu-lidar-humble:local \
+  echo "Building the native-architecture ROS 2 Humble sensor runtime. This may take several minutes; build-step output will be shown, and Docker will cache completed layers for future installs."
+  sudo docker build --pull=false -t uni-edu-lidar-humble:local \
     -f "$PROJECT_DIR/backend/ros/docker/Dockerfile" "$PROJECT_DIR"
 else
   if [[ ! -f "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash" ]]; then
