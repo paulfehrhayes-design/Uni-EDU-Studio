@@ -9,6 +9,7 @@ try:
     from . import ros_lidar_provider
     from .ros_lidar_provider import (
         SampleCache,
+        PointCloudClockNormalizer,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -23,6 +24,7 @@ except ImportError:
     import ros_lidar_provider
     from ros_lidar_provider import (
         SampleCache,
+        PointCloudClockNormalizer,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -41,6 +43,45 @@ except ImportError:
 
 
 class RosLidarProviderTests(unittest.TestCase):
+    def test_clock_normalizer_corrects_only_a_stable_future_sensor_offset(self):
+        normalizer = PointCloudClockNormalizer()
+        now = 1_800_000_000.0
+
+        for sample_index in range(4):
+            raw_timestamp = now + 3.0 + sample_index * 0.05
+            with self.assertRaisesRegex(ValueError, "stable LiDAR-to-ROS clock offset"):
+                normalizer.normalize(
+                    int(raw_timestamp),
+                    round((raw_timestamp % 1) * 1_000_000_000),
+                    now + sample_index * 0.05,
+                )
+
+        raw_timestamp = now + 3.2
+        corrected = normalizer.normalize(
+            int(raw_timestamp),
+            round((raw_timestamp % 1) * 1_000_000_000),
+            now + 0.2,
+        )
+
+        self.assertAlmostEqual(normalizer.offset_seconds, 3.0, places=5)
+        self.assertAlmostEqual(corrected.timestamp(), now + 0.2, places=5)
+
+    def test_clock_normalizer_does_not_rescue_stale_or_unstable_samples(self):
+        normalizer = PointCloudClockNormalizer()
+        with self.assertRaisesRegex(ValueError, "stale"):
+            normalizer.normalize(1_799_999_999, 0, 1_800_000_000)
+
+        offsets = [2.0, 2.3, 2.0, 2.3, 2.0, 2.3]
+        for offset in offsets:
+            now = 1_800_000_000.0
+            raw_timestamp = now + offset
+            with self.assertRaisesRegex(ValueError, "stable|unstable"):
+                normalizer.normalize(
+                    int(raw_timestamp),
+                    round((raw_timestamp % 1) * 1_000_000_000),
+                    now,
+                )
+
     def test_missing_live_tf_error_identifies_required_frames_and_safe_action(self):
         message = format_tf_calibration_error(
             RuntimeError('"torso_link" passed to lookupTransform argument target_frame does not exist'),

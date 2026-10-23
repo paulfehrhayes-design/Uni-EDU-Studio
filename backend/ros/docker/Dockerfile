@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-colcon-common-extensions \
     ros-humble-launch-ros \
     ros-humble-pcl-conversions \
+    ros-humble-robot-state-publisher \
+    ros-humble-rosidl-default-generators \
+    ros-humble-rosidl-generator-dds-idl \
     ros-humble-sensor-msgs-py \
     ros-humble-std-msgs \
     ros-humble-tf2-ros \
@@ -35,7 +38,15 @@ RUN mkdir -p /opt/livox_ws/src \
     && bash -e ./build.sh humble \
     && rm -rf /opt/livox_ws/src/livox_ros_driver2/.git
 
+COPY backend/ros/unitree_hg /opt/g1_state_ws/src/unitree_hg
+RUN source /opt/ros/humble/setup.bash \
+    && cd /opt/g1_state_ws \
+    && colcon build --packages-select unitree_hg
+
 COPY backend/ros/mid360_launch.py /opt/uni-edu/ros/mid360_launch.py
+COPY backend/ros/g1_sensor_runtime.launch.py /opt/uni-edu/ros/g1_sensor_runtime.launch.py
+COPY backend/ros/g1_joint_state_bridge.py /opt/uni-edu/ros/g1_joint_state_bridge.py
+COPY backend/ros/g1_joint_state.py /opt/uni-edu/ros/g1_joint_state.py
 COPY backend/ros_lidar_provider.py /opt/uni-edu/ros_lidar_provider.py
 COPY backend/sensor_calibration.py /opt/uni-edu/sensor_calibration.py
 COPY public/g1/g1.xml /opt/uni-edu/g1.xml

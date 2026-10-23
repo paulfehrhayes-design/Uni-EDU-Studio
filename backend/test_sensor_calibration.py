@@ -12,6 +12,7 @@ try:
         compare_transforms,
         derive_g1_footprint,
         load_candidate_sensor_mounts,
+        load_robot_root_frame,
     )
 except ImportError:
     import sensor_calibration as calibration_module
@@ -22,6 +23,7 @@ except ImportError:
         compare_transforms,
         derive_g1_footprint,
         load_candidate_sensor_mounts,
+        load_robot_root_frame,
     )
 
 
@@ -66,6 +68,9 @@ class SensorCalibrationTests(unittest.TestCase):
         self.assertEqual(mounts["d435"]["status"], "candidate_unverified")
         self.assertEqual(mounts["d435"]["parent_frame"], "torso_link")
         self.assertEqual(mounts["d435"]["sensor_frame"], "d435_link")
+
+    def test_supported_g1_description_has_pelvis_root(self):
+        self.assertEqual(load_robot_root_frame(), "pelvis")
 
     def test_reports_missing_or_malformed_description_without_fallback(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -190,6 +195,8 @@ class SensorCalibrationTests(unittest.TestCase):
             {
                 "G1_LIDAR_AXIS_CONFIRMED": "1",
                 "G1_DISTANCE_CALIBRATION_CONFIRMED": "1",
+                "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                "G1_LIDAR_MOUNT_CONFIRMED": "1",
                 "G1_DISTANCE_FOOTPRINT_FRONT_M": "0.4",
                 "G1_DISTANCE_FOOTPRINT_REAR_M": "0.3",
                 "G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M": "0.2",
@@ -211,7 +218,10 @@ class SensorCalibrationTests(unittest.TestCase):
     def test_calibration_becomes_ready_only_for_fresh_matching_model_evidence(self):
         model = automatic_calibration_model()
         status = calibration_status(
-            env={},
+            env={
+                "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                "G1_LIDAR_MOUNT_CONFIRMED": "1",
+            },
             live_report={
                 "ready": True,
                 "status": "verified",
@@ -236,7 +246,10 @@ class SensorCalibrationTests(unittest.TestCase):
     def test_driver_sensor_frame_alias_is_accepted_only_with_matching_mount_geometry(self):
         model = automatic_calibration_model()
         status = calibration_status(
-            env={},
+            env={
+                "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                "G1_LIDAR_MOUNT_CONFIRMED": "1",
+            },
             live_report={
                 "ready": True,
                 "status": "verified",
@@ -254,8 +267,12 @@ class SensorCalibrationTests(unittest.TestCase):
         self.assertTrue(status["ready"])
 
     def test_calibration_rejects_evidence_from_a_different_model(self):
+        model = automatic_calibration_model()
         status = calibration_status(
-            env={},
+            env={
+                "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                "G1_LIDAR_MOUNT_CONFIRMED": "1",
+            },
             live_report={
                 "ready": True,
                 "model_fingerprint": "not-the-current-model",
@@ -268,7 +285,10 @@ class SensorCalibrationTests(unittest.TestCase):
     def test_provider_ready_flag_without_transform_evidence_is_rejected(self):
         model = automatic_calibration_model()
         status = calibration_status(
-            env={},
+            env={
+                "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                "G1_LIDAR_MOUNT_CONFIRMED": "1",
+            },
             live_report={
                 "ready": True,
                 "model_fingerprint": model["model_fingerprint"],
@@ -278,6 +298,43 @@ class SensorCalibrationTests(unittest.TestCase):
 
         self.assertFalse(status["ready"])
         self.assertIn("without a matching live transform", status["reason"])
+
+    def test_calibration_remains_disabled_without_physical_mount_confirmation(self):
+        model = automatic_calibration_model()
+        status = calibration_status(
+            env={"G1_DISTANCE_BASE_FRAME": model["root_frame"]},
+            live_report={
+                "ready": True,
+                "status": "verified",
+                "model_fingerprint": model["model_fingerprint"],
+                "transform": {
+                    "parent_frame": model["mount"]["parent_frame"],
+                    "sensor_frame": "livox_frame",
+                    "translation_error_m": 0.0,
+                    "rotation_error_rad": 0.0,
+                },
+                "footprint": model["footprint"],
+            },
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertIn("physical MID-360 mount", status["reason"])
+
+    def test_calibration_rejects_non_model_distance_base_frame(self):
+        model = automatic_calibration_model()
+        status = calibration_status(
+            env={
+                "G1_DISTANCE_BASE_FRAME": "base_link",
+                "G1_LIDAR_MOUNT_CONFIRMED": "1",
+            },
+            live_report={
+                "ready": True,
+                "model_fingerprint": model["model_fingerprint"],
+            },
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertIn("supported G1 model root 'pelvis'", status["reason"])
 
 
 if __name__ == "__main__":

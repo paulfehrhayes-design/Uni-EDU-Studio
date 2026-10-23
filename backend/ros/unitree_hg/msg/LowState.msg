@@ -1,0 +1,9 @@
+uint32[2] version
+uint8 mode_pr
+uint8 mode_machine
+uint32 tick
+unitree_hg/IMUState imu_state
+unitree_hg/MotorState[35] motor_state
+uint8[40] wireless_remote
+uint32[4] reserve
+uint32 crc

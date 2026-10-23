@@ -4,8 +4,10 @@ import hmac
 import json
 import math
 import os
+import statistics
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
@@ -14,10 +16,93 @@ MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
 TF_WARNING_INTERVAL_SECONDS = 5.0
+SENSOR_CLOCK_MAX_OFFSET_SECONDS = 30.0
+SENSOR_CLOCK_MAX_JITTER_SECONDS = 0.1
+SENSOR_CLOCK_STABLE_SAMPLES = 5
 
 
 def should_log_tf_warning(last_warning_at: float | None, now: float) -> bool:
     return last_warning_at is None or now - last_warning_at >= TF_WARNING_INTERVAL_SECONDS
+
+
+class PointCloudClockNormalizer:
+    def __init__(self) -> None:
+        self._future_offsets: deque[float] = deque(maxlen=15)
+        self.offset_seconds: float | None = None
+
+    def normalize(
+        self,
+        seconds: int,
+        nanoseconds: int,
+        now_seconds: float,
+    ) -> datetime:
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, int)
+            or isinstance(nanoseconds, bool)
+            or not isinstance(nanoseconds, int)
+            or seconds < 0
+            or not 0 <= nanoseconds < 1_000_000_000
+        ):
+            raise ValueError("LiDAR point-cloud timestamp is invalid.")
+        raw_timestamp = seconds + nanoseconds / 1_000_000_000
+        if raw_timestamp <= 0:
+            raise ValueError("LiDAR point-cloud timestamp is missing.")
+        raw_age = now_seconds - raw_timestamp
+        if -MAX_FUTURE_SKEW_SECONDS <= raw_age <= MAX_SAMPLE_AGE_SECONDS:
+            self._future_offsets.clear()
+            self.offset_seconds = None
+            return validate_pointcloud_timestamp(seconds, nanoseconds, now_seconds)
+        if raw_age > MAX_SAMPLE_AGE_SECONDS:
+            raise ValueError(
+                "LiDAR point cloud is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
+                    raw_age * 1000,
+                    MAX_SAMPLE_AGE_SECONDS * 1000,
+                )
+            )
+
+        offset = raw_timestamp - now_seconds
+        if offset > SENSOR_CLOCK_MAX_OFFSET_SECONDS:
+            self._future_offsets.clear()
+            self.offset_seconds = None
+            raise ValueError(
+                "LiDAR point-cloud clock is {:.0f} ms ahead of ROS system time, "
+                "beyond the supported offset.".format(offset * 1000)
+            )
+        if self._future_offsets and abs(offset - statistics.median(self._future_offsets)) > (
+            SENSOR_CLOCK_MAX_JITTER_SECONDS
+        ):
+            self._future_offsets.clear()
+            self.offset_seconds = None
+        self._future_offsets.append(offset)
+        if len(self._future_offsets) < SENSOR_CLOCK_STABLE_SAMPLES:
+            raise ValueError(
+                "Waiting for a stable LiDAR-to-ROS clock offset ({}/{} samples).".format(
+                    len(self._future_offsets),
+                    SENSOR_CLOCK_STABLE_SAMPLES,
+                )
+            )
+        offset_median = statistics.median(self._future_offsets)
+        offset_spread = max(self._future_offsets) - min(self._future_offsets)
+        if offset_spread > SENSOR_CLOCK_MAX_JITTER_SECONDS:
+            raise ValueError(
+                "LiDAR-to-ROS clock offset is unstable ({:.0f} ms spread); "
+                "clock synchronization cannot be verified.".format(offset_spread * 1000)
+            )
+        self.offset_seconds = offset_median
+        corrected_timestamp = raw_timestamp - offset_median
+        corrected_seconds = int(corrected_timestamp)
+        corrected_nanoseconds = round(
+            (corrected_timestamp - corrected_seconds) * 1_000_000_000
+        )
+        if corrected_nanoseconds >= 1_000_000_000:
+            corrected_seconds += 1
+            corrected_nanoseconds -= 1_000_000_000
+        return validate_pointcloud_timestamp(
+            corrected_seconds,
+            corrected_nanoseconds,
+            now_seconds,
+        )
 
 
 def format_tf_calibration_error(
@@ -559,6 +644,7 @@ def main() -> None:
     minimum_height = float(os.environ.get("G1_LIDAR_MINIMUM_HEIGHT_M", "-0.5"))
     maximum_height = float(os.environ.get("G1_LIDAR_MAXIMUM_HEIGHT_M", "1.5"))
     calibration_error = None
+    mount_confirmed = os.environ.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
     try:
         calibration_model = automatic_calibration_model(
             os.getenv("G1_SENSOR_URDF_PATH", DEFAULT_URDF_PATH),
@@ -566,6 +652,10 @@ def main() -> None:
         )
         footprint = calibration_model["footprint"]
         sensor_mount = calibration_model["mount"]
+        if base_frame_id != calibration_model["root_frame"]:
+            calibration_error = (
+                "G1_DISTANCE_BASE_FRAME {!r} must match the supported G1 model root {!r}."
+            ).format(base_frame_id, calibration_model["root_frame"])
     except ValueError as error:
         calibration_model = None
         sensor_mount = None
@@ -587,9 +677,16 @@ def main() -> None:
             self.cache.update_calibration_status(
                 {
                     "ready": False,
-                    "status": "waiting_for_live_transform",
+                    "status": "unavailable" if calibration_error else (
+                        "awaiting_mount_confirmation" if not mount_confirmed else "waiting_for_live_transform"
+                    ),
                     "reason": calibration_error
-                    or "Waiting for a fresh point cloud and live G1 sensor transform.",
+                    or (
+                        "The physical MID-360 mount has not been explicitly verified "
+                        "against the supported G1 model."
+                        if not mount_confirmed
+                        else "Waiting for a fresh point cloud and live G1 sensor transform."
+                    ),
                     "model_fingerprint": (
                         calibration_model["model_fingerprint"] if calibration_model else None
                     ),
@@ -604,6 +701,8 @@ def main() -> None:
             self.last_diagnostic_cloud_count = 0
             self.last_diagnostic_at = time.monotonic()
             self.last_tf_warning_at = None
+            self.clock_normalizer = PointCloudClockNormalizer()
+            self.reported_clock_offset = None
             if calibration_error:
                 self.cache.mark_unavailable(calibration_error)
                 self.get_logger().error(calibration_error)
@@ -617,13 +716,20 @@ def main() -> None:
                     f"points={message.width * message.height}."
                 )
                 self.received_first_cloud = True
-            if calibration_error or footprint is None:
-                reason = calibration_error or "Automatic G1 footprint geometry is unavailable."
+            if calibration_error or footprint is None or not mount_confirmed:
+                reason = calibration_error
+                if reason is None and not mount_confirmed:
+                    reason = (
+                        "The physical MID-360 mount has not been explicitly verified "
+                        "against the supported G1 model; physical distance conditions are disabled."
+                    )
+                if reason is None:
+                    reason = "Automatic G1 footprint geometry is unavailable."
                 self.cache.mark_unavailable(reason)
                 self.cache.update_calibration_status(
                     {
                         "ready": False,
-                        "status": "unavailable",
+                        "status": "awaiting_mount_confirmation" if not mount_confirmed else "unavailable",
                         "reason": reason,
                         "model_fingerprint": (
                             calibration_model["model_fingerprint"] if calibration_model else None
@@ -649,14 +755,30 @@ def main() -> None:
                 )
                 return
             try:
-                captured_at = validate_pointcloud_timestamp(
+                now_seconds = self.get_clock().now().nanoseconds / 1_000_000_000
+                captured_at = self.clock_normalizer.normalize(
                     int(message.header.stamp.sec),
                     int(message.header.stamp.nanosec),
+                    now_seconds,
+                )
+                if (
+                    self.clock_normalizer.offset_seconds is not None
+                    and self.reported_clock_offset is None
+                ):
+                    self.reported_clock_offset = self.clock_normalizer.offset_seconds
+                    self.get_logger().warning(
+                        "LiDAR clock offset stabilized at {:.0f} ms; using corrected "
+                        "capture stamps for TF lookup and preserving receipt-age checks.".format(
+                            self.reported_clock_offset * 1000
+                        )
+                    )
+                cloud_time = Time(
+                    nanoseconds=round(captured_at.timestamp() * 1_000_000_000)
                 )
                 mount_transform: TransformStamped = self.tf_buffer.lookup_transform(
                     sensor_mount["parent_frame"],
                     source_frame,
-                    Time.from_msg(message.header.stamp),
+                    cloud_time,
                     timeout=Duration(seconds=0.05),
                 )
                 mount_translation = mount_transform.transform.translation
@@ -707,7 +829,7 @@ def main() -> None:
                     transform: TransformStamped = self.tf_buffer.lookup_transform(
                         base_frame_id,
                         source_frame,
-                        Time.from_msg(message.header.stamp),
+                        cloud_time,
                         timeout=Duration(seconds=0.05),
                     )
                     vector = transform.transform.translation
@@ -772,7 +894,10 @@ def main() -> None:
                         "transform": None,
                     }
                 )
-                self.get_logger().warning(reason)
+                warning_at = time.monotonic()
+                if should_log_tf_warning(self.last_tf_warning_at, warning_at):
+                    self.get_logger().warning(reason)
+                    self.last_tf_warning_at = warning_at
                 return
             self.cache.update_calibration_status(
                 {

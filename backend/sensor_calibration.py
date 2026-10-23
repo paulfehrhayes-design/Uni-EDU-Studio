@@ -230,6 +230,33 @@ def load_candidate_sensor_mounts(urdf_path=DEFAULT_URDF_PATH):
     return mounts
 
 
+def load_robot_root_frame(urdf_path=DEFAULT_URDF_PATH):
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise ValueError("Could not read supported G1 robot description: {}".format(error)) from error
+    links = {
+        link.get("name", "").strip()
+        for link in root.findall("link")
+        if link.get("name", "").strip()
+    }
+    child_links = set()
+    for joint in root.findall("joint"):
+        child = joint.find("child")
+        if child is not None:
+            child_name = child.get("link", "").strip()
+            if child_name:
+                child_links.add(child_name)
+    root_links = links - child_links
+    if len(root_links) != 1:
+        raise ValueError(
+            "Supported G1 model must have exactly one root link; found {}.".format(
+                len(root_links)
+            )
+        )
+    return next(iter(root_links))
+
+
 def _model_fingerprint(urdf_path, geometry_path):
     digest = hashlib.sha256()
     for path in (urdf_path, geometry_path):
@@ -270,6 +297,7 @@ def automatic_calibration_model(urdf_path=None, geometry_path=None):
             "the bundled G1 collision model."
         )
     mounts = load_candidate_sensor_mounts(urdf_path)
+    root_frame = load_robot_root_frame(urdf_path)
     footprint = derive_g1_footprint(geometry_path)
     mount = mounts.get("mid360")
     if not mount or not mount.get("available"):
@@ -277,6 +305,7 @@ def automatic_calibration_model(urdf_path=None, geometry_path=None):
     return {
         "model_fingerprint": _model_fingerprint(urdf_path, geometry_path),
         "mount": mount,
+        "root_frame": root_frame,
         "footprint": footprint,
         "path_warnings": path_warnings,
     }
@@ -444,32 +473,43 @@ def calibration_status(
         reason = model_error
     else:
         path_warnings = model["path_warnings"]
-        if live_report is None:
-            live_report, report_error = _live_provider_calibration_report(environment)
+        configured_base_frame = environment.get("G1_DISTANCE_BASE_FRAME", model["root_frame"]).strip()
+        mount_confirmed = environment.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
+        if configured_base_frame != model["root_frame"]:
+            reason = (
+                "Distance base frame {!r} is not the supported G1 model root {!r}."
+            ).format(configured_base_frame, model["root_frame"])
+        elif not mount_confirmed:
+            reason = (
+                "The physical MID-360 mount has not been explicitly verified against "
+                "the supported G1 model; distance conditions remain disabled."
+            )
         else:
             report_error = None
-        if report_error:
-            reason = report_error
-        elif not isinstance(live_report, dict):
-            reason = "LiDAR provider calibration status must be a JSON object."
-        elif live_report.get("model_fingerprint") != model["model_fingerprint"]:
-            reason = "Live calibration evidence was produced by a different G1 model."
-        elif live_report.get("ready") is True and _live_report_matches_model(model, live_report):
-            report_verified = True
-            reason = live_report.get(
-                "reason",
-                "Live sensor transform matches the G1 model and the footprint was derived automatically.",
-            )
-        elif live_report.get("ready") is True:
-            reason = (
-                "LiDAR provider marked calibration ready without a matching live transform "
-                "and model-derived footprint."
-            )
-        else:
-            reason = live_report.get(
-                "reason",
-                "Waiting for a fresh LiDAR sample and a matching live G1 sensor transform.",
-            )
+            if live_report is None:
+                live_report, report_error = _live_provider_calibration_report(environment)
+            if report_error:
+                reason = report_error
+            elif not isinstance(live_report, dict):
+                reason = "LiDAR provider calibration status must be a JSON object."
+            elif live_report.get("model_fingerprint") != model["model_fingerprint"]:
+                reason = "Live calibration evidence was produced by a different G1 model."
+            elif live_report.get("ready") is True and _live_report_matches_model(model, live_report):
+                report_verified = True
+                reason = live_report.get(
+                    "reason",
+                    "Live sensor transform matches the G1 model and the footprint was derived automatically.",
+                )
+            elif live_report.get("ready") is True:
+                reason = (
+                    "LiDAR provider marked calibration ready without a matching live transform "
+                    "and model-derived footprint."
+                )
+            else:
+                reason = live_report.get(
+                    "reason",
+                    "Waiting for a fresh LiDAR sample and a matching live G1 sensor transform.",
+                )
         if path_warnings:
             reason = "{} {}".format(reason, " ".join(path_warnings))
     ready = bool(model and report_verified)
@@ -480,7 +520,11 @@ def calibration_status(
         "ready": ready,
         "configuration_present": model is not None,
         "model": os.path.basename(urdf_path),
+        "root_frame": None if not model else model["root_frame"],
         "candidate_mounts": mounts,
+        "physical_mount_confirmed": bool(
+            environment.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
+        ),
         "footprint": None if not model else model["footprint"],
         "model_path_warnings": [] if not model else model["path_warnings"],
         "model_fingerprint": None if not model else model["model_fingerprint"],

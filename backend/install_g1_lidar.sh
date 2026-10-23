@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_WS="${G1_LIDAR_ROS_WS:-$HOME/uni-edu-lidar-ws}"
+STATE_WS="${G1_LIDAR_STATE_WS:-$HOME/uni-edu-g1-state-ws}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uni-edu-studio"
 CONFIG_FILE="$CONFIG_DIR/MID360_config.json"
 ENV_FILE="$CONFIG_DIR/lidar.env"
@@ -53,6 +54,7 @@ SAVED_REAR_EXTENT=""
 SAVED_HALF_WIDTH=""
 SAVED_LIDAR_TOPIC=""
 SAVED_SENSOR_FRAME=""
+SAVED_MOUNT_CONFIRMED=""
 SAVED_SENSOR_ID=""
 SAVED_PUBLISH_FREQ=""
 SAVED_AXIS_CONFIRMED=""
@@ -66,6 +68,7 @@ if [[ -f "$ENV_FILE" ]]; then
   SAVED_HALF_WIDTH="$(awk -F= '$1 == "G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_LIDAR_TOPIC="$(awk -F= '$1 == "G1_LIDAR_TOPIC" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_SENSOR_FRAME="$(awk -F= '$1 == "G1_DISTANCE_FRAME_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_MOUNT_CONFIRMED="$(awk -F= '$1 == "G1_LIDAR_MOUNT_CONFIRMED" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_SENSOR_ID="$(awk -F= '$1 == "G1_DISTANCE_SENSOR_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_PUBLISH_FREQ="$(awk -F= '$1 == "G1_LIDAR_PUBLISH_FREQ" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_AXIS_CONFIRMED="$(awk -F= '$1 == "G1_LIDAR_AXIS_CONFIRMED" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
@@ -105,7 +108,8 @@ G1_LIDAR_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-$(discovery_value network
 G1_LIDAR_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-$(discovery_value network.device_ip)}}"
 G1_LIDAR_TOPIC="${G1_LIDAR_TOPIC:-${SAVED_LIDAR_TOPIC:-$DISCOVERED_TOPIC}}"
 G1_DISTANCE_SENSOR_ID="${G1_DISTANCE_SENSOR_ID:-${DISCOVERED_SENSOR_ID:-${SAVED_SENSOR_ID:-mid360-front}}}"
-G1_DISTANCE_BASE_FRAME="${G1_DISTANCE_BASE_FRAME:-${SAVED_BASE_FRAME:-base_link}}"
+G1_LIDAR_LOWSTATE_TOPIC="${G1_LIDAR_LOWSTATE_TOPIC:-/lowstate}"
+G1_LIDAR_MOUNT_CONFIRMED="${G1_LIDAR_MOUNT_CONFIRMED:-${SAVED_MOUNT_CONFIRMED:-0}}"
 G1_LIDAR_PUBLISH_FREQ="${G1_LIDAR_PUBLISH_FREQ:-${SAVED_PUBLISH_FREQ:-20.0}}"
 CALIBRATION_MODEL_JSON="$(
   PYTHONPATH="$PROJECT_DIR/backend" python3 -c \
@@ -125,6 +129,21 @@ print(value)
 ' "$1"
 }
 MODEL_SENSOR_FRAME="$(model_value mount.sensor_frame)"
+MODEL_ROOT_FRAME="$(model_value root_frame)"
+if [[ -n "${G1_DISTANCE_BASE_FRAME:-}" ]]; then
+  :
+elif [[ -n "$SAVED_BASE_FRAME" && "$SAVED_BASE_FRAME" != "base_link" ]]; then
+  G1_DISTANCE_BASE_FRAME="$SAVED_BASE_FRAME"
+else
+  G1_DISTANCE_BASE_FRAME="$MODEL_ROOT_FRAME"
+  if [[ "$SAVED_BASE_FRAME" == "base_link" ]]; then
+    echo "Migrating the unsupported saved base_link distance frame to the supported model root $MODEL_ROOT_FRAME."
+  fi
+fi
+if [[ "$G1_DISTANCE_BASE_FRAME" != "$MODEL_ROOT_FRAME" ]]; then
+  echo "G1_DISTANCE_BASE_FRAME must be the supported G1 model root '$MODEL_ROOT_FRAME' for footprint-relative distance readings." >&2
+  exit 1
+fi
 if [[ "$CONNECTION_METHOD" == "direct_livox" ]]; then
   G1_DISTANCE_FRAME_ID="${G1_DISTANCE_FRAME_ID:-$MODEL_SENSOR_FRAME}"
 else
@@ -215,6 +234,10 @@ if [[ ! "$G1_DISTANCE_FRAME_ID" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
   echo "Discovered/configured LiDAR frame ID is not a valid ROS frame name." >&2
   exit 1
 fi
+if [[ ! "$G1_LIDAR_LOWSTATE_TOPIC" =~ ^/[A-Za-z][A-Za-z0-9_/]*$ ]]; then
+  echo "G1_LIDAR_LOWSTATE_TOPIC must be a fully qualified ROS topic name." >&2
+  exit 1
+fi
 if [[ -n "$G1_DISTANCE_BASE_FRAME" && ! "$G1_DISTANCE_BASE_FRAME" =~ ^[A-Za-z][A-Za-z0-9_/]*$ ]]; then
   echo "Configured robot base frame is not a valid ROS frame name." >&2
   exit 1
@@ -224,8 +247,9 @@ if [[ ! "$G1_DISTANCE_SENSOR_ID" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
   exit 1
 fi
 if [[ "$AXIS_CONFIRMED" != "0" && "$AXIS_CONFIRMED" != "1" ]] ||
-   [[ "$CALIBRATION_CONFIRMED" != "0" && "$CALIBRATION_CONFIRMED" != "1" ]]; then
-  echo "Calibration confirmation settings must be either 0 or 1." >&2
+   [[ "$CALIBRATION_CONFIRMED" != "0" && "$CALIBRATION_CONFIRMED" != "1" ]] ||
+   [[ "$G1_LIDAR_MOUNT_CONFIRMED" != "0" && "$G1_LIDAR_MOUNT_CONFIRMED" != "1" ]]; then
+  echo "Calibration and physical mount confirmation settings must be either 0 or 1." >&2
   exit 1
 fi
 for value in "$FRONT_EXTENT_M" "$REAR_EXTENT_M" "$HALF_WIDTH_M"; do
@@ -293,9 +317,22 @@ else
   sudo apt-get install -y "ros-${ROS_DISTRO_REQUIRED}-ros-base" \
     "ros-${ROS_DISTRO_REQUIRED}-rmw-cyclonedds-cpp" \
     "ros-${ROS_DISTRO_REQUIRED}-sensor-msgs-py" \
+    "ros-${ROS_DISTRO_REQUIRED}-robot-state-publisher" \
+    "ros-${ROS_DISTRO_REQUIRED}-rosidl-default-generators" \
+    "ros-${ROS_DISTRO_REQUIRED}-rosidl-generator-dds-idl" \
     "ros-${ROS_DISTRO_REQUIRED}-std-msgs" \
     "ros-${ROS_DISTRO_REQUIRED}-tf2-ros" \
     python3-colcon-common-extensions git cmake build-essential
+
+  mkdir -p "$STATE_WS"
+  (
+    set +u
+    source "/opt/ros/$ROS_DISTRO_REQUIRED/setup.bash"
+    set -u
+    cd "$STATE_WS"
+    colcon build --base-paths "$PROJECT_DIR/backend/ros/unitree_hg" \
+      --packages-select unitree_hg
+  )
 
   if [[ "$DRIVER_REQUIRED" == "1" ]]; then
     if [[ ! -d "$HOME/Livox-SDK2/.git" ]]; then
@@ -368,6 +405,8 @@ G1_DISTANCE_PROVIDER_TOKEN=$TOKEN
 G1_DISTANCE_SENSOR_ID=$G1_DISTANCE_SENSOR_ID
 G1_DISTANCE_FRAME_ID=$G1_DISTANCE_FRAME_ID
 G1_DISTANCE_BASE_FRAME=$G1_DISTANCE_BASE_FRAME
+G1_LIDAR_MOUNT_CONFIRMED=$G1_LIDAR_MOUNT_CONFIRMED
+G1_LIDAR_LOWSTATE_TOPIC=$G1_LIDAR_LOWSTATE_TOPIC
 G1_DISTANCE_FOOTPRINT_FRONT_M=$FRONT_EXTENT_M
 G1_DISTANCE_FOOTPRINT_REAR_M=$REAR_EXTENT_M
 G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M=$HALF_WIDTH_M
@@ -376,6 +415,7 @@ G1_SENSOR_GEOMETRY_PATH=$SENSOR_GEOMETRY_PATH
 G1_LIDAR_TOPIC=$G1_LIDAR_TOPIC
 G1_LIDAR_CONFIG_PATH=$CONFIG_FILE
 G1_LIDAR_ROS_WS=$ROS_WS
+G1_LIDAR_STATE_WS=$STATE_WS
 G1_LIDAR_ROS_DISTRO=$ROS_DISTRO_REQUIRED
 G1_LIDAR_ROS_RUNTIME=$ROS_RUNTIME
 G1_LIDAR_DRIVER_REQUIRED=$DRIVER_REQUIRED
@@ -438,7 +478,7 @@ $PROVIDER_DEPENDENCIES
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --env-file $ENV_FILE --env G1_SENSOR_URDF_PATH=/opt/uni-edu/g1_23dof.urdf.txt --env G1_SENSOR_GEOMETRY_PATH=/opt/uni-edu/g1.xml uni-edu-lidar-humble:local python3 /opt/uni-edu/ros_lidar_provider.py
+ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --env-file $ENV_FILE --env G1_SENSOR_URDF_PATH=/opt/uni-edu/g1_23dof.urdf.txt --env G1_SENSOR_GEOMETRY_PATH=/opt/uni-edu/g1.xml uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/g1_sensor_runtime.launch.py
 ExecStop=/usr/bin/docker stop --time 10 uni-edu-lidar-provider
 Restart=on-failure
 RestartSec=3
@@ -534,9 +574,12 @@ else
   echo "Using the detected existing ROS point-cloud source; no Livox driver was installed or started."
 fi
 if [[ "$AXIS_CONFIRMED" == "1" && "$CALIBRATION_CONFIRMED" == "1" ]]; then
-  echo "The read-only distance provider will derive the G1 footprint automatically and wait for live TF verification from $G1_DISTANCE_BASE_FRAME."
+  echo "The read-only G1 state bridge and distance provider are configured for the $G1_DISTANCE_BASE_FRAME model root."
 else
   echo "Physical distance conditions remain disabled until axis alignment, base transform, and metric footprint calibration are explicitly verified."
+fi
+if [[ "$G1_LIDAR_MOUNT_CONFIRMED" != "1" ]]; then
+  echo "MID-360 physical mount confirmation is not set; the model-to-cloud transform will not be published and physical distance conditions remain disabled."
 fi
 if [[ "$DRIVER_REQUIRED" == "1" ]]; then
   echo "The configured network was validated, but hardware presence still needs on-device verification. Review $CONFIG_FILE."

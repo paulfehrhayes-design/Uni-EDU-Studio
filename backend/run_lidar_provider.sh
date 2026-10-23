@@ -13,6 +13,7 @@ if [[ "$ROS_DISTRO" != "humble" ]]; then
   exit 1
 fi
 source "/opt/ros/$ROS_DISTRO/setup.bash"
+source "${G1_LIDAR_STATE_WS:-$HOME/uni-edu-g1-state-ws}/install/setup.bash"
 
 set -u
-exec /usr/bin/python3 "$PROJECT_DIR/backend/ros_lidar_provider.py"
+exec ros2 launch "$PROJECT_DIR/backend/ros/g1_sensor_runtime.launch.py"
