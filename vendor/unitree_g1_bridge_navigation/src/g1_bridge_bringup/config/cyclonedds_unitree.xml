@@ -1,0 +1,13 @@
+<CycloneDDS>
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <!--
+          把下面的 name 改成你实际连接机器人/路由器的网卡名。
+          常见例如：enp3s0、eth0、eno1
+        -->
+        <NetworkInterface name="eno1" priority="default" multicast="default" />
+      </Interfaces>
+    </General>
+  </Domain>
+</CycloneDDS>

@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>g1_bridge_bringup</name>
+  <version>0.1.0</version>
+  <description>ROS 2 bridge and bringup package for Unitree G1 navigation development.</description>
+  <maintainer email="zhangyu@example.com">zhangyu</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>unitree_api</depend>
+  <depend>unitree_hg</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

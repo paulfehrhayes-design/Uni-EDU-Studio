@@ -1,0 +1,7 @@
+image: atrium_2d.pgm
+mode: trinary
+resolution: 0.05
+origin: [-5.54, -23.7, 0]
+negate: 0
+occupied_thresh: 0.80
+free_thresh: 0.25

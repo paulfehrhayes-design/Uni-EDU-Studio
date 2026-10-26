@@ -13,9 +13,16 @@ test('mock connection runs catalog robot commands and expands bounded loops', as
   await connection.run('robot.wait(1)');
   assert.equal(connection.executions[1][0].method, 'wait');
   await assert.rejects(connection.run('robot.waveleft("high")'), /not supported by the mock connection/);
+  const fourHundredCommands = 'for _ in range(20):\n'
+    + '    for _ in range(20):\n'
+    + '        robot.walk(1)';
+  assert.deepEqual(
+    await connection.run(fourHundredCommands),
+    { status: 'completed', commandsExecuted: 400, adapter: 'mock' },
+  );
   await assert.rejects(
-    connection.run('for _ in range(20):\n    for _ in range(20):\n        robot.walk(1)\n        robot.walk(1)'),
-    /at most 200 expanded commands/,
+    connection.run(`${fourHundredCommands}\nrobot.walk(1)`),
+    /at most 400 expanded commands/,
   );
   await assert.rejects(
     connection.run('if robot.front_distance_m() < 1:\n    robot.walk(1)'),

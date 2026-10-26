@@ -1,0 +1,19 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Map files (large binary/generated files)
+maps/*.pgm
+maps/*.data
+maps/*.posegraph
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor
+.vscode/
+*.swp
+*.swo

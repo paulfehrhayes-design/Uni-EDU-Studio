@@ -443,8 +443,8 @@ export function parseG1Program(code = '') {
     if (node.type === 'repeat') return total + node.times * commandCount(node.body);
     return total + Math.max(commandCount(node.then), commandCount(node.else));
   }, 0);
-  if (commandCount(normalized) > 200) {
-    throw new Error('Programs may contain at most 200 expanded commands per execution path.');
+  if (commandCount(normalized) > 400) {
+    throw new Error('Programs may contain at most 400 expanded commands per execution path.');
   }
   return normalized;
 }

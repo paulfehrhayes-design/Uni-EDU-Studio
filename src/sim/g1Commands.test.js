@@ -396,11 +396,12 @@ test('G1 parser safely normalizes SDK diagnostics and audio arguments', () => {
 
 test('G1 program parser rejects unknown commands and loop counts outside safe limits', () => {
   assert.throws(() => parseG1Program('robot.moveTo(1, 2)'), /Unknown robot command/);
+  assert.equal(parseG1Program('for _ in range(20):\n    robot.stand()')[0].times, 20);
   assert.throws(() => parseG1Program('for _ in range(21):\n    robot.stand()'), /between 1 and 20/);
-  assert.equal(parseG1Program('robot.stand()\n'.repeat(200)).length, 200);
+  assert.equal(parseG1Program('robot.stand()\n'.repeat(400)).length, 400);
   assert.throws(
-    () => parseG1Program('robot.stand()\n'.repeat(201)),
-    /at most 200 expanded commands/,
+    () => parseG1Program('robot.stand()\n'.repeat(401)),
+    /at most 400 expanded commands/,
   );
 });
 

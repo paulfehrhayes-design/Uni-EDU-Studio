@@ -50,7 +50,7 @@ Programs can also use bounded `for` loops. The legacy G1 arm presets are availab
 
 `robot.wait(2)` pauses the program for 2 seconds. Wait durations are entered in seconds, from 0.1 to 10, in both Blocks and the IDE.
 
-There is no overall 30-second runtime cap for a program. Per-command input bounds and the limit of 200 expanded commands still apply. The teacher's explicit stop path remains available; as noted above, the SDK cannot cancel an arm preset it has already accepted.
+There is no overall 30-second runtime cap for a program. Per-command input bounds, a maximum of 20 loop repetitions, and the limit of 400 expanded commands per execution path still apply. The teacher's explicit stop path remains available; as noted above, the SDK cannot cancel an arm preset it has already accepted.
 
 Distance conditions can choose which supported commands run:
 
@@ -98,7 +98,7 @@ robot.arm_action("hands up")
 
 The available preset names are: `release arm`, `two-hand kiss`, `left kiss`, `right kiss`, `hands up`, `clap`, `high five`, `hug`, `heart`, `right heart`, `reject`, `right hand up`, `x-ray`, `face wave`, `high wave`, and `shake hand`.
 
-`wait(seconds)` pauses the program for 0.1 to 10 seconds. The whole program is limited to 30 seconds.
+`wait(seconds)` pauses a v1 program for 0.1 to 10 seconds. Neither v1 nor DUET v2 has an aggregate program-duration cap. Their individual command durations remain bounded; each loop allows up to 20 repetitions and programs allow up to 400 expanded commands (v1 counts the maximum execution path).
 
 Arm presets:
 - Release arm: relax the arms.

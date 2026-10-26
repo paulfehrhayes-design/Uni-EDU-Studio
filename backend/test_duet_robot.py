@@ -26,6 +26,50 @@ class DuetProgramValidationTests(unittest.TestCase):
         self.assertEqual(command["vx_mps"], -0.1)
         self.assertEqual(command["yaw_rate_rps"], -0.2)
 
+    def test_parser_accepts_only_bounded_concurrent_move_with_named_arm_pose(self):
+        command = duet_robot.parse_duet_program(
+            'duet.move_and_arm(0.15, 0, 0, 1, "forward", 1.5)'
+        )[0]
+        self.assertEqual(command, {
+            "type": "move_and_arm",
+            "vx_mps": 0.15,
+            "vy_mps": 0.0,
+            "yaw_rate_rps": 0.0,
+            "duration_s": 1.0,
+            "pose": "forward",
+            "arm_duration_s": 1.5,
+        })
+        for code in (
+            'duet.move_and_arm(0.31, 0, 0, 1, "forward", 1.5)',
+            'duet.move_and_arm(0.15, 0, 0, 2.6, "forward", 3)',
+            'duet.move_and_arm(0.15, 0, 0, 1, "wave", 1.5)',
+            'duet.move_and_arm(0.15, 0, 0, 1.5, "forward", 1.5)',
+        ):
+            with self.subTest(code=code), self.assertRaises(duet_robot.DuetProgramValidationError):
+                duet_robot.parse_duet_program(code)
+
+    def test_parser_pairs_any_supported_locomotion_with_a_specific_gesture(self):
+        command = duet_robot.parse_duet_program(
+            "with duet.concurrent():\n"
+            "    duet.arc_backward_right(1.5)\n"
+            "    duet.wave_left_mid(1)"
+        )[0]
+        self.assertEqual(command["type"], "concurrent")
+        self.assertEqual(command["movement"]["vx_mps"], -0.08)
+        self.assertEqual(command["movement"]["yaw_rate_rps"], -0.2)
+        self.assertEqual(
+            [(arm["pose"], arm["duration_s"]) for arm in command["arm_commands"]],
+            [("forward", 1), ("box_hold", 1), ("carry", 1)],
+        )
+        invalid_programs = (
+            "with duet.concurrent():\n    duet.wave_left_mid(1)\n    duet.arm_carry(1)",
+            "with duet.concurrent():\n    duet.forward(1)\n    duet.turn_left(1)",
+            "with duet.concurrent():\n    duet.forward(1)",
+        )
+        for code in invalid_programs:
+            with self.subTest(code=code), self.assertRaises(duet_robot.DuetProgramValidationError):
+                duet_robot.parse_duet_program(code)
+
     def test_parser_expands_directional_commands_to_bounded_velocity(self):
         commands = duet_robot.parse_duet_program(
             "duet.forward(1)\n"
@@ -74,10 +118,16 @@ class DuetProgramValidationTests(unittest.TestCase):
             [(command["pose"], command["duration_s"]) for command in commands],
             [("forward", 1.5), ("box_hold", 1.5), ("carry", 1.5)],
         )
+        left_wave = duet_robot.parse_duet_program('duet.wave_left("mid", 1.5)')
+        self.assertEqual(
+            [(command["pose"], command["duration_s"]) for command in left_wave],
+            [("forward", 1.5), ("box_hold", 1.5), ("carry", 1.5)],
+        )
         for code in (
             'duet.arm_motion("wave", 1.5)',
             'duet.arm_motion("reach_and_return", 0.5)',
             'duet.arm_motion(1, 1.5)',
+            'duet.wave_left("urgent", 1.5)',
         ):
             with self.subTest(code=code), self.assertRaises(duet_robot.DuetProgramValidationError):
                 duet_robot.parse_duet_program(code)
@@ -89,20 +139,30 @@ class DuetProgramValidationTests(unittest.TestCase):
             'duet.raise_arm("left", "mid", 1)',
             'duet.wave("left", "mid", 1)',
             "duet.move(0.31, 0, 0, 1)",
-            "for _ in range(11):\n    duet.stop()",
+            "for _ in range(21):\n    duet.stop()",
         ):
             with self.subTest(code=code), self.assertRaises(duet_robot.DuetProgramValidationError):
                 duet_robot.parse_duet_program(code)
+        self.assertEqual(
+            [(command["pose"], command["duration_s"]) for command in duet_robot.parse_duet_program('duet.raise_both_arms("high", 1.5)')],
+            [("forward", 1.5), ("carry", 1.5)],
+        )
 
-    def test_stop_must_be_final_and_program_duration_is_bounded(self):
+    def test_stop_must_be_final_and_program_has_no_aggregate_duration_cap(self):
         with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "final command"):
             duet_robot.parse_duet_program("duet.stop()\nduet.wait(1)")
-        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "duration may not exceed"):
-            duet_robot.parse_duet_program(
-                "for _ in range(10):\n"
-                "    for _ in range(10):\n"
-                "        duet.wait(0.4)"
-            )
+        twenty_repeats = "for _ in range(20):\n    duet.wait(0.1)"
+        four_hundred_repeats = (
+            "for _ in range(20):\n"
+            "    for _ in range(20):\n"
+            "        duet.wait(3)"
+        )
+        self.assertEqual(len(duet_robot.parse_duet_program(twenty_repeats)), 20)
+        commands = duet_robot.parse_duet_program(four_hundred_repeats)
+        self.assertEqual(len(commands), 400)
+        self.assertEqual(sum(command["duration_s"] for command in commands), 1200)
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "400 expanded commands"):
+            duet_robot.parse_duet_program(f"{four_hundred_repeats}\nduet.wait(3)")
 
     def test_gateway_configuration_uses_an_absolute_local_socket_directory(self):
         with tempfile.TemporaryDirectory() as temporary_directory, patch.dict(os.environ, {
@@ -191,6 +251,159 @@ class DuetOwnershipTests(unittest.TestCase):
             [call.args[0] for call in gateway_request.call_args_list],
             ["STATUS", "ARM_POSE box_hold 1000"],
         )
+
+    def test_concurrent_move_keeps_arm_lease_active_while_refreshing_base_velocity(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_pose_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_pose"],
+        }
+        pose_active = {**status, "arm_pose_active": True}
+        moving = {**pose_active, "motion_active": True}
+        stopped = {**status, "motion_active": False}
+
+        def gateway_response(request):
+            if request == "STATUS":
+                return status
+            if request.startswith("ARM_POSE "):
+                return pose_active
+            if request.startswith("MOVE 0 0 0 "):
+                return pose_active
+            if request.startswith("MOVE "):
+                return moving
+            if request == "STOP":
+                return stopped
+            raise AssertionError(f"Unexpected gateway request: {request}")
+
+        clock = {"now": 0.0}
+
+        def advance_clock():
+            clock["now"] += 0.05
+            return clock["now"]
+
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot,
+            "_gateway_request",
+            side_effect=gateway_response,
+        ) as gateway_request, patch.object(
+            duet_robot.time, "monotonic", side_effect=advance_clock
+        ), patch.object(
+            duet_robot._stop_requested, "wait", return_value=False
+        ):
+            result = duet_robot.execute_program(
+                'duet.move_and_arm(0.15, 0, 0, 0.2, "forward", 1)'
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["commandsExecuted"], 1)
+        requests = [request.args[0] for request in gateway_request.call_args_list]
+        self.assertEqual(requests[:3], [
+            "STATUS",
+            "ARM_POSE forward 1000",
+            "MOVE 0.150000 0.000000 0.000000 250",
+        ])
+        self.assertIn("MOVE 0 0 0 250", requests)
+        self.assertEqual(requests[-1], "STOP")
+
+    def test_concurrent_locomotion_runs_through_a_multi_pose_gesture(self):
+        initial = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_pose_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_pose"],
+        }
+        clock = {"now": 0.0}
+        requests = []
+
+        def gateway_response(request):
+            requests.append(request)
+            if request == "STATUS":
+                return initial
+            if request.startswith("ARM_POSE "):
+                return {**initial, "arm_pose_active": True}
+            if request.startswith("MOVE "):
+                moving = request != "MOVE 0.000000 0.000000 0.000000 250"
+                return {
+                    **initial,
+                    "motion_active": moving,
+                    "arm_pose_active": clock["now"] < 2,
+                }
+            if request == "STOP":
+                return initial
+            raise AssertionError(f"Unexpected gateway request: {request}")
+
+        def wait_and_advance(duration):
+            clock["now"] += duration
+            return False
+
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", side_effect=gateway_response
+        ), patch.object(
+            duet_robot.time, "monotonic", side_effect=lambda: clock["now"]
+        ), patch.object(
+            duet_robot._stop_requested, "wait", side_effect=wait_and_advance
+        ):
+            result = duet_robot.execute_program(
+                "with duet.concurrent():\n"
+                "    duet.forward(0.2)\n"
+                "    duet.wave_left_low(1)"
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["commandsExecuted"], 1)
+        self.assertIn("ARM_POSE carry 1000", requests)
+        self.assertIn("ARM_POSE forward 1000", requests)
+        self.assertIn("MOVE 0.150000 0.000000 0.000000 250", requests)
+        self.assertIn("MOVE 0.000000 0.000000 0.000000 250", requests)
+        self.assertEqual(requests[-1], "STOP")
+
+    def test_concurrent_move_stops_if_controller_drops_either_motion_lease(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_pose_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_pose"],
+        }
+        pose_active = {**status, "arm_pose_active": True}
+        arm_expired = {**pose_active, "motion_active": True, "arm_pose_active": False}
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", side_effect=[status, pose_active, arm_expired, status]
+        ) as gateway_request, patch.object(
+            duet_robot.time, "monotonic", side_effect=[0.0, 0.0, 0.2, 2.0]
+        ), patch.object(
+            duet_robot._stop_requested, "wait", return_value=False
+        ):
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "arm-pose lease ended"):
+                duet_robot.execute_program(
+                    'duet.move_and_arm(0.15, 0, 0, 0.1, "forward", 1)'
+                )
+
+        self.assertEqual(gateway_request.call_args_list[-1], call("STOP"))
 
     def test_connect_returns_the_acquired_controller_snapshot(self):
         acquired = {

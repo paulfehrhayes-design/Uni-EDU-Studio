@@ -1,0 +1,19 @@
+cmdvel_to_sport:
+  ros__parameters:
+    # Topic names
+    cmd_vel_topic: /cmd_vel
+    sport_request_topic: /api/sport/request
+
+    # Control loop rate
+    rate_hz: 30.0
+
+    # Safety: stop the robot if no cmd_vel received within this window (seconds)
+    timeout_s: 0.25
+
+    # Velocity limits for the G1 (keep conservative for safe indoor mapping)
+    max_vx: 0.20       # m/s  forward / backward
+    max_vy: 0.00       # m/s  lateral (G1 is non-holonomic)
+    max_wz: 0.30       # rad/s  yaw rate
+
+    # Duration field sent with each Sport API velocity command (seconds)
+    command_duration: 1.0

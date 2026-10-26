@@ -547,6 +547,10 @@ class G1RobotProgramTests(unittest.TestCase):
                 parse_robot_program(code)
 
     def test_loop_and_expanded_command_limits_remain_without_runtime_cap(self):
+        self.assertEqual(
+            len(parse_robot_program('for count in range(20):\n    robot.stand()')),
+            20,
+        )
         with self.assertRaisesRegex(CommandValidationError, "Loop count"):
             parse_robot_program('for count in range(21):\n    robot.stand()')
         self.assertEqual(
@@ -558,11 +562,11 @@ class G1RobotProgramTests(unittest.TestCase):
             16,
         )
         self.assertEqual(
-            len(parse_robot_program('robot.stand()\n' * 200)),
-            200,
+            len(parse_robot_program('robot.stand()\n' * 400)),
+            400,
         )
         with self.assertRaisesRegex(CommandValidationError, "expanded commands"):
-            parse_robot_program('robot.stand()\n' * 201)
+            parse_robot_program('robot.stand()\n' * 401)
 
     def test_motion_is_held_continuously_until_stop(self):
         class FakeLocoClient:

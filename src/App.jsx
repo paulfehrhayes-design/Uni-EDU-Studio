@@ -2171,7 +2171,9 @@ export default function App() {
         .filter((block) => block.category === category)
         .map((block) => `<block type="${block.type}"></block>`)
         .join('');
-      const colour = category === 'Gestures' || category === 'Arm gestures' || category === 'Arm poses'
+      const colour = category === 'Concurrent actions'
+        ? 210
+        : category === 'Gestures' || category === 'Arm gestures' || category === 'Arm poses'
         ? 280
         : category === 'Control' ? 190 : 160;
       return `<category name="${category}" colour="${colour}">${blocks}</category>`;
@@ -2248,6 +2250,12 @@ export default function App() {
     Blockly.common.defineBlocksWithJsonArray(definitions);
     
     [...allBlocks, ...commandBlocks].forEach(blockDef => {
+      if (blockDef.type === 'duet_concurrent_action') {
+        pythonGenerator.forBlock[blockDef.type] = (block, generator) => (
+          `with duet.concurrent():\n${generator.statementToCode(block, 'LOCOMOTION')}${generator.statementToCode(block, 'GESTURE')}`
+        );
+        return;
+      }
       if (!blockDef.codeTemplate) return;
       pythonGenerator.forBlock[blockDef.type] = function(block, generator) {
         let code = blockDef.codeTemplate;
@@ -2642,6 +2650,8 @@ export default function App() {
           let block;
           if (node.type === 'repeat') {
             block = workspace.newBlock('controls_repeat_ext');
+          } else if (node.type === 'concurrent') {
+            block = workspace.newBlock('duet_concurrent_action');
           } else if (node.type === 'condition') {
             block = workspace.newBlock('controls_if');
             if (node.else.length) {
@@ -2699,7 +2709,7 @@ export default function App() {
             valueBlock.render();
             block.setFieldValue(variable.getId(), 'VAR');
             block.getInput('VALUE').connection.connect(valueBlock.outputConnection);
-          } else {
+          } else if (node.type === 'command') {
             const definition = (controllerVersion === 'duet' ? DUET_COMMANDS : G1_COMMANDS)
               .find((entry) => entry.method === node.method);
             definition.args.forEach((argument, index) => {
@@ -2713,6 +2723,10 @@ export default function App() {
           if (previousBlock) previousBlock.nextConnection.connect(block.previousConnection);
           else if (parentConnection) parentConnection.connect(block.previousConnection);
           if (node.type === 'repeat') createBlocks(node.body, block.getInput('DO').connection);
+          if (node.type === 'concurrent') {
+            createBlocks([node.movement], block.getInput('LOCOMOTION').connection);
+            createBlocks([node.gesture], block.getInput('GESTURE').connection);
+          }
           if (node.type === 'condition') {
             createBlocks(node.then, block.getInput('DO0').connection);
             if (node.else.length) createBlocks(node.else, block.getInput('ELSE').connection);

@@ -28,14 +28,34 @@ DUET_MOVEMENT_PRESETS = {
     "arc_backward_right": (-0.08, 0.0, -0.2),
 }
 DUET_ARM_POSES = {"carry", "forward", "box_hold"}
+DUET_ARM_LEVELS = {"low", "mid", "high"}
 DUET_ARM_MOTIONS = {
     "reach_and_return": ("forward", "carry"),
     "receive_and_hold": ("forward", "box_hold"),
     "hold_and_return": ("box_hold", "carry"),
     "receive_hold_return": ("forward", "box_hold", "carry"),
+    "wave_left": {"low": ("carry", "forward"), "mid": ("forward", "box_hold", "carry"), "high": ("forward", "carry")},
+    "wave_right": {"low": ("carry", "forward"), "mid": ("forward", "box_hold", "carry"), "high": ("forward", "carry")},
+    "raise_left_arm": {"low": ("carry", "box_hold"), "mid": ("box_hold", "forward"), "high": ("forward", "carry")},
+    "raise_right_arm": {"low": ("carry", "box_hold"), "mid": ("box_hold", "forward"), "high": ("forward", "carry")},
+    "raise_both_arms": {"low": ("carry", "box_hold"), "mid": ("box_hold", "forward"), "high": ("forward", "carry")},
 }
-MAX_EXPANDED_COMMANDS = 100
-MAX_PROGRAM_SECONDS = 30.0
+DUET_ARM_COMMANDS = {
+    "arm_carry": ("carry",),
+    "arm_reach": ("forward",),
+    "arm_box_hold": ("box_hold",),
+    "reach_and_return": DUET_ARM_MOTIONS["reach_and_return"],
+    "receive_and_hold": DUET_ARM_MOTIONS["receive_and_hold"],
+    "hold_and_return": DUET_ARM_MOTIONS["hold_and_return"],
+    "receive_hold_return": DUET_ARM_MOTIONS["receive_hold_return"],
+    **{
+        f"{method}_{level}": poses
+        for method, levels in DUET_ARM_MOTIONS.items()
+        if isinstance(levels, dict)
+        for level, poses in levels.items()
+    },
+}
+MAX_EXPANDED_COMMANDS = 400
 COMMAND_LEASE_MS = 250
 COMMAND_REFRESH_SECONDS = 0.1
 
@@ -171,6 +191,39 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict:
             "yaw_rate_rps": yaw_rate,
             "duration_s": duration,
         }
+    if method == "move_and_arm" and len(args) == 6:
+        vx = _finite_number(args[0], "forward m/s")
+        vy = _finite_number(args[1], "lateral m/s")
+        yaw_rate = _finite_number(args[2], "yaw rad/s")
+        move_duration = _finite_number(args[3], "move duration")
+        pose = args[4]
+        if not isinstance(pose, ast.Constant) or not isinstance(pose.value, str):
+            raise DuetControllerError("arm pose must be a named preset string.")
+        pose_name = pose.value.strip().lower()
+        arm_duration = _finite_number(args[5], "arm pose lease duration")
+        if not -0.2 <= vx <= 0.3:
+            raise DuetControllerError("forward m/s must be between -0.2 and 0.3.")
+        if not -0.15 <= vy <= 0.15:
+            raise DuetControllerError("lateral m/s must be between -0.15 and 0.15.")
+        if not -0.35 <= yaw_rate <= 0.35:
+            raise DuetControllerError("yaw rad/s must be between -0.35 and 0.35.")
+        if not 0.1 <= move_duration <= 2.5:
+            raise DuetControllerError("move duration must be between 0.1 and 2.5 seconds.")
+        if pose_name not in DUET_ARM_POSES:
+            raise DuetControllerError(f"Unsupported DUET arm pose '{pose_name}'.")
+        if not 1 <= arm_duration <= 3:
+            raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
+        if arm_duration < move_duration + 0.25:
+            raise DuetControllerError("arm pose lease must exceed move duration by at least 0.25 seconds.")
+        return {
+            "type": "move_and_arm",
+            "vx_mps": vx,
+            "vy_mps": vy,
+            "yaw_rate_rps": yaw_rate,
+            "duration_s": move_duration,
+            "pose": pose_name,
+            "arm_duration_s": arm_duration,
+        }
     if method in DUET_MOVEMENT_PRESETS and len(args) == 1:
         duration = _finite_number(args[0], "duration")
         if not 0.1 <= duration <= 3:
@@ -194,6 +247,14 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict:
         if not 1 <= duration <= 3:
             raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
         return {"type": "arm_pose", "pose": pose_name, "duration_s": duration}
+    if method in DUET_ARM_COMMANDS and len(args) == 1:
+        duration = _finite_number(args[0], "arm pose lease duration")
+        if not 1 <= duration <= 3:
+            raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
+        return [
+            {"type": "arm_pose", "pose": pose, "duration_s": duration}
+            for pose in DUET_ARM_COMMANDS[method]
+        ]
     if method == "arm_motion" and len(args) == 2:
         motion = args[0]
         if not isinstance(motion, ast.Constant) or not isinstance(motion.value, str):
@@ -207,6 +268,23 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict:
         duration = _finite_number(args[1], "arm pose lease duration")
         if not 1 <= duration <= 3:
             raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
+        if isinstance(poses, dict):
+            poses = poses.get("mid", tuple())
+        return [
+            {"type": "arm_pose", "pose": pose, "duration_s": duration}
+            for pose in poses
+        ]
+    if method in {"wave_left", "wave_right", "raise_left_arm", "raise_right_arm", "raise_both_arms"} and len(args) == 2:
+        level = args[0]
+        if not isinstance(level, ast.Constant) or not isinstance(level.value, str):
+            raise DuetControllerError(f"{method} requires a named level string.")
+        level_name = level.value.strip().lower()
+        if level_name not in DUET_ARM_LEVELS:
+            raise DuetControllerError(f"Unsupported DUET arm level '{level_name}'.")
+        duration = _finite_number(args[1], "arm pose lease duration")
+        if not 1 <= duration <= 3:
+            raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
+        poses = DUET_ARM_MOTIONS[method][level_name]
         return [
             {"type": "arm_pose", "pose": pose, "duration_s": duration}
             for pose in poses
@@ -218,7 +296,7 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict:
         return {"type": "wait", "duration_s": duration}
     if method == "stop" and not args:
         return {"type": "stop"}
-    if method not in {"move", *DUET_MOVEMENT_PRESETS, "arm_pose", "arm_motion", "wait", "stop"}:
+    if method not in {"move", "move_and_arm", *DUET_MOVEMENT_PRESETS, "arm_pose", "arm_motion", "wait", "stop"}:
         raise DuetControllerError(f"Unknown DUET command 'duet.{method}' (line {line_number}).")
     raise DuetControllerError(f"duet.{method} has an invalid number of arguments (line {line_number}).")
 
@@ -240,6 +318,48 @@ def _parse_duet_program(code: str) -> list[dict]:
                 command = _command_from_call(statement.value, statement.lineno)
                 parsed.extend(command if isinstance(command, list) else [command])
             elif (
+                isinstance(statement, ast.With)
+                and len(statement.items) == 1
+                and statement.items[0].optional_vars is None
+                and isinstance(statement.items[0].context_expr, ast.Call)
+                and isinstance(statement.items[0].context_expr.func, ast.Attribute)
+                and isinstance(statement.items[0].context_expr.func.value, ast.Name)
+                and statement.items[0].context_expr.func.value.id == "duet"
+                and statement.items[0].context_expr.func.attr == "concurrent"
+                and not statement.items[0].context_expr.args
+                and not statement.items[0].context_expr.keywords
+            ):
+                body = statement.body
+                if len(body) != 2 or any(
+                    not isinstance(item, ast.Expr) or not isinstance(item.value, ast.Call)
+                    for item in body
+                ):
+                    raise DuetControllerError(
+                        f"Concurrent action on line {statement.lineno} must contain exactly one locomotion and one arm command."
+                    )
+                first = _command_from_call(body[0].value, body[0].lineno)
+                second = _command_from_call(body[1].value, body[1].lineno)
+                children = [first, second]
+                movement = next(
+                    (child for child in children if isinstance(child, dict) and child.get("type") == "move"),
+                    None,
+                )
+                gesture = next(
+                    (child for child in children if isinstance(child, list) and child and all(
+                        item.get("type") == "arm_pose" for item in child
+                    )),
+                    None,
+                )
+                if movement is None or gesture is None:
+                    raise DuetControllerError(
+                        f"Concurrent action on line {statement.lineno} needs one supported locomotion command and one arm gesture."
+                    )
+                parsed.append({
+                    "type": "concurrent",
+                    "movement": movement,
+                    "arm_commands": gesture,
+                })
+            elif (
                 isinstance(statement, ast.For)
                 and isinstance(statement.target, ast.Name)
                 and statement.target.id == "_"
@@ -253,8 +373,8 @@ def _parse_duet_program(code: str) -> list[dict]:
                 and not isinstance(statement.iter.args[0].value, bool)
             ):
                 repeat_count = statement.iter.args[0].value
-                if not 1 <= repeat_count <= 10:
-                    raise DuetControllerError(f"Loop count on line {statement.lineno} must be between 1 and 10.")
+                if not 1 <= repeat_count <= 20:
+                    raise DuetControllerError(f"Loop count on line {statement.lineno} must be between 1 and 20.")
                 if statement.orelse:
                     raise DuetControllerError("DUET loops may not contain else clauses.")
                 nested = visit(statement.body, depth + 1)
@@ -263,7 +383,11 @@ def _parse_duet_program(code: str) -> list[dict]:
                 parsed.extend(nested * repeat_count)
             else:
                 raise DuetControllerError(f"Unsupported DUET statement on line {getattr(statement, 'lineno', 1)}.")
-            if len(parsed) > MAX_EXPANDED_COMMANDS:
+            expanded_count = sum(
+                1 + len(item["arm_commands"]) if item.get("type") == "concurrent" else 1
+                for item in parsed
+            )
+            if expanded_count > MAX_EXPANDED_COMMANDS:
                 raise DuetControllerError(f"DUET programs may contain at most {MAX_EXPANDED_COMMANDS} expanded commands.")
         return parsed
 
@@ -273,9 +397,6 @@ def _parse_duet_program(code: str) -> list[dict]:
     for index, command in enumerate(commands[:-1]):
         if command["type"] == "stop":
             raise DuetControllerError("duet.stop() must be the final command in a program.")
-    total_seconds = sum(command.get("duration_s", 0.0) for command in commands)
-    if total_seconds > MAX_PROGRAM_SECONDS:
-        raise DuetControllerError(f"DUET program duration may not exceed {MAX_PROGRAM_SECONDS:g} seconds.")
     return commands
 
 
@@ -475,7 +596,7 @@ def execute_program(code: str) -> dict:
             or status.get("lowcmd_owner") != "duet"
         ):
             raise DuetControllerError("DUET controller must be ready and connected before running a program.")
-        if any(command["type"] == "arm_pose" for command in commands) and "arm_pose" not in status["capabilities"]:
+        if any(command["type"] in {"arm_pose", "move_and_arm", "concurrent"} for command in commands) and "arm_pose" not in status["capabilities"]:
             raise DuetControllerError("The DUET controller has not enabled its separately accepted arm-pose capability.")
 
         for command in parse_duet_program(code):
@@ -496,7 +617,167 @@ def execute_program(code: str) -> dict:
                     remaining = deadline - time.monotonic()
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
-                status = _stop_gateway_command()
+                _stop_gateway_command()
+                if _stop_requested.is_set():
+                    break
+            elif command["type"] == "concurrent":
+                movement = command["movement"]
+                arm_commands = command["arm_commands"]
+                if not arm_commands:
+                    raise DuetControllerError("DUET concurrent action has no validated arm commands.")
+
+                started_at = time.monotonic()
+                move_deadline = started_at + movement["duration_s"]
+                arm_deadline = started_at + sum(item["duration_s"] for item in arm_commands)
+                first_arm = arm_commands[0]
+                status = _validate_controller_status(_gateway_request(
+                    f"ARM_POSE {first_arm['pose']} {int(first_arm['duration_s'] * 1000)}"
+                ))
+                if (
+                    status.get("control_lease") is not True
+                    or status.get("ready") is not True
+                    or "arm_pose" not in status["capabilities"]
+                    or status.get("arm_pose_active") is not True
+                ):
+                    raise DuetControllerError(
+                        "DUET gateway did not confirm the first arm-pose lease before concurrent execution."
+                    )
+
+                pose_index = 0
+                next_pose_at = started_at + first_arm["duration_s"]
+                while time.monotonic() < max(move_deadline, arm_deadline):
+                    if _stop_requested.is_set():
+                        _stop_gateway_command()
+                        break
+
+                    now = time.monotonic()
+                    while pose_index + 1 < len(arm_commands) and now >= next_pose_at:
+                        pose_index += 1
+                        next_arm = arm_commands[pose_index]
+                        status = _validate_controller_status(_gateway_request(
+                            f"ARM_POSE {next_arm['pose']} {int(next_arm['duration_s'] * 1000)}"
+                        ))
+                        if (
+                            status.get("control_lease") is not True
+                            or status.get("ready") is not True
+                            or "arm_pose" not in status["capabilities"]
+                            or status.get("arm_pose_active") is not True
+                        ):
+                            raise DuetControllerError(
+                                "DUET gateway did not confirm an arm-pose transition during concurrent execution."
+                            )
+                        next_pose_at += next_arm["duration_s"]
+
+                    now = time.monotonic()
+                    moving = now < move_deadline
+                    velocity = movement if moving else {
+                        "vx_mps": 0.0,
+                        "vy_mps": 0.0,
+                        "yaw_rate_rps": 0.0,
+                    }
+                    request = (
+                        f"MOVE {velocity['vx_mps']:.6f} {velocity['vy_mps']:.6f} "
+                        f"{velocity['yaw_rate_rps']:.6f} {COMMAND_LEASE_MS}"
+                    )
+                    status = _validate_controller_status(_gateway_request(request))
+                    if status.get("control_lease") is not True or status.get("ready") is not True:
+                        raise DuetControllerError(
+                            "DUET control lease or controller readiness was lost during concurrent execution."
+                        )
+                    if status.get("motion_active") is not moving:
+                        expectation = "active" if moving else "inactive"
+                        raise DuetControllerError(
+                            f"DUET gateway did not confirm {expectation} base motion during concurrent execution."
+                        )
+                    arm_active = now < arm_deadline
+                    if status.get("arm_pose_active") is not arm_active:
+                        expectation = "active" if arm_active else "inactive"
+                        raise DuetControllerError(
+                            f"DUET gateway did not confirm the arm-pose lease was {expectation} during concurrent execution."
+                        )
+
+                    now = time.monotonic()
+                    deadline = max(move_deadline, arm_deadline)
+                    next_deadline = min(deadline, now + COMMAND_REFRESH_SECONDS)
+                    if now < move_deadline:
+                        next_deadline = min(next_deadline, move_deadline)
+                    if pose_index + 1 < len(arm_commands):
+                        next_deadline = min(next_deadline, next_pose_at)
+                    remaining = next_deadline - now
+                    if remaining > 0 and _stop_requested.wait(remaining):
+                        _stop_gateway_command()
+                        break
+                else:
+                    _stop_gateway_command()
+                if _stop_requested.is_set():
+                    break
+            elif command["type"] == "move_and_arm":
+                arm_duration_ms = int(command["arm_duration_s"] * 1000)
+                status = _validate_controller_status(_gateway_request(
+                    f"ARM_POSE {command['pose']} {arm_duration_ms}"
+                ))
+                if (
+                    status.get("control_lease") is not True
+                    or status.get("ready") is not True
+                    or "arm_pose" not in status["capabilities"]
+                    or status.get("arm_pose_active") is not True
+                ):
+                    raise DuetControllerError(
+                        "DUET gateway did not confirm the arm pose lease before concurrent movement."
+                    )
+                deadline = time.monotonic() + command["duration_s"]
+                while time.monotonic() < deadline:
+                    if _stop_requested.is_set():
+                        break
+                    request = (
+                        f"MOVE {command['vx_mps']:.6f} {command['vy_mps']:.6f} "
+                        f"{command['yaw_rate_rps']:.6f} {COMMAND_LEASE_MS}"
+                    )
+                    status = _validate_controller_status(_gateway_request(request))
+                    if status.get("control_lease") is not True or status.get("ready") is not True:
+                        raise DuetControllerError("DUET control lease or controller readiness was lost during concurrent motion.")
+                    if status.get("motion_active") is not True:
+                        raise DuetControllerError("DUET gateway did not confirm active base motion during concurrent execution.")
+                    if status.get("arm_pose_active") is not True:
+                        raise DuetControllerError("DUET arm-pose lease ended before concurrent movement completed.")
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
+                        break
+                if _stop_requested.is_set():
+                    _stop_gateway_command()
+                    break
+                status = _validate_controller_status(_gateway_request(
+                    f"MOVE 0 0 0 {COMMAND_LEASE_MS}"
+                ))
+                if (
+                    status.get("control_lease") is not True
+                    or status.get("ready") is not True
+                    or status.get("motion_active") is not False
+                    or status.get("arm_pose_active") is not True
+                ):
+                    raise DuetControllerError(
+                        "DUET gateway did not confirm zero base velocity while preserving the arm-pose lease."
+                    )
+                arm_deadline = time.monotonic() + command["arm_duration_s"] - command["duration_s"]
+                while time.monotonic() < arm_deadline:
+                    if _stop_requested.is_set():
+                        break
+                    status = _validate_controller_status(_gateway_request(
+                        f"MOVE 0 0 0 {COMMAND_LEASE_MS}"
+                    ))
+                    if (
+                        status.get("control_lease") is not True
+                        or status.get("ready") is not True
+                        or status.get("motion_active") is not False
+                        or status.get("arm_pose_active") is not True
+                    ):
+                        raise DuetControllerError(
+                            "DUET gateway lost zero base velocity or the arm-pose lease during concurrent execution."
+                        )
+                    remaining = arm_deadline - time.monotonic()
+                    if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
+                        break
+                _stop_gateway_command()
                 if _stop_requested.is_set():
                     break
             elif command["type"] == "wait":

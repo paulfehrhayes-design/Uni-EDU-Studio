@@ -17,6 +17,38 @@ test('DUET simulator applies bounded base velocity to the path', () => {
   assert.equal(final.mode, 'duet-preview');
 });
 
+test('DUET simulator previews base movement and named arm pose over the same interval', () => {
+  const frames = simulateDuetG1Edu23Program(
+    'with duet.concurrent():\n'
+    + '    duet.forward(1)\n'
+    + '    duet.arm_reach(1.5)',
+  );
+  const overlapFrame = frames.find((frame) => frame.x > 0 && frame.joints.left_shoulder_pitch_joint < 0);
+  const final = frames.at(-1);
+
+  assert.ok(overlapFrame, 'base path and arm target should both change during the preview');
+  assert.ok(Math.abs(final.x - 0.15) < 1e-6);
+  assert.equal(final.time, 1.5);
+  assert.equal(final.actions.at(-1).label, 'DUET concurrent move + arm');
+});
+
+test('DUET simulator overlaps locomotion with multi-stage gestures and keeps surrounding commands sequential', () => {
+  const frames = simulateDuetG1Edu23Program(
+    'duet.wait(0.5)\n'
+    + 'for _ in range(2):\n'
+    + '    with duet.concurrent():\n'
+    + '        duet.backward(1)\n'
+    + '        duet.wave_left_mid(1)\n'
+    + 'duet.wait(0.5)',
+  );
+  const final = frames.at(-1);
+  const pairedActions = final.actions.filter(({ label }) => label === 'DUET concurrent move + arm');
+
+  assert.equal(pairedActions.length, 2);
+  assert.equal(final.time, 7);
+  assert.ok(Math.abs(final.x + 0.2) < 1e-6);
+});
+
 test('DUET simulator maps preset locomotion blocks to the same bounded velocity space', () => {
   const final = simulateDuetG1Edu23Program(
     'duet.forward(1)\n'
@@ -30,14 +62,14 @@ test('DUET simulator maps preset locomotion blocks to the same bounded velocity 
 });
 
 test('DUET simulator previews only the three named arm-pose presets', () => {
-  const final = simulateDuetG1Edu23Program('duet.arm_pose("forward", 1)').at(-1);
+  const final = simulateDuetG1Edu23Program('duet.arm_reach(1)').at(-1);
   assert.ok(final.joints.left_shoulder_pitch_joint < 0);
   assert.equal(final.joints.left_elbow_joint, Number((0.87 * 180 / Math.PI).toFixed(2)));
   assert.equal(final.joints.right_shoulder_roll_joint < 0, true);
 });
 
 test('DUET simulator previews fixed arm sequences using only existing named poses', () => {
-  const frames = simulateDuetG1Edu23Program('duet.arm_motion("reach_and_return", 1.5)');
+  const frames = simulateDuetG1Edu23Program('duet.reach_and_return(1.5)');
   const final = frames.at(-1);
   assert.equal(final.actions.length, 2);
   assert.equal(final.actions.at(-1).summary, 'Preview the carry preset over 1.5 s');

@@ -1,7 +1,7 @@
 import { G1_COMMANDS, parseG1Program } from '../sim/g1Commands.js';
 
 const commandDefinitions = new Map(G1_COMMANDS.map((command) => [command.method, command]));
-const MAX_EXPANDED_COMMANDS = 100;
+const MAX_EXPANDED_COMMANDS = 400;
 
 function getPhysicalCommands(code, adapter, isSupported) {
   const commands = [];

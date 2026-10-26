@@ -1,0 +1,14 @@
+# VS Code
+.vscode/browse.vc.db
+.DS_Store
+*.swp
+*~
+
+# Build/Cache files
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+build/
+
