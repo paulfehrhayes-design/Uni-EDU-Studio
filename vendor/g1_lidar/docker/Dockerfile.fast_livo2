@@ -1,0 +1,88 @@
+FROM ros:humble
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ROS_DISTRO=humble
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    libpcl-dev \
+    libeigen3-dev \
+    libopencv-dev \
+    libboost-all-dev \
+    ros-${ROS_DISTRO}-pcl-ros \
+    ros-${ROS_DISTRO}-pcl-conversions \
+    ros-${ROS_DISTRO}-cv-bridge \
+    ros-${ROS_DISTRO}-image-transport \
+    ros-${ROS_DISTRO}-tf2 \
+    ros-${ROS_DISTRO}-tf2-ros \
+    ros-${ROS_DISTRO}-tf2-geometry-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Sophus 1.22.10
+RUN cd /tmp && \
+    git clone https://github.com/strasdat/Sophus.git -b 1.22.10 && \
+    cd Sophus && mkdir build && cd build && \
+    cmake .. && make -j$(nproc) && make install && \
+    cd / && rm -rf /tmp/Sophus
+
+# Livox SDK2 (needed by livox_ros_driver2)
+RUN cd /tmp && \
+    git clone https://github.com/Livox-SDK/Livox-SDK2.git && \
+    cd Livox-SDK2 && mkdir build && cd build && \
+    cmake .. && make -j$(nproc) && make install && \
+    cd / && rm -rf /tmp/Livox-SDK2
+
+WORKDIR /fast_livo2_ws/src
+
+# Vikit (ROS2 ament, with fisheye support)
+RUN git clone https://github.com/Rhymer-Lcy/rpg_vikit_ros2_fisheye.git && \
+    cp -r rpg_vikit_ros2_fisheye/vikit_common . && \
+    cp -r rpg_vikit_ros2_fisheye/vikit_ros . && \
+    rm -rf rpg_vikit_ros2_fisheye
+
+# livox_ros_driver2 (for CustomMsg type + driver)
+RUN git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+
+# FAST-LIVO2 (ROS2 Humble + MID-360 + Fisheye)
+RUN git clone https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git fast_livo
+
+WORKDIR /fast_livo2_ws
+
+SHELL ["/bin/bash", "-c"]
+
+# Build vikit first (dependency for fast_livo)
+RUN source /opt/ros/${ROS_DISTRO}/setup.bash && \
+    colcon build --symlink-install \
+      --packages-select vikit_common vikit_ros \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release 2>&1 || true
+
+# Prepare livox_ros_driver2 for ROS2 Humble build
+RUN cd /fast_livo2_ws/src/livox_ros_driver2 && \
+    cp package_ROS2.xml package.xml && \
+    cp -rf launch_ROS2/ launch/ && \
+    sed -i 's|</package>|  <member_of_group>rosidl_interface_packages</member_of_group>\n</package>|' package.xml
+
+# Build livox_ros_driver2 with ROS2 edition flags
+RUN source /opt/ros/${ROS_DISTRO}/setup.bash && \
+    source /fast_livo2_ws/install/setup.bash 2>/dev/null || true && \
+    colcon build --symlink-install \
+      --packages-select livox_ros_driver2 \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release -DROS_EDITION=ROS2 -DHUMBLE_ROS=humble 2>&1 || true
+
+# Build fast_livo
+RUN source /opt/ros/${ROS_DISTRO}/setup.bash && \
+    source /fast_livo2_ws/install/setup.bash 2>/dev/null || true && \
+    colcon build --symlink-install --continue-on-error \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release 2>&1 || true
+
+RUN echo 'source /opt/ros/${ROS_DISTRO}/setup.bash' >> /root/.bashrc && \
+    echo 'source /fast_livo2_ws/install/setup.bash 2>/dev/null || true' >> /root/.bashrc
+
+ENTRYPOINT ["/bin/bash", "-c", \
+  "source /opt/ros/${ROS_DISTRO}/setup.bash && \
+   source /fast_livo2_ws/install/setup.bash 2>/dev/null && \
+   exec \"$@\"", "--"]
+CMD ["bash"]

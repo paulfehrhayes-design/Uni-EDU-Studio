@@ -1,0 +1,6 @@
+<launch>
+    <node pkg="g1_decision" type="random_deci" name="random_deci">
+    </node>
+
+
+</launch>

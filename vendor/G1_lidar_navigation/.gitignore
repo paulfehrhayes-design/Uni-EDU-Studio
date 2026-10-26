@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+devel/
+**/build/
+Log/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / OS
+.vscode/c_cpp_properties.json
+.vscode/settings.json
+.idea/
+.DS_Store
+*.swp
+
+# Recordings & maps (large; never in git)
+*.bag
+*.mp4
+*.avi
+*.mov
+*.zip
+*.pcd
+*.pgm
+maps/

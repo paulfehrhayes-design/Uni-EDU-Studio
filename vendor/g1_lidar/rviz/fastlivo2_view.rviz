@@ -1,0 +1,88 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Value: true
+      Cell Size: 1
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Plane: XY
+      Plane Cell Count: 20
+
+    - Class: rviz_default_plugins/PointCloud2
+      Name: RegisteredCloud
+      Value: true
+      Topic:
+        Value: /cloud_registered
+        Depth: 5
+        Reliability Policy: Reliable
+      Size (Pixels): 2
+      Color Transformer: FlatColor
+      Color: 0; 255; 0
+      Decay Time: 30
+      Style: Points
+
+    - Class: rviz_default_plugins/PointCloud2
+      Name: LaserMap
+      Value: true
+      Topic:
+        Value: /Laser_map
+        Depth: 5
+        Reliability Policy: Reliable
+      Size (Pixels): 1
+      Color Transformer: FlatColor
+      Color: 255; 255; 255
+      Decay Time: 0
+      Style: Points
+
+    - Class: rviz_default_plugins/Path
+      Name: Path
+      Value: true
+      Topic:
+        Value: /path
+        Depth: 5
+        Reliability Policy: Reliable
+      Color: 255; 50; 50
+      Line Style: Lines
+      Line Width: 0.03
+
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Value: true
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Frame Timeout: 15
+
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: camera_init
+    Frame Rate: 30
+  Name: root
+  Value: ""
+  Views:
+    Current:
+      Class: rviz_default_plugins/ThirdPersonFollower
+      Distance: 30
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Name: Current View
+      Pitch: 0.5
+      Target Frame: <Fixed Frame>
+      Yaw: 3.14
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 846
+  Width: 1280

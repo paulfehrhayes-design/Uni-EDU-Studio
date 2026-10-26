@@ -1,0 +1,72 @@
+services:
+  # =========================================================
+  # GLIM: GPU-accelerated LiDAR SLAM (ROS2 Jazzy)
+  # =========================================================
+  # Usage:
+  #   docker compose up glim          # CPU mode
+  #   docker compose up glim-gpu      # GPU/CUDA mode
+  # =========================================================
+  glim:
+    image: koide3/glim_ros2:jazzy
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/config/fastdds_no_shm.xml
+    volumes:
+      - ../glim_config:/glim/config:ro
+      - ./fastdds_no_shm.xml:/config/fastdds_no_shm.xml:ro
+    command: >
+      ros2 run glim_ros glim_rosnode
+      --ros-args -p config_path:=/glim/config
+    profiles:
+      - glim
+
+  glim-gpu:
+    image: koide3/glim_ros2:jazzy_cuda13.1
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/config/fastdds_no_shm.xml
+    volumes:
+      - ../glim_config:/glim/config:ro
+      - ./fastdds_no_shm.xml:/config/fastdds_no_shm.xml:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      ros2 run glim_ros glim_rosnode
+      --ros-args -p config_path:=/glim/config
+    profiles:
+      - glim-gpu
+
+  # =========================================================
+  # Fast-LIVO2: LiDAR-Inertial-Visual SLAM (ROS2 Humble)
+  # =========================================================
+  # Build first: docker compose build fast-livo2
+  # Run:         docker compose up fast-livo2
+  # =========================================================
+  fast-livo2:
+    build:
+      context: .
+      dockerfile: Dockerfile.fast_livo2
+    image: fast_livo2_g1:latest
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/config/fastdds_no_shm.xml
+    volumes:
+      - ../fast_livo2_config:/fast_livo2_ws/config_g1:ro
+      - ./fastdds_no_shm.xml:/config/fastdds_no_shm.xml:ro
+    command: >
+      ros2 launch fast_livo mapping_aviz_metacamedu.launch.py use_rviz:=False
+    profiles:
+      - fast-livo2

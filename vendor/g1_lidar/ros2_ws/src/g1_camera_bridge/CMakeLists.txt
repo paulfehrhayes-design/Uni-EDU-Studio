@@ -1,0 +1,30 @@
+cmake_minimum_required(VERSION 3.14)
+project(g1_camera_bridge)
+
+set(CMAKE_CXX_STANDARD 17)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
+find_package(OpenCV REQUIRED)
+
+set(UNITREE_SDK /home/ubuntu/workspace/sakai/unitree_sdk2)
+
+add_executable(g1_camera_bridge g1_camera_bridge.cpp)
+target_include_directories(g1_camera_bridge PRIVATE
+  ${UNITREE_SDK}/include
+  ${UNITREE_SDK}/thirdparty/include
+  ${UNITREE_SDK}/thirdparty/include/ddscxx
+  ${UNITREE_SDK}/thirdparty/include/ddsc
+)
+target_link_libraries(g1_camera_bridge
+  ${UNITREE_SDK}/lib/x86_64/libunitree_sdk2.a
+  ${UNITREE_SDK}/thirdparty/lib/x86_64/libddsc.so
+  ${UNITREE_SDK}/thirdparty/lib/x86_64/libddscxx.so
+  ${OpenCV_LIBRARIES}
+  pthread
+)
+ament_target_dependencies(g1_camera_bridge rclcpp sensor_msgs cv_bridge)
+install(TARGETS g1_camera_bridge DESTINATION lib/${PROJECT_NAME})
+ament_package()

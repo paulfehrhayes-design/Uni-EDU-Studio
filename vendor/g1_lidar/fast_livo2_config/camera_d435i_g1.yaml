@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    camera:
+      model: Pinhole
+      width: 1280
+      height: 720
+      scale: 0.5
+      # Intel RealSense D435i default intrinsics (640x480 equivalent scaled)
+      # TODO: Replace with actual intrinsics from `ros2 topic echo /camera/color/camera_info`
+      fx: 615.0
+      fy: 615.0
+      cx: 640.0
+      cy: 360.0
+      d0: 0.0
+      d1: 0.0
+      d2: 0.0
+      d3: 0.0

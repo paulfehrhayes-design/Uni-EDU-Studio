@@ -1,0 +1,5 @@
+alpha_v: 0.4 # Increased from 0.2 to be more responsive
+alpha_w: 0.4 # Increased from 0.2 to be more responsive
+raw_cmd_topic: "cmd_vel" # raw_cmd_vel by default
+cmd_topic: "smooth_cmd_vel" # cmd_vel by default
+cmd_rate: 30.0 # 30.0 Hz by default

@@ -1,0 +1,14 @@
+<launch>
+    <param name="cmd_vel_topic" type="string" value="cmd_vel"/>
+    <node pkg="g1_serial" type="g1_send" name="g1_send" output="screen" 
+    args="/dev/ttyUSB0">
+
+    <!-- 
+        虚拟串口-ttyACM0
+        usb转ttl-ttyUSB0
+     -->
+	
+    </node>
+
+
+</launch>

@@ -1,0 +1,35 @@
+# Build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+fast_livo2_ws/build/
+fast_livo2_ws/install/
+fast_livo2_ws/log/
+
+# Symlinks in workspace src (point to local paths)
+ros2_ws/src/FAST_LIO
+ros2_ws/src/livox_ros_driver2
+ros2_ws/src/open3d_loc
+fast_livo2_ws/src/fast_livo
+
+# External repositories (clone separately or use git submodules)
+FAST-LIVO2-ROS2/
+FAST_LIO_LOCALIZATION_HUMANOID/
+Livox-SDK2/
+livox_ros_driver2/
+
+# Open3D pre-built binaries
+open3d-devel-linux-x86_64-cxx11-abi-0.18.0/
+open3d-devel.tar.xz
+open3d.tar.xz
+
+# OS / Editor
+.vscode/
+*.swp
+*.swo
+*~
+__pycache__/
+*.pyc
+
+# ROS2
+*.bag
