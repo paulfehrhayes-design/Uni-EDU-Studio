@@ -23,6 +23,31 @@ None of these sources justifies running a second locomotion publisher.
 
 - The workspace already builds/installs `Livox-SDK2` and `livox_ros_driver2`;
   keep that single sensor-driver path.
+- Distance-footprint geometry now comes from the checked-in DUET G1 EDU
+  23-DoF model, paired with the app's 23-actuated-joint URDF. The model-derived
+  footprint removes manual dimension entry; it does not prove that a physical
+  sensor is mounted in the modeled position.
+- `KaiFeng-Frank/lidar-camera-imu-calibration` is a calibration workbench for a
+  specific D435i/MID-360S rig. Its documented workflow relies on a physical
+  AprilGrid, repeated captures, sensor identity, and a ROS 2 Jazzy runtime.
+  Those dependencies do not match this project's ROS 2 Humble LiDAR distance
+  provider, so the workbench is not copied or reported as an automatic
+  calibration result.
+- `RaaSaaR-org/g1-sensor-toolkit` is a useful read-only DDS discovery reference,
+  but its stated target is a 29-DoF G1 and its camera path uses a separate ZMQ
+  transport. It is not a drop-in source for this 23-DoF, ROS-backed sensor path.
+- `botbotrobotics/BotBrain` documents ROS 2 Humble and RealSense streaming, but
+  it is a complete Jetson control/navigation stack rather than a calibration
+  library. Its motion arbitration and navigation stack are not imported because
+  Uni-EDU must retain one robot-motion owner.
+- RealSense and Unitree camera discovery currently reports ROS image topics,
+  freshness, and CameraInfo intrinsics; Uni-EDU does not yet relay those camera
+  frames into its browser. The MID-360 driver/provider is the only deployed
+  sensor execution path in the current installer.
+- A matching live ROS transform is a model-based check, not an independent
+  LiDAR-camera/IMU extrinsic calibration. Physical mount confirmation and
+  exact-robot acceptance remain required; do not treat sensor status as proof
+  of calibration or safety.
 - This audit does not select or install a SLAM/Nav2 stack or a G1 locomotion
   bridge. Those remain deployment choices requiring ROS-distro, license,
   hardware-layout, and commissioning review.
@@ -45,3 +70,6 @@ None of these sources justifies running a second locomotion publisher.
 - FAST-LIO branch and license ambiguity: [README](https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID/blob/e4234d4e559548bfe0afdf407990bfb206e183c0/README.md), [package manifest](https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID/blob/e4234d4e559548bfe0afdf407990bfb206e183c0/FAST_LIO/package.xml), [embedded license](https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID/blob/e4234d4e559548bfe0afdf407990bfb206e183c0/FAST_LIO/LICENSE)
 - Alternative G1 sensor configurations: [SETUP](https://github.com/syakaikungg/g1_lidar/blob/a321cd7ee114904edc8056ae6f801e818dbd3109/SETUP.md)
 - Optional RealSense wrapper: [README](https://github.com/realsenseai/realsense-ros/blob/7a87097c499e3b0b69518d54a8e7a9ac1924e87c/README.md), [LICENSE](https://github.com/realsenseai/realsense-ros/blob/7a87097c499e3b0b69518d54a8e7a9ac1924e87c/LICENSE)
+- Calibration workbench: [KaiFeng-Frank/lidar-camera-imu-calibration README](https://github.com/KaiFeng-Frank/lidar-camera-imu-calibration/blob/master/README.md)
+- G1 sensor discovery reference: [RaaSaaR-org/g1-sensor-toolkit README](https://github.com/RaaSaaR-org/g1-sensor-toolkit/blob/main/README.md)
+- Jetson camera/control stack: [botbotrobotics/BotBrain README](https://github.com/botbotrobotics/BotBrain/blob/main/README.md)

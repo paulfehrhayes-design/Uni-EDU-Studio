@@ -645,7 +645,12 @@ def _distance_condition_result(sample: dict[str, Any], operator: str, threshold:
     )
 
 
-def execute_robot_program(code: str) -> dict[str, Any]:
+def execute_robot_program(
+    code: str,
+    *,
+    reset_stop_request: bool = True,
+    clear_stop_request: bool = True,
+) -> dict[str, Any]:
     try:
         commands = parse_robot_program(code)
     except CommandValidationError as error:
@@ -655,7 +660,8 @@ def execute_robot_program(code: str) -> dict[str, Any]:
     if not _run_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="A robot program is already running.")
 
-    _stop_requested.clear()
+    if reset_stop_request:
+        _stop_requested.clear()
     results: list[dict[str, Any]] = []
     conditions_evaluated: list[dict[str, Any]] = []
     boolean_variables: dict[str, bool] = {}
@@ -867,8 +873,13 @@ def execute_robot_program(code: str) -> dict[str, Any]:
         _log_event("program_failed", error=str(error))
         raise HTTPException(status_code=502, detail=f"G1 command failed: {error}") from error
     finally:
-        _stop_requested.clear()
+        if clear_stop_request:
+            _stop_requested.clear()
         _run_lock.release()
+
+
+def clear_robot_stop_request() -> None:
+    _stop_requested.clear()
 
 
 def stop_robot() -> dict[str, str]:

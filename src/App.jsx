@@ -38,6 +38,107 @@ import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
 
+const PLANNER_PATH_MODES = Object.freeze({
+  manual: 'manual',
+  sensor_corrected: 'sensor_corrected',
+  autonomous: 'autonomous',
+});
+
+const PLANNER_MODE_LABELS = Object.freeze({
+  manual: 'Normal path',
+  sensor_corrected: 'Sensor-corrected path',
+  autonomous: 'Autonomous obstacle-aware path',
+});
+
+function attachPlannerProjectMeta(code = '', meta = {}) {
+  if (!meta || typeof meta !== 'object' || !Object.keys(meta).length) {
+    return code || '';
+  }
+  const payload = JSON.stringify(meta, null, 0);
+  return `# __PLANNER_META__ ${payload}\n${code || ''}`.trimEnd() + '\n';
+}
+
+function stripPlannerProjectMeta(code = '') {
+  if (!code || typeof code !== 'string') return '';
+  return code.replace(/^# __PLANNER_META__ .*\n?/m, '').trim();
+}
+
+function parsePlannerProjectMeta(code = '') {
+  if (!code || typeof code !== 'string') return null;
+  const match = code.match(/^# __PLANNER_META__\s*(\{.*\})\s*\n?/m);
+  if (!match || !match[1]) return null;
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function buildSdkCommandsFromTrace(pathTrace = []) {
+  if (!Array.isArray(pathTrace) || pathTrace.length < 2) {
+    throw new Error('Nav2 did not provide enough executed localization samples to create an editable SDK path.');
+  }
+  const sampled = [pathTrace[0]];
+  pathTrace.slice(1).forEach((point) => {
+    const previous = sampled.at(-1);
+    if (Math.hypot(point.x - previous.x, point.y - previous.y) >= 0.2
+      || Math.abs(point.yaw_rad - previous.yaw_rad) >= 0.2) {
+      sampled.push(point);
+    }
+  });
+  if (sampled.length < 2) {
+    throw new Error('The recorded Nav2 route contains no measurable movement to convert.');
+  }
+  if (sampled.length > 200) {
+    throw new Error('The recorded Nav2 route is too detailed to safely convert to editable SDK commands.');
+  }
+  const commands = ['robot.stand()'];
+  for (let index = 1; index < sampled.length; index += 1) {
+    const from = sampled[index - 1];
+    const to = sampled[index];
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    const direction = Math.atan2(to.y - from.y, to.x - from.x);
+    const turnDelta = ((direction - from.yaw_rad + Math.PI) % (2 * Math.PI)) - Math.PI;
+    if (Math.abs(turnDelta) >= 0.08) {
+      commands.push(`robot.turn("${turnDelta > 0 ? 'left' : 'right'}", ${Math.min(180, Math.abs(turnDelta * 180 / Math.PI)).toFixed(2)})`);
+    }
+    let remaining = distance / 0.4;
+    while (remaining >= 0.1) {
+      const duration = Math.min(10, remaining);
+      commands.push(`robot.walktime(${duration.toFixed(3)})`);
+      remaining -= duration;
+    }
+  }
+  commands.push('robot.stand()');
+  if (commands.length > 400) {
+    throw new Error('The recorded Nav2 route exceeds the 400-command SDK editor limit.');
+  }
+  return commands;
+}
+
+function relativePlannerWaypointsFromTrace(pathTrace = []) {
+  if (!Array.isArray(pathTrace) || pathTrace.length < 2) return [];
+  const start = pathTrace[0];
+  const cosine = Math.cos(start.yaw_rad);
+  const sine = Math.sin(start.yaw_rad);
+  return pathTrace
+    .filter((point, index) => index === 0 || Math.hypot(point.x - pathTrace[index - 1].x, point.y - pathTrace[index - 1].y) >= 0.2)
+    .map((point, index) => {
+      const dx = point.x - start.x;
+      const dy = point.y - start.y;
+      return {
+        id: `planner-recorded-${index}`,
+        x: Number((dx * cosine + dy * sine).toFixed(2)),
+        y: Number((-dx * sine + dy * cosine).toFixed(2)),
+      };
+    });
+}
+
+function buildPlannerProjectName(mode) {
+  const suffix = PLANNER_MODE_LABELS[mode] || 'Path';
+  return `${suffix.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+}
+
 // ==========================================================================
 //  开发模式说明 (Development Mode)
 // ==========================================================================
@@ -297,20 +398,6 @@ function SceneObstacleShape({ obstacle, centerX, centerY, size, color, opacity, 
     default:
       return <circle {...common} cx={centerX} cy={centerY} r={size} />;
   }
-}
-
-function hasSameNavigationMapGeometry(previous, next) {
-  if (!previous?.map || !next?.map) return false;
-  const previousMap = previous.map;
-  const nextMap = next.map;
-  return previousMap.map_id === nextMap.map_id
-    && previousMap.frame_id === nextMap.frame_id
-    && previousMap.width === nextMap.width
-    && previousMap.height === nextMap.height
-    && previousMap.resolution_m === nextMap.resolution_m
-    && previousMap.origin.x === nextMap.origin.x
-    && previousMap.origin.y === nextMap.origin.y
-    && previousMap.origin.yaw_rad === nextMap.origin.yaw_rad;
 }
 
 function removeBlocklyVariableInitializers(code, initializers) {
@@ -752,6 +839,7 @@ export default function App() {
   const fileInputRef = useRef(null);
   const compiledPlannerCodeRef = useRef(null);
   const applyGeneratedCodeRef = useRef(null);
+  const processedAutonomousOperationRef = useRef(null);
   
   const [lang, setLang] = useState('en');
   const [robotConfig, setRobotConfig] = useState(DEFAULT_ROBOT_CONFIG_EN);
@@ -795,6 +883,10 @@ export default function App() {
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [gridSize, setGridSize] = useState(20);
   const [plannerWaypoints, setPlannerWaypoints] = useState([]);
+  const [pathPlannerMode, setPathPlannerMode] = useState(PLANNER_PATH_MODES.manual);
+  const [plannerRouteVariants, setPlannerRouteVariants] = useState({ initial: '', corrected: '', final: '' });
+  const [selectedPlannerVariant, setSelectedPlannerVariant] = useState('final');
+  const [plannerProjectLabel, setPlannerProjectLabel] = useState('');
   const [isWaypointPlacementEnabled, setIsWaypointPlacementEnabled] = useState(false);
   const [simulatorState, setSimulatorState] = useState(createEmptyG1Edu23State());
   const [session, setSession] = useState(() => {
@@ -824,6 +916,12 @@ export default function App() {
   const [isNavigationMotionReady, setIsNavigationMotionReady] = useState(false);
   const [isNavigationBridgeChecking, setIsNavigationBridgeChecking] = useState(false);
   const [navigationMapSnapshot, setNavigationMapSnapshot] = useState(null);
+  const [navigationPlannerMode, setNavigationPlannerMode] = useState('static');
+  const navigationPlannerModeRef = useRef(navigationPlannerMode);
+  navigationPlannerModeRef.current = navigationPlannerMode;
+  const [liveNavigationObstacles, setLiveNavigationObstacles] = useState(null);
+  const [liveNavigationPose, setLiveNavigationPose] = useState(null);
+  const [isLiveAvoidanceReady, setIsLiveAvoidanceReady] = useState(false);
   const [navigationMapStatus, setNavigationMapStatus] = useState('Map not loaded');
   const [isNavigationMapLoading, setIsNavigationMapLoading] = useState(false);
   const [isNavigationMapVisible, setIsNavigationMapVisible] = useState(false);
@@ -853,6 +951,7 @@ export default function App() {
   const navigationMapRefreshPendingRef = useRef(false);
   const navigationMapRefreshStartedRef = useRef(0);
   const navigationMapCoordinatesRef = useRef(null);
+  const navigationWaypointFrameRef = useRef(null);
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [isRobotConnecting, setIsRobotConnecting] = useState(false);
   const [isLidarTesting, setIsLidarTesting] = useState(false);
@@ -935,6 +1034,19 @@ export default function App() {
   }, [session, apiFetch]);
 
   useEffect(() => {
+    if (!session?.token) return;
+    apiFetch('/api/planner/settings')
+      .then(({ active_mode: mode }) => {
+        if (Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, mode)) {
+          setPathPlannerMode(mode);
+        }
+      })
+      .catch((error) => {
+        setNavigationExecutionStatus(`Could not load the teacher-selected planner mode • ${error.message}`);
+      });
+  }, [session?.token, apiFetch]);
+
+  useEffect(() => {
     if (session) {
       localStorage.setItem('edu-classroom-session', JSON.stringify(session));
       const savedSceneObjects = localStorage.getItem(sceneObjectsKey);
@@ -972,6 +1084,13 @@ export default function App() {
           if (response.project && Array.isArray(response.project.plannerWaypoints)) {
             setPlannerWaypoints(response.project.plannerWaypoints);
           }
+          if (response.project && response.project.plannerMode
+            && Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, response.project.plannerMode)) {
+            setPathPlannerMode(response.project.plannerMode);
+            setPlannerProjectLabel(response.project.plannerLabel || response.project.name || '');
+            setPlannerRouteVariants(response.project.plannerVariants || { initial: '', corrected: '', final: '' });
+            setSelectedPlannerVariant(response.project.selectedPlannerVariant || 'final');
+          }
           if (response.project && typeof response.project.generatedCode === 'string') {
             codeByVersionRef.current.legacy = response.project.generatedCode;
           }
@@ -990,6 +1109,7 @@ export default function App() {
                 return;
               }
             }
+            compiledPlannerCodeRef.current = selectedCode;
             applyGeneratedCodeRef.current?.(selectedCode, { syncBlocks: true });
           }
         })
@@ -1051,15 +1171,24 @@ export default function App() {
           name: projectName,
           sceneObjects,
           plannerWaypoints,
-          generatedCode: codeByVersionRef.current.legacy,
+          generatedCode: attachPlannerProjectMeta(codeByVersionRef.current.legacy, {
+            plannerMode: pathPlannerMode,
+            plannerLabel: plannerProjectLabel,
+            plannerVariants: plannerRouteVariants,
+            selectedPlannerVariant,
+          }),
           duetCode: codeByVersionRef.current.duet,
+          plannerMode: pathPlannerMode,
+          plannerLabel: plannerProjectLabel,
+          plannerVariants: plannerRouteVariants,
+          selectedPlannerVariant,
         }),
       }).catch(() => {
         // keep the local app responsive even if the backend sync is delayed
       });
     }, 250);
     return () => clearTimeout(timer);
-  }, [session, projectName, sceneObjects, plannerWaypoints, generatedCode, controllerVersion]);
+  }, [session, projectName, sceneObjects, plannerWaypoints, generatedCode, controllerVersion, pathPlannerMode, plannerProjectLabel, plannerRouteVariants, selectedPlannerVariant, apiFetch]);
 
   useEffect(() => {
     if (!session?.token) {
@@ -1069,10 +1198,14 @@ export default function App() {
       setNavigationLiveStatus('Live updates disconnected');
       setNavigationDiagnostics(null);
       setIsNavigationMotionReady(false);
+      setLiveNavigationObstacles(null);
+      setLiveNavigationPose(null);
+      setIsLiveAvoidanceReady(false);
       sharedMapVersionRef.current = null;
       sharedMapLoadedRef.current = false;
       liveNavigationMapVersionRef.current = null;
       navigationMapSnapshotRef.current = null;
+      navigationWaypointFrameRef.current = null;
       setNavigationRoutePreview(null);
       setNavigationPreviewStatus('No route preview');
       return undefined;
@@ -1111,6 +1244,14 @@ export default function App() {
         }
         setSharedLidarOverlayEnabled(update.shared_overlay_enabled === true);
         setIsNavigationMotionReady(update.navigation?.motion_ready === true);
+        setIsLiveAvoidanceReady(update.navigation?.live_avoidance_ready === true);
+        setLiveNavigationObstacles(update.navigation?.live_obstacles || null);
+        setLiveNavigationPose(update.navigation?.localization?.pose
+          ? {
+            ...update.navigation.localization.pose,
+            frame_id: update.navigation.localization.frame_id,
+          }
+          : null);
         if (update.navigation?.diagnostics) {
           setNavigationDiagnostics(update.navigation.diagnostics);
         }
@@ -1148,6 +1289,7 @@ export default function App() {
         const liveMapVersion = update.navigation?.map?.version || null;
         if (
           session.user.role === 'teacher'
+          && navigationPlannerModeRef.current === 'live'
           && liveNavigationMapVersionRef.current
           && liveMapVersion
           && liveMapVersion !== liveNavigationMapVersionRef.current
@@ -1160,30 +1302,22 @@ export default function App() {
             .then((result) => {
               if (!active) return;
               const previousSnapshot = navigationMapSnapshotRef.current;
-              const previousWaypointCount = navigationRouteWaypointsRef.current.length;
-              const sameGeometry = hasSameNavigationMapGeometry(previousSnapshot, result);
-              if (!sameGeometry) {
+              const waypointFrame = previousSnapshot?.map || navigationWaypointFrameRef.current;
+              const sameFrame = waypointFrame?.map_id === result.map.map_id
+                && waypointFrame?.frame_id === result.map.frame_id;
+              if (!sameFrame) {
                 navigationRouteWaypointsRef.current = [];
                 setNavigationRouteWaypoints([]);
                 setIsNavigationGoalPlacementEnabled(false);
-              } else {
-                const retained = navigationRouteWaypointsRef.current.filter((waypoint) => (
-                  isNavigationWaypointInFreeSpace(waypoint, result)
-                ));
-                navigationRouteWaypointsRef.current = retained;
-                setNavigationRouteWaypoints(retained);
               }
               navigationMapSnapshotRef.current = result;
               setNavigationMapSnapshot(result);
               liveNavigationMapVersionRef.current = result.map.version;
               setNavigationRoutePreview(null);
               setNavigationPreviewStatus('Map changed • preview the route again');
-              const removedWaypointCount = previousWaypointCount - navigationRouteWaypointsRef.current.length;
-              setNavigationMapStatus(!sameGeometry
-                ? `Live map geometry changed • destinations cleared • version ${result.map.version}`
-                : removedWaypointCount > 0
-                  ? `Live map updated • ${removedWaypointCount} destination(s) removed because they are no longer in known free space`
-                  : `Live map updated • ${result.map.width} × ${result.map.height} cells • version ${result.map.version}`);
+              setNavigationMapStatus(!sameFrame
+                ? `Live map frame changed • destinations cleared • version ${result.map.version}`
+                : `Live map updated • ${result.map.width} × ${result.map.height} cells • destinations stay fixed in map coordinates • version ${result.map.version}`);
             })
             .catch((error) => {
               if (active) setNavigationMapStatus(`Live map refresh failed • ${error.message}`);
@@ -1321,19 +1455,188 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({
           name: `${session.user.username}-submission-${new Date().toLocaleTimeString()}`,
-          code: generatedCode || '# No code generated yet'
+          code: generatedCode || '# No code generated yet',
+          controller_version: controllerVersion,
         })
       });
       await refreshClassroomData();
-      alert('Submitted to the teacher queue.');
+      alert('Submitted to the teacher for review. The queued code preview is visible before a teacher can run it.');
     } catch (e) {
       alert('Submission failed: ' + e.message);
     }
   };
 
-  const handleRunNext = async () => {
+  const handleSubmitPlannerRequest = async () => {
+    if (!session) return;
+    if (pathPlannerMode === PLANNER_PATH_MODES.autonomous) {
+      if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
+        setNavigationExecutionStatus('Load a map and add at least one destination before sending an autonomous request to the teacher.');
+        return;
+      }
+      if (navigationPlannerMode !== 'live') {
+        setNavigationExecutionStatus('Autonomous obstacle-aware requests require the Live adaptive Nav2 planner mode.');
+        return;
+      }
+    } else if (plannerWaypoints.length < 2 || !plannerRouteVariants.initial) {
+      setNavigationExecutionStatus('Add at least two grid waypoints and compile the initial SDK path before requesting teacher review.');
+      return;
+    }
+    const navigation = pathPlannerMode === PLANNER_PATH_MODES.autonomous
+      ? {
+        map_id: navigationMapSnapshot?.map?.map_id,
+        version: navigationMapSnapshot?.map?.version,
+        frame_id: navigationMapSnapshot?.map?.frame_id,
+        planner_mode: navigationPlannerMode,
+        waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
+      }
+      : null;
+    const plannerRequest = {
+      planner_mode: pathPlannerMode,
+      planner_label: PLANNER_MODE_LABELS[pathPlannerMode],
+      planner_waypoints: plannerWaypoints.map(({ x, y }) => ({ x, y })),
+      route_variants: plannerRouteVariants,
+      selected_variant: selectedPlannerVariant,
+      navigation,
+    };
     try {
-      const response = await apiFetch('/api/classroom/run-next', { method: 'POST' });
+      await apiFetch('/api/classroom/submit-code', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: `${session.user.username}-${PLANNER_MODE_LABELS[pathPlannerMode]}-${new Date().toLocaleTimeString()}`,
+          code: generatedCode || '',
+          controller_version: controllerVersion,
+          planner_request: plannerRequest,
+        }),
+      });
+      await refreshClassroomData();
+      setNavigationExecutionStatus(
+        'Planner request sent to the teacher with its mode, waypoints, map identity, route variants, and exact generated code preview.',
+      );
+    } catch (error) {
+      setNavigationExecutionStatus(`Planner request was not submitted • ${error.message}`);
+    }
+  };
+
+  const handleLoadQueueItemForReview = async (item) => {
+    if (item.controller_version !== controllerVersion) {
+      setNavigationExecutionStatus(
+        `Request uses ${item.controller_version === 'duet' ? 'DUET v2' : 'legacy SDK'}; switch controller versions before loading it.`,
+      );
+      return;
+    }
+    if (item.planner_request) {
+      const request = item.planner_request;
+      if (!Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, request.planner_mode)) {
+        setNavigationExecutionStatus('Planner request has an unsupported mode and cannot be loaded.');
+        return;
+      }
+      setPathPlannerMode(request.planner_mode);
+      setPlannerProjectLabel(request.planner_label || item.name);
+      setPlannerWaypoints((request.planner_waypoints || []).map((point, index) => ({
+        id: `request-${item.id}-${index}`,
+        x: point.x,
+        y: point.y,
+      })));
+      setPlannerRouteVariants(request.route_variants || { initial: '', corrected: '', final: '' });
+      setSelectedPlannerVariant(request.selected_variant || 'initial');
+      setProjectName(request.planner_label || item.name);
+      setIsWaypointPlacementEnabled(false);
+      compiledPlannerCodeRef.current = item.code || '';
+      updateGeneratedCode(item.code || '', { syncBlocks: true });
+      setMainTab('planner');
+
+      if (request.planner_mode === PLANNER_PATH_MODES.autonomous && request.navigation) {
+        const nav = request.navigation;
+        const nextNavMode = nav.planner_mode === 'live' ? 'live' : 'static';
+        setNavigationPlannerMode(nextNavMode);
+        const goals = (nav.waypoints || []).map((point, index) => ({
+          id: `request-${item.id}-goal-${index}`,
+          x: point.x,
+          y: point.y,
+        }));
+        navigationRouteWaypointsRef.current = [];
+        setNavigationRouteWaypoints([]);
+        navigationMapSnapshotRef.current = null;
+        setNavigationMapSnapshot(null);
+        setIsNavigationMapVisible(false);
+        setNavigationRoutePreview(null);
+        try {
+          const result = nextNavMode === 'static'
+            ? (await apiFetch('/api/lidar/map')).map
+            : await apiFetch('/api/navigation/map');
+          const identityMatches = result?.map?.map_id === nav.map_id
+            && result?.map?.version === nav.version
+            && result?.map?.frame_id === nav.frame_id;
+          if (identityMatches) {
+            navigationMapSnapshotRef.current = result;
+            setNavigationMapSnapshot(result);
+            navigationRouteWaypointsRef.current = goals;
+            setNavigationRouteWaypoints(goals);
+            navigationWaypointFrameRef.current = {
+              map_id: nav.map_id,
+              frame_id: nav.frame_id,
+            };
+            setIsNavigationMapVisible(true);
+            setNavigationMapStatus(`Loaded teacher request map • ${nav.map_id} ${nav.version}`);
+            setNavigationExecutionStatus(
+              `Loaded ${PLANNER_MODE_LABELS[request.planner_mode]} request ${item.name} onto the planner grid. Review the ${goals.length} map goal(s) and route before approving any movement.`,
+            );
+          } else {
+            setNavigationRouteWaypoints([]);
+            setNavigationRoutePreview(null);
+            setNavigationExecutionStatus(
+              `Loaded ${item.name} request metadata, but the current map does not match ${nav.map_id} ${nav.version} (${nav.frame_id}). The route is not executable until the matching map is available.`,
+            );
+          }
+        } catch (error) {
+          setNavigationExecutionStatus(`Planner request loaded, but its map could not be restored • ${error.message}`);
+        }
+      } else {
+        setNavigationExecutionStatus(
+          `Loaded ${PLANNER_MODE_LABELS[request.planner_mode]} request ${item.name} onto the planner grid. The exact generated code is in Blocks and IDE for teacher review before execution.`,
+        );
+      }
+      return;
+    }
+    if (controllerVersion === 'duet') {
+      try {
+        parseDuetProgram(item.code);
+      } catch (error) {
+        setNavigationExecutionStatus(`Request code is invalid and was not loaded • ${error.message}`);
+        return;
+      }
+    }
+    codeByVersionRef.current[controllerVersion] = item.code || '';
+    compiledPlannerCodeRef.current = item.code || '';
+    updateGeneratedCode(item.code || '', { syncBlocks: true });
+    setMainTab('ide');
+    setNavigationExecutionStatus(
+      `Loaded ${item.name} from ${item.student} onto the teacher IDE. Review the exact command preview before approving execution.`,
+    );
+  };
+
+  const handleRunNext = async () => {
+    const nextItem = queueItems.find((item) => item.status === 'queued');
+    if (!nextItem) {
+      alert('There are no queued requests to approve.');
+      return;
+    }
+    if (nextItem.planner_request) {
+      alert('Planner requests cannot be run as ordinary queue code. Load the request for teacher review, then use its matching planner controls.');
+      return;
+    }
+    if (nextItem.controller_version !== 'legacy') {
+      alert('This queue item does not target the legacy SDK. Load it for teacher review and use the matching controller workflow; it will never be sent to the legacy executor.');
+      return;
+    }
+    if (!window.confirm(
+      `Teacher approval required: run ${nextItem.name} submitted by ${nextItem.student} on ${nextItem.controller_version === 'duet' ? 'DUET v2' : 'the legacy SDK'}?\n\nExact program preview:\n${nextItem.code || '(empty program)'}`,
+    )) return;
+    try {
+      const response = await apiFetch('/api/classroom/run-next', {
+        method: 'POST',
+        body: JSON.stringify({ item_id: nextItem.id }),
+      });
       setClassroomStatus(response.status || 'running');
       await refreshClassroomData();
       alert(`SDK finished sending ${response.process?.commandsExecuted ?? 0} command(s) from ${response.item?.name || 'the queued program'}. Physical movement is not verified by the SDK.`);
@@ -1430,8 +1733,8 @@ export default function App() {
       return;
     }
     const testDescription = controllerVersion === 'duet'
-      ? 'Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a bounded 0.5-second DUET forward command. The app cannot verify physical movement.'
-      : 'Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. This sends a 0.5-second slow forward movement (about 10 cm). The app cannot verify physical movement.';
+      ? 'Teacher approval required. Exact command: duet.move(0.1, 0, 0, 0.5). Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. The app cannot verify physical movement.'
+      : 'Teacher approval required. Exact command: robot.slowwalktime(0.5). Only continue if the G1 is upright and stable, the area is clear, and someone is ready at the emergency stop. The app cannot verify physical movement.';
     if (!window.confirm(testDescription)) return;
 
     setIsRunning(true);
@@ -1737,15 +2040,30 @@ export default function App() {
   };
 
   const handleLoadNavigationMap = async () => {
-    if (!session || session.user.role !== 'teacher') {
-      setNavigationMapStatus('Teacher login is required to load the map preview.');
+    if (!session) {
+      setNavigationMapStatus('Sign in to load the map preview.');
       return;
     }
     setIsNavigationMapLoading(true);
-    setNavigationMapStatus('Loading occupancy map…');
+    setNavigationMapStatus(
+      navigationPlannerMode === 'static'
+        ? 'Loading the published 360° scan map…'
+        : 'Loading the live SLAM occupancy map…',
+    );
     try {
-      const result = await apiFetch('/api/navigation/map');
-      const sameGeometry = hasSameNavigationMapGeometry(navigationMapSnapshotRef.current, result);
+      let result;
+      if (navigationPlannerMode === 'static') {
+        const published = await apiFetch('/api/lidar/map');
+        result = published.map;
+        if (!result?.ready || !result.map || !Array.isArray(result.data)) {
+          throw new Error('No validated 360° scan map has been published for planning.');
+        }
+      } else {
+        result = await apiFetch('/api/navigation/map');
+      }
+      const previous = navigationMapSnapshotRef.current?.map || navigationWaypointFrameRef.current;
+      const sameFrame = previous?.map_id === result.map.map_id
+        && previous?.frame_id === result.map.frame_id;
       if (
         navigationMapSnapshotRef.current?.map?.version !== result.map.version
         || navigationMapSnapshotRef.current?.map?.frame_id !== result.map.frame_id
@@ -1753,23 +2071,25 @@ export default function App() {
         setNavigationRoutePreview(null);
         setNavigationPreviewStatus('Map changed • preview the route again');
       }
-      if (sameGeometry) {
-        const retained = navigationRouteWaypointsRef.current.filter((waypoint) => (
-          isNavigationWaypointInFreeSpace(waypoint, result)
-        ));
-        navigationRouteWaypointsRef.current = retained;
-        setNavigationRouteWaypoints(retained);
-      } else {
+      if (!sameFrame && previous) {
         navigationRouteWaypointsRef.current = [];
         setNavigationRouteWaypoints([]);
         setIsNavigationGoalPlacementEnabled(false);
       }
       navigationMapSnapshotRef.current = result;
+      navigationWaypointFrameRef.current = {
+        map_id: result.map.map_id,
+        frame_id: result.map.frame_id,
+      };
       setNavigationMapSnapshot(result);
       liveNavigationMapVersionRef.current = result.map.version;
       setIsNavigationMapVisible(true);
       setNavigationMapStatus(
-        `Loaded • ${result.map.width} × ${result.map.height} cells • map ${result.map.map_id} • version ${result.map.version}`,
+        `${navigationPlannerMode === 'static' ? 'Static scan map loaded' : 'Live SLAM map loaded'} • `
+        + `${result.map.width} × ${result.map.height} cells • map ${result.map.map_id} • version ${result.map.version}`
+        + (navigationRouteWaypointsRef.current.length
+          ? ' • existing waypoints remain fixed in map coordinates'
+          : ''),
       );
     } catch (error) {
       navigationMapSnapshotRef.current = null;
@@ -1779,6 +2099,44 @@ export default function App() {
       setNavigationMapStatus(`Unavailable • ${error.message}`);
     } finally {
       setIsNavigationMapLoading(false);
+    }
+  };
+
+  const handleNavigationPlannerModeChange = (mode) => {
+    if (mode === navigationPlannerMode) return;
+    setNavigationPlannerMode(mode);
+    setNavigationRoutePreview(null);
+    setNavigationPreviewStatus('Planner mode changed • load the selected map and preview again');
+    navigationMapSnapshotRef.current = null;
+    liveNavigationMapVersionRef.current = null;
+    setNavigationMapSnapshot(null);
+    setIsNavigationMapVisible(false);
+    setNavigationMapStatus(
+      mode === 'static'
+        ? 'Load the published 360° scan map to place waypoints.'
+        : 'Load the live SLAM map; adaptive mode needs commissioned Nav2 obstacle avoidance.',
+    );
+  };
+
+  const handlePathPlannerModeChange = async (mode) => {
+    if (!Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, mode)) return;
+    if (session?.user?.role !== 'teacher') {
+      setNavigationExecutionStatus('Only a teacher can change the classroom path planner mode.');
+      return;
+    }
+    setPathPlannerMode(mode);
+    setPlannerRouteVariants({ initial: '', corrected: '', final: '' });
+    setSelectedPlannerVariant('initial');
+    if (mode === PLANNER_PATH_MODES.autonomous) {
+      setNavigationPlannerMode('live');
+    }
+    try {
+      await apiFetch('/api/planner/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ active_mode: mode }),
+      });
+    } catch (error) {
+      setNavigationExecutionStatus(`Planner mode was not saved for the classroom • ${error.message}`);
     }
   };
 
@@ -1959,6 +2317,10 @@ export default function App() {
       return;
     }
     const { x, y } = mapLocalToWorld(localPoint.x, mapLocalY, map);
+    navigationWaypointFrameRef.current = {
+      map_id: map.map_id,
+      frame_id: map.frame_id,
+    };
     setNavigationRouteWaypoints((points) => [
       ...points,
       { id: `nav-${Date.now()}-${points.length}`, x, y },
@@ -1969,12 +2331,18 @@ export default function App() {
   };
 
   const handlePreviewNavigationRoute = async () => {
-    if (!session || session.user.role !== 'teacher') {
-      setNavigationPreviewStatus('Teacher login is required to preview a route.');
+    if (!session) {
+      setNavigationPreviewStatus('Sign in to preview a route.');
       return;
     }
     if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
       setNavigationPreviewStatus('Load the map and add at least one destination before previewing.');
+      return;
+    }
+    if (navigationPlannerMode === 'live' && !isLiveAvoidanceReady) {
+      setNavigationPreviewStatus(
+        `Live adaptive preview unavailable • ${liveNavigationObstacles?.error || 'Nav2 local obstacle avoidance is not commissioned.'}`,
+      );
       return;
     }
     setIsNavigationPreviewing(true);
@@ -1987,6 +2355,7 @@ export default function App() {
           map_id: navigationMapSnapshot.map.map_id,
           version: navigationMapSnapshot.map.version,
           frame_id: navigationMapSnapshot.map.frame_id,
+          planner_mode: navigationPlannerMode,
           waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
         }),
       });
@@ -2021,6 +2390,16 @@ export default function App() {
       );
       return;
     }
+    if (navigationPlannerMode === 'live' && !isLiveAvoidanceReady) {
+      setNavigationExecutionStatus(
+        `Physical start blocked • ${liveNavigationObstacles?.error || 'Nav2 local obstacle avoidance is not commissioned.'}`,
+      );
+      return;
+    }
+    if (pathPlannerMode === PLANNER_PATH_MODES.autonomous && navigationPlannerMode !== 'live') {
+      setNavigationExecutionStatus('Autonomous path mode requires Live adaptive Nav2 with commissioned obstacle avoidance.');
+      return;
+    }
     if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
       setNavigationExecutionStatus('Load the map and add at least one destination before starting.');
       return;
@@ -2038,9 +2417,12 @@ export default function App() {
       setNavigationExecutionStatus('A navigation operation is already active.');
       return;
     }
+    const plannedPoints = (navigationRoutePreview.path || [])
+      .map((point, index) => `${index + 1}. (${Number(point.x).toFixed(2)}, ${Number(point.y).toFixed(2)})`)
+      .join('\n');
     if (!window.confirm(
-      `Start ROS navigation on map ${navigationMapSnapshot.map.map_id} (${navigationMapSnapshot.map.version}) `
-      + `with ${navigationRouteWaypoints.length} destination(s)? Keep the robot area clear and the physical emergency stop accessible.`,
+      `Teacher approval required: start ${navigationPlannerMode === 'live' ? 'live adaptive' : 'static scan-map'} ROS navigation on map ${navigationMapSnapshot.map.map_id} (${navigationMapSnapshot.map.version}) `
+      + `with ${navigationRouteWaypoints.length} destination(s)?\n\nPlanner path preview (map-frame coordinates, not motor commands):\n${plannedPoints || '(no path points returned)'}\n\nKeep the robot area clear and the physical emergency stop accessible.`,
     )) return;
 
     setIsNavigationStarting(true);
@@ -2052,6 +2434,7 @@ export default function App() {
           map_id: navigationMapSnapshot.map.map_id,
           version: navigationMapSnapshot.map.version,
           frame_id: navigationMapSnapshot.map.frame_id,
+          planner_mode: navigationPlannerMode,
           waypoints: navigationRouteWaypoints.map(({ x, y }) => ({ x, y })),
         }),
       });
@@ -2087,7 +2470,38 @@ export default function App() {
 
   useEffect(() => {
     const operationId = navigationOperation?.operation_id;
-    if (!operationId || ['completed', 'succeeded', 'canceled', 'failed'].includes(navigationOperation.status)) return undefined;
+    if (!operationId) return undefined;
+    if (['completed', 'succeeded', 'canceled', 'failed'].includes(navigationOperation.status)) {
+      if (
+        navigationOperation.status === 'completed'
+        && pathPlannerMode === PLANNER_PATH_MODES.autonomous
+        && processedAutonomousOperationRef.current !== operationId
+      ) {
+        processedAutonomousOperationRef.current = operationId;
+        try {
+          if (navigationOperation.path_trace_truncated || navigationOperation.path_trace_error) {
+            throw new Error(navigationOperation.path_trace_error || 'The executed route trace was truncated.');
+          }
+          const pathTrace = navigationOperation.path_trace || [];
+          const code = buildSdkCommandsFromTrace(pathTrace).join('\n');
+          const safeCode = sanitizeRobotCode(code).code;
+          if (!safeCode) throw new Error('The recorded route did not produce validated SDK commands.');
+          const waypoints = relativePlannerWaypointsFromTrace(pathTrace);
+          setPlannerWaypoints(waypoints);
+          setPlannerRouteVariants({ initial: '', corrected: safeCode, final: safeCode });
+          setSelectedPlannerVariant('final');
+          setPlannerProjectLabel((previous) => previous || buildPlannerProjectName(pathPlannerMode));
+          compiledPlannerCodeRef.current = safeCode;
+          applyGeneratedCodeRef.current?.(safeCode, { syncBlocks: true });
+          setNavigationExecutionStatus(
+            `Nav2 completed with ${pathTrace.length} localization feedback samples. The recorded path was translated to editable SDK commands in Blocks and IDE; review before rerunning.`,
+          );
+        } catch (error) {
+          setNavigationExecutionStatus(`Nav2 completed, but its executed path could not be converted to editable SDK commands • ${error.message}`);
+        }
+      }
+      return undefined;
+    }
     let active = true;
     const pollOperation = async () => {
       try {
@@ -2111,7 +2525,7 @@ export default function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [navigationOperation?.operation_id, navigationOperation?.status]);
+  }, [navigationOperation, pathPlannerMode, apiFetch]);
 
   useEffect(() => {
     const handleClickOutside = () => setActiveMenu(null);
@@ -2384,6 +2798,54 @@ export default function App() {
     a.download = controllerVersion === 'duet' ? 'duet-project.json' : 'project.json';
     a.click();
   };
+
+  const savePathPlannerProject = async () => {
+    if (!session?.user?.username || plannerWaypoints.length < 2) {
+      alert('Add at least two waypoints to save a path project.');
+      return;
+    }
+    if (
+      pathPlannerMode !== PLANNER_PATH_MODES.manual
+      && !plannerRouteVariants.corrected
+      && !plannerRouteVariants.final
+    ) {
+      alert('Run the selected sensor-corrected or autonomous mode first. Only the measured executed route can be saved as the final path.');
+      return;
+    }
+    const label = (plannerProjectLabel || projectName || buildPlannerProjectName(pathPlannerMode)).trim() || buildPlannerProjectName(pathPlannerMode);
+    const variantCode = selectedPlannerVariant === 'initial'
+      ? plannerRouteVariants.initial
+      : selectedPlannerVariant === 'corrected'
+        ? plannerRouteVariants.corrected
+        : plannerRouteVariants.final || generatedCode;
+    const projectPayload = {
+      name: label,
+      sceneObjects,
+      plannerWaypoints,
+      generatedCode: attachPlannerProjectMeta(variantCode || generatedCode, {
+        plannerMode: pathPlannerMode,
+        plannerLabel: label,
+        plannerVariants: plannerRouteVariants,
+        selectedPlannerVariant,
+      }),
+      duetCode: codeByVersionRef.current.duet || '',
+      plannerMode: pathPlannerMode,
+      plannerLabel: label,
+      plannerVariants: plannerRouteVariants,
+    };
+
+    try {
+      await apiFetch('/api/classroom/project/save', {
+        method: 'POST',
+        body: JSON.stringify(projectPayload),
+      });
+      setProjectName(label);
+      setPlannerProjectLabel(label);
+      alert(`Saved planner project as “${label}”. Open it from the project library to load the saved route and code.`);
+    } catch (error) {
+      alert(`Could not save the planner project: ${error.message}`);
+    }
+  };
   
   const loadProject = (event) => {
     const file = event.target.files[0];
@@ -2434,8 +2896,15 @@ export default function App() {
   const loadProjectFromLibrary = (project) => {
     if (!project) return;
     const legacyCode = typeof project.generatedCode === 'string' ? project.generatedCode : '';
+    const meta = parsePlannerProjectMeta(legacyCode) || {
+      plannerMode: project.plannerMode,
+      plannerLabel: project.plannerLabel,
+      plannerVariants: project.plannerVariants,
+      selectedPlannerVariant: project.selectedPlannerVariant,
+    };
+    const cleanLegacyCode = stripPlannerProjectMeta(legacyCode);
     const duetCode = typeof project.duetCode === 'string' ? project.duetCode : '';
-    const nextCode = controllerVersion === 'duet' ? duetCode : legacyCode;
+    const nextCode = controllerVersion === 'duet' ? duetCode : cleanLegacyCode;
     if (controllerVersion === 'duet') {
       try {
         parseDuetProgram(nextCode);
@@ -2444,13 +2913,20 @@ export default function App() {
         return;
       }
     }
-    setProjectName(project.name || 'default');
+    setProjectName(project.name || meta.plannerLabel || 'default');
+    setPlannerProjectLabel(meta.plannerLabel || project.name || 'default');
+    if (meta.plannerMode && Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, meta.plannerMode)) {
+      setPathPlannerMode(meta.plannerMode);
+    }
+    setPlannerRouteVariants(meta.plannerVariants || { initial: cleanLegacyCode, corrected: cleanLegacyCode, final: cleanLegacyCode });
+    setSelectedPlannerVariant(meta.selectedPlannerVariant || 'final');
     setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
     setSelectedSceneObjectId(null);
     setPlannerWaypoints(Array.isArray(project.plannerWaypoints) ? project.plannerWaypoints : []);
     setIsWaypointPlacementEnabled(false);
-    codeByVersionRef.current.legacy = legacyCode;
+    codeByVersionRef.current.legacy = cleanLegacyCode;
     codeByVersionRef.current.duet = duetCode;
+    compiledPlannerCodeRef.current = nextCode;
     applyGeneratedCode(nextCode, { syncBlocks: true });
     setMainTab('blocks');
   };
@@ -2488,20 +2964,84 @@ export default function App() {
       alert('Path planner export is not available in DUET version two yet. Use the DUET Blocks or IDE commands instead.');
       return;
     }
+    if (pathPlannerMode === PLANNER_PATH_MODES.autonomous) {
+      alert('For autonomous routing, place destinations on the LiDAR map, preview them, then start the Nav2 route. Only the completed Nav2 feedback trace can be translated into SDK commands.');
+      return;
+    }
     if (plannerWaypoints.length < 2) {
       alert('Add at least two waypoints before compiling a motion path.');
       return;
     }
     if (generatedCode.trim() && !window.confirm('Compiling this path will replace the current Blocks and IDE code. Continue?')) return;
 
-    const commands = buildPlannerMotionCommands(plannerWaypoints);
-    const plannerCode = commands.join('\n');
-    const safePlannerCode = sanitizeRobotCode(plannerCode).code || plannerCode;
+    const initialCode = buildPlannerMotionCommands(plannerWaypoints).join('\n');
+    const selectedCode = initialCode;
+    const safePlannerCode = sanitizeRobotCode(selectedCode).code || selectedCode;
     if (safePlannerCode !== generatedCode) {
       compiledPlannerCodeRef.current = safePlannerCode;
     }
-    updateGeneratedCode(plannerCode);
+
+    setPlannerRouteVariants({
+      initial: initialCode,
+      corrected: '',
+      final: '',
+    });
+    setSelectedPlannerVariant('initial');
+    setPlannerProjectLabel((previous) => previous || buildPlannerProjectName(pathPlannerMode));
+    updateGeneratedCode(selectedCode);
     setIsWaypointPlacementEnabled(false);
+  };
+
+  const handleRunCheckpointedPlanner = async () => {
+    if (session?.user?.role !== 'teacher') {
+      setNavigationExecutionStatus('Teacher login is required to run checkpointed SDK paths.');
+      return;
+    }
+    if (pathPlannerMode !== PLANNER_PATH_MODES.sensor_corrected) {
+      setNavigationExecutionStatus('Select the sensor-corrected planner mode to run checkpointed SDK motion.');
+      return;
+    }
+    if (plannerWaypoints.length < 2) {
+      setNavigationExecutionStatus('Add at least two waypoints before running a checkpointed path.');
+      return;
+    }
+    if (!plannerRouteVariants.initial) {
+      setNavigationExecutionStatus('Compile the initial SDK path first; it will be shown in Blocks and IDE before execution.');
+      return;
+    }
+    if (!window.confirm(
+      `Teacher approval required: run the initial path through the G1 SDK? The backend will verify fresh localization and safety health at each waypoint, make at most one correction per waypoint, and stop if a checkpoint cannot be verified.\n\nExact initial SDK program:\n${plannerRouteVariants.initial}`,
+    )) return;
+    setIsRunning(true);
+    setNavigationExecutionStatus('Running initial path through the SDK; checking live localization at each waypoint…');
+    try {
+      const result = await apiFetch('/api/planner/checkpointed-run', {
+        method: 'POST',
+        body: JSON.stringify({
+          waypoints: plannerWaypoints.map(({ x, y }) => ({ x, y })),
+        }),
+      });
+      if (result.status !== 'completed' || typeof result.correctedCode !== 'string') {
+        throw new Error('Backend did not confirm completion with a recorded SDK command sequence.');
+      }
+      const correctedCode = result.correctedCode;
+      setPlannerRouteVariants({
+        initial: plannerRouteVariants.initial,
+        corrected: correctedCode,
+        final: correctedCode,
+      });
+      setSelectedPlannerVariant('corrected');
+      setPlannerProjectLabel((previous) => previous || buildPlannerProjectName(pathPlannerMode));
+      compiledPlannerCodeRef.current = correctedCode;
+      updateGeneratedCode(correctedCode);
+      setNavigationExecutionStatus(
+        `SDK route completed • ${result.checkpoints.length} waypoint checkpoints confirmed within 0.25 m. Corrected executed commands are now in Blocks and IDE; physical accuracy remains unverified.`,
+      );
+    } catch (error) {
+      setNavigationExecutionStatus(`Checkpointed SDK route stopped or rejected • ${error.message}`);
+    } finally {
+      setIsRunning(false);
+    }
   };
 
   const handleRunCode = async () => {
@@ -2530,6 +3070,9 @@ export default function App() {
       }
     } else {
       try {
+        if (session?.user?.role !== 'teacher') {
+          throw new Error('A teacher must review and approve physical motion requests. Submit this exact program to the teacher queue for review.');
+        }
         if (!isRobotConnected) {
           throw new Error(controllerVersion === 'duet'
             ? 'Connect the DUET G1 23-DOF controller before sending a program.'
@@ -2537,6 +3080,9 @@ export default function App() {
         }
         if (controllerVersion === 'duet') parseDuetProgram(generatedCode);
         else parseG1Program(generatedCode);
+        if (!window.confirm(
+          `Teacher approval required: send this exact ${controllerVersion === 'duet' ? 'DUET v2' : 'legacy SDK'} program to the robot?\n\n${generatedCode}`,
+        )) return;
         setIsRunning(true);
         const result = await activeRobotConnection.run(generatedCode);
         let keepDuetRunLock = false;
@@ -2835,14 +3381,15 @@ export default function App() {
 
   const applyGeneratedCode = useCallback((nextCode, options = {}) => {
     const { syncBlocks = true, preserveFormatting = false } = options;
-    let boundedCode = nextCode;
+    const cleanedCode = stripPlannerProjectMeta(nextCode ?? '');
+    let boundedCode = cleanedCode;
     let boundsChanged = false;
-    if (!preserveFormatting && nextCode.trim()) {
+    if (!preserveFormatting && cleanedCode.trim()) {
       try {
         boundedCode = controllerVersion === 'duet'
-          ? formatDuetProgram(parseDuetProgram(nextCode))
-          : formatG1Program(parseG1Program(nextCode));
-        boundsChanged = boundedCode.trim() !== nextCode.trim();
+          ? formatDuetProgram(parseDuetProgram(cleanedCode))
+          : formatG1Program(parseG1Program(cleanedCode));
+        boundsChanged = boundedCode.trim() !== cleanedCode.trim();
       } catch {
         // Keep in-progress IDE edits intact; execution validates the complete program.
       }
@@ -3074,6 +3621,34 @@ export default function App() {
       return [{ ...point, mapX: local.x, mapY: local.y }];
     });
   }, [lidarScanJob?.frame_id, liveLidarScanPoints, navigationMapSnapshot]);
+  const navigationLiveObstaclePreview = useMemo(() => {
+    const map = navigationMapSnapshot?.map;
+    if (
+      navigationPlannerMode !== 'live'
+      || !map
+      || liveNavigationObstacles?.ready !== true
+      || liveNavigationObstacles.frame_id !== map.frame_id
+      || !Array.isArray(liveNavigationObstacles.points)
+    ) return [];
+    const mapWidth = map.width * map.resolution_m;
+    const mapHeight = map.height * map.resolution_m;
+    return liveNavigationObstacles.points.flatMap((point) => {
+      const local = worldToMapLocal(point.x, point.y, map);
+      if (local.x < 0 || local.y < 0 || local.x >= mapWidth || local.y >= mapHeight) return [];
+      return [{ ...point, mapX: local.x, mapY: local.y }];
+    });
+  }, [liveNavigationObstacles, navigationMapSnapshot, navigationPlannerMode]);
+  const navigationLivePosePreview = useMemo(() => {
+    const map = navigationMapSnapshot?.map;
+    if (!map || liveNavigationPose?.frame_id !== map.frame_id) return null;
+    const local = worldToMapLocal(liveNavigationPose.x, liveNavigationPose.y, map);
+    if (
+      local.x < 0 || local.y < 0
+      || local.x >= map.width * map.resolution_m
+      || local.y >= map.height * map.resolution_m
+    ) return null;
+    return { ...local, yaw_rad: liveNavigationPose.yaw_rad };
+  }, [liveNavigationPose, navigationMapSnapshot]);
   const sharedOccupiedCellsPath = useMemo(() => {
     const snapshot = sharedLidarMap?.map;
     if (!snapshot?.data?.length || !snapshot.map) return '';
@@ -3796,7 +4371,37 @@ export default function App() {
                       <p className="font-medium text-slate-800 text-sm truncate">{item.name}</p>
                       <span className="text-[10px] uppercase bg-slate-100 text-slate-600 rounded-full px-2 py-1">{item.status}</span>
                     </div>
-                    <p className="text-xs text-slate-500 mt-1">by {item.student}</p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      by {item.student} • {item.controller_version === 'duet' ? 'DUET v2' : 'legacy SDK'}
+                    </p>
+                    {item.planner_request && (
+                      <p className="mt-1 text-[10px] font-semibold text-cyan-800">
+                        Planner request • {PLANNER_MODE_LABELS[item.planner_request.planner_mode] || item.planner_request.planner_mode}
+                        {item.planner_request.navigation
+                          ? ` • ${item.planner_request.navigation.waypoints.length} Nav2 goal(s) • map ${item.planner_request.navigation.map_id} ${item.planner_request.navigation.version}`
+                          : ` • ${(item.planner_request.planner_waypoints || []).length} grid waypoint(s)`}
+                      </p>
+                    )}
+                    <details className="mt-2 rounded-md bg-slate-50 p-2">
+                      <summary className="cursor-pointer text-[10px] font-semibold text-blue-700">
+                        Review exact command preview
+                      </summary>
+                      <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-900 p-2 text-[10px] text-slate-100">
+                        {item.code || '(No SDK/DUET commands yet; review the requested planner goals below.)'}
+                      </pre>
+                      {item.planner_request && (
+                        <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-100 p-2 text-[10px] text-slate-700">
+                          {JSON.stringify(item.planner_request, null, 2)}
+                        </pre>
+                      )}
+                    </details>
+                    <button
+                      type="button"
+                      onClick={() => handleLoadQueueItemForReview(item)}
+                      className="mt-2 rounded-md border border-blue-200 px-2 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-50"
+                    >
+                      Load for teacher review
+                    </button>
                     <button onClick={() => handleDeleteQueueItem(item.id)} className="mt-2 text-xs text-red-600 hover:text-red-700">Delete</button>
                   </div>
                 ))}
@@ -3819,12 +4424,35 @@ export default function App() {
                 </div>
               </>
             ) : (
-              savedCodes.length === 0 ? <p className="text-sm text-slate-500">No saved code yet.</p> : savedCodes.map((code) => (
-                <div key={code.name} className="rounded-lg border border-slate-200 p-2">
-                  <p className="font-medium text-slate-800 text-sm">{code.name}</p>
-                  <p className="text-xs text-slate-500 mt-1">{code.code.slice(0, 60)}{code.code.length > 60 ? '...' : ''}</p>
+              <>
+                <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">My saved path projects</p>
+                  <div className="mt-2 space-y-2">
+                    {projectLibrary.length === 0 ? (
+                      <p className="text-xs text-slate-500">No saved projects yet.</p>
+                    ) : projectLibrary.map((project) => (
+                      <div key={project.name} className="rounded-lg border border-slate-200 bg-white p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium text-slate-800">{project.plannerLabel || project.name}</span>
+                          {project.plannerMode && (
+                            <span className="text-[10px] uppercase rounded-full bg-cyan-100 text-cyan-800 px-2 py-1">
+                              {PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}
+                            </span>
+                          )}
+                        </div>
+                        <button type="button" onClick={() => loadProjectFromLibrary(project)} className="mt-2 text-xs text-blue-600 hover:text-blue-700">Open project</button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ))
+                {savedCodes.length === 0 ? <p className="text-sm text-slate-500">No saved code yet.</p> : savedCodes.map((code) => (
+                  <div key={code.name} className="rounded-lg border border-slate-200 p-2">
+                    <p className="font-medium text-slate-800 text-sm">{code.name}</p>
+                    <p className="text-xs text-slate-500 mt-1">{code.code.slice(0, 60)}{code.code.length > 60 ? '...' : ''}</p>
+                    <button type="button" onClick={() => updateGeneratedCode(code.code)} className="mt-2 text-xs text-blue-600 hover:text-blue-700">Load</button>
+                  </div>
+                ))}
+              </>
             )}
           </div>
         </div>
@@ -4349,6 +4977,7 @@ export default function App() {
                           </p>
                           <p>
                             Map {navigationDiagnostics.topics?.map || 'topic unavailable'}
+                            {' • '}local costmap {navigationDiagnostics.topics?.local_costmap || 'topic unavailable'}
                             {' • '}frame {navigationDiagnostics.frames?.map || 'unavailable'}
                             {' • '}base {navigationDiagnostics.frames?.base || 'unavailable'}
                             {' • '}threshold {navigationDiagnostics.map?.occupied_threshold ?? '—'}
@@ -4361,6 +4990,12 @@ export default function App() {
                             )}
                           </p>
                           <p>
+                            Live obstacle layer {navigationDiagnostics.local_costmap?.ready
+                              ? `ready • ${navigationDiagnostics.local_costmap.obstacle_count ?? 0} points • ${navigationDiagnostics.local_costmap.age_ms ?? '—'} ms old`
+                              : 'unavailable'}
+                            {' • '}avoidance commissioning {navigationDiagnostics.local_costmap?.live_avoidance_enabled ? 'enabled' : 'not enabled'}
+                          </p>
+                          <p>
                             Localization {navigationDiagnostics.localization?.quality || 'unavailable'}
                             {' • '}actions Nav2 {navigationDiagnostics.actions?.navigation ? 'ready' : 'unavailable'},
                             {' '}preview {navigationDiagnostics.actions?.route_preview ? 'ready' : 'unavailable'},
@@ -4371,7 +5006,31 @@ export default function App() {
                           </p>
                         </div>
                       )}
-                      {session?.user?.role === 'teacher' && (
+                      {session && (
+                        <div className="space-y-2">
+                        <div className="flex flex-wrap gap-2" role="group" aria-label="Path planner mode">
+                          <button
+                            type="button"
+                            aria-pressed={navigationPlannerMode === 'static'}
+                            onClick={() => handleNavigationPlannerModeChange('static')}
+                            className={`rounded-md border px-2 py-1 text-[10px] font-semibold ${navigationPlannerMode === 'static' ? 'border-cyan-500 bg-cyan-950 text-cyan-100' : 'border-slate-600 text-slate-300'}`}
+                          >
+                            Static 360° map
+                          </button>
+                          <button
+                            type="button"
+                            aria-pressed={navigationPlannerMode === 'live'}
+                            onClick={() => handleNavigationPlannerModeChange('live')}
+                            className={`rounded-md border px-2 py-1 text-[10px] font-semibold ${navigationPlannerMode === 'live' ? 'border-emerald-500 bg-emerald-950 text-emerald-100' : 'border-slate-600 text-slate-300'}`}
+                          >
+                            Live adaptive
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          {navigationPlannerMode === 'live'
+                            ? 'Live adaptive keeps destinations fixed in map-frame coordinates, shows fresh Nav2 local-costmap obstacles, and relies on the commissioned Nav2 controller to adjust motion around them.'
+                            : 'Static planning uses the teacher-published 360° scan image. Waypoints are checked against both that saved map and the current live map before Nav2 may move.'}
+                        </p>
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
@@ -4379,7 +5038,11 @@ export default function App() {
                             disabled={isNavigationMapLoading}
                             className="rounded-md border border-slate-600 px-2 py-1 text-[10px] font-semibold text-slate-200 disabled:opacity-60"
                           >
-                            {isNavigationMapLoading ? 'Loading map…' : 'Load occupancy map'}
+                            {isNavigationMapLoading
+                              ? 'Loading map…'
+                              : navigationPlannerMode === 'static'
+                                ? 'Load static 360° map'
+                                : 'Load live occupancy map'}
                           </button>
                           {navigationMapSnapshot && (
                             <button
@@ -4390,6 +5053,7 @@ export default function App() {
                               {isNavigationMapVisible ? 'Hide overlay' : 'Show overlay'}
                             </button>
                           )}
+                        </div>
                         </div>
                       )}
                       <p className="break-words text-[10px] text-slate-400">{navigationMapStatus}</p>
@@ -4574,6 +5238,37 @@ export default function App() {
                             >
                               <path d={navigationOccupiedCellsPath} fill="#ef4444" fillOpacity="0.72" />
                             </g>
+                            {navigationLiveObstaclePreview.length > 0 && (
+                              <g data-testid="navigation-live-obstacles-overlay" pointerEvents="none">
+                                {navigationLiveObstaclePreview.map((point, index) => (
+                                  <circle
+                                    key={`live-obstacle-${index}-${point.x}-${point.y}`}
+                                    cx={point.mapX}
+                                    cy={point.mapY}
+                                    r={navigationMapSnapshot.map.resolution_m * 0.65}
+                                    fill="#111827"
+                                    fillOpacity="0.9"
+                                  />
+                                ))}
+                              </g>
+                            )}
+                            {navigationLivePosePreview && (
+                              <g data-testid="navigation-live-robot-pose" pointerEvents="none">
+                                <circle
+                                  cx={navigationLivePosePreview.x}
+                                  cy={navigationLivePosePreview.y}
+                                  r={navigationMapSnapshot.map.resolution_m * 2}
+                                  fill="#06b6d4"
+                                  stroke="#fff"
+                                  strokeWidth={navigationMapSnapshot.map.resolution_m * 0.3}
+                                />
+                                <path
+                                  d={`M${navigationLivePosePreview.x} ${navigationLivePosePreview.y}L${navigationLivePosePreview.x + Math.cos(navigationLivePosePreview.yaw_rad - navigationMapSnapshot.map.origin.yaw_rad) * navigationMapSnapshot.map.resolution_m * 5} ${navigationLivePosePreview.y + Math.sin(navigationLivePosePreview.yaw_rad - navigationMapSnapshot.map.origin.yaw_rad) * navigationMapSnapshot.map.resolution_m * 5}`}
+                                  stroke="#0891b2"
+                                  strokeWidth={navigationMapSnapshot.map.resolution_m * 0.6}
+                                />
+                              </g>
+                            )}
                             {session?.user?.role === 'teacher' && lidarScanJob?.status === 'scanning' && (
                               <g data-testid="navigation-live-lidar-scan-overlay" pointerEvents="none">
                                 {navigationLiveScanPreview.map((point, index) => (
@@ -4607,11 +5302,12 @@ export default function App() {
                               return (
                                 <g key={point.id} pointerEvents="none">
                                   <circle
+                                    data-testid={`navigation-waypoint-${index + 1}`}
                                     cx={local.x}
                                     cy={local.y}
                                     r={navigationMapSnapshot.map.resolution_m * 2}
-                                    fill="#2563eb"
-                                    stroke="#fff"
+                                    fill={isNavigationWaypointInFreeSpace(point, navigationMapSnapshot) ? '#2563eb' : '#dc2626'}
+                                    stroke={isNavigationWaypointInFreeSpace(point, navigationMapSnapshot) ? '#fff' : '#fca5a5'}
                                     strokeWidth={navigationMapSnapshot.map.resolution_m * 0.15}
                                   />
                                   <text
@@ -4631,11 +5327,18 @@ export default function App() {
                         </svg>
                       </div>
                     )}
-                    {session?.user?.role === 'teacher' && navigationMapSnapshot && (
+                    {session && navigationMapSnapshot && (
                       <div className="space-y-2 rounded-lg border border-slate-700 bg-slate-900 p-2">
                         <p className="text-[10px] text-slate-300">
-                          Add ordered goals by clicking the map. The backend and Nav2 gateway reject stale maps, out-of-map goals, and unknown or occupied cells.
+                          Add ordered goals by clicking the map. Their world/map coordinates stay fixed as live updates arrive; blocked goals are highlighted and rejected by the backend before motion.
                         </p>
+                        {navigationPlannerMode === 'live' && (
+                          <p role="status" className="text-[10px] text-emerald-200">
+                            {isLiveAvoidanceReady
+                              ? `Live local costmap • ${liveNavigationObstacles?.points?.length || 0} obstacle samples • ${liveNavigationObstacles?.age_ms ?? '—'} ms old • Nav2 adjusts motion using its commissioned local controller.`
+                              : `Adaptive execution locked • ${liveNavigationObstacles?.error || 'fresh costmap and explicit Nav2 avoidance commissioning are required.'}`}
+                          </p>
+                        )}
                         <div className="flex flex-wrap gap-2">
                           <button
                             type="button"
@@ -4666,14 +5369,26 @@ export default function App() {
                           >
                             {isNavigationPreviewing ? 'Planning…' : 'Preview route • no motion'}
                           </button>
-                          <button
-                            type="button"
-                            onClick={handleStartNavigation}
-                            disabled={isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
-                            className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
-                          >
-                            {isNavigationStarting ? 'Starting…' : 'Start Nav2'}
-                          </button>
+                          {session?.user?.role === 'teacher' ? (
+                            <button
+                              type="button"
+                              aria-label="Start Nav2"
+                              onClick={handleStartNavigation}
+                              disabled={isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                              className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
+                            >
+                              {isNavigationStarting ? 'Starting…' : 'Approve & start Nav2'}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={handleSubmitPlannerRequest}
+                              disabled={!navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version}
+                              className="rounded-md border border-amber-600 px-2 py-1 text-[10px] font-semibold text-amber-200 disabled:opacity-50"
+                            >
+                              Send route to teacher for review
+                            </button>
+                          )}
                           {navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status) && (
                             <button
                               type="button"
@@ -4712,6 +5427,18 @@ export default function App() {
                       </div>
                     )}
                     <div className="flex gap-2">
+                      {session?.user?.role === 'teacher' && (
+                        <select
+                          aria-label="Path planner mode"
+                          value={pathPlannerMode}
+                          onChange={(event) => handlePathPlannerModeChange(event.target.value)}
+                          className="min-w-0 flex-1 rounded-md border border-slate-600 bg-slate-800 px-2 py-2 text-[10px] font-semibold text-slate-200"
+                        >
+                          {Object.entries(PLANNER_MODE_LABELS).map(([mode, label]) => (
+                            <option key={mode} value={mode}>{label}</option>
+                          ))}
+                        </select>
+                      )}
                       <button
                         type="button"
                         aria-label="Place waypoint"
@@ -4723,6 +5450,83 @@ export default function App() {
                       </button>
                       <button type="button" onClick={compilePlannerPath} className="flex-1 rounded-md bg-emerald-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-emerald-500">Compile</button>
                     </div>
+                    {session && session.user.role !== 'teacher' && (
+                      <button
+                        type="button"
+                        onClick={handleSubmitPlannerRequest}
+                        className="w-full rounded-md border border-amber-600 bg-amber-950/40 px-2 py-2 text-[10px] font-semibold text-amber-200 hover:bg-amber-900/50"
+                      >
+                        Send {PLANNER_MODE_LABELS[pathPlannerMode]} request to teacher
+                      </button>
+                    )}
+                    {session?.user?.role !== 'teacher' && (
+                      <p className="text-[10px] text-slate-400">Teacher-selected mode: {PLANNER_MODE_LABELS[pathPlannerMode]}</p>
+                    )}
+                    {pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && session?.user?.role === 'teacher' && (
+                      <button
+                        type="button"
+                        onClick={handleRunCheckpointedPlanner}
+                        disabled={isRunning || !plannerRouteVariants.initial}
+                        className="w-full rounded-md bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 disabled:opacity-50"
+                      >
+                        {isRunning ? 'Running SDK path and checking waypoints…' : 'Run SDK path • checkpoint and correct'}
+                      </button>
+                    )}
+                    {pathPlannerMode === PLANNER_PATH_MODES.autonomous && (
+                      <p className="rounded-md border border-amber-700 bg-amber-950/40 p-2 text-[10px] text-amber-200">
+                        Autonomous mode runs only from the teacher Nav2 map controls. The completed Nav2 feedback path—not the preview—is translated to SDK commands.
+                      </p>
+                    )}
+                    {pathPlannerMode !== PLANNER_PATH_MODES.manual && (
+                      <div className="space-y-1 rounded-md border border-slate-700 bg-slate-900 p-2">
+                        <p className="text-[10px] uppercase tracking-wide text-slate-300">Compiled route variants</p>
+                        <div className="flex flex-wrap gap-2">
+                          {['initial', 'corrected', 'final'].filter((variant) => (
+                            typeof plannerRouteVariants[variant] === 'string' && plannerRouteVariants[variant].length > 0
+                          )).map((variant) => (
+                            <button
+                              key={variant}
+                              type="button"
+                              aria-pressed={selectedPlannerVariant === variant}
+                              onClick={() => {
+                                setSelectedPlannerVariant(variant);
+                                const nextCode = plannerRouteVariants[variant];
+                                if (nextCode) {
+                                  compiledPlannerCodeRef.current = nextCode;
+                                  updateGeneratedCode(nextCode);
+                                }
+                              }}
+                              className={`rounded-md border px-2 py-1 text-[10px] font-semibold ${selectedPlannerVariant === variant ? 'border-emerald-500 bg-emerald-950 text-emerald-100' : 'border-slate-600 text-slate-300'}`}
+                            >
+                              {variant === 'initial' ? 'Initial' : variant === 'corrected' ? 'Corrected' : 'Final'}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          {pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected
+                            ? 'Initial is the compiled SDK plan. Corrected appears only after checkpointed SDK execution and contains the commands actually sent, including any measured corrections.'
+                            : 'The autonomous SDK variant appears only after a successful Nav2 run with a valid localization feedback trace.'}
+                        </p>
+                      </div>
+                    )}
+                    {session?.user?.username && pathPlannerMode !== PLANNER_PATH_MODES.manual
+                      && (plannerRouteVariants.corrected || plannerRouteVariants.final) && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          value={plannerProjectLabel}
+                          onChange={(event) => setPlannerProjectLabel(event.target.value)}
+                          placeholder="Planner route label"
+                          className="flex-1 rounded-md border border-slate-600 bg-slate-800 px-2 py-1 text-[10px] text-slate-100"
+                        />
+                        <button
+                          type="button"
+                          onClick={savePathPlannerProject}
+                          className="rounded-md bg-slate-700 px-2 py-1 text-[10px] font-semibold text-white"
+                        >
+                          Save path project
+                        </button>
+                      </div>
+                    )}
                     {isWaypointPlacementEnabled && (
                       <p className="rounded-lg border border-cyan-500/30 bg-cyan-950/50 p-2 text-xs text-cyan-200">
                         Click an open spot on the grid to place a waypoint, or click again to cancel.

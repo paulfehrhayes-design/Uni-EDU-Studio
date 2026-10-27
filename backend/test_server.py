@@ -14,6 +14,117 @@ app = server.app
 
 
 class ServerClassroomTests(unittest.TestCase):
+    def test_planner_mode_setting_is_teacher_controlled_and_shared(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            result = server.update_planner_settings(
+                server.PlannerSettingsRequest(active_mode="sensor_corrected"),
+                {"role": "teacher", "username": "teacher"},
+            )
+            self.assertEqual(result["active_mode"], "sensor_corrected")
+            self.assertEqual(
+                server.get_planner_settings({"role": "student", "username": "student1"}),
+                {"active_mode": "sensor_corrected"},
+            )
+            with self.assertRaisesRegex(HTTPException, "Teacher role required"):
+                server.update_planner_settings(
+                    server.PlannerSettingsRequest(active_mode="autonomous"),
+                    {"role": "student", "username": "student1"},
+                )
+
+    def test_saved_path_project_round_trips_mode_label_variants_and_plain_code(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            project = server.save_project_for_user(
+                "student1",
+                {
+                    "name": "checkpointed-classroom-route",
+                    "plannerWaypoints": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}],
+                    "generatedCode": "robot.stand()\nrobot.walktime(2.5)",
+                    "plannerMode": "sensor_corrected",
+                    "plannerLabel": "checkpointed-classroom-route",
+                    "plannerVariants": {"initial": "robot.walktime(2)", "corrected": "robot.walktime(2.5)"},
+                    "selectedPlannerVariant": "corrected",
+                },
+            )
+            self.assertEqual(project["plannerMode"], "sensor_corrected")
+            self.assertEqual(project["plannerLabel"], "checkpointed-classroom-route")
+            self.assertEqual(project["selectedPlannerVariant"], "corrected")
+            self.assertEqual(project["generatedCode"], "robot.stand()\nrobot.walktime(2.5)\n")
+            library_project = server.list_projects_for_user("student1")[0]
+            self.assertEqual(library_project["plannerVariants"]["corrected"], "robot.walktime(2.5)")
+
+    def test_checkpointed_sdk_route_fails_closed_without_deployment_enablement(self):
+        request = server.CheckpointedPlannerRequest(
+            waypoints=[{"x": 0.0, "y": 0.0}, {"x": 0.5, "y": 0.0}]
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "G1_SDK_CHECKPOINTED_PLANNER_ENABLED": "",
+                "G1_SDK_CHECKPOINTED_PLANNER_OWNER_CONFIRMED": "1",
+            },
+        ):
+            with self.assertRaisesRegex(HTTPException, "deployment-disabled"):
+                server.run_checkpointed_planner(request, {"role": "teacher", "username": "teacher"})
+
+    def test_checkpointed_sdk_route_uses_live_pose_at_waypoint_checkpoints(self):
+        request = server.CheckpointedPlannerRequest(
+            waypoints=[{"x": 0.5, "y": 0.0}, {"x": 1.0, "y": 0.0}]
+        )
+        poses = iter([
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.5, 0.0),
+            (0.5, 0.0),
+            (1.0, 0.0),
+        ])
+
+        def localization_snapshot():
+            x, y = next(poses)
+            return {
+                "localization": {
+                    "ready": True,
+                    "frame_id": "map",
+                    "pose": {"x": x, "y": y, "yaw_rad": 0.0},
+                },
+                "pointcloudReady": True,
+                "estop": {"ready": True},
+                "robotHealth": {"ready": True},
+            }
+
+        executions = []
+
+        def execute(code, **_kwargs):
+            executions.append(code)
+            return {"status": "completed", "commandsExecuted": 1}
+
+        with patch.dict(
+            os.environ,
+            {
+                "G1_SDK_CHECKPOINTED_PLANNER_ENABLED": "1",
+                "G1_SDK_CHECKPOINTED_PLANNER_OWNER_CONFIRMED": "1",
+            },
+        ), patch.object(server, "ensure_sdk_motion_available"), patch.object(
+            server, "robot_status", return_value={"sdkAvailable": True, "running": False}
+        ), patch.object(server, "navigation_bridge_status", side_effect=localization_snapshot), patch.object(
+            server, "execute_robot_program", side_effect=execute
+        ):
+            result = server.run_checkpointed_planner(
+                request, {"role": "teacher", "username": "teacher"}
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(result["checkpoints"]), 2)
+        self.assertTrue(all(checkpoint["error_m"] <= 0.25 for checkpoint in result["checkpoints"]))
+        self.assertIn("robot.walktime", result["correctedCode"])
+        self.assertEqual(executions[0], "robot.stand()")
+        self.assertEqual(executions[-1], "robot.stand()")
+
     def test_teacher_can_capture_publish_and_share_validated_lidar_map(self):
         client = TestClient(app)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
@@ -243,7 +354,7 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(anonymous.status_code, 401)
 
-    def test_navigation_map_endpoint_is_teacher_only_and_read_only(self):
+    def test_navigation_map_endpoint_is_available_for_authenticated_planning_and_read_only(self):
         client = TestClient(app)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
@@ -280,9 +391,10 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["data"], [0, 100, -1, 50])
         self.assertEqual(response.json()["knownMapVersions"][0]["version"], "v2")
-        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.status_code, 200)
+        self.assertEqual(denied.json()["map"]["version"], "v2")
 
-    def test_route_preview_is_teacher_only_and_does_not_start_navigation(self):
+    def test_route_preview_is_available_for_authenticated_users_and_does_not_start_navigation(self):
         client = TestClient(app)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
@@ -331,9 +443,10 @@ class ServerClassroomTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), preview)
-        plan_route.assert_called_once()
+        self.assertEqual(plan_route.call_count, 2)
         start_route.assert_not_called()
-        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.status_code, 200)
+        self.assertEqual(denied.json(), preview)
 
     def test_navigation_start_is_teacher_only_persists_operation_and_locks_sdk(self):
         client = TestClient(app)
@@ -795,11 +908,11 @@ class ServerClassroomTests(unittest.TestCase):
             teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
             student_headers = {"Authorization": f"Bearer {student['token']}"}
             code = "robot.walktime(0.5)"
-            client.post(
+            submission = client.post(
                 "/api/classroom/submit-code",
                 headers=student_headers,
                 json={"name": "robot-motion", "code": code},
-            )
+            ).json()["item"]
 
             with patch.object(
                 server,
@@ -809,6 +922,7 @@ class ServerClassroomTests(unittest.TestCase):
                 response = client.post(
                     "/api/classroom/run-next",
                     headers=teacher_headers,
+                    json={"item_id": submission["id"]},
                 )
 
             self.assertEqual(response.status_code, 200)
@@ -846,6 +960,7 @@ class ServerClassroomTests(unittest.TestCase):
                 response = client.post(
                     "/api/classroom/run-next",
                     headers=teacher_headers,
+                    json={"item_id": submission["id"]},
                 )
 
             self.assertEqual(response.status_code, 409)
@@ -855,6 +970,41 @@ class ServerClassroomTests(unittest.TestCase):
             ).json()["items"]
             self.assertEqual(items[0]["id"], submission["id"])
             self.assertEqual(items[0]["status"], "queued")
+
+    def test_run_next_requires_the_exact_teacher_reviewed_queue_item_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            client = TestClient(app)
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": "Bearer " + teacher["token"]}
+            student_headers = {"Authorization": "Bearer " + student["token"]}
+            submission = client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={"name": "reviewed-code", "code": "robot.walktime(1)"},
+            ).json()["item"]
+
+            with patch.object(server, "execute_robot_program") as execute:
+                response = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": "not-the-reviewed-request"},
+                )
+            queued_items = server.list_queue_items()
+
+        self.assertEqual(response.status_code, 404)
+        execute.assert_not_called()
+        self.assertEqual(queued_items[0]["id"], submission["id"])
+        self.assertEqual(queued_items[0]["status"], "queued")
 
 
 class AccountManagementTests(unittest.TestCase):

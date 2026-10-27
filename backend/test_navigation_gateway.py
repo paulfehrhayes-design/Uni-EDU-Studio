@@ -113,6 +113,31 @@ class NavigationGatewayScanTests(unittest.TestCase):
         ), self.assertRaisesRegex(GatewayConfigurationError, "between 1 and 60"):
             _configuration()
 
+    def test_local_costmap_and_live_avoidance_require_explicit_commissioning(self):
+        with patch.dict(
+            os.environ,
+            {
+                "G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token",
+            },
+            clear=True,
+        ):
+            config = _configuration()
+        self.assertEqual(config["local_costmap_topic"], "/local_costmap/costmap")
+        self.assertFalse(config["live_avoidance_enabled"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token",
+                "G1_NAV_LOCAL_COSTMAP_TOPIC": "/robot/local_costmap",
+                "G1_NAV_LIVE_AVOIDANCE_ENABLED": "1",
+            },
+            clear=True,
+        ):
+            config = _configuration()
+        self.assertEqual(config["local_costmap_topic"], "/robot/local_costmap")
+        self.assertTrue(config["live_avoidance_enabled"])
+
     def test_estop_heartbeat_topic_and_freshness_are_configurable(self):
         with patch.dict(
             os.environ,

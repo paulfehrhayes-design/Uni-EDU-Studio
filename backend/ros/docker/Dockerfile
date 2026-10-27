@@ -53,9 +53,12 @@ COPY backend/ros/g1_joint_state_bridge.py /opt/uni-edu/ros/g1_joint_state_bridge
 COPY backend/ros/g1_joint_state.py /opt/uni-edu/ros/g1_joint_state.py
 COPY backend/ros_lidar_provider.py /opt/uni-edu/ros_lidar_provider.py
 COPY backend/sensor_calibration.py /opt/uni-edu/sensor_calibration.py
-COPY public/g1/g1.xml /opt/uni-edu/g1.xml
+COPY vendor/DUET/src/assets/robots/unitree_g1/xmls/g1_23dof.xml /opt/uni-edu/g1_23dof.xml
 COPY g1_23dof.urdf.txt /opt/uni-edu/g1_23dof.urdf.txt
 COPY backend/ros/docker/entrypoint.sh /usr/local/bin/uni-edu-ros-entrypoint
+
+ENV G1_SENSOR_URDF_PATH=/opt/uni-edu/g1_23dof.urdf.txt
+ENV G1_SENSOR_GEOMETRY_PATH=/opt/uni-edu/g1_23dof.xml
 
 RUN chmod 755 /usr/local/bin/uni-edu-ros-entrypoint
 

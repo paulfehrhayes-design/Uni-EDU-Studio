@@ -71,7 +71,9 @@ environment variables are `G1_NAV_GATEWAY_HOST`, `G1_NAV_GATEWAY_PORT`,
 `G1_NAV_ACTION_NAME`, `G1_NAV_PLAN_ACTION_NAME`, `G1_NAV_PLANNER_ID`,
 `G1_NAV_PLAN_TIMEOUT_SECONDS`, `G1_NAV_SPIN_ACTION_NAME`,
 `G1_NAV_SCAN_ROTATION_TIMEOUT_SECONDS` (30–300 seconds, default 180),
-`G1_NAV_MAP_TOPIC`, `G1_NAV_POINTCLOUD_TOPIC`, `G1_NAV_MAP_FRAME`,
+`G1_NAV_MAP_TOPIC`, `G1_NAV_POINTCLOUD_TOPIC`, `G1_NAV_LOCAL_COSTMAP_TOPIC`
+(default `/local_costmap/costmap`), `G1_NAV_LIVE_AVOIDANCE_ENABLED` (default
+`0`), `G1_NAV_MAP_FRAME`,
 `G1_NAV_BASE_FRAME`, `G1_NAV_MAP_ID`, `G1_NAV_OCCUPIED_THRESHOLD`,
 `G1_NAV_ESTOP_HEALTHY_TOPIC`, `G1_NAV_ESTOP_MAX_AGE_MS`,
 `G1_NAV_ROBOT_HEALTHY_TOPIC`, and `G1_NAV_ROBOT_HEALTH_MAX_AGE_MS` (100–5000 ms,
@@ -159,13 +161,40 @@ overlay automatically. The API is teacher-authenticated for capture and
 publishing; students can read the approved shared map only while the shared
 overlay setting is on.
 
-The teacher's planner refreshes its loaded occupancy map when the live map
-version changes and reconnects its live status stream after a dropped
-connection. Destinations are retained only while they remain inside known
-free cells; they are cleared when map geometry changes and removed when their
-cells become occupied or unknown. This live planner preview is separate from
-the approved shared student overlay: students continue to see only the
-centrally published map controlled by the teacher setting.
+The teacher's planner reconnects its live status stream after a dropped
+connection and offers two planning modes:
+
+- **Static 360° map** displays the approved shared scan snapshot. Before route
+  preview or execution, the backend checks every waypoint against both that
+  saved map and the current live SLAM map, and requires their map geometry and
+  frame to match. A changed or stale scan therefore cannot silently authorize
+  motion.
+- **Live adaptive** overlays fresh occupied cells sampled from Nav2's local
+  costmap on the current SLAM map, along with the live robot pose. Nav2's
+  existing `NavigateThroughPoses` controller remains the only motion path and
+  performs local obstacle avoidance; the app does not publish velocity
+  commands or create a second planner/controller. This mode stays disabled
+  unless the local costmap is fresh and
+  `G1_NAV_LIVE_AVOIDANCE_ENABLED=1` is explicitly set after the local obstacle
+  layer, controller behavior, and robot stop response have been commissioned
+  together on the target robot. The flag is an operator commissioning
+  attestation, not an automatic proof of collision avoidance.
+
+Waypoints stay fixed in map-frame coordinates when map versions or costmaps
+update. They are cleared only when the map ID or coordinate frame changes.
+Goals that become blocked or unknown remain visible and are highlighted, but
+the backend rejects them before planning or motion. The local costmap topic
+may need an override for the deployed Nav2 namespace. These planner views are
+separate from the approved shared student overlay: students continue to see
+only the centrally published map controlled by the teacher setting.
+
+For live-adaptive mode, configure the actual Nav2 local-costmap topic and keep
+`G1_NAV_LIVE_AVOIDANCE_ENABLED` unset/`0` until the local obstacle layer and
+Nav2 controller have been verified on hardware. The gateway transforms fresh
+occupied local-costmap cells into the configured map frame for visualization
+and rejects adaptive route requests when that data is missing or stale. A
+live overlay is diagnostic context only; it is not an independent emergency
+stop system or proof that Nav2 is avoiding obstacles correctly.
 
 The classroom API exposes the workflow as:
 
@@ -288,14 +317,53 @@ canceled state. If gateway status is lost or uncertain, the backend retains
 the motion lock (fail closed). This software status is not a substitute for an
 independent physical emergency stop.
 
-## Current boundary
+## Three teacher-selected path planner modes
 
-The existing **Compile** button still creates timed SDK commands from simulator
-waypoints; it is not map-based navigation. Use the separate map goals and
-**Start Nav2** path for ROS navigation. A ready status or accepted goal does
-not prove safe physical operation. Before enabling execution on a real robot,
-commission the correct map/base transforms, Nav2 behavior, controller
-ownership, cancellation, communication-loss response, and physical emergency
-stop in a controlled, supervised area. The `unitree_g1_bridge_navigation`
-repository supplies the `/cmd_vel` to G1 bridge, not Nav2 or route actions;
-the gateway relies on a separately installed Nav2 action server.
+The IDE path planner selector is teacher-controlled and centrally persisted.
+The normal mode compiles relative simulator waypoints into validated SDK
+commands and remains open-loop.
+
+Sensor-corrected mode displays that initial SDK plan, then offers a separate
+checkpointed SDK run. The backend obtains a fresh localization pose before
+each waypoint move and after each move, uses the SDK to move toward the
+waypoint, and allows one SDK correction when the measured error exceeds 0.25 m.
+This route is available only after `G1_SDK_CHECKPOINTED_PLANNER_ENABLED=1`
+and `G1_SDK_CHECKPOINTED_PLANNER_OWNER_CONFIRMED=1` are explicitly set after
+supervised commissioning. A checkpoint that is stale, unhealthy, in a
+different frame, or still out of tolerance stops the run; it does not yield a
+successful corrected path. The corrected variant is the list of SDK commands
+actually submitted during that run, not proof of exact physical waypoint
+attainment.
+
+Autonomous mode requires Live adaptive Nav2 and commissioned local obstacle
+avoidance. The gateway records bounded map-frame localization feedback while
+the route executes. After a successful terminal Nav2 result, the app converts
+that observed path into editable SDK commands for Blocks and IDE. This is a
+best-effort replay approximation, not Nav2's original controller output and
+not a safety-certified replay. If the feedback is missing, truncated, or in a
+different frame, no editable final path is generated.
+
+Both sensor-assisted modes retain an explicit **Save path project** action.
+Saved projects include the waypoint display, mode, initial/corrected/final
+variants, and editor code and are scoped to the saving user's account. They
+are not automatically distributed to other accounts. Students can open their
+own saved path projects; teachers can open their own and classroom projects.
+
+A ready status or accepted goal does not prove safe physical operation.
+Commission the correct map/base transforms, controller ownership, SDK/Nav2
+handoff, cancellation, communication-loss response, localization tolerances,
+and physical emergency stop in a controlled, supervised area before enabling
+physical execution. The `unitree_g1_bridge_navigation` repository supplies
+the `/cmd_vel` to G1 bridge, not Nav2 or route actions; the gateway relies on
+a separately installed Nav2 action server.
+
+### Teacher review and physical approval
+
+Physical run endpoints remain teacher-role protected. Students may submit
+their exact Blocks/IDE program or a planner request to the classroom queue.
+Planner requests preserve the selected mode, grid waypoints, route variants,
+and (for autonomous paths) Nav2 goals and map identity. The teacher queue
+shows the command and route preview and can load a request into the teacher's
+IDE or planner grid. Loading is review-only and never starts motion. The
+teacher must explicitly approve execution; stale or mismatched map versions
+must be reloaded and previewed before Nav2 execution.

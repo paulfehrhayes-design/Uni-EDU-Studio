@@ -52,6 +52,35 @@ def _bridge_configuration() -> tuple[str, str]:
     return base_url, token
 
 
+def _bridge_credentials() -> tuple[str, str]:
+    try:
+        config = _bridge_configuration()
+    except (TypeError, ValueError):
+        config = None
+    if isinstance(config, tuple) and len(config) == 2:
+        base_url, token = config
+    else:
+        base_url = os.getenv("G1_NAV_BRIDGE_URL", "").strip().rstrip("/")
+        token = os.getenv("G1_NAV_BRIDGE_TOKEN", "").strip()
+    parsed = urlparse(base_url)
+    if not base_url or not token:
+        raise NavigationBridgeError(
+            "LiDAR navigation bridge is not configured; set G1_NAV_BRIDGE_URL and G1_NAV_BRIDGE_TOKEN."
+        )
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise NavigationBridgeError("LiDAR navigation bridge URL must be a valid HTTP(S) URL without embedded credentials.")
+    if parsed.query or parsed.fragment:
+        raise NavigationBridgeError("LiDAR navigation bridge URL must not contain a query or fragment.")
+    if parsed.scheme == "http":
+        try:
+            is_loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            is_loopback = parsed.hostname.lower() == "localhost"
+        if not is_loopback:
+            raise NavigationBridgeError("LiDAR navigation bridge must use HTTPS unless it is bound to localhost.")
+    return base_url, token
+
+
 def _get_json(
     base_url: str,
     token: str,
@@ -150,6 +179,7 @@ def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float) -> 
     map_diagnostics = raw.get("map") if isinstance(raw.get("map"), dict) else {}
     actions = raw.get("actions") if isinstance(raw.get("actions"), dict) else {}
     controller = raw.get("controller") if isinstance(raw.get("controller"), dict) else {}
+    local_costmap = raw.get("local_costmap") if isinstance(raw.get("local_costmap"), dict) else {}
 
     def optional_text(value: Any, name: str) -> str | None:
         if value is None:
@@ -215,6 +245,19 @@ def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float) -> 
                 pointcloud.get("callback_duration_ms"), "point-cloud callback duration"
             ),
         },
+        "local_costmap": {
+            "ready": local_costmap.get("ready") is True,
+            "age_ms": optional_number(local_costmap.get("age_ms"), "local costmap age")
+            if local_costmap.get("age_ms") is not None else None,
+            "obstacle_count": (
+                local_costmap.get("obstacle_count")
+                if isinstance(local_costmap.get("obstacle_count"), int)
+                and not isinstance(local_costmap.get("obstacle_count"), bool)
+                and local_costmap.get("obstacle_count") >= 0
+                else None
+            ),
+            "live_avoidance_enabled": local_costmap.get("live_avoidance_enabled") is True,
+        },
         "map": {
             "occupied_threshold": float(threshold) if threshold is not None else None,
             "metadata": None,
@@ -277,6 +320,30 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
     planner_ready = payload.get("planner_ready") is True
     bridge_ready = payload.get("ready") is True
     diagnostics = _validate_diagnostics(payload, float(pointcloud_age_ms))
+    raw_live_obstacles = payload.get("live_obstacles")
+    if not isinstance(raw_live_obstacles, dict):
+        raw_live_obstacles = {}
+    obstacle_frame = raw_live_obstacles.get("frame_id")
+    obstacle_age_ms = raw_live_obstacles.get("age_ms")
+    obstacle_ready = (
+        raw_live_obstacles.get("ready") is True
+        and obstacle_frame == frame_id
+        and isinstance(obstacle_age_ms, (int, float))
+        and not isinstance(obstacle_age_ms, bool)
+        and math.isfinite(float(obstacle_age_ms))
+        and 0 <= obstacle_age_ms <= MAX_POINTCLOUD_AGE_SECONDS * 1000
+    )
+    raw_obstacle_points = raw_live_obstacles.get("points", [])
+    if not isinstance(raw_obstacle_points, list) or len(raw_obstacle_points) > 2_500:
+        raise NavigationBridgeError("Navigation bridge live obstacle point list is invalid or oversized.")
+    obstacle_points = []
+    for index, point in enumerate(raw_obstacle_points):
+        if not isinstance(point, dict):
+            raise NavigationBridgeError(f"Navigation bridge live obstacle point {index + 1} is invalid.")
+        obstacle_points.append({
+            axis: _finite_number(point.get(axis), f"live obstacle point {index + 1} {axis}")
+            for axis in ("x", "y")
+        })
     estop = payload.get("estop")
     estop_age_ms = estop.get("age_ms") if isinstance(estop, dict) else None
     valid_estop_age = (
@@ -338,6 +405,21 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
             "age_ms": max(0, round(age_seconds * 1000)),
         },
         "plannerReady": planner_ready,
+        "liveAvoidanceReady": (
+            payload.get("live_avoidance_ready") is True and obstacle_ready
+        ),
+        "liveObstacles": {
+            "ready": obstacle_ready,
+            "frame_id": obstacle_frame if isinstance(obstacle_frame, str) else None,
+            "age_ms": round(float(obstacle_age_ms)) if obstacle_ready else None,
+            "points": obstacle_points if obstacle_ready else [],
+            "error": (
+                raw_live_obstacles.get("error")
+                if isinstance(raw_live_obstacles.get("error"), str)
+                else None if obstacle_ready
+                else "Nav2 local costmap is missing, stale, or not aligned to the map frame."
+            ),
+        },
         "diagnostics": diagnostics,
         "estop": {
             "ready": estop_ready,
@@ -456,6 +538,42 @@ def _validate_route_targets(
     return normalized
 
 
+def _static_route_targets(
+    live_snapshot: dict[str, Any],
+    static_snapshot: dict[str, Any],
+    map_id: str,
+    version: str,
+    frame_id: str,
+    waypoints: list[dict[str, Any]],
+) -> list[dict[str, float]]:
+    if not isinstance(static_snapshot, dict) or static_snapshot.get("ready") is not True:
+        raise NavigationBridgeError("A published, validated 360-degree scan map is required for static planning.")
+    static_map = _validate_map(static_snapshot.get("map", {}), frame_id)
+    live_map = live_snapshot["map"]
+    geometry_keys = ("map_id", "frame_id", "resolution_m", "width", "height", "origin")
+    if any(static_map[key] != live_map[key] for key in geometry_keys):
+        raise NavigationBridgeError(
+            "The published scan map no longer matches the active map geometry; reload or republish the scan."
+        )
+    if (map_id, version, frame_id) != (
+        static_map["map_id"], static_map["version"], static_map["frame_id"],
+    ):
+        raise NavigationBridgeError("The published scan map changed; reload it before planning.")
+    static_data = _validate_occupancy(static_snapshot, static_map)
+    validated_static = {"map": static_map, "data": static_data}
+    normalized = _validate_route_targets(
+        validated_static, map_id, version, frame_id, waypoints
+    )
+    _validate_route_targets(
+        live_snapshot,
+        live_map["map_id"],
+        live_map["version"],
+        live_map["frame_id"],
+        normalized,
+    )
+    return normalized
+
+
 def navigation_start_route(
     map_id: str,
     version: str,
@@ -464,6 +582,8 @@ def navigation_start_route(
     operation_id: str,
     now: datetime | None = None,
     on_dispatch: Callable[[], None] | None = None,
+    planner_mode: str | None = None,
+    static_map_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if os.getenv("G1_NAV_EXECUTION_ENABLED", "").strip() != "1":
         raise NavigationBridgeError(
@@ -474,8 +594,18 @@ def navigation_start_route(
         raise NavigationBridgeError(snapshot.get("error") or "Navigation map is not ready.")
     if not snapshot.get("motion_ready"):
         raise NavigationBridgeError(snapshot.get("motion_error") or "Physical navigation is disabled because robot and e-stop health are not confirmed.")
-    route = _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
-    base_url, token = _bridge_configuration()
+    if planner_mode == "live" and not snapshot.get("liveAvoidanceReady"):
+        raise NavigationBridgeError(
+            "Live adaptive navigation requires a fresh Nav2 local costmap and commissioned obstacle avoidance."
+        )
+    route = (
+        _static_route_targets(
+            snapshot, static_map_snapshot, map_id, version, frame_id, waypoints
+        )
+        if planner_mode == "static"
+        else _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
+    )
+    base_url, token = _bridge_credentials()
     requested_operation_id = _navigation_operation_id(operation_id)
     if on_dispatch:
         on_dispatch()
@@ -484,9 +614,10 @@ def navigation_start_route(
         token,
         "/api/v1/navigation/goal",
         {
-            "map_id": map_id,
-            "version": version,
-            "frame_id": frame_id,
+            "map_id": snapshot["map"]["map_id"],
+            "version": snapshot["map"]["version"],
+            "frame_id": snapshot["map"]["frame_id"],
+            "planner_mode": planner_mode or "static",
             "operation_id": requested_operation_id,
             "goals": [
                 {"x": waypoint["x"], "y": waypoint["y"], "yaw_rad": 0.0}
@@ -509,20 +640,33 @@ def navigation_plan_route(
     frame_id: str,
     waypoints: list[dict[str, Any]],
     now: datetime | None = None,
+    planner_mode: str | None = None,
+    static_map_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     snapshot = navigation_map_snapshot(now=now)
     if not snapshot.get("ready"):
         raise NavigationBridgeError(snapshot.get("error") or "Navigation map is not ready.")
-    route = _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
-    base_url, token = _bridge_configuration()
+    if planner_mode == "live" and not snapshot.get("liveAvoidanceReady"):
+        raise NavigationBridgeError(
+            "Live adaptive navigation requires a fresh Nav2 local costmap and commissioned obstacle avoidance."
+        )
+    route = (
+        _static_route_targets(
+            snapshot, static_map_snapshot, map_id, version, frame_id, waypoints
+        )
+        if planner_mode == "static"
+        else _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
+    )
+    base_url, token = _bridge_credentials()
     result = _post_json(
         base_url,
         token,
         "/api/v1/navigation/plan",
         {
-            "map_id": map_id,
-            "version": version,
-            "frame_id": frame_id,
+            "map_id": snapshot["map"]["map_id"],
+            "version": snapshot["map"]["version"],
+            "frame_id": snapshot["map"]["frame_id"],
+            "planner_mode": planner_mode or "static",
             "goals": [
                 {"x": waypoint["x"], "y": waypoint["y"], "yaw_rad": 0.0}
                 for waypoint in route
@@ -531,9 +675,9 @@ def navigation_plan_route(
         timeout=NAVIGATION_PLAN_TIMEOUT_SECONDS,
     )
     if (
-        result.get("map_id") != map_id
-        or result.get("version") != version
-        or result.get("frame_id") != frame_id
+        result.get("map_id") != snapshot["map"]["map_id"]
+        or result.get("version") != snapshot["map"]["version"]
+        or result.get("frame_id") != snapshot["map"]["frame_id"]
     ):
         raise NavigationBridgeError("Navigation gateway planned a route against a different map or frame.")
     planner_id = result.get("planner_id")
@@ -551,9 +695,9 @@ def navigation_plan_route(
             for axis in ("x", "y")
         })
     return {
-        "map_id": map_id,
-        "version": version,
-        "frame_id": frame_id,
+        "map_id": map_id if planner_mode == "static" else snapshot["map"]["map_id"],
+        "version": version if planner_mode == "static" else snapshot["map"]["version"],
+        "frame_id": frame_id if planner_mode == "static" else snapshot["map"]["frame_id"],
         "planner_id": planner_id,
         "path": path,
     }
@@ -561,7 +705,7 @@ def navigation_plan_route(
 
 def navigation_operation_status(operation_id: str) -> dict[str, Any]:
     safe_id = _navigation_operation_id(operation_id)
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     result = _get_json(base_url, token, f"/api/v1/navigation/operations/{safe_id}")
     if result.get("operation_id") != safe_id:
         raise NavigationBridgeError("Navigation gateway returned a different operation ID.")
@@ -570,12 +714,35 @@ def navigation_operation_status(operation_id: str) -> dict[str, Any]:
         "succeeded", "canceled", "failed", "uncertain",
     }:
         raise NavigationBridgeError("Navigation gateway returned an invalid operation status.")
-    return result
+    raw_trace = result.get("path_trace", [])
+    if not isinstance(raw_trace, list) or len(raw_trace) > 2_000:
+        raise NavigationBridgeError("Navigation gateway returned an invalid or oversized executed path trace.")
+    trace = []
+    for index, point in enumerate(raw_trace):
+        if not isinstance(point, dict):
+            raise NavigationBridgeError(f"Navigation gateway executed path point {index + 1} is invalid.")
+        frame_id = point.get("frame_id")
+        if not isinstance(frame_id, str) or not frame_id.strip() or len(frame_id) > 256:
+            raise NavigationBridgeError(f"Navigation gateway executed path point {index + 1} has an invalid frame.")
+        trace.append({
+            "x": _finite_number(point.get("x"), f"executed path point {index + 1} x"),
+            "y": _finite_number(point.get("y"), f"executed path point {index + 1} y"),
+            "yaw_rad": _finite_number(point.get("yaw_rad"), f"executed path point {index + 1} yaw"),
+            "frame_id": frame_id,
+        })
+    error = result.get("path_trace_error")
+    if error is not None and (not isinstance(error, str) or len(error) > 1000):
+        raise NavigationBridgeError("Navigation gateway returned an invalid executed path trace error.")
+    normalized = dict(result)
+    normalized["path_trace"] = trace
+    normalized["path_trace_truncated"] = result.get("path_trace_truncated") is True
+    normalized["path_trace_error"] = error
+    return normalized
 
 
 def navigation_cancel_route(operation_id: str) -> dict[str, Any]:
     safe_id = _navigation_operation_id(operation_id)
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     result = _post_json(
         base_url,
         token,
@@ -594,7 +761,7 @@ def navigation_start_scan() -> dict[str, Any]:
         raise NavigationBridgeError(
             "Physical scan execution is disabled; set G1_NAV_EXECUTION_ENABLED=1 after commissioning the ROS/Nav2 gateway."
         )
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     result = _post_json(base_url, token, "/api/v1/scans/start", {})
     job_id = _scan_job_id(result.get("job_id"))
     if result.get("status") != "scanning":
@@ -618,7 +785,7 @@ def _validated_scan_status(result: dict[str, Any], job_id: str) -> dict[str, Any
         isinstance(rotation_radians, bool)
         or not isinstance(rotation_radians, (int, float))
         or not math.isfinite(float(rotation_radians))
-        or not 0 <= float(rotation_radians) <= 100
+        or abs(float(rotation_radians)) > 100
     ):
         raise NavigationBridgeError("LiDAR gateway returned an invalid scan rotation measurement.")
     point_count = result.get("point_count", 0)
@@ -652,7 +819,7 @@ def _validated_scan_status(result: dict[str, Any], job_id: str) -> dict[str, Any
 
 def navigation_scan_status(job_id: str) -> dict[str, Any]:
     safe_id = _scan_job_id(job_id)
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     result = _get_json(
         base_url,
         token,
@@ -664,7 +831,7 @@ def navigation_scan_status(job_id: str) -> dict[str, Any]:
 
 def navigation_scan_pointcloud(job_id: str) -> dict[str, Any]:
     safe_id = _scan_job_id(job_id)
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     result = _get_json(
         base_url,
         token,
@@ -699,7 +866,7 @@ def navigation_scan_pointcloud(job_id: str) -> dict[str, Any]:
 
 def navigation_scan_map_snapshot(job_id: str) -> dict[str, Any]:
     safe_id = _scan_job_id(job_id)
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     payload = _get_json(
         base_url,
         token,
@@ -714,7 +881,7 @@ def navigation_scan_map_snapshot(job_id: str) -> dict[str, Any]:
 
 def navigation_complete_scan(job_id: str) -> dict[str, Any]:
     safe_id = _scan_job_id(job_id)
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     result = _post_json(base_url, token, f"/api/v1/scans/{safe_id}/complete", {})
     if result.get("job_id") != safe_id or result.get("status") not in {"completed", "failed"}:
         raise NavigationBridgeError("LiDAR gateway did not confirm scan completion.")
@@ -723,14 +890,14 @@ def navigation_complete_scan(job_id: str) -> dict[str, Any]:
 
 def navigation_cancel_scan(job_id: str) -> dict[str, Any]:
     safe_id = _scan_job_id(job_id)
-    base_url, token = _bridge_configuration()
+    base_url, token = _bridge_credentials()
     result = _post_json(base_url, token, f"/api/v1/scans/{safe_id}/cancel", {})
     return _validated_scan_status(result, safe_id)
 
 
 def navigation_bridge_status(now: datetime | None = None) -> dict[str, Any]:
     try:
-        base_url, token = _bridge_configuration()
+        base_url, token = _bridge_credentials()
         current_time = now or datetime.now(timezone.utc)
         if current_time.tzinfo is None:
             raise ValueError("Navigation bridge validation time must include a timezone.")
@@ -769,7 +936,7 @@ def navigation_bridge_status(now: datetime | None = None) -> dict[str, Any]:
 
 def navigation_map_snapshot(now: datetime | None = None) -> dict[str, Any]:
     try:
-        base_url, token = _bridge_configuration()
+        base_url, token = _bridge_credentials()
         current_time = now or datetime.now(timezone.utc)
         if current_time.tzinfo is None:
             raise ValueError("Navigation bridge validation time must include a timezone.")

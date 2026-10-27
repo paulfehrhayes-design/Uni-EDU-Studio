@@ -1,12 +1,15 @@
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
 try:
     from . import sensor_calibration as calibration_module
     from .sensor_calibration import (
         _live_provider_calibration_report,
+        DEFAULT_GEOMETRY_PATH,
+        DEFAULT_URDF_PATH,
         automatic_calibration_model,
         calibration_status,
         compare_transforms,
@@ -18,6 +21,8 @@ except ImportError:
     import sensor_calibration as calibration_module
     from sensor_calibration import (
         _live_provider_calibration_report,
+        DEFAULT_GEOMETRY_PATH,
+        DEFAULT_URDF_PATH,
         automatic_calibration_model,
         calibration_status,
         compare_transforms,
@@ -111,8 +116,43 @@ class SensorCalibrationTests(unittest.TestCase):
 
         self.assertEqual(len(model["path_warnings"]), 2)
         self.assertEqual(len(status["model_path_warnings"]), 2)
-        self.assertIn("bundled G1 URDF", status["reason"])
+        self.assertIn("bundled G1 EDU 23-DOF URDF", status["reason"])
         self.assertFalse(status["ready"])
+
+    def test_calibration_uses_the_exact_23_dof_edu_collision_model(self):
+        model = automatic_calibration_model()
+
+        self.assertEqual(model["actuated_joint_count"], 23)
+        self.assertEqual(model["footprint"]["source"], "g1_23dof.xml")
+        status = calibration_status(
+            env={"G1_DISTANCE_BASE_FRAME": model["root_frame"]},
+            live_report={"ready": False},
+        )
+        self.assertEqual(status["geometry_model"], "g1_23dof.xml")
+        self.assertEqual(status["actuated_joint_count"], 23)
+        self.assertEqual(
+            {key: model["footprint"][key] for key in ("front", "rear", "half_width")},
+            {"front": 0.175, "rear": 0.175, "half_width": 0.225},
+        )
+
+    def test_calibration_rejects_a_robot_description_with_the_wrong_dof_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            urdf_path = os.path.join(temp_dir, "wrong_dof.urdf")
+            tree = ET.parse(DEFAULT_URDF_PATH)
+            root = tree.getroot()
+            ET.SubElement(root, "link", {"name": "extra_link"})
+            joint = ET.SubElement(
+                root,
+                "joint",
+                {"name": "extra_joint", "type": "revolute"},
+            )
+            ET.SubElement(joint, "parent", {"link": "pelvis"})
+            ET.SubElement(joint, "child", {"link": "extra_link"})
+            ET.SubElement(joint, "axis", {"xyz": "0 0 1"})
+            tree.write(urdf_path, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "must have 23 actuated joints"):
+                automatic_calibration_model(urdf_path, DEFAULT_GEOMETRY_PATH)
 
     def test_live_transform_must_match_frames_and_tolerances(self):
         candidate = {
@@ -335,6 +375,42 @@ class SensorCalibrationTests(unittest.TestCase):
 
         self.assertFalse(status["ready"])
         self.assertIn("supported G1 model root 'pelvis'", status["reason"])
+
+    def test_verified_calibration_can_persist_and_restore_for_same_model(self):
+        model = automatic_calibration_model()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = os.path.join(temp_dir, "sensor-calibration.json")
+            env = {
+                "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                "G1_LIDAR_MOUNT_CONFIRMED": "1",
+                "G1_SENSOR_AUTO_CALIBRATION_PERSIST": "1",
+                "G1_SENSOR_CALIBRATION_CACHE_PATH": cache_path,
+            }
+            live_report = {
+                "ready": True,
+                "status": "verified",
+                "reason": "Persisted model match.",
+                "model_fingerprint": model["model_fingerprint"],
+                "transform": {
+                    "parent_frame": model["mount"]["parent_frame"],
+                    "sensor_frame": model["mount"]["sensor_frame"],
+                    "translation_error_m": 0.0,
+                    "rotation_error_rad": 0.0,
+                },
+                "footprint": model["footprint"],
+            }
+            status = calibration_status(env=env, live_report=live_report)
+            self.assertTrue(status["ready"])
+
+            restored = calibration_status(
+                env={
+                    "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                    "G1_SENSOR_AUTO_CALIBRATION_PERSIST": "1",
+                    "G1_SENSOR_CALIBRATION_CACHE_PATH": cache_path,
+                }
+            )
+            self.assertTrue(restored["ready"])
+            self.assertEqual(restored["model_fingerprint"], model["model_fingerprint"])
 
 
 if __name__ == "__main__":

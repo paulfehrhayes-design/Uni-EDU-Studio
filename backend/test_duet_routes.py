@@ -114,12 +114,74 @@ class DuetRouteTests(unittest.TestCase):
         self.assertEqual(submitted.json()["item"]["controller_version"], "duet")
 
         with patch.object(server, "execute_robot_program") as execute_sdk:
-            response = self.client.post("/api/classroom/run-next", headers=self.teacher)
+            response = self.client.post(
+                "/api/classroom/run-next",
+                headers=self.teacher,
+                json={"item_id": submitted.json()["item"]["id"]},
+            )
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("will not be sent to the legacy SDK", response.json()["detail"])
         execute_sdk.assert_not_called()
         self.assertEqual(server.list_queue_items()[0]["status"], "queued")
+
+    def test_planner_request_queue_preserves_reviewable_mode_waypoints_and_code(self):
+        planner_request = {
+            "planner_mode": "sensor_corrected",
+            "planner_label": "Checkpoint route",
+            "planner_waypoints": [{"x": 1, "y": -0.5}, {"x": 2, "y": 1}],
+            "route_variants": {"initial": "robot.walktime(2.5)", "corrected": ""},
+            "selected_variant": "initial",
+        }
+        response = self.client.post(
+            "/api/classroom/submit-code",
+            headers=self.student,
+            json={
+                "name": "checkpoint-route",
+                "code": "robot.walktime(2.5)",
+                "controller_version": "legacy",
+                "planner_request": planner_request,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["item"]
+        self.assertEqual(item["code"], "robot.walktime(2.5)")
+        self.assertEqual(item["planner_request"]["planner_mode"], "sensor_corrected")
+        self.assertEqual(len(item["planner_request"]["planner_waypoints"]), 2)
+        self.assertEqual(server.list_queue_items()[0]["planner_request"], item["planner_request"])
+        with patch.object(server, "execute_robot_program") as execute_sdk:
+            queue_run = self.client.post(
+                "/api/classroom/run-next",
+                headers=self.teacher,
+                json={"item_id": item["id"]},
+            )
+        self.assertEqual(queue_run.status_code, 409)
+        self.assertIn("matching planner controls", queue_run.json()["detail"])
+        execute_sdk.assert_not_called()
+
+    def test_planner_request_rejects_invalid_autonomous_map_goals(self):
+        response = self.client.post(
+            "/api/classroom/submit-code",
+            headers=self.student,
+            json={
+                "name": "bad-autonomous-route",
+                "code": "",
+                "planner_request": {
+                    "planner_mode": "autonomous",
+                    "navigation": {
+                        "map_id": "classroom",
+                        "version": "v1",
+                        "frame_id": "map",
+                        "planner_mode": "live",
+                        "waypoints": [{"x": 1001, "y": 2}],
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("outside the accepted finite coordinate range", response.json()["detail"])
 
 
 if __name__ == "__main__":

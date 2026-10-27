@@ -260,13 +260,32 @@ Each connection creates a private JSON Lines session file under `/home/unitree/h
 
 Check service startup/errors with `systemctl --user status uni-edu-studio` and `journalctl --user -u uni-edu-studio -e`. Keep the service and port on a trusted local network; do not expose port 5179 to the public internet or configure router port forwarding. Physical motion is not verified by service startup or a Connected status. Keep a clear supervised area and the robot's independent emergency stop available.
 
+### Ubuntu 20.04 ROS container and directional sensing checks
+
+On Ubuntu 20.04, ROS 2 Humble runs inside the `uni-edu-lidar-humble:local` Docker image; it is not installed into the host OS. The installer enables the system-level `uni-edu-lidar-driver` container service when it must start the MID-360 driver, and the `uni-edu-lidar-provider` container service for read-only distance processing. Check them on the robot computer with:
+
+```bash
+sudo systemctl status docker uni-edu-lidar-driver uni-edu-lidar-provider
+sudo journalctl -u uni-edu-lidar-driver -u uni-edu-lidar-provider -b --no-pager
+```
+
+The installer may reuse a compatible existing point-cloud stream and then will not start a duplicate Livox driver. In that case, the provider can still run in Docker and subscribe through host networking. A successful image build or active service does not prove that the MID-360 is powered, reachable, publishing fresh data, or physically mounted as modeled.
+
+After teacher login, inspect **Settings → Sensors** or request the authenticated `GET /api/sensors/status`. A usable reading must report `lidar.distance.ready: true` for forward and `lidar.distance.rear.ready: true` for rear, with fresh samples. IDE conditions `robot.front_distance_m()` and `robot.rear_distance_m()` read the corresponding footprint-clearance sectors from the same 360-degree cloud; distances and comparison thresholds are in meters. Both remain unavailable unless the supported G1 model, live ROS transforms, verified physical mount, and fresh point clouds pass calibration checks. Do not set `G1_LIDAR_MOUNT_CONFIRMED=1` until the installed mount has been checked against the model. If either direction is unavailable, use the status error and service logs to diagnose it; do not bypass the calibration or freshness gate.
+
 The backend accepts only the shared, bounded `robot.*` command language and bounded `for ... in range(...)` loops. Physical execution currently maps stand, forward/backward walking, timed/slow/fast walking, turns, and one-step sidesteps to the SDK locomotion client. Supported arm presets use the G1 arm-action SDK; they are sent exactly as written and do not implicitly append a `release arm` action. `robot.hold_arm("hands up", 3)` runs one of the supported static presets and waits at least the requested 0.1–10 seconds before continuing; it does not actively maintain joint targets or verify that the pose has completed. The SDK reports acceptance rather than completion, so wait for a preset or posture transition to finish before walking. Before every locomotion command the backend checks `GetFsmId()` and only sends velocity in ready FSM 500; otherwise it rejects the command and directs the program to use `robot.stand()` and wait. Kicks and knee actions remain unavailable for physical runs unless a verified SDK mapping is configured.
 
 The teacher queue's **Clear queue** action removes waiting and finished entries, while leaving any currently running job visible. **Run next** sends the oldest queued program to the same physical G1 SDK executor; if the robot is not ready, that job remains queued so the teacher can reconnect and retry.
 
 After connecting, teachers can use **Test motion** for one confirmed 0.5-second slow forward command (about 10 cm at the configured SDK speed). It does not run automatically on connection and does not verify physical movement. Use it only when the robot is upright and stable, the area is clear, and someone is ready at the emergency stop.
 
-Planner paths are converted to timed walking and turn commands. The G1 SDK interface used here is open-loop and does not read localization, so a physical route cannot stop exactly at its plotted waypoint coordinates. The simulation may show the intended waypoints; physical accuracy requires a localization/odometry feedback integration and real-robot calibration.
+The teacher-selected path planner mode is stored centrally and has three workflows:
+
+- **Normal path** compiles simulator waypoints to the existing validated SDK command language. It remains open-loop.
+- **Sensor-corrected path** first compiles and displays the initial SDK commands. Its separate **Run SDK path • checkpoint and correct** action requires fresh localization, LiDAR, robot-link, and E-stop health at each waypoint. It uses the SDK to move, checks each waypoint to a 0.25 m tolerance, and permits one measured correction. It is deployment-disabled unless both `G1_SDK_CHECKPOINTED_PLANNER_ENABLED=1` and `G1_SDK_CHECKPOINTED_PLANNER_OWNER_CONFIRMED=1` are set after supervised commissioning. The returned corrected code contains the SDK commands actually sent; failed or unverified checkpoints stop the route and do not produce a successful corrected path.
+- **Autonomous obstacle-aware path** requires Live adaptive Nav2 and its commissioned local obstacle-avoidance costmap. Only after Nav2 reports successful completion with a valid localization feedback trace does the app convert that trace into editable SDK commands. This conversion is a replay approximation, not an exact reproduction of Nav2's controller output or a guarantee of safe replay.
+
+The initial and corrected/final variants synchronize to Blocks and IDE. Saving a labeled path project is an explicit user action; the route is saved to that user's project library rather than automatically applied to every account. Reopening the project restores its waypoints, mode, variants, and editable code. The simulator remains an approximate command-space preview. Physical accuracy and ownership require supervised acceptance on the exact robot.
 
 The browser uses a connection adapter interface (`src/robot/RobotConnection.js`) for status, connect, run, and stop. The SDK adapter wraps the existing authenticated backend routes; a mock adapter exercises the same bounded command catalog in tests. The WebRTC adapter requires an explicitly supplied transport and command encoders, and no WebRTC command is marked supported until its G1 protocol mapping is verified. It parses the shared command language and sends structured encoded commands, never arbitrary Python source.
 

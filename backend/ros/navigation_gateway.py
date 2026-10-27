@@ -74,6 +74,7 @@ MAX_MAP_CELLS = 4_000_000
 MAX_MAP_PREVIEW_CELLS = 250_000
 MAX_PREVIEW_PATH_POSES = 50_000
 MAX_SCAN_POINTS = 300_000
+MAX_LIVE_OBSTACLE_POINTS = 2_500
 MIN_COMPLETED_SCAN_POINTS = 1_000
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_OPERATIONS = 500
@@ -177,13 +178,16 @@ def _configuration() -> dict[str, Any]:
     ).strip()
     map_topic = os.getenv("G1_NAV_MAP_TOPIC", "/map").strip()
     pointcloud_topic = os.getenv("G1_NAV_POINTCLOUD_TOPIC", "/mid360/livox/lidar").strip()
+    local_costmap_topic = os.getenv(
+        "G1_NAV_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"
+    ).strip()
     map_frame = os.getenv("G1_NAV_MAP_FRAME", "map").strip()
     base_frame = os.getenv("G1_NAV_BASE_FRAME", "base_link").strip()
     map_id = os.getenv("G1_NAV_MAP_ID", "nav2-map").strip()
     locomotion_owner = os.getenv("G1_NAV_LOCOMOTION_OWNER", "unverified").strip()
     if not all((
         action_name, spin_action_name, plan_action_name, map_topic,
-        pointcloud_topic, map_frame, base_frame, map_id, locomotion_owner,
+        pointcloud_topic, local_costmap_topic, map_frame, base_frame, map_id, locomotion_owner,
     )):
         raise GatewayConfigurationError("Action, map, frame, and map ID settings cannot be empty.")
     try:
@@ -206,6 +210,10 @@ def _configuration() -> dict[str, Any]:
         ),
         "map_topic": map_topic,
         "pointcloud_topic": pointcloud_topic,
+        "local_costmap_topic": local_costmap_topic,
+        "live_avoidance_enabled": os.getenv(
+            "G1_NAV_LIVE_AVOIDANCE_ENABLED", "0"
+        ).strip() == "1",
         "map_frame": map_frame,
         "base_frame": base_frame,
         "robot_healthy_topic": os.getenv("G1_NAV_ROBOT_HEALTHY_TOPIC", "").strip(),
@@ -298,6 +306,9 @@ def _make_ros_node(config: dict[str, Any]):
             self.pointcloud_count = 0
             self.pointcloud_rate_hz: float | None = None
             self.pointcloud_callback_duration_ms: float | None = None
+            self.local_costmap: dict[str, Any] | None = None
+            self.local_costmap_received_monotonic: float | None = None
+            self.local_costmap_error: str | None = None
             self.estop_healthy: bool | None = None
             self.estop_received_monotonic: float | None = None
             self.robot_healthy: bool | None = None
@@ -315,6 +326,9 @@ def _make_ros_node(config: dict[str, Any]):
             )
             self.pointcloud_subscription = self.create_subscription(
                 PointCloud2, config["pointcloud_topic"], self._pointcloud_callback, 10
+            )
+            self.local_costmap_subscription = self.create_subscription(
+                OccupancyGrid, config["local_costmap_topic"], self._local_costmap_callback, 10
             )
             self.estop_subscription = (
                 self.create_subscription(
@@ -994,6 +1008,112 @@ def _make_ros_node(config: dict[str, Any]):
                 self.grid = grid
                 self.grid_received_monotonic = time.monotonic()
 
+        def _local_costmap_callback(self, message):
+            info = message.info
+            frame = str(message.header.frame_id).strip()
+            width, height = int(info.width), int(info.height)
+            resolution = float(info.resolution)
+            if (
+                not frame
+                or width < 1
+                or height < 1
+                or width * height > MAX_MAP_CELLS
+                or len(message.data) != width * height
+                or not math.isfinite(resolution)
+                or resolution <= 0
+            ):
+                with self.lock:
+                    self.local_costmap_error = "Nav2 local costmap has invalid dimensions, data, or frame."
+                return
+            try:
+                stamp_age_seconds = validate_pointcloud_timestamp(
+                    int(message.header.stamp.sec),
+                    int(message.header.stamp.nanosec),
+                )
+                if frame == self.config["map_frame"]:
+                    translation = (0.0, 0.0, 0.0)
+                    rotation = type("IdentityRotation", (), {
+                        "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0,
+                    })()
+                else:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.config["map_frame"],
+                        frame,
+                        Time.from_msg(message.header.stamp),
+                        timeout=Duration(seconds=0.1),
+                    )
+                    translation = (
+                        float(transform.transform.translation.x),
+                        float(transform.transform.translation.y),
+                        float(transform.transform.translation.z),
+                    )
+                    rotation = transform.transform.rotation
+                origin = info.origin
+                origin_x = float(origin.position.x)
+                origin_y = float(origin.position.y)
+                origin_yaw = _yaw_from_quaternion(origin.orientation)
+                transform_yaw = _yaw_from_quaternion(rotation)
+                if not all(math.isfinite(value) for value in (
+                    origin_x, origin_y, origin_yaw, transform_yaw, *translation,
+                )):
+                    raise ValueError("Nav2 local costmap transform is non-finite.")
+                raw_data = tuple(int(cell) for cell in message.data)
+                if any(cell < -1 or cell > 100 for cell in raw_data):
+                    raise ValueError("Nav2 local costmap occupancy values must be between -1 and 100.")
+
+                cell_count = width * height
+                stride = max(1, math.ceil(cell_count / MAX_LIVE_OBSTACLE_POINTS))
+                origin_cosine = math.cos(origin_yaw)
+                origin_sine = math.sin(origin_yaw)
+                points = []
+                for index in range(0, cell_count, stride):
+                    if raw_data[index] < self.config["occupied_threshold"]:
+                        continue
+                    column = index % width
+                    row = index // width
+                    local_x = (column + 0.5) * resolution
+                    local_y = (row + 0.5) * resolution
+                    frame_x = origin_x + origin_cosine * local_x - origin_sine * local_y
+                    frame_y = origin_y + origin_sine * local_x + origin_cosine * local_y
+                    mapped_x, mapped_y, _ = self._rotate_point(
+                        (frame_x, frame_y, 0.0), rotation
+                    )
+                    points.append({
+                        "x": mapped_x + translation[0],
+                        "y": mapped_y + translation[1],
+                    })
+                snapshot = {
+                    "ready": True,
+                    "frame_id": self.config["map_frame"],
+                    "age_ms": round(stamp_age_seconds * 1000),
+                    "points": points,
+                    "updated_at": _utc_now(),
+                }
+            except (self._transform_exception, TypeError, ValueError, IndexError) as error:
+                with self.lock:
+                    self.local_costmap_error = str(error)
+                return
+            with self.lock:
+                self.local_costmap = snapshot
+                self.local_costmap_received_monotonic = time.monotonic()
+                self.local_costmap_error = None
+
+        def _local_costmap_snapshot(self) -> dict[str, Any]:
+            with self.lock:
+                snapshot = self.local_costmap
+                received = self.local_costmap_received_monotonic
+                error = self.local_costmap_error
+            age_seconds = time.monotonic() - received if received is not None else math.inf
+            ready = snapshot is not None and age_seconds <= SCAN_SENSOR_MAX_AGE_SECONDS
+            return {
+                "ready": ready,
+                "frame_id": snapshot["frame_id"] if ready else self.config["map_frame"],
+                "age_ms": round(age_seconds * 1000) if math.isfinite(age_seconds) else None,
+                "points": snapshot["points"] if ready else [],
+                "updated_at": snapshot["updated_at"] if ready else None,
+                "error": None if ready else error or "Nav2 local costmap is missing or stale.",
+            }
+
         def _localization_snapshot(self) -> dict[str, Any]:
             try:
                 transform = self.tf_buffer.lookup_transform(
@@ -1044,6 +1164,7 @@ def _make_ros_node(config: dict[str, Any]):
         def status_snapshot(self) -> dict[str, Any]:
             localization = self._localization_snapshot()
             motion_health = self._motion_health_snapshot()
+            live_obstacles = self._local_costmap_snapshot()
             with self.lock:
                 grid = self.grid
                 grid_age = (
@@ -1074,6 +1195,10 @@ def _make_ros_node(config: dict[str, Any]):
                 "ready": ready,
                 "status": "ready" if ready else "unavailable",
                 "motion_ready": motion_ready,
+                "live_avoidance_ready": bool(
+                    self.config["live_avoidance_enabled"] and live_obstacles["ready"]
+                ),
+                "live_obstacles": live_obstacles,
                 "estop": motion_health["estop"],
                 "robot_health": motion_health["robot"],
                 "planner_ready": bool(map_ready and action_ready),
@@ -1088,6 +1213,7 @@ def _make_ros_node(config: dict[str, Any]):
                     "topics": {
                         "pointcloud": self.config["pointcloud_topic"],
                         "map": self.config["map_topic"],
+                        "local_costmap": self.config["local_costmap_topic"],
                     },
                     "frames": {
                         "pointcloud": pointcloud_frame,
@@ -1109,6 +1235,12 @@ def _make_ros_node(config: dict[str, Any]):
                         "metadata": map_metadata,
                         "age_ms": round(max(0.0, grid_age) * 1000)
                         if math.isfinite(grid_age) else None,
+                    },
+                    "local_costmap": {
+                        "ready": live_obstacles["ready"],
+                        "age_ms": live_obstacles["age_ms"],
+                        "obstacle_count": len(live_obstacles["points"]),
+                        "live_avoidance_enabled": self.config["live_avoidance_enabled"],
                     },
                     "actions": {
                         "navigation": action_ready,
@@ -1197,6 +1329,16 @@ def _make_ros_node(config: dict[str, Any]):
                     if request.get("frame_id") != grid["frame_id"] or grid["frame_id"] != self.config["map_frame"]:
                         raise GatewayHTTPError(409, "frame_id must exactly match the current map frame.")
                     goals = request.get("goals")
+                    planner_mode = request.get("planner_mode", "live")
+                    if planner_mode not in {"live", "static"}:
+                        raise GatewayHTTPError(400, "planner_mode must be 'live' or 'static'.")
+                    if planner_mode == "live":
+                        live_obstacles = self._local_costmap_snapshot()
+                        if not self.config["live_avoidance_enabled"] or not live_obstacles["ready"]:
+                            raise GatewayHTTPError(
+                                503,
+                                "Live adaptive navigation requires a fresh Nav2 local costmap and commissioned obstacle avoidance.",
+                            )
                     if not isinstance(goals, list) or not goals or len(goals) > MAX_GOALS:
                         raise GatewayHTTPError(400, f"goals must contain between 1 and {MAX_GOALS} poses.")
                     valid_goals = []
@@ -1401,6 +1543,10 @@ def _make_ros_node(config: dict[str, Any]):
                     )
                 if not self.action_client.server_is_ready():
                     raise GatewayHTTPError(503, "Nav2 NavigateThroughPoses action server is not ready.")
+                start_localization = self._localization_snapshot()
+                if not start_localization.get("ready") or start_localization.get("frame_id") != grid["frame_id"]:
+                    raise GatewayHTTPError(503, "Fresh localization in the active map frame is required before route execution.")
+                start_pose = start_localization["pose"]
 
                 operation_id = requested_id
                 operation = {
@@ -1412,10 +1558,16 @@ def _make_ros_node(config: dict[str, Any]):
                     "version": grid["version"],
                     "frame_id": grid["frame_id"],
                     "goal_count": len(valid_goals),
+                    "planner_mode": planner_mode,
                     "goals": [
                         {"x": x, "y": y, "yaw_rad": yaw}
                         for x, y, yaw in valid_goals
                     ],
+                    "path_trace": [{
+                        **start_pose,
+                        "frame_id": start_localization["frame_id"],
+                    }],
+                    "path_trace_truncated": False,
                     "cancel_requested": False,
                     "_goal_handle": None,
                 }
@@ -1451,12 +1603,46 @@ def _make_ros_node(config: dict[str, Any]):
                     return self._public_operation(operation)
                 return self._public_operation(operation)
 
-        def _feedback_callback(self, operation_id: str, _feedback: Any) -> None:
+        def _feedback_callback(self, operation_id: str, feedback: Any) -> None:
             with self.lock:
                 operation = self.operations.get(operation_id)
                 if operation and operation["state"] in {"submitted", "running"}:
                     operation["state"] = "running"
                     operation["updated_at"] = _utc_now()
+                    current_pose = getattr(feedback.feedback, "current_pose", None)
+                    if current_pose is not None:
+                        position = current_pose.pose.position
+                        orientation = current_pose.pose.orientation
+                        x = float(position.x)
+                        y = float(position.y)
+                        qz = float(orientation.z)
+                        qw = float(orientation.w)
+                        frame_id = str(current_pose.header.frame_id)
+                        if all(math.isfinite(value) for value in (x, y, qz, qw)):
+                            yaw_rad = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+                            sample = {
+                                "x": x,
+                                "y": y,
+                                "yaw_rad": yaw_rad,
+                                "frame_id": frame_id,
+                            }
+                            operation["current_pose"] = sample
+                            if frame_id != operation["frame_id"]:
+                                operation["path_trace_error"] = "Nav2 feedback frame does not match the route frame."
+                            else:
+                                trace = operation["path_trace"]
+                                previous = trace[-1] if trace else None
+                                moved = previous is None or math.hypot(
+                                    x - previous["x"], y - previous["y"]
+                                ) >= 0.05
+                                turned = previous is None or abs(
+                                    (yaw_rad - previous["yaw_rad"] + math.pi) % (2 * math.pi) - math.pi
+                                ) >= 0.08
+                                if moved or turned:
+                                    if len(trace) < 2_000:
+                                        trace.append(sample)
+                                    else:
+                                        operation["path_trace_truncated"] = True
 
         def _goal_response(self, operation_id: str, future: Any) -> None:
             try:

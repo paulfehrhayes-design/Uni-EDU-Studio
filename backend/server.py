@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import socket
@@ -25,7 +26,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 try:
-    from .g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from .g1_robot import clear_robot_stop_request, connect_robot, execute_robot_program, robot_status, stop_robot
     from .duet_robot import (
         DuetControllerError,
         DuetProgramValidationError,
@@ -56,7 +57,7 @@ try:
         navigation_start_route,
     )
 except ImportError:
-    from g1_robot import connect_robot, execute_robot_program, robot_status, stop_robot
+    from g1_robot import clear_robot_stop_request, connect_robot, execute_robot_program, robot_status, stop_robot
     from duet_robot import (
         DuetControllerError,
         DuetProgramValidationError,
@@ -144,6 +145,11 @@ class SaveCodeRequest(BaseModel):
 
 class QueueSubmissionRequest(SaveCodeRequest):
     controller_version: Literal["legacy", "duet"] = "legacy"
+    planner_request: Optional[dict] = None
+
+
+class QueueRunRequest(BaseModel):
+    item_id: str
 
 
 class ProjectSaveRequest(BaseModel):
@@ -152,12 +158,24 @@ class ProjectSaveRequest(BaseModel):
     plannerWaypoints: List[dict] = []
     generatedCode: str = ""
     duetCode: Optional[str] = None
+    plannerMode: Optional[str] = None
+    plannerLabel: Optional[str] = None
+    plannerVariants: Optional[dict] = None
 
 class NavigationStartRequest(BaseModel):
     map_id: str
     version: str
     frame_id: str
     waypoints: List[dict]
+    planner_mode: Optional[Literal["static", "live"]] = None
+
+
+class CheckpointedPlannerRequest(BaseModel):
+    waypoints: List[dict]
+
+
+class PlannerSettingsRequest(BaseModel):
+    active_mode: Literal["manual", "sensor_corrected", "autonomous"]
 
 
 class LidarScanStartRequest(BaseModel):
@@ -611,6 +629,15 @@ def init_db():
     conn.execute("INSERT OR IGNORE INTO lidar_settings (id, show_shared_overlay) VALUES (1, 0)")
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS planner_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            active_mode TEXT NOT NULL DEFAULT 'manual'
+        )
+        """
+    )
+    conn.execute("INSERT OR IGNORE INTO planner_settings (id, active_mode) VALUES (1, 'manual')")
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS lidar_scans (
             job_id TEXT PRIMARY KEY,
             status TEXT NOT NULL,
@@ -666,7 +693,8 @@ def init_db():
             code TEXT NOT NULL,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            controller_version TEXT NOT NULL DEFAULT 'legacy'
+            controller_version TEXT NOT NULL DEFAULT 'legacy',
+            planner_request TEXT
         )
         """
     )
@@ -677,6 +705,8 @@ def init_db():
         conn.execute(
             "ALTER TABLE queue ADD COLUMN controller_version TEXT NOT NULL DEFAULT 'legacy'"
         )
+    if "planner_request" not in queue_columns:
+        conn.execute("ALTER TABLE queue ADD COLUMN planner_request TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -747,12 +777,17 @@ def get_saved_codes_for_user(username: str):
 def list_queue_items():
     conn = get_db_connection()
     rows = conn.execute(
-        "SELECT id, student, name, code, status, created_at, controller_version "
+        "SELECT id, student, name, code, status, created_at, controller_version, planner_request "
         "FROM queue ORDER BY created_at ASC"
     ).fetchall()
     conn.close()
-    return [
-        {
+    items = []
+    for row in rows:
+        try:
+            planner_request = json.loads(row["planner_request"]) if row["planner_request"] else None
+        except (TypeError, json.JSONDecodeError):
+            planner_request = None
+        items.append({
             "id": row["id"],
             "student": row["student"],
             "name": row["name"],
@@ -760,8 +795,10 @@ def list_queue_items():
             "status": row["status"],
             "created_at": row["created_at"],
             "controller_version": row["controller_version"],
-        }
-        for row in rows
+            "planner_request": planner_request,
+        })
+    return [
+        item for item in items
     ]
 
 
@@ -785,14 +822,20 @@ def insert_queue_item(
     name: str,
     code: str,
     controller_version: Literal["legacy", "duet"] = "legacy",
+    planner_request: Optional[dict] = None,
 ):
     item_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    planner_request_json = (
+        json.dumps(planner_request, separators=(",", ":"), allow_nan=False)
+        if planner_request is not None
+        else None
+    )
     conn = get_db_connection()
     conn.execute(
-        "INSERT INTO queue (id, student, name, code, status, created_at, controller_version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (item_id, student, name, code, "queued", now, controller_version),
+        "INSERT INTO queue (id, student, name, code, status, created_at, controller_version, planner_request) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (item_id, student, name, code, "queued", now, controller_version, planner_request_json),
     )
     conn.commit()
     conn.close()
@@ -804,6 +847,7 @@ def insert_queue_item(
         "status": "queued",
         "created_at": now,
         "controller_version": controller_version,
+        "planner_request": planner_request,
     }
 
 
@@ -836,8 +880,11 @@ def list_projects_for_user(username: str):
             "name": row["name"],
             "sceneObjects": __safe_json_load(row["scene_objects"]),
             "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
-            "generatedCode": row["generated_code"],
+            "generatedCode": (row["generated_code"] or "").split("\n", 1)[1]
+            if (row["generated_code"] or "").startswith("# __PLANNER_META__") and "\n" in (row["generated_code"] or "")
+            else row["generated_code"],
             "duetCode": row["duet_code"] or "",
+            **_project_planner_metadata(row["generated_code"] or ""),
         }
         for row in rows
     ]
@@ -855,8 +902,11 @@ def list_all_projects_for_teacher():
             "name": row["name"],
             "sceneObjects": __safe_json_load(row["scene_objects"]),
             "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
-            "generatedCode": row["generated_code"],
+            "generatedCode": (row["generated_code"] or "").split("\n", 1)[1]
+            if (row["generated_code"] or "").startswith("# __PLANNER_META__") and "\n" in (row["generated_code"] or "")
+            else row["generated_code"],
             "duetCode": row["duet_code"] or "",
+            **_project_planner_metadata(row["generated_code"] or ""),
         }
         for row in rows
     ]
@@ -871,6 +921,35 @@ def __safe_json_load(value: Optional[str]):
         return []
 
 
+def _planner_project_meta_payload(payload: dict) -> dict:
+    meta = {}
+    for key in ("plannerMode", "plannerLabel", "plannerVariants", "selectedPlannerVariant"):
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            meta[key] = value
+    return meta
+
+
+def _annotate_generated_code(code: str, payload: dict) -> str:
+    meta = _planner_project_meta_payload(payload)
+    if isinstance(code, str) and code.startswith("# __PLANNER_META__"):
+        code = code.split("\n", 1)[1] if "\n" in code else ""
+    if not meta:
+        return code or ""
+    serialized = json.dumps(meta, separators=(",", ":"), ensure_ascii=True)
+    return f"# __PLANNER_META__ {serialized}\n{code or ''}".strip() + ("\n" if code else "")
+
+
+def _project_planner_metadata(code: str) -> dict:
+    if not isinstance(code, str) or not code.startswith("# __PLANNER_META__"):
+        return {}
+    try:
+        metadata = json.loads(code.split("\n", 1)[0].split("__PLANNER_META__", 1)[1].strip())
+    except (IndexError, json.JSONDecodeError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def get_project_for_user(username: str, name: str = "default"):
     conn = get_db_connection()
     row = conn.execute(
@@ -880,17 +959,21 @@ def get_project_for_user(username: str, name: str = "default"):
     conn.close()
     if not row:
         return None
+    generated_code = row["generated_code"] or ""
+    stripped_code = generated_code.split("\n", 1)[1] if generated_code.startswith("# __PLANNER_META__") and "\n" in generated_code else generated_code
     return {
         "name": row["name"],
         "sceneObjects": __safe_json_load(row["scene_objects"]),
         "plannerWaypoints": __safe_json_load(row["planner_waypoints"]),
-        "generatedCode": row["generated_code"],
+        "generatedCode": stripped_code,
         "duetCode": row["duet_code"] or "",
+        **_project_planner_metadata(generated_code),
     }
 
 
 def save_project_for_user(username: str, payload: dict):
     name = (payload.get("name") or "default").strip() or "default"
+    generated_code = _annotate_generated_code(payload.get("generatedCode", ""), payload)
     conn = get_db_connection()
     conn.execute(
         """
@@ -908,7 +991,7 @@ def save_project_for_user(username: str, payload: dict):
             name,
             json.dumps(payload.get("sceneObjects", [])),
             json.dumps(payload.get("plannerWaypoints", [])),
-            payload.get("generatedCode", ""),
+            generated_code,
             payload.get("duetCode"),
         ),
     )
@@ -1094,13 +1177,121 @@ def save_code(user: dict = Depends(auth_required), request: SaveCodeRequest = No
 def submit_code(user: dict = Depends(auth_required), request: QueueSubmissionRequest = None):
     if not request:
         raise HTTPException(status_code=400, detail="Missing code payload")
+    planner_request = _validated_planner_request(request.planner_request)
     item = insert_queue_item(
         user["username"],
         request.name,
         request.code,
         request.controller_version,
+        planner_request,
     )
     return {"status": "submitted", "item": item}
+
+
+def _validated_planner_request(value: Optional[dict]) -> Optional[dict]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Planner request must be an object.")
+    mode = value.get("planner_mode")
+    if not isinstance(mode, str) or mode not in {"manual", "sensor_corrected", "autonomous"}:
+        raise HTTPException(status_code=400, detail="Planner request mode is invalid.")
+
+    def validate_points(points, label, minimum=1, maximum=20, coordinate_limit=100.0):
+        if not isinstance(points, list) or not minimum <= len(points) <= maximum:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} must contain between {minimum} and {maximum} points.",
+            )
+        normalized = []
+        for index, point in enumerate(points):
+            if not isinstance(point, dict):
+                raise HTTPException(status_code=400, detail=f"{label} point {index + 1} is invalid.")
+            coordinates = {}
+            for axis in ("x", "y"):
+                coordinate = point.get(axis)
+                if (
+                    isinstance(coordinate, bool)
+                    or not isinstance(coordinate, (int, float))
+                    or not math.isfinite(float(coordinate))
+                    or abs(float(coordinate)) > coordinate_limit
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{label} point {index + 1} {axis} is outside the accepted finite coordinate range.",
+                    )
+                coordinates[axis] = float(coordinate)
+            normalized.append(coordinates)
+        return normalized
+
+    planner_waypoints = value.get("planner_waypoints")
+    if mode in {"manual", "sensor_corrected"}:
+        planner_waypoints = validate_points(
+            planner_waypoints,
+            "Planner waypoints",
+            minimum=2,
+            coordinate_limit=10.0,
+        )
+    elif planner_waypoints is not None:
+        planner_waypoints = (
+            validate_points(
+                planner_waypoints,
+                "Planner waypoints",
+                minimum=2,
+                coordinate_limit=10.0,
+            )
+            if planner_waypoints
+            else []
+        )
+
+    variants = value.get("route_variants", {})
+    if not isinstance(variants, dict) or set(variants) - {"initial", "corrected", "final"}:
+        raise HTTPException(status_code=400, detail="Planner route variants are invalid.")
+    normalized_variants = {}
+    for variant, code in variants.items():
+        if not isinstance(code, str) or len(code) > 40000:
+            raise HTTPException(status_code=400, detail=f"Planner {variant} code is invalid or too large.")
+        normalized_variants[variant] = code
+
+    navigation = value.get("navigation")
+    normalized_navigation = None
+    if mode == "autonomous":
+        if not isinstance(navigation, dict):
+            raise HTTPException(status_code=400, detail="Autonomous requests must include map goals.")
+        map_id = navigation.get("map_id")
+        version = navigation.get("version")
+        frame_id = navigation.get("frame_id")
+        nav_mode = navigation.get("planner_mode")
+        if not all(isinstance(item, str) and item.strip() for item in (map_id, version, frame_id)):
+            raise HTTPException(status_code=400, detail="Autonomous request map identity is incomplete.")
+        if not isinstance(nav_mode, str) or nav_mode not in {"static", "live"}:
+            raise HTTPException(status_code=400, detail="Autonomous request Nav2 mode is invalid.")
+        normalized_navigation = {
+            "map_id": map_id.strip()[:128],
+            "version": version.strip()[:128],
+            "frame_id": frame_id.strip()[:128],
+            "planner_mode": nav_mode,
+            "waypoints": validate_points(
+                navigation.get("waypoints"),
+                "Autonomous map goals",
+                coordinate_limit=1000.0,
+            ),
+        }
+
+    selected_variant = value.get("selected_variant", "initial")
+    if not isinstance(selected_variant, str) or selected_variant not in {"initial", "corrected", "final"}:
+        raise HTTPException(status_code=400, detail="Selected planner variant is invalid.")
+    label = value.get("planner_label", "")
+    if not isinstance(label, str):
+        raise HTTPException(status_code=400, detail="Planner label must be text.")
+    return {
+        "planner_mode": mode,
+        "planner_label": label.strip()[:120],
+        "planner_waypoints": planner_waypoints or [],
+        "route_variants": normalized_variants,
+        "selected_variant": selected_variant,
+        "navigation": normalized_navigation,
+    }
 
 
 @app.get("/api/classroom/queue")
@@ -1111,7 +1302,7 @@ def queue_items(user: dict = Depends(auth_required)):
 
 
 @app.post("/api/classroom/run-next")
-def run_next(user: dict = Depends(auth_required)):
+def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
 
@@ -1119,33 +1310,40 @@ def run_next(user: dict = Depends(auth_required)):
         raise HTTPException(status_code=409, detail="A queued robot program is already running.")
     try:
         queue = list_queue_items()
-        for item in queue:
-            if item["status"] == "queued":
-                if item["controller_version"] != "legacy":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Queue item {item['name']} targets the DUET controller. "
-                            "DUET queue execution is not enabled; it will not be sent to the legacy SDK."
-                        ),
-                    )
-                set_queue_item_status(item["id"], "running")
-                item["status"] = "running"
-                try:
-                    with _MOTION_START_LOCK:
-                        ensure_sdk_motion_available()
-                        result = execute_robot_program(item["code"])
-                except HTTPException as error:
-                    set_queue_item_status(
-                        item["id"],
-                        "queued" if error.status_code == 409 else "failed",
-                    )
-                    raise
-                set_queue_item_status(item["id"], "completed")
-                item["status"] = "completed"
-                return {"status": "completed", "item": item, "process": result}
-
-        raise HTTPException(status_code=404, detail="No queued student jobs")
+        item = next((queued for queued in queue if queued["id"] == request.item_id), None)
+        if not item or item["status"] != "queued":
+            raise HTTPException(status_code=404, detail="The approved queue item is no longer queued.")
+        if item.get("planner_request"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Planner request {item['name']} must be loaded into the teacher workspace "
+                    "and approved through its matching planner controls; it cannot run as ordinary queue code."
+                ),
+            )
+        if item["controller_version"] != "legacy":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Queue item {item['name']} targets the DUET controller. "
+                    "DUET queue execution is not enabled; it will not be sent to the legacy SDK."
+                ),
+            )
+        set_queue_item_status(item["id"], "running")
+        item["status"] = "running"
+        try:
+            with _MOTION_START_LOCK:
+                ensure_sdk_motion_available()
+                result = execute_robot_program(item["code"])
+        except HTTPException as error:
+            set_queue_item_status(
+                item["id"],
+                "queued" if error.status_code == 409 else "failed",
+            )
+            raise
+        set_queue_item_status(item["id"], "completed")
+        item["status"] = "completed"
+        return {"status": "completed", "item": item, "process": result}
     finally:
         _QUEUE_RUN_LOCK.release()
 
@@ -1293,6 +1491,175 @@ def run_code(request: CodeRequest, user: dict = Depends(auth_required)):
     with _MOTION_START_LOCK:
         ensure_sdk_motion_available()
         return execute_robot_program(request.code)
+
+
+def _checkpoint_localization() -> dict:
+    snapshot = navigation_bridge_status()
+    localization = snapshot.get("localization")
+    if not isinstance(localization, dict) or localization.get("ready") is not True:
+        raise HTTPException(status_code=503, detail="Fresh robot localization is required at every planner checkpoint.")
+    if snapshot.get("pointcloudReady") is not True:
+        raise HTTPException(status_code=503, detail="Fresh LiDAR data is required at every planner checkpoint.")
+    if not isinstance(snapshot.get("estop"), dict) or snapshot["estop"].get("ready") is not True:
+        raise HTTPException(status_code=503, detail="Fresh emergency-stop health is required for checkpointed motion.")
+    if not isinstance(snapshot.get("robotHealth"), dict) or snapshot["robotHealth"].get("ready") is not True:
+        raise HTTPException(status_code=503, detail="Fresh robot-link health is required for checkpointed motion.")
+    pose = localization.get("pose")
+    if not isinstance(pose, dict):
+        raise HTTPException(status_code=503, detail="Robot localization did not report a pose.")
+    try:
+        x, y, yaw = (float(pose[key]) for key in ("x", "y", "yaw_rad"))
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=503, detail="Robot localization pose is incomplete.") from error
+    if not all(math.isfinite(value) for value in (x, y, yaw)):
+        raise HTTPException(status_code=503, detail="Robot localization pose is not finite.")
+    frame_id = localization.get("frame_id")
+    if not isinstance(frame_id, str) or not frame_id.strip():
+        raise HTTPException(status_code=503, detail="Robot localization frame is missing.")
+    return {"x": x, "y": y, "yaw_rad": yaw, "frame_id": frame_id}
+
+
+def _sdk_commands_to_pose(current: dict, target: dict) -> list[str]:
+    dx = target["x"] - current["x"]
+    dy = target["y"] - current["y"]
+    distance = math.hypot(dx, dy)
+    if distance > 3.0:
+        raise HTTPException(status_code=400, detail="Checkpoint spacing exceeds the 3 m SDK correction envelope.")
+    if distance <= 0.04:
+        return []
+    target_yaw = math.atan2(dy, dx)
+    turn = (target_yaw - current["yaw_rad"] + math.pi) % (2 * math.pi) - math.pi
+    commands = []
+    if abs(turn) >= math.radians(5):
+        commands.append(
+            f'robot.turn("{"left" if turn > 0 else "right"}", {math.degrees(abs(turn)):.2f})'
+        )
+    remaining = distance / 0.4
+    while remaining > 0.001:
+        duration = min(10.0, remaining)
+        if duration < 0.1:
+            break
+        commands.append(f"robot.walktime({duration:.3f})")
+        remaining -= duration
+    return commands
+
+
+@app.post("/api/planner/checkpointed-run")
+def run_checkpointed_planner(
+    request: CheckpointedPlannerRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if os.getenv("G1_SDK_CHECKPOINTED_PLANNER_ENABLED", "").strip() != "1":
+        raise HTTPException(
+            status_code=503,
+            detail="Checkpointed SDK planning is deployment-disabled until supervised SDK ownership and localization are commissioned.",
+        )
+    if os.getenv("G1_SDK_CHECKPOINTED_PLANNER_OWNER_CONFIRMED", "").strip() != "1":
+        raise HTTPException(
+            status_code=503,
+            detail="SDK locomotion ownership has not been explicitly commissioned for checkpointed planning.",
+        )
+    if not 2 <= len(request.waypoints) <= 20:
+        raise HTTPException(status_code=400, detail="Checkpointed routes require 2 to 20 waypoints.")
+    targets = []
+    for index, waypoint in enumerate(request.waypoints):
+        if not isinstance(waypoint, dict):
+            raise HTTPException(status_code=400, detail=f"Waypoint {index + 1} is invalid.")
+        values = []
+        for axis in ("x", "y"):
+            value = waypoint.get(axis)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise HTTPException(status_code=400, detail=f"Waypoint {index + 1} {axis} must be finite.")
+            if not -10 <= float(value) <= 10:
+                raise HTTPException(status_code=400, detail=f"Waypoint {index + 1} {axis} must be between -10 and 10 m.")
+            values.append(float(value))
+        targets.append({"x": values[0], "y": values[1]})
+
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
+    executed_code = []
+    checkpoints = []
+    try:
+        ensure_sdk_motion_available()
+        status = robot_status()
+        if status.get("sdkAvailable") is not True:
+            raise HTTPException(status_code=409, detail="Connect the G1 SDK before running a checkpointed path.")
+        if status.get("running"):
+            raise HTTPException(status_code=409, detail="An SDK program is already running.")
+
+        clear_robot_stop_request()
+        start = _checkpoint_localization()
+        cosine = math.cos(start["yaw_rad"])
+        sine = math.sin(start["yaw_rad"])
+        world_targets = [
+            {
+                "x": start["x"] + point["x"] * cosine - point["y"] * sine,
+                "y": start["y"] + point["x"] * sine + point["y"] * cosine,
+            }
+            for point in targets
+        ]
+        stand = execute_robot_program(
+            "robot.stand()", reset_stop_request=False, clear_stop_request=False
+        )
+        executed_code.append("robot.stand()")
+        if stand.get("status") != "completed":
+            raise HTTPException(status_code=502, detail="SDK did not confirm the initial stand command.")
+
+        for index, target in enumerate(world_targets):
+            reached = False
+            for correction_index in range(2):
+                current = _checkpoint_localization()
+                if current["frame_id"] != start["frame_id"]:
+                    raise HTTPException(status_code=503, detail="Localization frame changed during the SDK path.")
+                commands = _sdk_commands_to_pose(current, target)
+                if commands:
+                    result = execute_robot_program(
+                        "\n".join(commands), reset_stop_request=False, clear_stop_request=False
+                    )
+                    if result.get("status") != "completed":
+                        raise HTTPException(status_code=502, detail=f"SDK did not complete waypoint {index + 1}.")
+                    executed_code.extend(commands)
+                measured = _checkpoint_localization()
+                if measured["frame_id"] != start["frame_id"]:
+                    raise HTTPException(status_code=503, detail="Localization frame changed during the SDK path.")
+                error = math.hypot(target["x"] - measured["x"], target["y"] - measured["y"])
+                checkpoints.append({
+                    "waypoint": index + 1,
+                    "correction": correction_index + 1,
+                    "target": target,
+                    "measured": measured,
+                    "error_m": round(error, 3),
+                })
+                if error <= 0.25:
+                    reached = True
+                    break
+            if not reached:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Waypoint {index + 1} was not reached within 0.25 m after one SDK correction; route stopped.",
+                )
+        stand = execute_robot_program(
+            "robot.stand()", reset_stop_request=False, clear_stop_request=False
+        )
+        executed_code.append("robot.stand()")
+        if stand.get("status") != "completed":
+            raise HTTPException(status_code=502, detail="SDK did not confirm the final stand command.")
+        return {
+            "status": "completed",
+            "initialPose": start,
+            "checkpoints": checkpoints,
+            "correctedCode": "\n".join(executed_code),
+            "physicalMotionVerified": False,
+        }
+    except HTTPException:
+        raise
+    except NavigationBridgeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        clear_robot_stop_request()
+        _MOTION_START_LOCK.release()
 
 @app.post("/api/robot/connect")
 def robot_connect(request: ConnectRobotRequest, user: dict = Depends(auth_required)):
@@ -1527,8 +1894,6 @@ def get_navigation_status(user: dict = Depends(auth_required)):
 
 @app.get("/api/navigation/map")
 def get_navigation_map(user: dict = Depends(auth_required)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher role required")
     snapshot = navigation_map_snapshot()
     if not snapshot["ready"]:
         raise HTTPException(status_code=503, detail=snapshot["error"])
@@ -1766,6 +2131,33 @@ def update_lidar_settings(
     return {"show_shared_overlay": request.show_shared_overlay}
 
 
+@app.get("/api/planner/settings")
+def get_planner_settings(user: dict = Depends(auth_required)):
+    conn = get_db_connection()
+    row = conn.execute("SELECT active_mode FROM planner_settings WHERE id = 1").fetchone()
+    conn.close()
+    if not row or row["active_mode"] not in {"manual", "sensor_corrected", "autonomous"}:
+        raise HTTPException(status_code=503, detail="Path planner mode setting is unavailable or invalid.")
+    return {"active_mode": row["active_mode"]}
+
+
+@app.put("/api/planner/settings")
+def update_planner_settings(
+    request: PlannerSettingsRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE planner_settings SET active_mode = ? WHERE id = 1",
+        (request.active_mode,),
+    )
+    conn.commit()
+    conn.close()
+    return {"active_mode": request.active_mode}
+
+
 @app.websocket("/api/lidar/live")
 async def lidar_live_updates(websocket: WebSocket):
     protocol = next(
@@ -1814,6 +2206,8 @@ async def lidar_live_updates(websocket: WebSocket):
                     "pointcloud_ready": bridge_status.get("pointcloudReady"),
                     "pointcloud_age_ms": bridge_status.get("pointcloudAgeMs"),
                     "diagnostics": bridge_status.get("diagnostics"),
+                    "live_avoidance_ready": bridge_status.get("liveAvoidanceReady", False),
+                    "live_obstacles": bridge_status.get("liveObstacles"),
                     "error": bridge_status.get("error"),
                 },
                 "scan": scan_status,
@@ -1843,7 +2237,12 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
             "version": request.version,
             "frame_id": request.frame_id,
             "waypoints": request.waypoints,
+            "planner_mode": request.planner_mode,
         }
+        static_map_snapshot = None
+        if request.planner_mode == "static":
+            shared_map = get_shared_lidar_map()
+            static_map_snapshot = shared_map.get("map") if shared_map else None
         dispatch_started = False
 
         def persist_starting_operation():
@@ -1863,6 +2262,8 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
                 request.waypoints,
                 operation_id,
                 on_dispatch=persist_starting_operation,
+                planner_mode=request.planner_mode,
+                static_map_snapshot=static_map_snapshot,
             )
         except NavigationBridgeError as error:
             if dispatch_started:
@@ -1882,8 +2283,6 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
 
 @app.post("/api/navigation/plan")
 def preview_navigation_route(request: NavigationStartRequest, user: dict = Depends(auth_required)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher role required")
     ensure_sdk_motion_available()
     if robot_status()["running"]:
         raise HTTPException(
@@ -1891,11 +2290,17 @@ def preview_navigation_route(request: NavigationStartRequest, user: dict = Depen
             detail="Stop the active SDK robot program before requesting a route preview.",
         )
     try:
+        static_map_snapshot = None
+        if request.planner_mode == "static":
+            shared_map = get_shared_lidar_map()
+            static_map_snapshot = shared_map.get("map") if shared_map else None
         return navigation_plan_route(
             request.map_id,
             request.version,
             request.frame_id,
             request.waypoints,
+            planner_mode=request.planner_mode,
+            static_map_snapshot=static_map_snapshot,
         )
     except NavigationBridgeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error

@@ -121,6 +121,28 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertTrue(result["diagnostics"]["controller"]["ready"])
         self.assertTrue(result["diagnostics"]["execution_enabled"])
 
+    def test_live_obstacle_layer_requires_fresh_points_in_the_localization_frame(self):
+        status = {
+            **self.status,
+            "live_avoidance_ready": True,
+            "live_obstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 120,
+                "points": [{"x": 1.0, "y": -0.5}],
+            },
+        }
+        with self.mock_bridge(status=status):
+            result = navigation_bridge_status(now=self.now)
+        self.assertTrue(result["liveAvoidanceReady"])
+        self.assertEqual(result["liveObstacles"]["points"], [{"x": 1.0, "y": -0.5}])
+
+        status["live_obstacles"]["age_ms"] = 2_000
+        with self.mock_bridge(status=status):
+            result = navigation_bridge_status(now=self.now)
+        self.assertFalse(result["liveAvoidanceReady"])
+        self.assertEqual(result["liveObstacles"]["points"], [])
+
     def test_unconfirmed_or_competing_controller_ownership_disables_motion(self):
         for controller in (
             {
@@ -425,6 +447,96 @@ class NavigationBridgeTests(unittest.TestCase):
                 )
         post.assert_not_called()
 
+    def test_static_scan_route_validates_saved_and_live_maps_but_plans_on_current_version(self):
+        static_map = {
+            **self.map_metadata,
+            "version": "published-scan-v3",
+        }
+        static_snapshot = {"ready": True, "map": static_map, "data": self.map_snapshot["data"]}
+        plan = {
+            "map_id": "classroom",
+            "version": "v4",
+            "frame_id": "map",
+            "planner_id": "GridBased",
+            "path": [{"x": 0.0, "y": 0.0}],
+        }
+        with patch.object(
+            navigation_bridge,
+            "navigation_map_snapshot",
+            return_value={
+                "ready": True,
+                "map": self.map_metadata,
+                "data": self.map_snapshot["data"],
+            },
+        ), patch.object(navigation_bridge, "_bridge_configuration"), patch.object(
+            navigation_bridge, "_post_json", return_value=plan
+        ) as post:
+            result = navigation_plan_route(
+                "classroom",
+                "published-scan-v3",
+                "map",
+                [{"x": 0.0, "y": 0.0}],
+                planner_mode="static",
+                static_map_snapshot=static_snapshot,
+            )
+
+        self.assertEqual(result["version"], "published-scan-v3")
+        self.assertEqual(post.call_args.args[3]["version"], "v4")
+        self.assertEqual(post.call_args.args[3]["planner_mode"], "static")
+
+    def test_static_scan_route_rejects_waypoint_blocked_on_current_live_map(self):
+        static_map = {**self.map_metadata, "version": "published-scan-v3"}
+        static_snapshot = {"ready": True, "map": static_map, "data": self.map_snapshot["data"]}
+        live_snapshot = {
+            **self.map_snapshot,
+            "data": list(self.map_snapshot["data"]),
+        }
+        waypoint_index = 75 * self.map_metadata["width"] + 100
+        live_snapshot["data"][waypoint_index] = 100
+        with patch.object(
+            navigation_bridge,
+            "navigation_map_snapshot",
+            return_value={
+                "ready": True,
+                "map": self.map_metadata,
+                "data": live_snapshot["data"],
+            },
+        ), patch.object(navigation_bridge, "_bridge_configuration"), patch.object(
+            navigation_bridge, "_post_json"
+        ) as post:
+            with self.assertRaisesRegex(NavigationBridgeError, "known free space"):
+                navigation_plan_route(
+                    "classroom",
+                    "published-scan-v3",
+                    "map",
+                    [{"x": 0.0, "y": 0.0}],
+                    planner_mode="static",
+                    static_map_snapshot=static_snapshot,
+                )
+        post.assert_not_called()
+
+    def test_live_adaptive_route_requires_fresh_commissioned_costmap(self):
+        with patch.object(
+            navigation_bridge,
+            "navigation_map_snapshot",
+            return_value={
+                "ready": True,
+                "map": self.map_metadata,
+                "data": self.map_snapshot["data"],
+            },
+        ), patch.object(navigation_bridge, "_bridge_configuration"), patch.object(
+            navigation_bridge, "_post_json"
+        ) as post:
+            with self.assertRaisesRegex(NavigationBridgeError, "commissioned obstacle avoidance"):
+                navigation_plan_route(
+                    "classroom",
+                    "v4",
+                    "map",
+                    [{"x": 0.0, "y": 0.0}],
+                    planner_mode="live",
+                )
+        post.assert_not_called()
+
     def test_route_cancellation_requires_valid_operation_and_terminal_contract(self):
         operation_id = "12345678-1234-1234-1234-123456789abc"
         response = {"operation_id": operation_id, "status": "cancel_requested"}
@@ -483,6 +595,19 @@ class NavigationBridgeTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(NavigationBridgeError, "point count"):
                 navigation_bridge.navigation_scan_status(job_id)
+
+        with patch.object(
+            navigation_bridge,
+            "_get_json",
+            return_value={
+                "job_id": job_id,
+                "status": "scanning",
+                "rotation_status": "rotating",
+                "rotation_radians": -6.283185307179586,
+            },
+        ):
+            status = navigation_bridge.navigation_scan_status(job_id)
+        self.assertEqual(status["rotation_radians"], -6.283185307179586)
 
         with patch.object(
             navigation_bridge,
@@ -550,6 +675,35 @@ class NavigationBridgeTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(NavigationBridgeError, "length does not match"):
                 navigation_bridge.navigation_scan_map_snapshot(job_id)
+
+    def test_completed_navigation_status_preserves_validated_executed_feedback_trace(self):
+        operation_id = "12345678-1234-1234-1234-123456789abc"
+        payload = {
+            "operation_id": operation_id,
+            "status": "succeeded",
+            "path_trace": [
+                {"x": 0.0, "y": 0.0, "yaw_rad": 0.0, "frame_id": "map"},
+                {"x": 1.0, "y": 0.5, "yaw_rad": 0.2, "frame_id": "map"},
+            ],
+        }
+        with patch.object(navigation_bridge, "_bridge_credentials", return_value=("https://bridge", "token")), patch.object(
+            navigation_bridge, "_get_json", return_value=payload
+        ):
+            result = navigation_bridge.navigation_operation_status(operation_id)
+        self.assertEqual(result["path_trace"], payload["path_trace"])
+        self.assertFalse(result["path_trace_truncated"])
+
+        invalid = {
+            **payload,
+            "path_trace": [
+                {"x": float("nan"), "y": 0.0, "yaw_rad": 0.0, "frame_id": "map"},
+            ],
+        }
+        with patch.object(navigation_bridge, "_bridge_credentials", return_value=("https://bridge", "token")), patch.object(
+            navigation_bridge, "_get_json", return_value=invalid
+        ):
+            with self.assertRaisesRegex(NavigationBridgeError, "finite number"):
+                navigation_bridge.navigation_operation_status(operation_id)
 
 
 if __name__ == "__main__":

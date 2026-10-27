@@ -28,7 +28,8 @@ Use **Delete** beside an account to remove it. The currently signed-in teacher c
 ## 4. Check the classroom
 The teacher view lets you:
 - see student submissions
-- preview saved code
+- inspect the exact queued SDK/DUET code preview and planner mode, waypoint, and map details
+- load a submitted program into the teacher IDE or planner grid for review
 - create and remove classroom accounts
 - delete queue items
 - pause or stop the current robot run
@@ -36,16 +37,17 @@ The teacher view lets you:
 
 ## 5. Review student work
 For each student submission:
-1. Open the code.
-2. Look for obvious problems.
-3. Use the simulator preview before running.
-4. Approve or reject the job.
+1. Open **Review exact command preview** and inspect the submitted code and, for planner requests, the mode, waypoints, route variants, and map identity.
+2. Use **Load for teacher review** to repopulate the IDE or planner grid. Autonomous requests are only shown on a map with the matching map ID, version, and frame.
+3. Look for problems and use the simulator preview when appropriate.
+4. Approve physical execution explicitly. The IDE/Blocks run prompt displays the exact program; planner run prompts show the route or initial SDK commands. Students cannot call physical execution endpoints.
 
 ## 6. Start the robot queue
 When the robot is ready:
-- click the queue action to start the next item
+- review the exact preview for the next queued request
+- click **Run next** and confirm the teacher-approval prompt to authorize that specific displayed program
 - watch the simulation first if needed
-- run the student code when safe
+- run the student code only when safe
 
 ## 7. Keep the robot safe
 Use these classroom rules:
@@ -78,6 +80,12 @@ Students:
 - preview the program
 - submit to the queue
 - wait for teacher approval
+
+Students can also send Normal path, Sensor-corrected path, or Autonomous
+obstacle-aware path requests. These include the generated command preview and
+the route details needed for a teacher to load the request into their own
+planner workspace. Loading a request does not execute it; a teacher must
+review and explicitly approve any physical run.
 
 Teacher:
 - review queue

@@ -10,15 +10,24 @@ import urllib.request
 from urllib.parse import urlsplit, urlunsplit
 
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 DEFAULT_URDF_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
+    REPO_ROOT,
     "g1_23dof.urdf.txt",
 )
 DEFAULT_GEOMETRY_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "static",
-    "g1",
-    "g1.xml",
+    REPO_ROOT,
+    "vendor",
+    "DUET",
+    "src",
+    "assets",
+    "robots",
+    "unitree_g1",
+    "xmls",
+    "g1_23dof.xml",
+)
+FALLBACK_GEOMETRY_PATH = os.path.join(
+    os.path.dirname(__file__), "static", "g1", "g1.xml"
 )
 SENSOR_LINKS = {
     "mid360": "mid360_link",
@@ -95,12 +104,32 @@ def _mjcf_body_pose(body):
     return position, (1.0, 0.0, 0.0, 0.0)
 
 
+def _mjcf_default_geom_attributes(root):
+    classes = {}
+
+    def visit(default, inherited):
+        attributes = dict(inherited)
+        geom = default.find("geom")
+        if geom is not None:
+            attributes.update(geom.attrib)
+        class_name = default.get("class")
+        if class_name:
+            classes[class_name] = attributes
+        for child in default.findall("default"):
+            visit(child, attributes)
+
+    for default in root.findall("default"):
+        visit(default, {})
+    return classes
+
+
 def derive_g1_footprint(geometry_path=DEFAULT_GEOMETRY_PATH):
     """Derive a conservative G1 footprint from model foot collisions."""
     try:
         root = ET.parse(geometry_path).getroot()
     except (OSError, ET.ParseError) as error:
         raise ValueError("Could not read supported G1 collision model: {}".format(error)) from error
+    geom_defaults = _mjcf_default_geom_attributes(root)
     world = root.find("worldbody")
     pelvis = (
         next(
@@ -124,16 +153,20 @@ def derive_g1_footprint(geometry_path=DEFAULT_GEOMETRY_PATH):
             name = geom.get("name", "")
             if not name.startswith(("left_foot", "right_foot")) or "collision" not in name:
                 continue
-            if geom.get("type") != "capsule" or not geom.get("fromto"):
+            attributes = {
+                **geom_defaults.get(geom.get("class", ""), {}),
+                **geom.attrib,
+            }
+            if attributes.get("type") != "capsule" or not attributes.get("fromto"):
                 raise ValueError("G1 foot collision {} is not a supported capsule.".format(name))
-            endpoints = _numbers(geom.get("fromto"), 6, "G1 foot collision endpoints")
-            radius = _numbers(geom.get("size"), 1, "G1 foot collision radius")[0]
+            endpoints = _numbers(attributes.get("fromto"), 6, "G1 foot collision endpoints")
+            radius = _numbers(attributes.get("size"), 1, "G1 foot collision radius")[0]
             if radius <= 0:
                 raise ValueError("G1 foot collision {} has a non-positive radius.".format(name))
             for offset in (0, 3):
                 endpoint = tuple(endpoints[offset : offset + 3])
                 local_geom_position = _numbers(
-                    geom.get("pos", "0 0 0"), 3, "G1 foot collision position"
+                    attributes.get("pos", "0 0 0"), 3, "G1 foot collision position"
                 )
                 endpoint = tuple(a + b for a, b in zip(endpoint, local_geom_position))
                 point = _rotate_point(rotation, endpoint)
@@ -257,6 +290,17 @@ def load_robot_root_frame(urdf_path=DEFAULT_URDF_PATH):
     return next(iter(root_links))
 
 
+def load_actuated_joint_count(urdf_path=DEFAULT_URDF_PATH):
+    try:
+        root = ET.parse(urdf_path).getroot()
+    except (OSError, ET.ParseError) as error:
+        raise ValueError("Could not read supported G1 robot description: {}".format(error)) from error
+    return sum(
+        joint.get("type") in {"revolute", "continuous", "prismatic"}
+        for joint in root.findall("joint")
+    )
+
+
 def _model_fingerprint(urdf_path, geometry_path):
     digest = hashlib.sha256()
     for path in (urdf_path, geometry_path):
@@ -276,25 +320,31 @@ def automatic_calibration_model(urdf_path=None, geometry_path=None):
     path_warnings = []
     urdf_path = configured_urdf
     geometry_path = configured_geometry
-    if (
-        not os.path.isfile(urdf_path)
-        and os.path.normpath(urdf_path) == "/opt/uni-edu/g1_23dof.urdf.txt"
-        and os.path.isfile(DEFAULT_URDF_PATH)
-    ):
+    if not os.path.isfile(urdf_path) and os.path.isfile(DEFAULT_URDF_PATH):
         urdf_path = DEFAULT_URDF_PATH
         path_warnings.append(
-            "Configured container URDF path is unavailable on this host; using the "
-            "bundled G1 URDF."
+            "Configured G1 URDF path is unavailable; using the bundled G1 EDU 23-DOF URDF."
         )
-    if (
-        not os.path.isfile(geometry_path)
-        and os.path.normpath(geometry_path) == "/opt/uni-edu/g1.xml"
-        and os.path.isfile(DEFAULT_GEOMETRY_PATH)
-    ):
+    if not os.path.isfile(geometry_path) and os.path.isfile(DEFAULT_GEOMETRY_PATH):
         geometry_path = DEFAULT_GEOMETRY_PATH
         path_warnings.append(
-            "Configured container geometry path is unavailable on this host; using "
-            "the bundled G1 collision model."
+            "Configured G1 geometry path is unavailable; using the bundled G1 EDU 23-DOF collision model."
+        )
+    if not os.path.isfile(geometry_path) and os.path.isfile(FALLBACK_GEOMETRY_PATH):
+        geometry_path = FALLBACK_GEOMETRY_PATH
+        path_warnings.append(
+            "The G1 EDU 23-DOF collision model is unavailable; using the legacy bundled G1 collision model."
+        )
+    if not os.path.isfile(urdf_path):
+        raise ValueError("Could not locate the supported G1 EDU 23-DOF URDF.")
+    if not os.path.isfile(geometry_path):
+        raise ValueError("Could not locate a supported G1 EDU collision geometry model.")
+    actuated_joint_count = load_actuated_joint_count(urdf_path)
+    if actuated_joint_count != 23:
+        raise ValueError(
+            "Supported G1 EDU robot description must have 23 actuated joints; found {}.".format(
+                actuated_joint_count
+            )
         )
     mounts = load_candidate_sensor_mounts(urdf_path)
     root_frame = load_robot_root_frame(urdf_path)
@@ -306,9 +356,65 @@ def automatic_calibration_model(urdf_path=None, geometry_path=None):
         "model_fingerprint": _model_fingerprint(urdf_path, geometry_path),
         "mount": mount,
         "root_frame": root_frame,
+        "actuated_joint_count": actuated_joint_count,
         "footprint": footprint,
         "path_warnings": path_warnings,
     }
+
+
+def _calibration_cache_enabled(environment=None):
+    if environment is None:
+        environment = os.environ
+    return environment.get("G1_SENSOR_AUTO_CALIBRATION_PERSIST", "0") == "1"
+
+
+def _calibration_cache_path(environment=None):
+    if environment is None:
+        environment = os.environ
+    if not _calibration_cache_enabled(environment):
+        return None
+    configured = environment.get(
+        "G1_SENSOR_CALIBRATION_CACHE_PATH",
+        os.path.join(
+            os.path.expanduser("~/.config"),
+            "uni-edu-studio",
+            "sensor-calibration.json",
+        ),
+    ).strip()
+    if not configured:
+        return None
+    return os.path.abspath(os.path.expanduser(configured))
+
+
+def _read_persisted_calibration(environment=None):
+    cache_path = _calibration_cache_path(environment)
+    if not cache_path:
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not payload.get("ready"):
+        return None
+    return payload
+
+
+def _write_persisted_calibration(status, environment=None):
+    cache_path = _calibration_cache_path(environment)
+    if not cache_path or not isinstance(status, dict):
+        return
+    try:
+        directory = os.path.dirname(cache_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as handle:
+            json.dump(status, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except OSError:
+        return
 
 
 def _live_provider_calibration_report(environment, timeout=0.5):
@@ -469,12 +575,22 @@ def calibration_status(
         model = None
         model_error = str(error)
     report_verified = False
+    persisted_status = None
     if model_error:
         reason = model_error
     else:
         path_warnings = model["path_warnings"]
         configured_base_frame = environment.get("G1_DISTANCE_BASE_FRAME", model["root_frame"]).strip()
         mount_confirmed = environment.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
+        persisted_status = _read_persisted_calibration(environment)
+        persisted_valid = (
+            isinstance(persisted_status, dict)
+            and persisted_status.get("ready") is True
+            and persisted_status.get("model_fingerprint") == model["model_fingerprint"]
+            and persisted_status.get("root_frame") == model["root_frame"]
+        )
+        if persisted_valid:
+            mount_confirmed = True
         if configured_base_frame != model["root_frame"]:
             reason = (
                 "Distance base frame {!r} is not the supported G1 model root {!r}."
@@ -486,7 +602,9 @@ def calibration_status(
             )
         else:
             report_error = None
-            if live_report is None:
+            if persisted_valid and live_report is None:
+                live_report = persisted_status
+            elif live_report is None:
                 live_report, report_error = _live_provider_calibration_report(environment)
             if report_error:
                 reason = report_error
@@ -498,7 +616,7 @@ def calibration_status(
                 report_verified = True
                 reason = live_report.get(
                     "reason",
-                    "Live sensor transform matches the G1 model and the footprint was derived automatically.",
+                    "Live ROS transform matches the model mount and the footprint was derived from the G1 EDU 23-DOF collision geometry.",
                 )
             elif live_report.get("ready") is True:
                 reason = (
@@ -512,6 +630,19 @@ def calibration_status(
                 )
         if path_warnings:
             reason = "{} {}".format(reason, " ".join(path_warnings))
+        if report_verified:
+            _write_persisted_calibration(
+                {
+                    "ready": True,
+                    "status": "verified",
+                    "reason": reason,
+                    "model_fingerprint": model["model_fingerprint"],
+                    "root_frame": model["root_frame"],
+                    "footprint": model["footprint"],
+                    "transform": (live_report or {}).get("transform"),
+                },
+                environment,
+            )
     ready = bool(model and report_verified)
     mounts = {} if not model else {"mid360": model["mount"]}
     missing_footprint = [] if model else ["automatic G1 footprint geometry"]
@@ -520,10 +651,19 @@ def calibration_status(
         "ready": ready,
         "configuration_present": model is not None,
         "model": os.path.basename(urdf_path),
+        "geometry_model": None if not model else model["footprint"]["source"],
+        "actuated_joint_count": (
+            None if not model else model["actuated_joint_count"]
+        ),
         "root_frame": None if not model else model["root_frame"],
         "candidate_mounts": mounts,
         "physical_mount_confirmed": bool(
             environment.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
+            or (
+                isinstance(persisted_status, dict)
+                and persisted_status.get("ready") is True
+                and persisted_status.get("model_fingerprint") == (model["model_fingerprint"] if model else None)
+            )
         ),
         "footprint": None if not model else model["footprint"],
         "model_path_warnings": [] if not model else model["path_warnings"],
@@ -532,12 +672,17 @@ def calibration_status(
         "calibration_confirmed": ready,
         "missing_footprint": missing_footprint,
         "reason": reason,
+        "calibration_method": "model_derived_footprint_and_live_ros_transform_check",
         "verification_note": (
-            "Calibration is automatic and remains ready only while a fresh live ROS transform matches the supported G1 model."
+            "Footprint dimensions are derived from the G1 EDU 23-DOF model. "
+            "The sensor mount still requires explicit physical confirmation; a live "
+            "ROS transform check is model-based and is not independent LiDAR-camera "
+            "extrinsic calibration or supervised hardware acceptance."
         ),
         "live_transform": (
             live_report.get("transform") if isinstance(live_report, dict) else None
         ),
+        "persisted_calibration": persisted_status,
     }
 
 
