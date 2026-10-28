@@ -372,6 +372,80 @@ class SensorDiscoveryTests(unittest.TestCase):
         self.assertFalse(report["connection"]["ready"])
         self.assertIn("Multiple fresh", report["connection"]["reason"])
 
+    def test_multiple_fresh_pointclouds_reuse_the_saved_topic_and_frame(self):
+        self.env.update({
+            "G1_LIDAR_TOPIC": "/lidar/rear",
+            "G1_DISTANCE_FRAME_ID": "sensor_frame",
+            "G1_DISTANCE_SENSOR_ID": "rear-lidar",
+        })
+        fresh_header = (
+            "stamp:\n"
+            "  sec: 1799999999\n"
+            "  nanosec: 900000000\n"
+            "frame_id: sensor_frame\n"
+        )
+
+        report = self.run_discovery(
+            {
+                "topics": (
+                    "/lidar/front [sensor_msgs/msg/PointCloud2]\n"
+                    "/lidar/rear [sensor_msgs/msg/PointCloud2]\n"
+                ),
+                "headers": {
+                    "/lidar/front": fresh_header,
+                    "/lidar/rear": fresh_header,
+                },
+            }
+        )
+
+        self.assertEqual(report["connection"]["method"], "existing_ros_pointcloud")
+        self.assertTrue(report["connection"]["ready"])
+        self.assertEqual(report["connection"]["topic"], "/lidar/rear")
+        self.assertEqual(report["connection"]["sensor_id"], "rear-lidar")
+        self.assertEqual(len(report["ros"]["pointclouds"]), 2)
+
+    def test_auxiliary_sensor_topics_report_roles_frames_and_freshness(self):
+        fresh_header = (
+            "stamp:\n"
+            "  sec: 1799999999\n"
+            "  nanosec: 900000000\n"
+            "frame_id: base_link\n"
+        )
+        report = self.run_discovery(
+            {
+                "topics": (
+                    "/imu/data [sensor_msgs/msg/Imu]\n"
+                    "/joint_states [sensor_msgs/msg/JointState]\n"
+                    "/map [nav_msgs/msg/OccupancyGrid]\n"
+                    "/local_costmap/costmap [nav_msgs/msg/OccupancyGrid]\n"
+                    "/odom [nav_msgs/msg/Odometry]\n"
+                ),
+                "headers": {
+                    "/imu/data": fresh_header,
+                    "/joint_states": fresh_header,
+                    "/map": fresh_header,
+                    "/local_costmap/costmap": (
+                        "stamp:\n"
+                        "  sec: 1799999980\n"
+                        "  nanosec: 0\n"
+                        "frame_id: map\n"
+                    ),
+                    "/odom": fresh_header,
+                },
+            }
+        )
+
+        sources = {source["name"]: source for source in report["ros"]["sources"]}
+        self.assertEqual(sources["/imu/data"]["role"], "imu")
+        self.assertEqual(sources["/joint_states"]["role"], "joint_state")
+        self.assertEqual(sources["/map"]["role"], "map")
+        self.assertEqual(sources["/local_costmap/costmap"]["role"], "local_costmap")
+        self.assertEqual(sources["/odom"]["role"], "odometry")
+        self.assertTrue(sources["/imu/data"]["fresh"])
+        self.assertEqual(sources["/imu/data"]["frame_id"], "base_link")
+        self.assertFalse(sources["/local_costmap/costmap"]["fresh"])
+        self.assertIn("stale", sources["/local_costmap/costmap"]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

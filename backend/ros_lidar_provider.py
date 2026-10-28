@@ -255,6 +255,35 @@ def _rotation_matrix(rotation: tuple[float, float, float, float]) -> tuple[tuple
     )
 
 
+def compose_transforms(
+    parent_translation: tuple[float, float, float],
+    parent_rotation: tuple[float, float, float, float],
+    child_translation: tuple[float, float, float],
+    child_rotation: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Compose parent<-intermediate and intermediate<-child transforms."""
+    matrix = _rotation_matrix(parent_rotation)
+    rotated_child = tuple(
+        sum(matrix[row][column] * child_translation[column] for column in range(3))
+        for row in range(3)
+    )
+    translation = tuple(
+        parent_translation[index] + rotated_child[index] for index in range(3)
+    )
+    px, py, pz, pw = parent_rotation
+    cx, cy, cz, cw = child_rotation
+    rotation = (
+        pw * cx + px * cw + py * cz - pz * cy,
+        pw * cy - px * cz + py * cw + pz * cx,
+        pw * cz + px * cy - py * cx + pz * cw,
+        pw * cw - px * cx - py * cy - pz * cz,
+    )
+    _rotation_matrix(rotation)
+    if not all(math.isfinite(value) for value in (*parent_translation, *child_translation)):
+        raise ValueError("Transform translation must be finite.")
+    return translation, rotation
+
+
 def transform_points_to_base_array(
     points: object,
     translation: tuple[float, float, float],
@@ -677,16 +706,9 @@ def main() -> None:
             self.cache.update_calibration_status(
                 {
                     "ready": False,
-                    "status": "unavailable" if calibration_error else (
-                        "awaiting_mount_confirmation" if not mount_confirmed else "waiting_for_live_transform"
-                    ),
+                    "status": "unavailable" if calibration_error else "waiting_for_live_transform",
                     "reason": calibration_error
-                    or (
-                        "The physical MID-360 mount has not been explicitly verified "
-                        "against the supported G1 model."
-                        if not mount_confirmed
-                        else "Waiting for a fresh point cloud and live G1 sensor transform."
-                    ),
+                    or "Waiting for a fresh point cloud and the robot-root-to-mount transform.",
                     "model_fingerprint": (
                         calibration_model["model_fingerprint"] if calibration_model else None
                     ),
@@ -716,20 +738,13 @@ def main() -> None:
                     f"points={message.width * message.height}."
                 )
                 self.received_first_cloud = True
-            if calibration_error or footprint is None or not mount_confirmed:
-                reason = calibration_error
-                if reason is None and not mount_confirmed:
-                    reason = (
-                        "The physical MID-360 mount has not been explicitly verified "
-                        "against the supported G1 model; physical distance conditions are disabled."
-                    )
-                if reason is None:
-                    reason = "Automatic G1 footprint geometry is unavailable."
+            if calibration_error or footprint is None:
+                reason = calibration_error or "Automatic G1 footprint geometry is unavailable."
                 self.cache.mark_unavailable(reason)
                 self.cache.update_calibration_status(
                     {
                         "ready": False,
-                        "status": "awaiting_mount_confirmation" if not mount_confirmed else "unavailable",
+                        "status": "unavailable",
                         "reason": reason,
                         "model_fingerprint": (
                             calibration_model["model_fingerprint"] if calibration_model else None
@@ -775,54 +790,95 @@ def main() -> None:
                 cloud_time = Time(
                     nanoseconds=round(captured_at.timestamp() * 1_000_000_000)
                 )
-                mount_transform: TransformStamped = self.tf_buffer.lookup_transform(
-                    sensor_mount["parent_frame"],
-                    source_frame,
-                    cloud_time,
-                    timeout=Duration(seconds=0.05),
-                )
-                mount_translation = mount_transform.transform.translation
-                mount_rotation = mount_transform.transform.rotation
-                observed_mount = {
-                    "parent_frame": mount_transform.header.frame_id,
-                    "sensor_frame": mount_transform.child_frame_id,
-                    "translation_m": [
-                        float(mount_translation.x),
-                        float(mount_translation.y),
-                        float(mount_translation.z),
-                    ],
-                    "rotation_xyzw": [
-                        float(mount_rotation.x),
-                        float(mount_rotation.y),
-                        float(mount_rotation.z),
-                        float(mount_rotation.w),
-                    ],
-                }
                 candidate_mount = {
                     **sensor_mount,
                     "sensor_frame": source_frame,
                 }
-                mount_comparison = compare_transforms(
-                    candidate_mount, observed_mount
-                )
-                if not mount_comparison["matches"]:
-                    reason = mount_comparison["reason"]
-                    self.cache.mark_unavailable(reason)
-                    self.cache.update_calibration_status(
-                        {
-                            "ready": False,
-                            "status": "transform_mismatch",
-                            "reason": reason,
-                            "model_fingerprint": calibration_model["model_fingerprint"],
-                            "footprint": footprint,
-                            "transform": {
-                                "translation_error_m": mount_comparison.get("translation_error_m"),
-                                "rotation_error_rad": mount_comparison.get("rotation_error_rad"),
-                            },
-                        }
+                model_derived = False
+                try:
+                    mount_transform: TransformStamped = self.tf_buffer.lookup_transform(
+                        sensor_mount["parent_frame"],
+                        source_frame,
+                        cloud_time,
+                        timeout=Duration(seconds=0.05),
                     )
-                    return
-                if source_frame == base_frame_id:
+                except TransformException:
+                    model_derived = True
+                    observed_mount = candidate_mount
+                    mount_comparison = {
+                        "matches": True,
+                        "translation_error_m": 0.0,
+                        "rotation_error_rad": 0.0,
+                    }
+                    sensor_to_parent_translation = tuple(sensor_mount["translation_m"])
+                    sensor_to_parent_rotation = tuple(sensor_mount["rotation_xyzw"])
+                else:
+                    mount_translation = mount_transform.transform.translation
+                    mount_rotation = mount_transform.transform.rotation
+                    observed_mount = {
+                        "parent_frame": mount_transform.header.frame_id,
+                        "sensor_frame": mount_transform.child_frame_id,
+                        "translation_m": [
+                            float(mount_translation.x),
+                            float(mount_translation.y),
+                            float(mount_translation.z),
+                        ],
+                        "rotation_xyzw": [
+                            float(mount_rotation.x),
+                            float(mount_rotation.y),
+                            float(mount_rotation.z),
+                            float(mount_rotation.w),
+                        ],
+                    }
+                    mount_comparison = compare_transforms(candidate_mount, observed_mount)
+                    if not mount_comparison["matches"]:
+                        reason = mount_comparison["reason"]
+                        self.cache.mark_unavailable(reason)
+                        self.cache.update_calibration_status(
+                            {
+                                "ready": False,
+                                "status": "transform_mismatch",
+                                "reason": reason,
+                                "model_fingerprint": calibration_model["model_fingerprint"],
+                                "footprint": footprint,
+                                "transform": {
+                                    "translation_error_m": mount_comparison.get("translation_error_m"),
+                                    "rotation_error_rad": mount_comparison.get("rotation_error_rad"),
+                                },
+                            }
+                        )
+                        return
+                    sensor_to_parent_translation = tuple(observed_mount["translation_m"])
+                    sensor_to_parent_rotation = tuple(observed_mount["rotation_xyzw"])
+                if model_derived:
+                    if sensor_mount["parent_frame"] == base_frame_id:
+                        translation = sensor_to_parent_translation
+                        rotation = sensor_to_parent_rotation
+                    else:
+                        parent_transform: TransformStamped = self.tf_buffer.lookup_transform(
+                            base_frame_id,
+                            sensor_mount["parent_frame"],
+                            cloud_time,
+                            timeout=Duration(seconds=0.05),
+                        )
+                        parent_translation = parent_transform.transform.translation
+                        parent_rotation = parent_transform.transform.rotation
+                        translation, rotation = compose_transforms(
+                            (
+                                float(parent_translation.x),
+                                float(parent_translation.y),
+                                float(parent_translation.z),
+                            ),
+                            (
+                                float(parent_rotation.x),
+                                float(parent_rotation.y),
+                                float(parent_rotation.z),
+                                float(parent_rotation.w),
+                            ),
+                            sensor_to_parent_translation,
+                            sensor_to_parent_rotation,
+                        )
+                elif source_frame == base_frame_id:
                     translation = (0.0, 0.0, 0.0)
                     rotation = (0.0, 0.0, 0.0, 1.0)
                 else:
@@ -902,20 +958,24 @@ def main() -> None:
             self.cache.update_calibration_status(
                 {
                     "ready": True,
-                    "status": "verified",
+                    "status": "model_derived" if model_derived or not mount_confirmed else "verified",
                     "reason": (
-                        "Live sensor transform matches the supported G1 mount geometry; "
+                        "Using the nominal URDF mount and model-derived footprint; "
+                        "physical sensor mounting has not been independently verified."
+                        if model_derived or not mount_confirmed
+                        else "Live sensor transform matches the supported G1 mount geometry; "
                         "footprint was derived automatically from the G1 collision model."
                     ),
                     "model_fingerprint": calibration_model["model_fingerprint"],
                     "footprint": footprint,
+                    "calibration_source": "model_derived" if model_derived or not mount_confirmed else "live_transform_match",
                     "transform": {
                         "parent_frame": observed_mount["parent_frame"],
                         "sensor_frame": observed_mount["sensor_frame"],
                         "translation_m": observed_mount["translation_m"],
                         "rotation_xyzw": observed_mount["rotation_xyzw"],
-                        "translation_error_m": mount_comparison["translation_error_m"],
-                        "rotation_error_rad": mount_comparison["rotation_error_rad"],
+                        "translation_error_m": mount_comparison.get("translation_error_m"),
+                        "rotation_error_rad": mount_comparison.get("rotation_error_rad"),
                     },
                 }
             )

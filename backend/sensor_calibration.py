@@ -595,11 +595,6 @@ def calibration_status(
             reason = (
                 "Distance base frame {!r} is not the supported G1 model root {!r}."
             ).format(configured_base_frame, model["root_frame"])
-        elif not mount_confirmed:
-            reason = (
-                "The physical MID-360 mount has not been explicitly verified against "
-                "the supported G1 model; distance conditions remain disabled."
-            )
         else:
             report_error = None
             if persisted_valid and live_report is None:
@@ -614,9 +609,9 @@ def calibration_status(
                 reason = "Live calibration evidence was produced by a different G1 model."
             elif live_report.get("ready") is True and _live_report_matches_model(model, live_report):
                 report_verified = True
-                reason = live_report.get(
-                    "reason",
-                    "Live ROS transform matches the model mount and the footprint was derived from the G1 EDU 23-DOF collision geometry.",
+                reason = (
+                    live_report.get("reason")
+                    or "Live ROS transform matches the nominal G1 model mount; distances use model-derived geometry."
                 )
             elif live_report.get("ready") is True:
                 reason = (
@@ -630,11 +625,12 @@ def calibration_status(
                 )
         if path_warnings:
             reason = "{} {}".format(reason, " ".join(path_warnings))
-        if report_verified:
+        if report_verified and mount_confirmed:
             _write_persisted_calibration(
                 {
                     "ready": True,
                     "status": "verified",
+                    "calibration_source": "live_transform_match",
                     "reason": reason,
                     "model_fingerprint": model["model_fingerprint"],
                     "root_frame": model["root_frame"],
@@ -647,7 +643,12 @@ def calibration_status(
     mounts = {} if not model else {"mid360": model["mount"]}
     missing_footprint = [] if model else ["automatic G1 footprint geometry"]
     return {
-        "status": "verified" if ready else ("unavailable" if model_error else "awaiting_live_validation"),
+        "status": (
+            "unavailable" if model_error
+            else "model_derived" if ready and not mount_confirmed
+            else "verified" if ready
+            else "awaiting_live_validation"
+        ),
         "ready": ready,
         "configuration_present": model is not None,
         "model": os.path.basename(urdf_path),
@@ -673,6 +674,7 @@ def calibration_status(
         "missing_footprint": missing_footprint,
         "reason": reason,
         "calibration_method": "model_derived_footprint_and_live_ros_transform_check",
+        "calibration_source": "model_derived" if ready and not mount_confirmed else "live_transform_match",
         "verification_note": (
             "Footprint dimensions are derived from the G1 EDU 23-DOF model. "
             "The sensor mount still requires explicit physical confirmation; a live "

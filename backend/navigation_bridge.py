@@ -260,6 +260,14 @@ def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float | No
             "ready_sources": pointcloud.get("ready_sources", 0),
             "configured_sources": pointcloud.get("configured_sources", len(pointcloud_sources)),
             "sources": pointcloud_sources,
+            "discovery_truncated": (
+                pointcloud.get("discovery_truncated")
+                if isinstance(pointcloud.get("discovery_truncated"), int)
+                and not isinstance(pointcloud.get("discovery_truncated"), bool)
+                and pointcloud.get("discovery_truncated") >= 0
+                else 0
+            ),
+            "discovery_error": optional_text(pointcloud.get("discovery_error"), "point-cloud discovery error"),
             "stamp_age_ms": optional_number(pointcloud.get("stamp_age_ms"), "point-cloud timestamp age"),
             "callback_duration_ms": optional_number(
                 pointcloud.get("callback_duration_ms"), "point-cloud callback duration"
@@ -613,6 +621,9 @@ def navigation_start_route(
     static_map_snapshot: dict[str, Any] | None = None,
     allow_map_version_update: bool = False,
 ) -> dict[str, Any]:
+    effective_planner_mode = planner_mode or "static"
+    if effective_planner_mode not in {"static", "live"}:
+        raise NavigationBridgeError("planner_mode must be 'static' or 'live'.")
     if os.getenv("G1_NAV_EXECUTION_ENABLED", "").strip() != "1":
         raise NavigationBridgeError(
             "Navigation execution is disabled; set G1_NAV_EXECUTION_ENABLED=1 after commissioning the ROS/Nav2 gateway."
@@ -622,7 +633,7 @@ def navigation_start_route(
         raise NavigationBridgeError(snapshot.get("error") or "Navigation map is not ready.")
     if not snapshot.get("motion_ready"):
         raise NavigationBridgeError(snapshot.get("motion_error") or "Physical navigation is disabled because robot and e-stop health are not confirmed.")
-    if planner_mode == "live" and not snapshot.get("liveAvoidanceReady"):
+    if effective_planner_mode == "live" and not snapshot.get("liveAvoidanceReady"):
         raise NavigationBridgeError(
             "Live adaptive navigation requires a fresh Nav2 local costmap and commissioned obstacle avoidance."
         )
@@ -630,7 +641,7 @@ def navigation_start_route(
         _static_route_targets(
             snapshot, static_map_snapshot, map_id, version, frame_id, waypoints
         )
-        if planner_mode == "static"
+        if effective_planner_mode == "static"
         else _validate_route_targets(
             snapshot,
             map_id,
@@ -652,7 +663,7 @@ def navigation_start_route(
             "map_id": snapshot["map"]["map_id"],
             "version": snapshot["map"]["version"],
             "frame_id": snapshot["map"]["frame_id"],
-            "planner_mode": planner_mode or "static",
+            "planner_mode": effective_planner_mode,
             "operation_id": requested_operation_id,
             "goals": [
                 {
@@ -682,10 +693,13 @@ def navigation_plan_route(
     planner_mode: str | None = None,
     static_map_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    effective_planner_mode = planner_mode or "static"
+    if effective_planner_mode not in {"static", "live"}:
+        raise NavigationBridgeError("planner_mode must be 'static' or 'live'.")
     snapshot = navigation_map_snapshot(now=now)
     if not snapshot.get("ready"):
         raise NavigationBridgeError(snapshot.get("error") or "Navigation map is not ready.")
-    if planner_mode == "live" and not snapshot.get("liveAvoidanceReady"):
+    if effective_planner_mode == "live" and not snapshot.get("liveAvoidanceReady"):
         raise NavigationBridgeError(
             "Live adaptive navigation requires a fresh Nav2 local costmap and commissioned obstacle avoidance."
         )
@@ -693,7 +707,7 @@ def navigation_plan_route(
         _static_route_targets(
             snapshot, static_map_snapshot, map_id, version, frame_id, waypoints
         )
-        if planner_mode == "static"
+        if effective_planner_mode == "static"
         else _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
     )
     base_url, token = _bridge_credentials()
@@ -705,7 +719,7 @@ def navigation_plan_route(
             "map_id": snapshot["map"]["map_id"],
             "version": snapshot["map"]["version"],
             "frame_id": snapshot["map"]["frame_id"],
-            "planner_mode": planner_mode or "static",
+            "planner_mode": effective_planner_mode,
             "goals": [
                 {
                     "x": waypoint["x"],
@@ -738,9 +752,9 @@ def navigation_plan_route(
             for axis in ("x", "y")
         })
     return {
-        "map_id": map_id if planner_mode == "static" else snapshot["map"]["map_id"],
-        "version": version if planner_mode == "static" else snapshot["map"]["version"],
-        "frame_id": frame_id if planner_mode == "static" else snapshot["map"]["frame_id"],
+        "map_id": map_id if effective_planner_mode == "static" else snapshot["map"]["map_id"],
+        "version": version if effective_planner_mode == "static" else snapshot["map"]["version"],
+        "frame_id": frame_id if effective_planner_mode == "static" else snapshot["map"]["frame_id"],
         "planner_id": planner_id,
         "path": path,
     }

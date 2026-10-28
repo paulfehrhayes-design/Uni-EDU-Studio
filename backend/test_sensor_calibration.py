@@ -339,26 +339,35 @@ class SensorCalibrationTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertIn("without a matching live transform", status["reason"])
 
-    def test_calibration_remains_disabled_without_physical_mount_confirmation(self):
+    def test_model_derived_calibration_is_available_without_physical_mount_confirmation(self):
         model = automatic_calibration_model()
-        status = calibration_status(
-            env={"G1_DISTANCE_BASE_FRAME": model["root_frame"]},
-            live_report={
-                "ready": True,
-                "status": "verified",
-                "model_fingerprint": model["model_fingerprint"],
-                "transform": {
-                    "parent_frame": model["mount"]["parent_frame"],
-                    "sensor_frame": "livox_frame",
-                    "translation_error_m": 0.0,
-                    "rotation_error_rad": 0.0,
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = os.path.join(temp_dir, "sensor-calibration.json")
+            status = calibration_status(
+                env={
+                    "G1_DISTANCE_BASE_FRAME": model["root_frame"],
+                    "G1_SENSOR_AUTO_CALIBRATION_PERSIST": "1",
+                    "G1_SENSOR_CALIBRATION_CACHE_PATH": cache_path,
                 },
-                "footprint": model["footprint"],
-            },
-        )
+                live_report={
+                    "ready": True,
+                    "status": "verified",
+                    "model_fingerprint": model["model_fingerprint"],
+                    "transform": {
+                        "parent_frame": model["mount"]["parent_frame"],
+                        "sensor_frame": "livox_frame",
+                        "translation_error_m": 0.0,
+                        "rotation_error_rad": 0.0,
+                    },
+                    "footprint": model["footprint"],
+                },
+            )
+            self.assertFalse(os.path.exists(cache_path))
 
-        self.assertFalse(status["ready"])
-        self.assertIn("physical MID-360 mount", status["reason"])
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["status"], "model_derived")
+        self.assertEqual(status["calibration_source"], "model_derived")
+        self.assertFalse(status["physical_mount_confirmed"])
 
     def test_calibration_rejects_non_model_distance_base_frame(self):
         model = automatic_calibration_model()

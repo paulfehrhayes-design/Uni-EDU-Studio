@@ -584,7 +584,7 @@ else
   echo "Physical distance conditions remain disabled until axis alignment, base transform, and metric footprint calibration are explicitly verified."
 fi
 if [[ "$G1_LIDAR_MOUNT_CONFIRMED" != "1" ]]; then
-  echo "MID-360 physical mount confirmation is not set; the model-to-cloud transform will not be published and physical distance conditions remain disabled."
+  echo "MID-360 mount is not physically confirmed; distance readings use the nominal G1 model mount and are labeled model-derived until checked on hardware."
 fi
 if [[ "$DRIVER_REQUIRED" == "1" ]]; then
   echo "The configured network was validated, but hardware presence still needs on-device verification. Review $CONFIG_FILE."

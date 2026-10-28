@@ -7,8 +7,10 @@ try:
     from .ros.navigation_gateway import (
         GatewayConfigurationError,
         _configuration,
+        _aggregate_pointcloud_health,
         accumulate_scan_rotation,
         controller_ownership_ready,
+        pointcloud_topics_for_runtime,
         scan_rotation_complete,
         validate_estop_health,
         validate_pointcloud_timestamp,
@@ -17,8 +19,10 @@ except ImportError:
     from ros.navigation_gateway import (
         GatewayConfigurationError,
         _configuration,
+        _aggregate_pointcloud_health,
         accumulate_scan_rotation,
         controller_ownership_ready,
+        pointcloud_topics_for_runtime,
         scan_rotation_complete,
         validate_estop_health,
         validate_pointcloud_timestamp,
@@ -63,7 +67,7 @@ class NavigationGatewayScanTests(unittest.TestCase):
         self.assertEqual(config["pointcloud_topics"], ["/lidar/front", "/lidar/rear"])
 
         now = 1000.0
-        health = __import__("backend.ros.navigation_gateway", fromlist=["_aggregate_pointcloud_health"])._aggregate_pointcloud_health(
+        health = _aggregate_pointcloud_health(
             [
                 {"received_monotonic": now - 0.25, "ready": True},
                 {"received_monotonic": now - 10.0, "ready": True},
@@ -74,6 +78,48 @@ class NavigationGatewayScanTests(unittest.TestCase):
         self.assertTrue(health["ready"])
         self.assertEqual(health["age_ms"], 250)
         self.assertEqual(health["latest_received_monotonic"], now - 0.25)
+
+    def test_runtime_pointcloud_discovery_adds_all_streams_with_a_bounded_limit(self):
+        topics, truncated = pointcloud_topics_for_runtime(
+            [
+                ("/depth/points", ["sensor_msgs/msg/PointCloud2"]),
+                ("/lidar/front", ["sensor_msgs/msg/PointCloud2"]),
+                ("/camera/image", ["sensor_msgs/msg/Image"]),
+                ("relative/cloud", ["sensor_msgs/msg/PointCloud2"]),
+            ],
+            ["/mid360/livox/lidar"],
+            maximum=3,
+        )
+
+        self.assertEqual(topics, ["/mid360/livox/lidar", "/depth/points", "/lidar/front"])
+        self.assertEqual(truncated, 0)
+        topics, truncated = pointcloud_topics_for_runtime(
+            [(f"/cloud/{index}", ["sensor_msgs/msg/PointCloud2"]) for index in range(5)],
+            [],
+            maximum=3,
+        )
+        self.assertEqual(topics, ["/cloud/0", "/cloud/1", "/cloud/2"])
+        self.assertEqual(truncated, 2)
+
+    def test_pointcloud_runtime_autodiscovery_yields_to_explicit_topic_configuration(self):
+        with patch.dict(
+            os.environ,
+            {
+                "G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token",
+                "G1_NAV_POINTCLOUD_TOPICS": "/lidar/front,/lidar/rear",
+            },
+            clear=True,
+        ):
+            configured = _configuration()
+        self.assertFalse(configured["auto_discover_pointcloud_topics"])
+
+        with patch.dict(
+            os.environ,
+            {"G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token"},
+            clear=True,
+        ):
+            automatic = _configuration()
+        self.assertTrue(automatic["auto_discover_pointcloud_topics"])
 
     def test_scan_rotation_accumulates_wrapped_yaw_in_signed_direction(self):
         rotation = accumulate_scan_rotation(0.0, 3.1, -3.1)

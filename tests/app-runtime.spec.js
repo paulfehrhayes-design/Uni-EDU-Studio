@@ -481,7 +481,7 @@ test('student queue does not expose teacher sensor diagnostics or call sensor AP
   expect(sensorRequests).toEqual([]);
 });
 
-test('teacher sensor diagnostics distinguish a LiDAR path from unverified calibration', async ({ page }) => {
+test('teacher sensor diagnostics label model-derived distance readings as provisional', async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-sensor-diagnostics-token',
@@ -495,11 +495,24 @@ test('teacher sensor diagnostics distinguish a LiDAR path from unverified calibr
           method: 'direct_livox',
           reason: 'Validated direct Livox network path; sensor stream not yet verified.',
         },
+        ros: {
+          pointclouds: [
+            { name: '/lidar/front', fresh: true, frame_id: 'front_lidar', age_ms: 42 },
+            { name: '/lidar/rear', fresh: false, frame_id: 'rear_lidar', age_ms: 1800, error: 'PointCloud2 sample is stale.' },
+          ],
+          sources: [
+            { role: 'imu', name: '/imu/data', fresh: true, frame_id: 'base_link', age_ms: 35 },
+            { role: 'joint_state', name: '/joint_states', fresh: true, frame_id: 'pelvis', age_ms: 40 },
+            { role: 'local_costmap', name: '/local_costmap/costmap', fresh: false, frame_id: 'map', age_ms: 1800, error: 'OccupancyGrid sample is stale.' },
+          ],
+        },
         diagnostics: [],
       },
       calibration: {
-        status: 'configured_unverified',
-        reason: 'No live transform comparison or independent calibration validation is available.',
+        status: 'model_derived',
+        calibration_source: 'model_derived',
+        physical_mount_confirmed: false,
+        reason: 'Using the nominal URDF mount and model-derived footprint; physical sensor mounting has not been independently verified.',
         candidate_mounts: {
           mid360: {
             available: true,
@@ -510,9 +523,9 @@ test('teacher sensor diagnostics distinguish a LiDAR path from unverified calibr
         },
       },
       distance: {
-        ready: false,
-        error: 'MID-360 calibration is unconfirmed.',
-        rear: { ready: false, error: 'MID-360 calibration is unconfirmed.' },
+        ready: true,
+        front: { ready: true, distance_m: 0.84 },
+        rear: { ready: true, distance_m: 1.14 },
       },
     },
     cameras: { sources: {} },
@@ -531,7 +544,13 @@ test('teacher sensor diagnostics distinguish a LiDAR path from unverified calibr
   await page.goto('/');
   await page.getByRole('button', { name: 'Open queue' }).click();
   await page.getByRole('button', { name: 'Discover sensors' }).click();
-  await expect(page.getByText(/direct_livox.*configured_unverified/)).toBeVisible();
+  await expect(page.getByText(/direct_livox.*model-derived \(provisional\)/)).toBeVisible();
+  await expect(page.getByText('/lidar/front · fresh · frame front_lidar · 42 ms old')).toBeVisible();
+  await expect(page.getByText('/lidar/rear · unavailable · frame rear_lidar · 1800 ms old · PointCloud2 sample is stale.')).toBeVisible();
+  await expect(page.getByText('imu: /imu/data · fresh · frame base_link · 35 ms old')).toBeVisible();
+  await expect(page.getByText('joint state: /joint_states · fresh · frame pelvis · 40 ms old')).toBeVisible();
+  await expect(page.getByText('local costmap: /local_costmap/costmap · unavailable · frame map · 1800 ms old · OccupancyGrid sample is stale.')).toBeVisible();
+  await expect(page.getByText(/Forward distance: ready.*Rear distance: ready/)).toBeVisible();
   await expect(page.getByText(/Unverified model mount candidate/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Restart managed LiDAR driver' })).toBeVisible();
 });
@@ -1222,6 +1241,15 @@ test('live adaptive planner displays fresh obstacles and keeps waypoints anchore
         age_ms: 50,
       },
       map: { map_id: 'classroom', version: 'live-v1' },
+      diagnostics: {
+        topics: { pointcloud: '/lidar/front,/lidar/rear' },
+        pointcloud: {
+          sources: [
+            { topic: '/lidar/front', frame_id: 'front_lidar', ready: true, age_ms: 60 },
+            { topic: '/lidar/rear', frame_id: 'rear_lidar', ready: false, age_ms: 1700, error: 'stale source' },
+          ],
+        },
+      },
     },
     scan: null,
     shared_overlay_enabled: false,
@@ -1230,6 +1258,8 @@ test('live adaptive planner displays fresh obstacles and keeps waypoints anchore
   await expect(page.getByTestId('navigation-live-robot-pose')).toBeVisible();
   await expect(page.getByTestId('navigation-waypoint-1')).toHaveAttribute('cx', '0.5');
   await expect(page.getByText(/Live local costmap • 1 obstacle samples/)).toBeVisible();
+  await expect(page.getByTestId('navigation-pointcloud-source').filter({ hasText: '/lidar/front · contributing' })).toBeVisible();
+  await expect(page.getByTestId('navigation-pointcloud-source').filter({ hasText: '/lidar/rear · unavailable' })).toContainText('stale source');
 });
 
 test('teacher can preview a route without motion before starting Nav2', async ({ page }) => {

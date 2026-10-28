@@ -444,6 +444,7 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), preview)
         self.assertEqual(plan_route.call_count, 2)
+        self.assertTrue(all(call.kwargs["planner_mode"] == "static" for call in plan_route.call_args_list))
         start_route.assert_not_called()
         self.assertEqual(denied.status_code, 200)
         self.assertEqual(denied.json(), preview)
@@ -476,7 +477,7 @@ class ServerClassroomTests(unittest.TestCase):
             }
             with patch.object(server, "robot_status", return_value={"running": False}), patch.object(
                 server, "navigation_start_route", return_value=operation
-            ):
+            ) as start_route:
                 response = client.post(
                     "/api/navigation/start",
                     headers=teacher_headers,
@@ -496,6 +497,7 @@ class ServerClassroomTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["operation_id"], operation["operation_id"])
+        self.assertEqual(start_route.call_args.kwargs["planner_mode"], "static")
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(blocked_sdk.status_code, 409)
         self.assertIn("owns locomotion", blocked_sdk.json()["detail"])
@@ -929,6 +931,133 @@ class ServerClassroomTests(unittest.TestCase):
             self.assertEqual(response.json()["item"]["status"], "completed")
             self.assertEqual(response.json()["process"]["commandsExecuted"], 1)
             execute.assert_called_once_with(code)
+
+    def test_run_next_dispatches_each_project_planner_mode_to_its_executor(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            client = TestClient(app)
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            base_request = {
+                "planner_label": "mode-dispatch-test",
+                "planner_waypoints": [{"x": 0, "y": 0}, {"x": 1, "y": 0}],
+                "route_variants": {"initial": "robot.walktime(1)"},
+                "selected_variant": "initial",
+            }
+            navigation = {
+                "map_id": "classroom",
+                "version": "v1",
+                "frame_id": "map",
+                "planner_mode": "live",
+                "waypoints": [{"x": 0, "y": 0}, {"x": 1, "y": 0}],
+            }
+
+            manual_item = client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={
+                    "name": "manual-planner",
+                    "code": "robot.walktime(1)",
+                    "planner_request": {**base_request, "planner_mode": "manual"},
+                },
+            ).json()["item"]
+            with patch.object(server, "ensure_sdk_motion_available"), patch.object(
+                server,
+                "execute_robot_program",
+                return_value={"status": "completed", "commandsExecuted": 1},
+            ) as execute_manual:
+                manual_result = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": manual_item["id"]},
+                )
+            execute_manual.assert_called_once_with("robot.walktime(1)")
+            self.assertEqual(manual_result.status_code, 200)
+            self.assertEqual(manual_result.json()["status"], "completed")
+
+            corrected_item = client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={
+                    "name": "sensor-corrected-planner",
+                    "code": "robot.walktime(1)",
+                    "planner_request": {**base_request, "planner_mode": "sensor_corrected"},
+                },
+            ).json()["item"]
+            corrected = {
+                "status": "completed",
+                "correctedCode": "robot.walktime(1.1)",
+                "checkpoints": [{"error_m": 0.1}],
+            }
+            with patch.object(
+                server, "run_checkpointed_planner", return_value=corrected
+            ) as execute_corrected, patch.object(
+                server,
+                "save_unique_project_for_user",
+                return_value={"name": "sensor-corrected-planner"},
+            ):
+                corrected_result = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": corrected_item["id"]},
+                )
+            execute_corrected.assert_called_once()
+            self.assertEqual(corrected_result.status_code, 200)
+            self.assertEqual(corrected_result.json()["status"], "completed")
+
+            autonomous_item = client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={
+                    "name": "autonomous-planner",
+                    "code": "",
+                    "planner_request": {
+                        **base_request,
+                        "planner_mode": "autonomous",
+                        "navigation": navigation,
+                    },
+                },
+            ).json()["item"]
+            operation = {"operation_id": "12345678-1234-1234-1234-123456789abc", "status": "accepted"}
+            with patch.object(server, "start_navigation", return_value=operation) as execute_autonomous:
+                autonomous_result = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": autonomous_item["id"]},
+                )
+            execute_autonomous.assert_called_once()
+            self.assertEqual(
+                execute_autonomous.call_args.args[0].planner_mode,
+                "live",
+            )
+            self.assertEqual(autonomous_result.status_code, 200)
+            self.assertEqual(autonomous_result.json()["status"], "running")
+
+    def test_autonomous_planner_request_rejects_static_nav2_mode(self):
+        with self.assertRaisesRegex(HTTPException, "require Live adaptive Nav2"):
+            server._validated_planner_request({
+                "planner_mode": "autonomous",
+                "planner_waypoints": [],
+                "route_variants": {},
+                "selected_variant": "initial",
+                "navigation": {
+                    "map_id": "classroom",
+                    "version": "v1",
+                    "frame_id": "map",
+                    "planner_mode": "static",
+                    "waypoints": [{"x": 0, "y": 0}],
+                },
+            })
 
     def test_run_next_keeps_program_queued_when_robot_is_not_ready(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(

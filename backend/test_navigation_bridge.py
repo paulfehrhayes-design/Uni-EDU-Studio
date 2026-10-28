@@ -41,6 +41,14 @@ class NavigationBridgeTests(unittest.TestCase):
                     "count": 120,
                     "rate_hz": 20.0,
                     "age_ms": 80,
+                    "configured_sources": 2,
+                    "ready_sources": 1,
+                    "sources": [
+                        {"topic": "/lidar/front", "frame_id": "front_frame", "ready": True, "age_ms": 60},
+                        {"topic": "/lidar/rear", "frame_id": "rear_frame", "ready": False, "age_ms": None, "error": "No recent transform-valid point cloud from this sensor."},
+                    ],
+                    "discovery_truncated": 2,
+                    "discovery_error": None,
                     "stamp_age_ms": 30.0,
                     "callback_duration_ms": 2.5,
                 },
@@ -117,6 +125,9 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertEqual(result["map"]["width"], 200)
         self.assertEqual(result["diagnostics"]["topics"]["pointcloud"], "/mid360/livox/lidar")
         self.assertEqual(result["diagnostics"]["pointcloud"]["rate_hz"], 20.0)
+        self.assertEqual(result["diagnostics"]["pointcloud"]["ready_sources"], 1)
+        self.assertEqual(result["diagnostics"]["pointcloud"]["discovery_truncated"], 2)
+        self.assertEqual(len(result["diagnostics"]["pointcloud"]["sources"]), 2)
         self.assertTrue(result["diagnostics"]["actions"]["spin"])
         self.assertTrue(result["diagnostics"]["controller"]["ready"])
         self.assertTrue(result["diagnostics"]["execution_enabled"])
@@ -345,23 +356,35 @@ class NavigationBridgeTests(unittest.TestCase):
     def test_route_start_requires_enabled_execution_and_current_free_map_targets(self):
         route = [{"x": -4.975, "y": -3.725, "yaw_rad": 1.2}]
         operation_id = "12345678-1234-1234-1234-123456789abc"
+        live_status = {
+            **self.status,
+            "live_avoidance_ready": True,
+            "live_obstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 80,
+                "points": [],
+            },
+        }
         with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "0"}):
             with self.assertRaisesRegex(NavigationBridgeError, "disabled"):
                 navigation_start_route(
-                    "classroom", "v4", "map", route, operation_id, now=self.now
+                    "classroom", "v4", "map", route, operation_id,
+                    now=self.now, planner_mode="live",
                 )
 
         accepted = {
             "operation_id": "12345678-1234-1234-1234-123456789abc",
             "status": "accepted",
         }
-        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
+        with self.mock_bridge(status=live_status), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
             navigation_bridge.httpx,
             "post",
             return_value=SimpleNamespace(status_code=202, json=lambda: accepted),
         ) as request:
             result = navigation_start_route(
-                "classroom", "v4", "map", route, operation_id, now=self.now
+                "classroom", "v4", "map", route, operation_id,
+                now=self.now, planner_mode="live",
             )
         self.assertEqual(result["operation_id"], accepted["operation_id"])
         self.assertEqual(
@@ -369,15 +392,16 @@ class NavigationBridgeTests(unittest.TestCase):
             [{"x": route[0]["x"], "y": route[0]["y"], "yaw_rad": 1.2}],
         )
 
-        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}):
+        with self.mock_bridge(status=live_status), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}):
             with self.assertRaisesRegex(NavigationBridgeError, "map changed"):
                 navigation_start_route(
-                    "classroom", "old-version", "map", route, operation_id, now=self.now
+                    "classroom", "old-version", "map", route, operation_id,
+                    now=self.now, planner_mode="live",
                 )
             with self.assertRaisesRegex(NavigationBridgeError, "outside the current map"):
                 navigation_start_route(
                     "classroom", "v4", "map", [{"x": 100, "y": 100}],
-                    operation_id,                     now=self.now,
+                    operation_id, now=self.now, planner_mode="live",
                 )
         occupied_map = {
             **self.map_metadata,
@@ -386,24 +410,25 @@ class NavigationBridgeTests(unittest.TestCase):
             "origin": {"x": 0, "y": 0, "yaw_rad": 0},
         }
         occupied = {**occupied_map, "data": [100, 0, 0, 0]}
-        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
+        with self.mock_bridge(status=live_status), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
             navigation_bridge,
             "_get_json",
-            side_effect=[self.status, occupied],
+            side_effect=[live_status, occupied],
         ):
             with self.assertRaisesRegex(NavigationBridgeError, "known free space"):
                 navigation_start_route(
                     "classroom", "v4", "map", [{"x": 0.025, "y": 0.025}],
-                    operation_id, now=self.now,
+                    operation_id, now=self.now, planner_mode="live",
                 )
 
-        status_without_estop = {key: value for key, value in self.status.items() if key != "estop"}
+        status_without_estop = {key: value for key, value in live_status.items() if key != "estop"}
         with self.mock_bridge(status=status_without_estop), patch.dict(
             os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}
         ), patch.object(navigation_bridge.httpx, "post") as motion_request:
             with self.assertRaisesRegex(NavigationBridgeError, "E-stop health is missing, stale, or invalid"):
                 navigation_start_route(
-                    "classroom", "v4", "map", route, operation_id, now=self.now
+                    "classroom", "v4", "map", route, operation_id,
+                    now=self.now, planner_mode="live",
                 )
         motion_request.assert_not_called()
 
@@ -464,6 +489,7 @@ class NavigationBridgeTests(unittest.TestCase):
             "planner_id": "GridBased",
             "path": [{"x": -0.5, "y": 0.25}, {"x": 0.0, "y": 0.5}],
         }
+        static_snapshot = {"ready": True, "map": self.map_metadata, "data": self.map_snapshot["data"]}
         with patch.object(navigation_bridge, "navigation_map_snapshot", return_value={
             "ready": True,
             "map": self.map_metadata,
@@ -474,18 +500,21 @@ class NavigationBridgeTests(unittest.TestCase):
             navigation_bridge, "_post_json", return_value=plan
         ) as post:
             result = navigation_plan_route(
-                "classroom", "v4", "map", [{"x": 0.0, "y": 0.0}], now=self.now
+                "classroom", "v4", "map", [{"x": 0.0, "y": 0.0}],
+                now=self.now, static_map_snapshot=static_snapshot,
             )
 
         self.assertEqual(result["path"], plan["path"])
         self.assertEqual(result["planner_id"], "GridBased")
         self.assertEqual(post.call_args.args[2], "/api/v1/navigation/plan")
+        self.assertEqual(post.call_args.args[3]["planner_mode"], "static")
         self.assertEqual(post.call_args.args[3]["goals"], [
             {"x": 0.0, "y": 0.0, "yaw_rad": 0.0},
         ])
         self.assertEqual(post.call_args.kwargs["timeout"], navigation_bridge.NAVIGATION_PLAN_TIMEOUT_SECONDS)
 
     def test_route_preview_rejects_unmapped_targets_before_contacting_gateway(self):
+        static_snapshot = {"ready": True, "map": self.map_metadata, "data": self.map_snapshot["data"]}
         with patch.object(navigation_bridge, "navigation_map_snapshot", return_value={
             "ready": True,
             "map": self.map_metadata,
@@ -495,9 +524,22 @@ class NavigationBridgeTests(unittest.TestCase):
         ) as post:
             with self.assertRaisesRegex(NavigationBridgeError, "outside the current map"):
                 navigation_plan_route(
-                    "classroom", "v4", "map", [{"x": 100.0, "y": 100.0}], now=self.now
+                    "classroom", "v4", "map", [{"x": 100.0, "y": 100.0}],
+                    now=self.now, static_map_snapshot=static_snapshot,
                 )
         post.assert_not_called()
+
+    def test_route_preview_rejects_unknown_planner_mode_before_fetching_map(self):
+        with patch.object(navigation_bridge, "navigation_map_snapshot") as get_map:
+            with self.assertRaisesRegex(NavigationBridgeError, "planner_mode"):
+                navigation_plan_route(
+                    "classroom",
+                    "v4",
+                    "map",
+                    [{"x": 0.0, "y": 0.0}],
+                    planner_mode="unknown",
+                )
+        get_map.assert_not_called()
 
     def test_static_scan_route_validates_saved_and_live_maps_but_plans_on_current_version(self):
         static_map = {
@@ -535,6 +577,33 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertEqual(result["version"], "published-scan-v3")
         self.assertEqual(post.call_args.args[3]["version"], "v4")
         self.assertEqual(post.call_args.args[3]["planner_mode"], "static")
+
+    def test_static_route_start_validates_scan_and_live_maps_then_starts_current_map_goal(self):
+        static_snapshot = {"ready": True, "map": self.map_metadata, "data": self.map_snapshot["data"]}
+        accepted = {
+            "operation_id": "12345678-1234-1234-1234-123456789abc",
+            "status": "accepted",
+        }
+        with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
+            navigation_bridge.httpx,
+            "post",
+            return_value=SimpleNamespace(status_code=202, json=lambda: accepted),
+        ) as post:
+            result = navigation_start_route(
+                "classroom",
+                "v4",
+                "map",
+                [{"x": 0.0, "y": 0.0, "yaw_rad": 0.7}],
+                accepted["operation_id"],
+                now=self.now,
+                planner_mode="static",
+                static_map_snapshot=static_snapshot,
+            )
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(post.call_args.kwargs["json"]["planner_mode"], "static")
+        self.assertEqual(post.call_args.kwargs["json"]["version"], self.map_metadata["version"])
+        self.assertEqual(post.call_args.kwargs["json"]["goals"][0]["yaw_rad"], 0.7)
 
     def test_static_scan_route_rejects_waypoint_blocked_on_current_live_map(self):
         static_map = {**self.map_metadata, "version": "published-scan-v3"}

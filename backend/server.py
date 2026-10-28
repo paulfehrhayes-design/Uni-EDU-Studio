@@ -201,7 +201,7 @@ class NavigationStartRequest(BaseModel):
     version: str
     frame_id: str
     waypoints: List[dict]
-    planner_mode: Optional[Literal["static", "live"]] = None
+    planner_mode: Literal["static", "live"] = "static"
     queue_item_id: Optional[str] = None
     operation_kind: Optional[Literal["return_home"]] = None
 
@@ -1609,6 +1609,11 @@ def _validated_planner_request(value: Optional[dict]) -> Optional[dict]:
             raise HTTPException(status_code=400, detail="Autonomous request map identity is incomplete.")
         if not isinstance(nav_mode, str) or nav_mode not in {"static", "live"}:
             raise HTTPException(status_code=400, detail="Autonomous request Nav2 mode is invalid.")
+        if nav_mode != "live":
+            raise HTTPException(
+                status_code=400,
+                detail="Autonomous obstacle-aware requests require Live adaptive Nav2.",
+            )
         normalized_navigation = {
             "map_id": map_id.strip()[:128],
             "version": version.strip()[:128],

@@ -88,6 +88,7 @@ SCAN_MAP_MAX_AGE_SECONDS = 2.0
 POINTCLOUD_MAX_FUTURE_SKEW_SECONDS = 0.1
 POINTCLOUD_RATE_WINDOW_SECONDS = 5.0
 MAX_POINTCLOUD_TOPICS = 16
+POINTCLOUD_MESSAGE_TYPE = "sensor_msgs/msg/PointCloud2"
 
 
 def _aggregate_pointcloud_health(
@@ -193,6 +194,22 @@ def controller_ownership_ready(owner: str, confirmed: bool) -> bool:
     return owner == "nav2_via_single_unitree_bridge" and confirmed is True
 
 
+def pointcloud_topics_for_runtime(
+    topic_types: list[tuple[str, list[str]]],
+    configured_topics: list[str],
+    maximum: int = MAX_POINTCLOUD_TOPICS,
+) -> tuple[list[str], int]:
+    topics = list(dict.fromkeys(configured_topics))
+    candidates = sorted({
+        name
+        for name, message_types in topic_types
+        if POINTCLOUD_MESSAGE_TYPE in message_types and isinstance(name, str) and name.startswith("/")
+    } - set(topics))
+    available_slots = max(0, maximum - len(topics))
+    topics.extend(candidates[:available_slots])
+    return topics, max(0, len(candidates) - available_slots)
+
+
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     raw = os.getenv(name, str(default))
     try:
@@ -220,10 +237,12 @@ def _configuration() -> dict[str, Any]:
     ).strip()
     map_topic = os.getenv("G1_NAV_MAP_TOPIC", "/map").strip()
     pointcloud_topics_value = os.getenv("G1_NAV_POINTCLOUD_TOPICS", "").strip()
+    legacy_pointcloud_topic = os.getenv("G1_NAV_POINTCLOUD_TOPIC", "").strip()
+    auto_discover_pointcloud_topics = not pointcloud_topics_value and not legacy_pointcloud_topic
     pointcloud_topics = (
         [topic.strip() for topic in pointcloud_topics_value.split(",") if topic.strip()]
         if pointcloud_topics_value
-        else [os.getenv("G1_NAV_POINTCLOUD_TOPIC", "/mid360/livox/lidar").strip()]
+        else [legacy_pointcloud_topic or "/mid360/livox/lidar"]
     )
     local_costmap_topic = os.getenv(
         "G1_NAV_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"
@@ -269,6 +288,7 @@ def _configuration() -> dict[str, Any]:
         ),
         "map_topic": map_topic,
         "pointcloud_topics": pointcloud_topics,
+        "auto_discover_pointcloud_topics": auto_discover_pointcloud_topics,
         "local_costmap_topic": local_costmap_topic,
         "live_avoidance_enabled": os.getenv(
             "G1_NAV_LIVE_AVOIDANCE_ENABLED", "0"
@@ -370,6 +390,8 @@ def _make_ros_node(config: dict[str, Any]):
                 }
                 for topic in config["pointcloud_topics"]
             }
+            self.pointcloud_discovery_truncated = 0
+            self.pointcloud_discovery_error: str | None = None
             self.pointcloud_received_monotonic: float | None = None
             self.local_costmap: dict[str, Any] | None = None
             self.local_costmap_received_monotonic: float | None = None
@@ -389,15 +411,9 @@ def _make_ros_node(config: dict[str, Any]):
             self.map_subscription = self.create_subscription(
                 OccupancyGrid, config["map_topic"], self._map_callback, 10
             )
-            self.pointcloud_subscriptions = [
-                self.create_subscription(
-                    PointCloud2,
-                    topic,
-                    lambda message, source_topic=topic: self._pointcloud_callback(message, source_topic),
-                    10,
-                )
-                for topic in config["pointcloud_topics"]
-            ]
+            self.pointcloud_subscriptions: dict[str, Any] = {}
+            for topic in config["pointcloud_topics"]:
+                self._subscribe_pointcloud(topic)
             self.local_costmap_subscription = self.create_subscription(
                 OccupancyGrid, config["local_costmap_topic"], self._local_costmap_callback, 10
             )
@@ -414,6 +430,50 @@ def _make_ros_node(config: dict[str, Any]):
                 if config["robot_healthy_topic"] else None
             )
             self.scan_health_timer = self.create_timer(0.05, self._scan_health_tick)
+            self.pointcloud_discovery_timer = (
+                self.create_timer(2.0, self._discover_pointcloud_sources)
+                if config["auto_discover_pointcloud_topics"] else None
+            )
+
+        def _subscribe_pointcloud(self, topic: str) -> None:
+            if topic in self.pointcloud_subscriptions:
+                return
+            self.pointcloud_subscriptions[topic] = self.create_subscription(
+                PointCloud2,
+                topic,
+                lambda message, source_topic=topic: self._pointcloud_callback(message, source_topic),
+                10,
+            )
+
+        def _discover_pointcloud_sources(self) -> None:
+            try:
+                topics, truncated = pointcloud_topics_for_runtime(
+                    self.get_topic_names_and_types(),
+                    self.config["pointcloud_topics"],
+                )
+            except Exception as error:
+                self.pointcloud_discovery_error = "Could not inspect live point-cloud topics: {}".format(error)
+                return
+            existing = set(self.config["pointcloud_topics"])
+            now = time.monotonic()
+            for topic in topics:
+                if topic in existing:
+                    continue
+                with self.lock:
+                    self.pointcloud_sources[topic] = {
+                        "received_monotonic": None,
+                        "frame_id": None,
+                        "stamp_age_ms": None,
+                        "rate_started_monotonic": now,
+                        "rate_window_count": 0,
+                        "count": 0,
+                        "rate_hz": None,
+                        "callback_duration_ms": None,
+                    }
+                self._subscribe_pointcloud(topic)
+            self.config["pointcloud_topics"] = topics
+            self.pointcloud_discovery_truncated = truncated
+            self.pointcloud_discovery_error = None
 
         def _estop_callback(self, message):
             with self.lock:
@@ -1338,6 +1398,8 @@ def _make_ros_node(config: dict[str, Any]):
                         "ready": pointcloud_ready,
                         "ready_sources": len(ready_sources),
                         "configured_sources": source_count,
+                        "discovery_truncated": self.pointcloud_discovery_truncated,
+                        "discovery_error": self.pointcloud_discovery_error,
                         "count": sum(source["count"] for source in pointcloud_status["sources"]),
                         "rate_hz": sum(source["rate_hz"] or 0 for source in ready_sources)
                         if ready_sources else None,

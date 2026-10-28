@@ -10,6 +10,7 @@ try:
     from .ros_lidar_provider import (
         SampleCache,
         PointCloudClockNormalizer,
+        compose_transforms,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -25,6 +26,7 @@ except ImportError:
     from ros_lidar_provider import (
         SampleCache,
         PointCloudClockNormalizer,
+        compose_transforms,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -109,6 +111,19 @@ class RosLidarProviderTests(unittest.TestCase):
         )
 
         for actual, expected in zip(point, (0.2, 0.9, 0.3)):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_composes_model_mount_with_live_parent_to_base_transform(self):
+        translation, rotation = compose_transforms(
+            (0.2, -0.1, 0.3),
+            (0.0, 0.0, 2 ** -0.5, 2 ** -0.5),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+
+        for actual, expected in zip(translation, (0.2, 0.9, 0.3)):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(rotation, (0.0, 0.0, 2 ** -0.5, 2 ** -0.5)):
             self.assertAlmostEqual(actual, expected)
 
     def test_distance_is_measured_from_robot_footprint_boundary(self):

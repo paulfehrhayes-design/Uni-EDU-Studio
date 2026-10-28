@@ -52,9 +52,13 @@ Humble and the SLAM/Nav2 workspace. The host must provide:
   Nav2 velocity-output path and commissioned G1 `/cmd_vel` bridge;
 - a live, correctly registered `OccupancyGrid` on `/map`, in the configured
   `map` frame;
-- a `PointCloud2` stream from the MID-360, default topic
-  `/mid360/livox/lidar`, with a time-valid TF transform from the cloud's frame
-  into the configured `map` frame;
+- one or more `PointCloud2` streams with a time-valid TF transform from each
+  cloud's frame into the configured `map` frame. When neither
+  `G1_NAV_POINTCLOUD_TOPICS` nor the legacy `G1_NAV_POINTCLOUD_TOPIC` is set,
+  the gateway discovers PointCloud2 topics at runtime and subscribes to up to
+  16 sources, retaining `/mid360/livox/lidar` as the fallback topic. Each
+  source is reported independently; stale or untransformable sources do not
+  make a healthy source appear ready;
 - a fresh TF transform from `map` to `base_link`;
 - a `std_msgs/Bool` heartbeat on `G1_NAV_ESTOP_HEALTHY_TOPIC`; `true` must mean
   the independent physical e-stop is released and the verified safety chain is
@@ -71,7 +75,8 @@ environment variables are `G1_NAV_GATEWAY_HOST`, `G1_NAV_GATEWAY_PORT`,
 `G1_NAV_ACTION_NAME`, `G1_NAV_PLAN_ACTION_NAME`, `G1_NAV_PLANNER_ID`,
 `G1_NAV_PLAN_TIMEOUT_SECONDS`, `G1_NAV_SPIN_ACTION_NAME`,
 `G1_NAV_SCAN_ROTATION_TIMEOUT_SECONDS` (30–300 seconds, default 180),
-`G1_NAV_MAP_TOPIC`, `G1_NAV_POINTCLOUD_TOPIC`, `G1_NAV_LOCAL_COSTMAP_TOPIC`
+`G1_NAV_MAP_TOPIC`, `G1_NAV_POINTCLOUD_TOPICS` (comma-separated explicit
+override), legacy `G1_NAV_POINTCLOUD_TOPIC`, `G1_NAV_LOCAL_COSTMAP_TOPIC`
 (default `/local_costmap/costmap`), `G1_NAV_LIVE_AVOIDANCE_ENABLED` (default
 `0`), `G1_NAV_MAP_FRAME`,
 `G1_NAV_BASE_FRAME`, `G1_NAV_MAP_ID`, `G1_NAV_OCCUPIED_THRESHOLD`,
@@ -88,7 +93,10 @@ navigation status reports configured point-cloud/map topics and frames,
 observed point-cloud rate after a five-second measurement window, acquisition
 stamp age, gateway callback duration, map age/resolution/origin/occupancy
 threshold/version, localization freshness, action-server readiness, and
-controller-ownership confirmation. The callback metric is not a DDS packet-drop
+controller-ownership confirmation. The gateway combines transform-valid clouds
+for supervised 3D scan capture and source-readiness diagnostics; SLAM and Nav2
+remain responsible for incorporating their configured sensor inputs into
+`/map` and the local costmap. The callback metric is not a DDS packet-drop
 counter; verify delivery and loss independently on the robot with ROS tooling.
 The ROS host also needs the Python ROS packages used by the gateway:
 `rclpy`, `nav2_msgs`, `nav_msgs`, `geometry_msgs`, `action_msgs`, `tf2_ros`,

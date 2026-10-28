@@ -14,10 +14,17 @@ import time
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_TOPIC_SAMPLE_BYTES = 65536
+MAX_AUXILIARY_TOPIC_SAMPLES = 32
 LIDAR_NAME_PATTERN = re.compile(
     r"lidar|livox|mid.?360|utlidar|point.?cloud", re.IGNORECASE
 )
 POINTCLOUD_TYPE = "sensor_msgs/msg/PointCloud2"
+AUXILIARY_SOURCE_TYPES = {
+    "sensor_msgs/msg/Imu": "imu",
+    "sensor_msgs/msg/JointState": "joint_state",
+    "nav_msgs/msg/Odometry": "odometry",
+}
+OCCUPANCY_GRID_TYPE = "nav_msgs/msg/OccupancyGrid"
 ROS_TOPIC_PATTERN = re.compile(r"^/[A-Za-z0-9_/]+$")
 
 
@@ -203,7 +210,7 @@ def _parse_topic_list(text):
     return topics
 
 
-def _parse_pointcloud_header(text, now_seconds):
+def _parse_message_header(text, now_seconds, message_name):
     frame_match = re.search(r"^\s*frame_id:\s*(.*?)\s*$", text, re.MULTILINE)
     seconds_match = re.search(r"^\s*sec:\s*(-?\d+)\s*$", text, re.MULTILINE)
     nanoseconds_match = re.search(r"^\s*nanosec:\s*(-?\d+)\s*$", text, re.MULTILINE)
@@ -212,7 +219,7 @@ def _parse_pointcloud_header(text, now_seconds):
             "frame_id": None,
             "fresh": False,
             "age_ms": None,
-            "error": "Could not read frame and acquisition timestamp from the PointCloud2 header.",
+            "error": "Could not read frame and acquisition timestamp from the {} header.".format(message_name),
         }
     frame_id = frame_match.group(1).strip().strip("\"'")
     seconds = int(seconds_match.group(1))
@@ -222,7 +229,7 @@ def _parse_pointcloud_header(text, now_seconds):
             "frame_id": frame_id or None,
             "fresh": False,
             "age_ms": None,
-            "error": "PointCloud2 header has an invalid frame or timestamp.",
+            "error": "{} header has an invalid frame or timestamp.".format(message_name),
         }
     timestamp = seconds + nanoseconds / 1_000_000_000
     if timestamp <= 0:
@@ -230,16 +237,17 @@ def _parse_pointcloud_header(text, now_seconds):
             "frame_id": frame_id,
             "fresh": False,
             "age_ms": None,
-            "error": "PointCloud2 acquisition timestamp is missing.",
+            "error": "{} acquisition timestamp is missing.".format(message_name),
         }
     age = now_seconds - timestamp
     if age < -MAX_FUTURE_SKEW_SECONDS:
         error = (
-            "PointCloud2 acquisition timestamp is more than {:.0f} ms ahead of the "
+            "{} acquisition timestamp is more than {:.0f} ms ahead of the "
             "host wall clock; verify G1, ROS, and LiDAR time synchronization."
-        ).format(-age * 1000)
+        ).format(message_name, -age * 1000)
     elif age > MAX_SAMPLE_AGE_SECONDS:
-        error = "PointCloud2 sample is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
+        error = "{} sample is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
+            message_name,
             age * 1000,
             MAX_SAMPLE_AGE_SECONDS * 1000,
         )
@@ -251,6 +259,17 @@ def _parse_pointcloud_header(text, now_seconds):
         "age_ms": max(0, round(age * 1000)),
         "error": error,
     }
+
+
+def _parse_pointcloud_header(text, now_seconds):
+    return _parse_message_header(text, now_seconds, "PointCloud2")
+
+
+def _auxiliary_source_role(topic):
+    message_type = topic["type"]
+    if message_type == OCCUPANCY_GRID_TYPE:
+        return "local_costmap" if "costmap" in topic["name"].lower() else "map"
+    return AUXILIARY_SOURCE_TYPES.get(message_type)
 
 
 def _discover_interfaces(runner, ip_executable):
@@ -407,6 +426,7 @@ def discover_sensors(
     ros_distro = ros_distro or "unknown"
     topics = []
     pointclouds = []
+    auxiliary_sources = []
     ros_topics_error = ros_error
     current_time = time.time() if now_seconds is None else now_seconds
     if ros_prefix is not None:
@@ -442,6 +462,29 @@ def discover_sensors(
                     }
                 )
                 pointclouds.append(dict(topic, **sample))
+            for topic in topics:
+                role = _auxiliary_source_role(topic)
+                if role is None or len(auxiliary_sources) >= MAX_AUXILIARY_TOPIC_SAMPLES:
+                    continue
+                header_output, header_error = _read_topic_sample(
+                    ros_prefix,
+                    topic["name"],
+                    runner=runner,
+                    timeout=2.0,
+                )
+                sample = (
+                    _parse_message_header(header_output, current_time, topic["type"].rsplit("/", 1)[-1])
+                    if not header_error
+                    else {
+                        "frame_id": None,
+                        "fresh": False,
+                        "age_ms": None,
+                        "error": "Could not read {} header: {}".format(
+                            topic["type"].rsplit("/", 1)[-1], header_error
+                        ),
+                    }
+                )
+                auxiliary_sources.append({**topic, "role": role, **sample})
 
     services, service_diagnostics = _discover_services(runner, systemctl_executable)
     driver_processes, process_diagnostics = _discover_driver_processes(proc_root)
@@ -459,8 +502,8 @@ def discover_sensors(
     pointcloud_topics = [
         topic for topic in topics if topic["type"] == POINTCLOUD_TYPE
     ]
-    saved_topic_name = saved.get("G1_LIDAR_TOPIC", "").strip()
-    saved_sensor_frame = saved.get("G1_DISTANCE_FRAME_ID", "").strip()
+    saved_topic_name = environment.get("G1_LIDAR_TOPIC", "").strip() or saved.get("G1_LIDAR_TOPIC", "").strip()
+    saved_sensor_frame = environment.get("G1_DISTANCE_FRAME_ID", "").strip() or saved.get("G1_DISTANCE_FRAME_ID", "").strip()
     saved_pointcloud = next(
         (
             topic
@@ -470,20 +513,37 @@ def discover_sensors(
         ),
         None,
     )
+    saved_fresh_pointcloud = next(
+        (
+            source
+            for source in fresh_pointclouds
+            if source["name"] == saved_topic_name
+            and (not saved_sensor_frame or source["frame_id"] == saved_sensor_frame)
+        ),
+        None,
+    )
+    selected_pointcloud = saved_fresh_pointcloud or (
+        fresh_pointclouds[0] if len(fresh_pointclouds) == 1 else None
+    )
 
-    if len(fresh_pointclouds) == 1:
-        selected = fresh_pointclouds[0]
+    if selected_pointcloud:
+        selected = selected_pointcloud
         unitree_name = re.search(r"unitree|utlidar", selected["name"], re.IGNORECASE)
         method = "unitree_ros_pointcloud" if unitree_name else "existing_ros_pointcloud"
         connection = {
             "method": method,
             "ready": True,
             "driver_required": False,
-            "sensor_id": "unitree-lidar" if unitree_name else "ros-pointcloud",
+            "sensor_id": environment.get("G1_DISTANCE_SENSOR_ID", "").strip()
+            or saved.get("G1_DISTANCE_SENSOR_ID", "unitree-lidar" if unitree_name else "ros-pointcloud"),
             "topic": selected["name"],
             "message_type": selected["type"],
             "frame_id": selected["frame_id"],
-            "reason": "A fresh ROS 2 PointCloud2 stream was detected; no Livox driver will be started.",
+            "reason": (
+                "The previously selected PointCloud2 source is fresh; other discovered sources remain listed for diagnostics."
+                if saved_fresh_pointcloud and len(fresh_pointclouds) > 1
+                else "A fresh ROS 2 PointCloud2 stream was detected; no Livox driver will be started."
+            ),
         }
     elif len(fresh_pointclouds) > 1:
         connection = {
@@ -562,6 +622,7 @@ def discover_sensors(
     diagnostics.extend(service_diagnostics)
     diagnostics.extend(process_diagnostics)
     diagnostics.extend(sample["error"] for sample in pointclouds if sample["error"])
+    diagnostics.extend(sample["error"] for sample in auxiliary_sources if sample["error"])
 
     return {
         "platform": {
@@ -584,6 +645,10 @@ def discover_sensors(
             "available": ros_prefix is not None and ros_topics_error is None,
             "topics": topics,
             "pointclouds": pointclouds,
+            "sources": auxiliary_sources,
+            "sources_truncated": sum(
+                1 for topic in topics if _auxiliary_source_role(topic) is not None
+            ) > MAX_AUXILIARY_TOPIC_SAMPLES,
             "error": ros_topics_error,
         },
         "connection": connection,

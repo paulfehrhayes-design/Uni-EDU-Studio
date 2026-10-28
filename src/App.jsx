@@ -4767,7 +4767,9 @@ export default function App() {
                           <span className="text-[10px] text-slate-600">
                             {sensorDiagnostics.lidar?.discovery?.connection?.method || 'unknown'}
                             {' · '}
-                            {sensorDiagnostics.lidar?.calibration?.status || 'unverified'}
+                            {sensorDiagnostics.lidar?.calibration?.status === 'model_derived'
+                              ? 'model-derived (provisional)'
+                              : sensorDiagnostics.lidar?.calibration?.status || 'unverified'}
                           </span>
                         </div>
                         <p className="mt-1 text-[10px] text-slate-600">
@@ -4775,9 +4777,25 @@ export default function App() {
                             || sensorDiagnostics.lidar?.discovery?.connection?.reason
                             || 'No LiDAR diagnostic reported.'}
                         </p>
+                        {(sensorDiagnostics.lidar?.discovery?.ros?.pointclouds || []).map((source) => (
+                          <p key={source.name} className="mt-1 break-all text-[10px] text-slate-600">
+                            {source.name} · {source.fresh ? 'fresh' : 'unavailable'}
+                            {source.frame_id ? ` · frame ${source.frame_id}` : ''}
+                            {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                            {source.error ? ` · ${source.error}` : ''}
+                          </p>
+                        ))}
+                        {(sensorDiagnostics.lidar?.discovery?.ros?.sources || []).map((source) => (
+                          <p key={`${source.role}:${source.name}`} className="mt-1 break-all text-[10px] text-slate-600">
+                            {source.role.replaceAll('_', ' ')}: {source.name} · {source.fresh ? 'fresh' : 'unavailable'}
+                            {source.frame_id ? ` · frame ${source.frame_id}` : ''}
+                            {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                            {source.error ? ` · ${source.error}` : ''}
+                          </p>
+                        ))}
                         {sensorDiagnostics.lidar?.calibration?.candidate_mounts?.mid360?.available && (
                           <p className="mt-1 text-[10px] text-amber-700">
-                            Unverified model mount candidate ({sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.parent_frame} → {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.sensor_frame}): {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.translation_m.map((value) => Number(value).toFixed(3)).join(', ')} m
+                            Nominal model mount ({sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.parent_frame} → {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.sensor_frame}; physical fit not independently checked): {sensorDiagnostics.lidar.calibration.candidate_mounts.mid360.translation_m.map((value) => Number(value).toFixed(3)).join(', ')} m
                           </p>
                         )}
                         <p className="mt-1 text-[10px] text-slate-600">
@@ -5580,6 +5598,22 @@ export default function App() {
                             {' • '}callback {navigationDiagnostics.pointcloud?.callback_duration_ms ?? '—'} ms
                             {' • '}{navigationDiagnostics.pointcloud?.count ?? 0} valid clouds
                           </p>
+                          {(navigationDiagnostics.pointcloud?.sources || []).map((source) => (
+                            <p key={source.topic} data-testid="navigation-pointcloud-source">
+                              {source.topic || 'PointCloud2 source'} · {source.ready ? 'contributing' : 'unavailable'}
+                              {source.frame_id ? ` · frame ${source.frame_id}` : ''}
+                              {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                              {source.error ? ` · ${source.error}` : ''}
+                            </p>
+                          ))}
+                          {navigationDiagnostics.pointcloud?.discovery_error && (
+                            <p className="text-amber-300">PointCloud2 discovery: {navigationDiagnostics.pointcloud.discovery_error}</p>
+                          )}
+                          {navigationDiagnostics.pointcloud?.discovery_truncated > 0 && (
+                            <p className="text-amber-300">
+                              {navigationDiagnostics.pointcloud.discovery_truncated} additional PointCloud2 topic(s) omitted by the source limit.
+                            </p>
+                          )}
                           <p>
                             Map {navigationDiagnostics.topics?.map || 'topic unavailable'}
                             {' • '}local costmap {navigationDiagnostics.topics?.local_costmap || 'topic unavailable'}
