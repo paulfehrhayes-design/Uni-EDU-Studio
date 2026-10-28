@@ -1,3 +1,10 @@
+import {
+  getDuetArmCatalog,
+  getDuetArmGesture,
+  getDuetArmPoseNames,
+  getDuetArmPoseTarget,
+} from './duetArmCatalog.js';
+
 const numberArgument = (name, label, value, min, max, step = 0.01) => ({
   name,
   label,
@@ -28,16 +35,23 @@ const armPose = (method, label, pose) => ({
   ...command(method, `${label} for %1 s`, `Apply the fixed ${label.toLowerCase()} arm pose for a bounded lease.`, [
     numberArgument('SECONDS', 'seconds', 1.5, 1, 3, 0.1),
   ]),
+  category: 'Arm poses',
   armPoses: Object.freeze([pose]),
+  armTargets: Object.freeze([getDuetArmPoseTarget(pose)]),
 });
 const armGesture = (method, label, poses) => ({
-  ...command(method, `${label} (%1 s per pose)`, `Run the fixed ${label.toLowerCase()} gesture using only approved named arm poses.`, [
-    numberArgument('SECONDS', 'seconds per pose', 1.5, 1, 3, 0.1),
-  ]),
+  ...command(
+    method,
+    `${label} (%1 s per pose)`,
+    `Run the fixed ${label.toLowerCase()} arm trajectory with bounded transitions.`,
+    [numberArgument('SECONDS', 'seconds per pose', 1.5, 1, 3, 0.1)],
+  ),
+  category: 'Arm gestures',
   armPoses: Object.freeze(poses),
+  armTargets: Object.freeze(poses.map(getDuetArmPoseTarget)),
 });
 
-export const DUET_ARM_MOTIONS = Object.freeze({
+const DUET_ARM_MOTIONS = Object.freeze({
   reach_and_return: Object.freeze(['forward', 'carry']),
   receive_and_hold: Object.freeze(['forward', 'box_hold']),
   hold_and_return: Object.freeze(['box_hold', 'carry']),
@@ -51,29 +65,29 @@ export const DUET_ARM_MOTIONS = Object.freeze({
 
 const DUET_ARM_LEVEL_MOTIONS = Object.freeze({
   wave_left: Object.freeze({
-    low: ['carry', 'forward'],
-    mid: ['forward', 'box_hold', 'carry'],
-    high: ['forward', 'carry'],
+    low: ['left_wave_low', 'left_wave_low_out', 'left_wave_low', 'left_wave_low_out', 'carry'],
+    mid: ['left_wave_mid', 'left_wave_mid_out', 'left_wave_mid', 'left_wave_mid_out', 'carry'],
+    high: ['left_wave_high', 'left_wave_high_out', 'left_wave_high', 'left_wave_high_out', 'carry'],
   }),
   wave_right: Object.freeze({
-    low: ['carry', 'forward'],
-    mid: ['forward', 'box_hold', 'carry'],
-    high: ['forward', 'carry'],
+    low: ['right_wave_low', 'right_wave_low_out', 'right_wave_low', 'right_wave_low_out', 'carry'],
+    mid: ['right_wave_mid', 'right_wave_mid_out', 'right_wave_mid', 'right_wave_mid_out', 'carry'],
+    high: ['right_wave_high', 'right_wave_high_out', 'right_wave_high', 'right_wave_high_out', 'carry'],
   }),
   raise_left_arm: Object.freeze({
-    low: ['carry', 'box_hold'],
-    mid: ['box_hold', 'forward'],
-    high: ['forward', 'carry'],
+    low: ['left_raise_low', 'carry'],
+    mid: ['left_raise_mid', 'carry'],
+    high: ['left_raise_high', 'carry'],
   }),
   raise_right_arm: Object.freeze({
-    low: ['carry', 'box_hold'],
-    mid: ['box_hold', 'forward'],
-    high: ['forward', 'carry'],
+    low: ['right_raise_low', 'carry'],
+    mid: ['right_raise_mid', 'carry'],
+    high: ['right_raise_high', 'carry'],
   }),
   raise_both_arms: Object.freeze({
-    low: ['carry', 'box_hold'],
-    mid: ['box_hold', 'forward'],
-    high: ['forward', 'carry'],
+    low: ['both_raise_low', 'carry'],
+    mid: ['both_raise_mid', 'carry'],
+    high: ['both_raise_high', 'carry'],
   }),
 });
 
@@ -89,6 +103,30 @@ export const DUET_ARM_COMMANDS = Object.freeze({
     Object.entries(levels).map(([level, poses]) => [`${method}_${level}`, Object.freeze(poses)])
   ))),
 });
+
+const catalogGestureCommands = Object.keys(getDuetArmGestureCatalog()).map((method) => {
+  const gesture = getDuetArmGesture(method);
+  return armGesture(
+    `gesture_${method.replace(/^legacy_/, '')}`,
+    gesture.label,
+    gesture.poses.map(({ name }) => name),
+  );
+});
+
+const holdPoseCommand = (method, label, description, args) => ({
+  ...command(method, label, description, args),
+  poseInput: true,
+});
+
+const DUET_ARM_POSE_BLOCKS = Object.freeze(getDuetArmPoseNames().map((poseName) => Object.freeze({
+  type: `duet_pose_target_${poseName}`,
+  label: poseName.replaceAll('_', ' '),
+  message: poseName.replaceAll('_', ' '),
+  description: `Use the bounded ${poseName.replaceAll('_', ' ')} arm target.`,
+  codeTemplate: `duet.pose(${JSON.stringify(poseName)})`,
+  output: 'String',
+  category: 'Arm pose targets',
+})));
 
 export const DUET_COMMANDS = Object.freeze([
   command('move', 'Move vx %1 vy %2 yaw %3 for %4 s', 'Bounded DUET planar velocity and yaw-rate command for a short duration.', [
@@ -111,6 +149,22 @@ export const DUET_COMMANDS = Object.freeze([
     armPose('arm_carry', 'Carry / neutral arms', 'carry'),
     armPose('arm_reach', 'Reach forward', 'forward'),
     armPose('arm_box_hold', 'Hold a box', 'box_hold'),
+    holdPoseCommand(
+      'hold_pose',
+      'Hold pose %1 for %2 s',
+      'Move to the supplied arm pose, hold it for 1–30 seconds, then return to carry.',
+      [
+        { name: 'POSE', label: 'pose', kind: 'input' },
+        numberArgument('SECONDS', 'seconds', 3, 1, 30, 1),
+      ],
+    ),
+    holdPoseCommand(
+      'hold_pose_until_reset',
+      'Hold pose %1 until reset',
+      'Maintain the supplied arm pose until duet.reset_arms(); no other arm motion may start first.',
+      [{ name: 'POSE', label: 'pose', kind: 'input' }],
+    ),
+    command('reset_arms', 'Reset arms to carry', 'Return both arms to the approved default/carry target.', []),
     armGesture('reach_and_return', 'Reach and return', DUET_ARM_COMMANDS.reach_and_return),
     armGesture('receive_and_hold', 'Receive and hold', DUET_ARM_COMMANDS.receive_and_hold),
     armGesture('hold_and_return', 'Hold and return', DUET_ARM_COMMANDS.hold_and_return),
@@ -120,6 +174,7 @@ export const DUET_COMMANDS = Object.freeze([
         armGesture(`${method}_${level}`, `${method.replaceAll('_', ' ')} ${level}`, poses)
       ))
     )),
+    ...catalogGestureCommands,
   ],
   command('wait', 'Wait %1 s', 'Pause the program.', [seconds()]),
   command('stop', 'Stop DUET motion', 'Request a DUET controller stop; execution stops at this command.', []),
@@ -137,6 +192,10 @@ const POSE_METHODS = Object.freeze({
   forward: 'arm_reach',
   box_hold: 'arm_box_hold',
 });
+
+function getDuetArmGestureCatalog() {
+  return getDuetArmCatalog().gestures;
+}
 
 function splitArguments(rawArgs, lineNumber) {
   if (!rawArgs.trim()) return [];
@@ -179,6 +238,32 @@ function formatValue(value, argument) {
 }
 
 function normalizeCommand(method, rawArgs, lineNumber) {
+  if (method === 'hold_pose' || method === 'hold_pose_until_reset') {
+    const args = splitArguments(rawArgs, lineNumber);
+    const expectedCount = method === 'hold_pose' ? 2 : 1;
+    if (args.length !== expectedCount) {
+      throw new Error(`duet.${method} expects ${expectedCount} argument${expectedCount === 1 ? '' : 's'} on line ${lineNumber}.`);
+    }
+    const poseMatch = args[0].match(/^duet\.pose\((['"])([A-Za-z_]\w*)\1\)$/);
+    const poseName = poseMatch?.[2];
+    if (!poseName || !getDuetArmPoseNames().includes(poseName)) {
+      throw new Error(`duet.${method} on line ${lineNumber} requires a named DUET pose target block.`);
+    }
+    const duration = method === 'hold_pose'
+      ? parseValue(args[1], numberArgument('SECONDS', 'seconds', 3, 1, 30, 1), lineNumber)
+      : null;
+    const values = duration === null ? [] : [duration];
+    const poseCode = `duet.pose(${JSON.stringify(poseName)})`;
+    return {
+      type: 'command',
+      method,
+      poseName,
+      values,
+      code: method === 'hold_pose'
+        ? `duet.hold_pose(${poseCode}, ${duration})`
+        : `duet.hold_pose_until_reset(${poseCode})`,
+    };
+  }
   if (method === 'move_and_arm') {
     const args = splitArguments(rawArgs, lineNumber);
     if (args.length !== 6) throw new Error(`duet.move_and_arm expects 6 arguments on line ${lineNumber}.`);
@@ -287,7 +372,10 @@ function parseLines(lines, start, indent, depth) {
         throw new Error(`Concurrent action on line ${line.lineNumber} must contain exactly two simple commands.`);
       }
       const movement = body.find((node) => node.method === 'move' || getDuetCommand(node.method)?.motion);
-      const gesture = body.find((node) => getDuetCommand(node.method)?.armPoses);
+      const gesture = body.find((node) => {
+        const definition = getDuetCommand(node.method);
+        return definition?.armPoses || definition?.poseInput;
+      });
       if (!movement || !gesture || movement === gesture) {
         throw new Error(`Concurrent action on line ${line.lineNumber} needs one locomotion command and one arm gesture.`);
       }
@@ -328,7 +416,7 @@ function countCommands(nodes) {
     total + (node.type === 'repeat'
       ? node.times * countCommands(node.body)
       : node.type === 'concurrent'
-        ? 1 + getDuetCommand(node.gesture.method).armPoses.length
+        ? 1 + (getDuetCommand(node.gesture.method)?.armPoses?.length || 1)
         : getDuetCommand(node.method)?.armPoses?.length || 1)
   ), 0);
 }
@@ -346,6 +434,23 @@ export function parseDuetProgram(code = '') {
   if (countCommands(nodes) > 400) {
     throw new Error('DUET programs may contain at most 400 expanded commands.');
   }
+  const flattened = flattenDuetCommands(nodes);
+  if (flattened.some((node, index) => node.method === 'stop' && index !== flattened.length - 1)) {
+    throw new Error('duet.stop() must be the final command in a program.');
+  }
+  let poseHeldUntilReset = false;
+  flattened.forEach((node) => {
+    const commands = node.type === 'concurrent' ? [node.gesture] : [node];
+    const startsArmMotion = commands.some(({ method }) => {
+      const definition = getDuetCommand(method);
+      return definition?.armPoses || definition?.poseInput;
+    });
+    if (poseHeldUntilReset && startsArmMotion) {
+      throw new Error('Reset arms with duet.reset_arms() before starting another arm motion.');
+    }
+    if (node.type === 'command' && node.method === 'reset_arms') poseHeldUntilReset = false;
+    else if (commands.some(({ method }) => method === 'hold_pose_until_reset')) poseHeldUntilReset = true;
+  });
   return nodes;
 }
 
@@ -375,10 +480,11 @@ export function getDuetBlocklyCommandBlocks() {
   return [
     ...DUET_COMMANDS.map((definition) => ({
     type: definition.type,
-    category: definition.method === 'wait' || definition.method === 'stop'
+    category: definition.category || (definition.method === 'wait' || definition.method === 'stop' || definition.method === 'reset_arms'
       ? 'Control'
       : definition.armPoses
-        ? 'Arm poses' : 'Locomotion',
+        ? 'Arm gestures'
+        : definition.poseInput ? 'Arm poses' : 'Locomotion'),
     message0: definition.message,
     args0: definition.args.map((argument) => argument.kind === 'number'
       ? {
@@ -389,14 +495,24 @@ export function getDuetBlocklyCommandBlocks() {
         max: argument.max,
         precision: argument.step,
       }
-      : { type: 'field_dropdown', name: argument.name, options: argument.choices }),
+      : argument.kind === 'input'
+        ? { type: 'input_value', name: argument.name, check: 'String' }
+        : { type: 'field_dropdown', name: argument.name, options: argument.choices }),
     previousStatement: null,
     nextStatement: null,
-    colour: definition.method === 'wait' || definition.method === 'stop'
+    colour: definition.method === 'wait' || definition.method === 'stop' || definition.method === 'reset_arms'
       ? 190
       : definition.armPoses ? 280 : 160,
     tooltip: definition.description,
     codeTemplate: definition.codeTemplate,
+    })),
+    ...DUET_ARM_POSE_BLOCKS.map(({ category, label, ...block }) => ({
+      ...block,
+      category,
+      message0: label,
+      args0: [],
+      output: 'String',
+      colour: 280,
     })),
     {
       type: 'duet_concurrent_action',
@@ -415,6 +531,31 @@ export function getDuetBlocklyCommandBlocks() {
 
 export function getDuetCommand(method) {
   return COMMAND_BY_METHOD.get(method) || null;
+}
+
+export function getDuetCommandExamples() {
+  return DUET_COMMANDS.flatMap((definition) => {
+    if (definition.poseInput) {
+      return getDuetArmPoseNames().map((poseName) => {
+        const poseCode = `duet.pose(${JSON.stringify(poseName)})`;
+        const code = definition.method === 'hold_pose'
+          ? `duet.hold_pose(${poseCode}, ${definition.args[1].value})`
+          : `duet.hold_pose_until_reset(${poseCode})`;
+        return {
+          key: `${definition.method}_${poseName}`,
+          label: `${definition.method === 'hold_pose' ? 'Hold' : 'Hold until reset'}: ${poseName.replaceAll('_', ' ')}`,
+          code,
+        };
+      });
+    }
+    return [{
+      key: definition.method,
+      label: definition.label,
+      code: `duet.${definition.method}(${definition.args.map((argument) => (
+        argument.kind === 'choice' ? JSON.stringify(argument.value) : String(argument.value)
+      )).join(', ')})`,
+    }];
+  });
 }
 
 export function compileDuetMotionPrompt(prompt = '') {

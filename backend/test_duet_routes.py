@@ -100,7 +100,7 @@ class DuetRouteTests(unittest.TestCase):
         self.assertIn("DUET ownership", response.json()["detail"])
         execute_sdk.assert_not_called()
 
-    def test_duet_queue_item_is_never_sent_to_legacy_sdk(self):
+    def test_duet_queue_item_uses_duet_controller_not_legacy_sdk(self):
         submitted = self.client.post(
             "/api/classroom/submit-code",
             headers=self.student,
@@ -113,17 +113,23 @@ class DuetRouteTests(unittest.TestCase):
         self.assertEqual(submitted.status_code, 200)
         self.assertEqual(submitted.json()["item"]["controller_version"], "duet")
 
-        with patch.object(server, "execute_robot_program") as execute_sdk:
+        with patch.object(server, "active_navigation_operation", return_value=None), patch.object(
+            server, "active_lidar_scan", return_value=None
+        ), patch.object(server, "robot_status", return_value={"running": False}), patch.object(
+            server,
+            "execute_duet_program",
+            return_value={"status": "completed", "commandsExecuted": 1},
+        ) as execute_duet, patch.object(server, "execute_robot_program") as execute_sdk:
             response = self.client.post(
                 "/api/classroom/run-next",
                 headers=self.teacher,
                 json={"item_id": submitted.json()["item"]["id"]},
             )
 
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("will not be sent to the legacy SDK", response.json()["detail"])
+        self.assertEqual(response.status_code, 200)
+        execute_duet.assert_called_once_with("duet.stop()")
         execute_sdk.assert_not_called()
-        self.assertEqual(server.list_queue_items()[0]["status"], "queued")
+        self.assertEqual(server.list_queue_items()[0]["status"], "completed")
 
     def test_planner_request_queue_preserves_reviewable_mode_waypoints_and_code(self):
         planner_request = {
@@ -150,15 +156,198 @@ class DuetRouteTests(unittest.TestCase):
         self.assertEqual(item["planner_request"]["planner_mode"], "sensor_corrected")
         self.assertEqual(len(item["planner_request"]["planner_waypoints"]), 2)
         self.assertEqual(server.list_queue_items()[0]["planner_request"], item["planner_request"])
-        with patch.object(server, "execute_robot_program") as execute_sdk:
+        with patch.object(
+            server,
+            "run_checkpointed_planner",
+            return_value={"status": "completed", "correctedCode": "robot.walktime(2.5)"},
+        ) as run_checkpointed:
             queue_run = self.client.post(
                 "/api/classroom/run-next",
                 headers=self.teacher,
                 json={"item_id": item["id"]},
             )
-        self.assertEqual(queue_run.status_code, 409)
-        self.assertIn("matching planner controls", queue_run.json()["detail"])
-        execute_sdk.assert_not_called()
+        self.assertEqual(queue_run.status_code, 200)
+        self.assertEqual(queue_run.json()["item"]["status"], "completed")
+        self.assertEqual(run_checkpointed.call_args.args[0].waypoints, planner_request["planner_waypoints"])
+        project = queue_run.json()["process"]["saved_project"]
+        self.assertEqual(project["username"], "student1")
+        self.assertEqual(project["plannerVariants"]["initial"], planner_request["route_variants"]["initial"])
+        self.assertEqual(project["plannerVariants"]["corrected"], "robot.walktime(2.5)")
+        self.assertEqual(server.list_queue_items()[0]["result_project"]["name"], project["name"])
+
+    def test_queue_snapshot_preserves_project_fields_and_manual_run_uses_submitted_code(self):
+        project_snapshot = {
+            "name": "student-project",
+            "sceneObjects": [{"id": "box-1", "type": "box", "x": 1, "y": 2}],
+            "plannerWaypoints": [{"id": "a", "x": 0, "y": 0}, {"id": "b", "x": 1, "y": 0}],
+            "generatedCode": "robot.walktime(1)",
+            "duetCode": "duet.move(0.1, 0, 0, 0.5)",
+            "plannerMode": "manual",
+            "plannerLabel": "student route",
+            "plannerVariants": {"initial": "robot.walktime(1)", "corrected": "", "final": ""},
+            "selectedPlannerVariant": "initial",
+        }
+        planner_request = {
+            "planner_mode": "manual",
+            "planner_label": "student route",
+            "planner_waypoints": [{"x": 0, "y": 0}, {"x": 1, "y": 0}],
+            "route_variants": {"initial": "robot.walktime(1)"},
+            "selected_variant": "initial",
+        }
+        submitted = self.client.post(
+            "/api/classroom/submit-code",
+            headers=self.student,
+            json={
+                "name": "manual-route",
+                "code": "robot.walktime(1)",
+                "controller_version": "legacy",
+                "planner_request": planner_request,
+                "project_snapshot": project_snapshot,
+            },
+        )
+        self.assertEqual(submitted.status_code, 200)
+        item = submitted.json()["item"]
+        self.assertEqual(item["project_snapshot"], project_snapshot)
+        self.assertEqual(server.list_queue_items()[0]["project_snapshot"], project_snapshot)
+
+        with patch.object(server, "ensure_sdk_motion_available"), patch.object(
+            server,
+            "execute_robot_program",
+            return_value={"status": "completed", "commandsExecuted": 1},
+        ) as execute_sdk:
+            approved = self.client.post(
+                "/api/classroom/run-next",
+                headers=self.teacher,
+                json={"item_id": item["id"]},
+            )
+
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.json()["item"]["status"], "completed")
+        execute_sdk.assert_called_once_with("robot.walktime(1)")
+        self.assertEqual(server.list_queue_items()[0]["status"], "completed")
+
+    def test_teacher_stop_during_queue_run_keeps_item_paused(self):
+        submitted = self.client.post(
+            "/api/classroom/submit-code",
+            headers=self.student,
+            json={"name": "stoppable", "code": "robot.walktime(1)"},
+        )
+        item = submitted.json()["item"]
+
+        def stop_during_execution(code):
+            server.set_queue_item_status(item["id"], "paused")
+            raise server.HTTPException(status_code=409, detail="Robot program stopped by teacher.")
+
+        with patch.object(server, "ensure_sdk_motion_available"), patch.object(
+            server, "execute_robot_program", side_effect=stop_during_execution
+        ):
+            response = self.client.post(
+                "/api/classroom/run-next",
+                headers=self.teacher,
+                json={"item_id": item["id"]},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(server.list_queue_items()[0]["status"], "paused")
+
+    def test_autonomous_queue_status_tracks_linked_navigation_operation(self):
+        submitted = self.client.post(
+            "/api/classroom/submit-code",
+            headers=self.student,
+            json={
+                "name": "autonomous-route",
+                "code": "",
+                "controller_version": "legacy",
+                "planner_request": {
+                    "planner_mode": "autonomous",
+                    "planner_waypoints": [],
+                    "route_variants": {},
+                    "navigation": {
+                        "map_id": "classroom",
+                        "version": "map-v2",
+                        "frame_id": "map",
+                        "planner_mode": "live",
+                        "waypoints": [{"x": 1, "y": 2}],
+                    },
+                },
+            },
+        )
+        item = submitted.json()["item"]
+        with patch.object(
+            server,
+            "start_navigation",
+            return_value={"status": "accepted", "operation_id": "nav-queue-linked"},
+        ) as start_navigation:
+            approved = self.client.post(
+                "/api/classroom/run-next",
+                headers=self.teacher,
+                json={"item_id": item["id"]},
+            )
+
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.json()["item"]["status"], "running")
+        self.assertEqual(start_navigation.call_args.args[0].queue_item_id, item["id"])
+        server.save_navigation_operation(
+            {"operation_id": "nav-queue-linked", "status": "running"},
+            "teacher",
+            {"queue_item_id": item["id"]},
+        )
+        with patch.object(
+            server,
+            "navigation_operation_status",
+            return_value={
+                "operation_id": "nav-queue-linked",
+                "status": "succeeded",
+                "path_trace": [
+                    {"x": 0.0, "y": 0.0, "yaw_rad": 0.0, "frame_id": "map"},
+                    {"x": 1.0, "y": 0.0, "yaw_rad": 0.0, "frame_id": "map"},
+                ],
+                "path_trace_truncated": False,
+                "path_trace_error": None,
+            },
+        ):
+            operation = self.client.get(
+                "/api/navigation/operation/nav-queue-linked",
+                headers=self.teacher,
+            )
+
+        self.assertEqual(operation.status_code, 200)
+        self.assertEqual(operation.json()["status"], "completed")
+        project = operation.json()["saved_project"]
+        self.assertEqual(project["username"], "student1")
+        self.assertEqual(project["plannerMode"], "autonomous")
+        self.assertNotIn("initial", project["plannerVariants"])
+        self.assertEqual(server.list_queue_items()[0]["status"], "completed")
+        self.assertEqual(server.list_queue_items()[0]["result_project"]["name"], project["name"])
+
+    def test_truncated_autonomous_trace_does_not_create_project(self):
+        item = server.insert_queue_item("student1", "truncated-route", "")
+        server.set_queue_item_status(item["id"], "running")
+        server.save_navigation_operation(
+            {"operation_id": "nav-truncated", "status": "running"},
+            "teacher",
+            {"queue_item_id": item["id"]},
+        )
+        with patch.object(
+            server,
+            "navigation_operation_status",
+            return_value={
+                "operation_id": "nav-truncated",
+                "status": "succeeded",
+                "path_trace": [],
+                "path_trace_truncated": True,
+                "path_trace_error": "feedback trace was truncated",
+            },
+        ):
+            operation = self.client.get(
+                "/api/navigation/operation/nav-truncated",
+                headers=self.teacher,
+            )
+
+        self.assertEqual(operation.status_code, 200)
+        self.assertNotIn("saved_project", operation.json())
+        self.assertIsNone(server.list_queue_items()[0]["result_project"])
+        self.assertEqual(server.list_queue_items()[0]["status"], "completed")
 
     def test_planner_request_rejects_invalid_autonomous_map_goals(self):
         response = self.client.post(
@@ -182,6 +371,24 @@ class DuetRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("outside the accepted finite coordinate range", response.json()["detail"])
+
+    def test_planner_request_rejects_duet_controller(self):
+        response = self.client.post(
+            "/api/classroom/submit-code",
+            headers=self.student,
+            json={
+                "name": "duet-planner-route",
+                "code": "duet.move(0.1, 0, 0, 0.5)",
+                "controller_version": "duet",
+                "planner_request": {
+                    "planner_mode": "manual",
+                    "planner_waypoints": [{"x": 0, "y": 0}, {"x": 1, "y": 0}],
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("require the G1 SDK", response.json()["detail"])
 
 
 if __name__ == "__main__":

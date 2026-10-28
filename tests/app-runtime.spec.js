@@ -125,6 +125,206 @@ test('teacher can create and delete student accounts from the classroom panel', 
   await expect(page.getByRole('button', { name: 'Delete account classroom_24' })).toHaveCount(0);
 });
 
+test('teacher queue review overlays the workspace and shows the complete submitted project', async ({ page }) => {
+  const runRequests = [];
+  const queuedItem = {
+    id: 'queued-project-review',
+    name: 'student-route',
+    student: 'student1',
+    status: 'queued',
+    controller_version: 'legacy',
+    code: 'robot.walktime(1)',
+    planner_request: {
+      planner_mode: 'manual',
+      planner_label: 'student route',
+      planner_waypoints: [{ x: 0, y: 0 }, { x: 1, y: 0 }],
+      route_variants: { initial: 'robot.walktime(1)' },
+      selected_variant: 'initial',
+    },
+    project_snapshot: {
+      name: 'student-project',
+      sceneObjects: [{ id: 'box-1', type: 'box', x: 1, y: 2 }],
+      plannerWaypoints: [{ id: 'a', x: 0, y: 0 }, { id: 'b', x: 1, y: 0 }],
+      generatedCode: 'robot.walktime(1)',
+      duetCode: 'duet.move(0.1, 0, 0, 0.5)',
+      plannerMode: 'manual',
+      plannerLabel: 'student route',
+      plannerVariants: { initial: 'robot.walktime(1)' },
+      selectedPlannerVariant: 'initial',
+    },
+  };
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-review-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/run-next') runRequests.push(request.postDataJSON());
+    const responses = {
+      '/api/classroom/codes': { codes: [] },
+      '/api/classroom/queue': { items: [queuedItem] },
+      '/api/classroom/users': { users: [{ username: 'teacher', role: 'teacher' }] },
+      '/api/classroom/status': { status: 'idle' },
+      '/api/classroom/projects/all': { projects: [] },
+      '/api/classroom/project': { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } },
+      '/api/planner/settings': { active_mode: 'manual' },
+      '/api/robot/status': { sdkAvailable: false, running: false },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(responses[path] || {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await page.getByRole('button', { name: 'Review request' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByText('Exact command preview')).toBeVisible();
+  await expect(dialog.getByText('robot.walktime(1)', { exact: true }).first()).toBeVisible();
+  await expect(dialog.getByText('Complete submitted project state')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'IDE', exact: true }).first()).toHaveClass(/bg-blue-600/);
+  await expect(dialog.getByRole('button', { name: 'Approve & run queued request' })).toBeEnabled();
+  expect(runRequests).toEqual([]);
+
+  await dialog.getByRole('button', { name: 'Close request review' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  expect(runRequests).toEqual([]);
+});
+
+test('student can open a shared mode-2 project as a private copy with its original route visible', async ({ page }) => {
+  const projectSaves = [];
+  const sharedProject = {
+    username: 'teacher',
+    name: 'checkpoint-route',
+    sceneObjects: [{ id: 'box-1', type: 'box', x: 1, y: 2 }],
+    plannerWaypoints: [{ id: 'start', x: 0, y: 0 }, { id: 'goal', x: 1, y: 0 }],
+    generatedCode: 'robot.walktime(1.2)',
+    duetCode: '',
+    plannerMode: 'sensor_corrected',
+    plannerLabel: 'Checkpoint route',
+    plannerVariants: {
+      initial: 'robot.walktime(1)',
+      corrected: 'robot.walktime(1.2)',
+      final: 'robot.walktime(1.2)',
+    },
+    selectedPlannerVariant: 'corrected',
+  };
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'student-shared-library-token',
+      user: { role: 'student', username: 'student1' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/project/save' && request.method() === 'POST') {
+      projectSaves.push(request.postDataJSON());
+    }
+    const responses = {
+      '/api/classroom/codes': { codes: [] },
+      '/api/classroom/projects': { projects: [sharedProject] },
+      '/api/classroom/project': { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } },
+      '/api/planner/settings': { active_mode: 'manual' },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/project/save'
+        ? { status: 'saved' }
+        : responses[path] || {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Library', exact: true }).click();
+  await expect(page.getByText('Shared project library')).toBeVisible();
+  await expect(page.getByText('teacher', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Rename' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Delete', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Open project' }).click();
+  await expect(page.getByText('Original route · read only')).toBeVisible();
+  await expect(page.getByText('robot.walktime(1)', { exact: true })).toBeVisible();
+  await expect(page.getByText('robot.walktime(1.2)', { exact: true })).toBeVisible();
+  await expect.poll(() => projectSaves.some((project) => project.name === 'checkpoint-route (copy)')).toBe(true);
+
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await expect(page.getByText('Original route · read only')).toBeVisible();
+  await expect(page.locator('textarea').last()).toHaveValue('robot.walktime(1.2)');
+});
+
+test('teacher can rename and delete another owner project from the shared library', async ({ page }) => {
+  const projectRequests = [];
+  let projects = [{
+    username: 'student1',
+    name: 'student-route',
+    generatedCode: 'robot.walktime(1)',
+    plannerMode: 'sensor_corrected',
+    plannerLabel: 'student-route',
+    plannerVariants: { initial: 'robot.walktime(0.5)', corrected: 'robot.walktime(1)' },
+  }];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-project-library-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/project/rename' || path === '/api/classroom/project/delete') {
+      const body = request.postDataJSON();
+      projectRequests.push({ path, body });
+      if (path.endsWith('/rename')) {
+        projects = projects.map((project) => project.username === body.owner && project.name === body.name
+          ? { ...project, name: body.new_name, plannerLabel: body.new_name }
+          : project);
+      } else {
+        projects = projects.filter((project) => project.username !== body.owner || project.name !== body.name);
+      }
+    }
+    const responses = {
+      '/api/classroom/codes': { codes: [] },
+      '/api/classroom/queue': { items: [] },
+      '/api/classroom/users': { users: [{ username: 'teacher', role: 'teacher' }] },
+      '/api/classroom/status': { status: 'idle' },
+      '/api/classroom/projects': { projects },
+      '/api/classroom/project': { project: { name: 'default', sceneObjects: [], plannerWaypoints: [], generatedCode: '' } },
+      '/api/planner/settings': { active_mode: 'manual' },
+      '/api/robot/status': { sdkAvailable: false, running: false },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/project/rename'
+        ? { status: 'renamed' }
+        : path === '/api/classroom/project/delete'
+          ? { status: 'deleted' }
+          : responses[path] || {}),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await expect(page.getByText('student-route', { exact: true })).toBeVisible();
+  page.once('dialog', (dialog) => dialog.accept('reviewed-route'));
+  await page.getByRole('button', { name: 'Rename' }).click();
+  await expect(page.getByText('reviewed-route', { exact: true })).toBeVisible();
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(page.getByText('No saved projects yet.')).toBeVisible();
+  expect(projectRequests).toEqual([
+    { path: '/api/classroom/project/rename', body: { owner: 'student1', name: 'student-route', new_name: 'reviewed-route' } },
+    { path: '/api/classroom/project/delete', body: { owner: 'student1', name: 'reviewed-route' } },
+  ]);
+});
+
 test('student view does not expose teacher account management', async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({

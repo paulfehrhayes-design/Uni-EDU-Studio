@@ -1,0 +1,123 @@
+{
+  "jointOrder": [
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint"
+  ],
+  "defaultArm": [0.35, 0.18, 0, 0.87, 0],
+  "poses": {
+    "carry": {
+      "left": [0.35, 0.18, 0, 0.87, 0],
+      "right": [0.35, -0.18, 0, 0.87, 0]
+    },
+    "forward": {
+      "left": [-1.35, 0.5, 0, 0.87, 0],
+      "right": [-1.35, -0.5, 0, 0.87, 0]
+    },
+    "box_hold": {
+      "left": [-1.25, 0, 0, 0.7, 0],
+      "right": [-1.25, 0, 0, 0.7, 0]
+    },
+    "left_raise_low": {"side": "left", "target": [-0.5, 0.45, 0, 1.0, 0]},
+    "left_raise_mid": {"side": "left", "target": [-1.0, 0.65, 0, 1.15, 0]},
+    "left_raise_high": {"side": "left", "target": [-1.7, 0.75, 0, 0.9, 0]},
+    "both_raise_low": {
+      "left": [-0.5, 0.45, 0, 1.0, 0],
+      "right": [-0.5, -0.45, 0, 1.0, 0]
+    },
+    "both_raise_mid": {
+      "left": [-1.0, 0.65, 0, 1.15, 0],
+      "right": [-1.0, -0.65, 0, 1.15, 0]
+    },
+    "both_raise_high": {
+      "left": [-1.7, 0.75, 0, 0.9, 0],
+      "right": [-1.7, -0.75, 0, 0.9, 0]
+    },
+    "both_overhead": {
+      "left": [-1.8, 0.35, 0, 0.65, 0],
+      "right": [-1.8, -0.35, 0, 0.65, 0]
+    },
+    "both_sideways": {
+      "left": [0.1, 1.2, 0, 0.45, 0],
+      "right": [0.1, -1.2, 0, 0.45, 0]
+    },
+    "both_hold_object": {
+      "left": [-0.9, 0.25, 0, 1.2, 0],
+      "right": [-0.9, -0.25, 0, 1.2, 0]
+    },
+    "both_kiss": {
+      "left": [-0.52, -0.2, 0, 1.3, 0],
+      "right": [-0.52, 0.2, 0, 1.3, 0]
+    },
+    "left_kiss": {"side": "left", "target": [-0.52, -0.2, 0, 1.3, 0]},
+    "both_hands_up": {
+      "left": [-1.3, 0.3, 0, 0.45, 0],
+      "right": [-1.3, -0.3, 0, 0.45, 0]
+    },
+    "both_clap_open": {
+      "left": [-0.65, 0.35, 0, 1.25, 0],
+      "right": [-0.65, -0.35, 0, 1.25, 0]
+    },
+    "both_clap_closed": {
+      "left": [-0.95, 0.08, 0, 1.55, 0],
+      "right": [-0.95, -0.08, 0, 1.55, 0]
+    },
+    "left_high_five": {"side": "left", "target": [-1.2, 0.65, 0, 0.55, 0]},
+    "both_hug": {
+      "left": [-0.3, 0.85, 0, 0.75, 0],
+      "right": [-0.3, -0.85, 0, 0.75, 0]
+    },
+    "both_heart": {
+      "left": [-0.6, 0.35, 0, 1.45, 0],
+      "right": [-0.6, -0.35, 0, 1.45, 0]
+    },
+    "left_heart": {"side": "left", "target": [-0.6, 0.35, 0, 1.45, 0]},
+    "left_reject": {"side": "left", "target": [-0.25, 1.0, 0, 1.25, 0]},
+    "left_hand_up": {"side": "left", "target": [-1.3, 0.55, 0, 0.45, 0]},
+    "both_xray": {
+      "left": [-0.4, 0.35, 0, 1.45, 0],
+      "right": [-0.4, -0.35, 0, 1.45, 0]
+    },
+    "left_wave_low": {"side": "left", "target": [-0.55, 0.45, 0, 1.2, 0]},
+    "left_wave_low_out": {"side": "left", "target": [-0.55, 0.45, 0, 1.2, 0.35]},
+    "left_wave_mid": {"side": "left", "target": [-1.0, 0.65, 0, 1.2, 0]},
+    "left_wave_mid_out": {"side": "left", "target": [-1.0, 0.65, 0, 1.2, 0.5]},
+    "left_wave_face": {"side": "left", "target": [-0.95, 0.65, 0, 1.2, 0]},
+    "left_wave_face_out": {"side": "left", "target": [-0.95, 0.65, 0, 1.2, 0.55]},
+    "left_wave_high": {"side": "left", "target": [-1.55, 0.75, 0, 1.0, 0]},
+    "left_wave_high_out": {"side": "left", "target": [-1.55, 0.75, 0, 1.0, -0.55]},
+    "left_shake_hand": {"side": "left", "target": [-0.65, 0.65, 0, 1.1, 0]},
+    "right_shake_hand": {"side": "right", "target": [-0.65, -0.65, 0, 1.1, 0]}
+  },
+  "gestures": {
+    "legacy_kiss_both": {"label": "Two-hand kiss", "poses": ["both_kiss", "carry"]},
+    "legacy_kiss_left": {"label": "Left kiss", "poses": ["left_kiss", "carry"]},
+    "legacy_kiss_right": {"label": "Right kiss", "poses": ["right_kiss", "carry"]},
+    "legacy_hands_up": {"label": "Hands up", "poses": ["both_hands_up", "carry"]},
+    "legacy_clap": {"label": "Clap", "poses": ["both_clap_open", "both_clap_closed", "both_clap_open", "carry"]},
+    "legacy_high_five_left": {"label": "Left high five", "poses": ["left_high_five", "carry"]},
+    "legacy_high_five_right": {"label": "Right high five", "poses": ["right_high_five", "carry"]},
+    "legacy_hug": {"label": "Hug", "poses": ["both_hug", "carry"]},
+    "legacy_heart_both": {"label": "Heart", "poses": ["both_heart", "carry"]},
+    "legacy_heart_left": {"label": "Left heart", "poses": ["left_heart", "carry"]},
+    "legacy_heart_right": {"label": "Right heart", "poses": ["right_heart", "carry"]},
+    "legacy_reject_left": {"label": "Left reject", "poses": ["left_reject", "carry"]},
+    "legacy_reject_right": {"label": "Right reject", "poses": ["right_reject", "carry"]},
+    "legacy_hand_up_left": {"label": "Left hand up", "poses": ["left_hand_up", "carry"]},
+    "legacy_hand_up_right": {"label": "Right hand up", "poses": ["right_hand_up", "carry"]},
+    "legacy_xray": {"label": "X-ray pose", "poses": ["both_xray", "carry"]},
+    "legacy_face_wave_left": {"label": "Face wave left", "poses": ["left_wave_face", "left_wave_face_out", "left_wave_face", "carry"]},
+    "legacy_face_wave_right": {"label": "Face wave right", "poses": ["right_wave_face", "right_wave_face_out", "right_wave_face", "carry"]},
+    "legacy_high_wave_left": {"label": "High wave left", "poses": ["left_wave_high", "left_wave_high_out", "left_wave_high", "carry"]},
+    "legacy_high_wave_right": {"label": "High wave right", "poses": ["right_wave_high", "right_wave_high_out", "right_wave_high", "carry"]},
+    "legacy_shake_hand_left": {"label": "Shake hand left", "poses": ["left_shake_hand", "carry"]},
+    "legacy_shake_hand_right": {"label": "Shake hand right", "poses": ["right_shake_hand", "carry"]}
+  }
+}

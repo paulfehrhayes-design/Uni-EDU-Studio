@@ -4,27 +4,13 @@ import {
   getDuetCommand,
   parseDuetProgram,
 } from './duetCommands.js';
+import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
 import { G1_MODEL_INFO } from './g1ModelRuntime.js';
 
 const FRAME_RATE = 30;
 const RADIANS_TO_DEGREES = 180 / Math.PI;
-const ARM_POSES = {
-  carry: [0.35, 0.18, 0, 0.87, 0, 0.35, -0.18, 0, 0.87, 0],
-  forward: [-1.35, 0.5, 0, 0.87, 0, -1.35, -0.5, 0, 0.87, 0],
-  box_hold: [-1.25, 0, 0, 0.7, 0, -1.25, 0, 0, 0.7, 0],
-};
-const ARM_JOINT_NAMES = [
-  'left_shoulder_pitch_joint',
-  'left_shoulder_roll_joint',
-  'left_shoulder_yaw_joint',
-  'left_elbow_joint',
-  'left_wrist_roll_joint',
-  'right_shoulder_pitch_joint',
-  'right_shoulder_roll_joint',
-  'right_shoulder_yaw_joint',
-  'right_elbow_joint',
-  'right_wrist_roll_joint',
-];
+const ARM_POSE_CARRY = getDuetArmPoseTarget('carry');
+const ARM_JOINT_NAMES = getDuetArmCatalog().jointOrder;
 
 function appendFrame(frames, state, joints, actions, timeline, elapsed, mode = 'duet-preview') {
   const snapshot = {
@@ -70,15 +56,14 @@ function simulateMove(command, frames, state, joints, actions, timeline, elapsed
   state.torsoRoll = 0;
 }
 
-function simulateArmPose(command, frames, state, joints, actions, timeline, elapsed) {
-  const target = ARM_POSES[command.values[0]];
-  const duration = command.values[1];
+function simulateArmTarget(target, duration, label, frames, state, joints, actions, timeline, elapsed) {
   const initial = ARM_JOINT_NAMES.map((name) => joints[name] || 0);
   const targetDegrees = target.map((radians) => radians * RADIANS_TO_DEGREES);
   const frameCount = Math.max(1, Math.ceil(duration * FRAME_RATE));
+  const posePreset = ['carry', 'forward', 'box_hold'].includes(label);
   actions.push({
     label: 'DUET arm pose',
-    summary: `Preview the ${command.values[0].replace('_', ' ')} preset over ${duration.toFixed(1)} s`,
+    summary: `Preview ${posePreset ? 'the ' : ''}${label.replaceAll('_', ' ')}${posePreset ? ' preset' : ''} over ${duration.toFixed(1)} s`,
   });
   timeline.push(actions[actions.length - 1]);
   for (let frame = 1; frame <= frameCount; frame += 1) {
@@ -91,18 +76,28 @@ function simulateArmPose(command, frames, state, joints, actions, timeline, elap
   }
 }
 
-function simulateConcurrent(movement, gesture, frames, state, joints, actions, timeline, elapsed) {
+function simulateConcurrent(movement, gesture, frames, state, joints, actions, timeline, elapsed, heldPose) {
   const movementPreset = getDuetCommand(movement.method)?.motion;
   const [vx, vy, yawRate, moveDuration] = movementPreset
     ? [movementPreset.vx, movementPreset.vy, movementPreset.yawRate, movement.values[0]]
     : movement.values;
   const armDefinition = getDuetCommand(gesture.method);
-  const armDuration = gesture.values[0];
-  const armSequence = armDefinition.armPoses.map((pose) => ({
-    pose,
-    duration: armDuration,
-  }));
-  const totalArmDuration = armSequence.reduce((total, step) => total + step.duration, 0);
+  const isPoseHold = armDefinition.poseInput;
+  const armDuration = isPoseHold ? (gesture.values[0] || moveDuration) : gesture.values[0];
+  const armSequence = isPoseHold
+    ? [{
+      pose: gesture.poseName,
+      target: getDuetArmPoseTarget(gesture.poseName),
+      duration: 1,
+    }]
+    : armDefinition.armTargets.map((target, index) => ({
+      pose: armDefinition.armPoses[index],
+      target,
+      duration: armDuration,
+    }));
+  const totalArmDuration = isPoseHold
+    ? gesture.method === 'hold_pose' ? 1 + armDuration : Math.max(1, moveDuration)
+    : armSequence.reduce((total, step) => total + step.duration, 0);
   const totalDuration = Math.max(moveDuration, totalArmDuration);
   actions.push({
     label: 'DUET concurrent move + arm',
@@ -138,13 +133,12 @@ function simulateConcurrent(movement, gesture, frames, state, joints, actions, t
       armIndex + 1 < armSequence.length
       && taskElapsed >= armSegmentStart + armSequence[armIndex].duration
     ) {
-      const completedPose = ARM_POSES[armSequence[armIndex].pose];
-      armInitial = completedPose.map((radians) => radians * RADIANS_TO_DEGREES);
+      armInitial = armSequence[armIndex].target.map((radians) => radians * RADIANS_TO_DEGREES);
       armSegmentStart += armSequence[armIndex].duration;
       armIndex += 1;
     }
     const currentArm = armSequence[armIndex];
-    const targetDegrees = ARM_POSES[currentArm.pose].map((radians) => radians * RADIANS_TO_DEGREES);
+    const targetDegrees = currentArm.target.map((radians) => radians * RADIANS_TO_DEGREES);
     const armProgress = Math.min(1, (taskElapsed + dt - armSegmentStart) / currentArm.duration);
     ARM_JOINT_NAMES.forEach((name, index) => {
       joints[name] = Number((armInitial[index] + (targetDegrees[index] - armInitial[index]) * armProgress).toFixed(2));
@@ -155,6 +149,11 @@ function simulateConcurrent(movement, gesture, frames, state, joints, actions, t
   }
   state.torsoPitch = 0;
   state.torsoRoll = 0;
+  if (isPoseHold && gesture.method === 'hold_pose_until_reset') {
+    heldPose.name = gesture.poseName;
+  } else if (isPoseHold && gesture.method === 'hold_pose') {
+    simulateArmTarget(ARM_POSE_CARRY, 1, 'carry', frames, state, joints, actions, timeline, elapsed);
+  }
 }
 
 export function simulateDuetG1Edu23Program(code) {
@@ -174,6 +173,7 @@ export function simulateDuetG1Edu23Program(code) {
   const actions = [];
   const timeline = [];
   const elapsed = { value: 0 };
+  const heldPose = { name: null };
   appendFrame(frames, state, joints, actions, timeline, elapsed.value);
 
   for (const command of commands) {
@@ -184,15 +184,40 @@ export function simulateDuetG1Edu23Program(code) {
         : command;
       simulateMove(movement, frames, state, joints, actions, timeline, elapsed);
     } else if (command.type === 'concurrent') {
-      simulateConcurrent(command.movement, command.gesture, frames, state, joints, actions, timeline, elapsed);
+      simulateConcurrent(command.movement, command.gesture, frames, state, joints, actions, timeline, elapsed, heldPose);
     } else if (getDuetCommand(command.method)?.armPoses) {
       const duration = command.values[0];
-      getDuetCommand(command.method).armPoses.forEach((pose) => {
-        simulateArmPose({
-          ...command,
-          values: [pose, duration],
-        }, frames, state, joints, actions, timeline, elapsed);
+      const definition = getDuetCommand(command.method);
+      definition.armTargets.forEach((target, index) => {
+        simulateArmTarget(
+          target,
+          duration,
+          definition.armPoses[index],
+          frames,
+          state,
+          joints,
+          actions,
+          timeline,
+          elapsed,
+        );
       });
+    } else if (command.method === 'hold_pose' || command.method === 'hold_pose_until_reset') {
+      const target = getDuetArmPoseTarget(command.poseName);
+      simulateArmTarget(target, 1, command.poseName, frames, state, joints, actions, timeline, elapsed);
+      if (command.method === 'hold_pose') {
+        const holdSeconds = command.values[0];
+        const frameCount = Math.ceil(holdSeconds * FRAME_RATE);
+        for (let frame = 0; frame < frameCount; frame += 1) {
+          elapsed.value += holdSeconds / frameCount;
+          appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+        }
+        simulateArmTarget(ARM_POSE_CARRY, 1, 'carry', frames, state, joints, actions, timeline, elapsed);
+      } else {
+        heldPose.name = command.poseName;
+      }
+    } else if (command.method === 'reset_arms') {
+      simulateArmTarget(ARM_POSE_CARRY, 1, 'carry', frames, state, joints, actions, timeline, elapsed);
+      heldPose.name = null;
     } else if (command.method === 'wait') {
       const [duration] = command.values;
       const frameCount = Math.max(1, Math.ceil(duration * FRAME_RATE));
@@ -204,11 +229,18 @@ export function simulateDuetG1Edu23Program(code) {
       }
     } else if (command.method === 'stop') {
       state.status = 'Stopped';
+      ARM_JOINT_NAMES.forEach((name, index) => {
+        joints[name] = Number((ARM_POSE_CARRY[index] * RADIANS_TO_DEGREES).toFixed(2));
+      });
+      heldPose.name = null;
       actions.push({ label: 'DUET stop', summary: 'Stop requested.' });
       timeline.push(actions[actions.length - 1]);
       appendFrame(frames, state, joints, actions, timeline, elapsed.value);
       break;
     }
+  }
+  if (heldPose.name && state.status !== 'Stopped') {
+    simulateArmTarget(ARM_POSE_CARRY, 1, 'carry reset on program completion', frames, state, joints, actions, timeline, elapsed);
   }
   state.status = state.status === 'Stopped' ? 'Stopped' : 'DUET preview complete';
   return frames;

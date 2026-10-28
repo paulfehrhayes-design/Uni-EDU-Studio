@@ -8,6 +8,7 @@ import {
   getDuetBlocklyCommandBlocks,
   parseDuetProgram,
 } from './duetCommands.js';
+import { getDuetArmCatalog, getDuetArmPoseNames, getDuetArmPoseTarget } from './duetArmCatalog.js';
 
 test('DUET command catalog contains no legacy robot commands', () => {
   assert.deepEqual(DUET_COMMANDS.map(({ method }) => method), [
@@ -25,6 +26,9 @@ test('DUET command catalog contains no legacy robot commands', () => {
     'arm_carry',
     'arm_reach',
     'arm_box_hold',
+    'hold_pose',
+    'hold_pose_until_reset',
+    'reset_arms',
     'reach_and_return',
     'receive_and_hold',
     'hold_and_return',
@@ -44,16 +48,44 @@ test('DUET command catalog contains no legacy robot commands', () => {
     'raise_both_arms_low',
     'raise_both_arms_mid',
     'raise_both_arms_high',
+    'gesture_kiss_both',
+    'gesture_kiss_left',
+    'gesture_kiss_right',
+    'gesture_hands_up',
+    'gesture_clap',
+    'gesture_high_five_left',
+    'gesture_high_five_right',
+    'gesture_hug',
+    'gesture_heart_both',
+    'gesture_heart_left',
+    'gesture_heart_right',
+    'gesture_reject_left',
+    'gesture_reject_right',
+    'gesture_hand_up_left',
+    'gesture_hand_up_right',
+    'gesture_xray',
+    'gesture_face_wave_left',
+    'gesture_face_wave_right',
+    'gesture_high_wave_left',
+    'gesture_high_wave_right',
+    'gesture_shake_hand_left',
+    'gesture_shake_hand_right',
     'wait',
     'stop',
   ]);
   assert.ok(getDuetBlocklyCommandBlocks().every(({ type }) => (
-    type.startsWith('duet_command_') || type === 'duet_concurrent_action'
+    type.startsWith('duet_command_')
+    || type.startsWith('duet_pose_target_')
+    || type === 'duet_concurrent_action'
   )));
   assert.equal(getDuetBlocklyCommandBlocks().filter(({ category }) => category === 'Locomotion').length, 11);
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_concurrent_action').category, 'Concurrent actions');
   assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_arm_carry').category, 'Arm poses');
-  assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_wave_left_mid').category, 'Arm poses');
+  assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_wave_left_mid').category, 'Arm gestures');
+  assert.equal(getDuetBlocklyCommandBlocks().find(({ type }) => type === 'duet_command_gesture_kiss_both').category, 'Arm gestures');
+  assert.ok(getDuetBlocklyCommandBlocks().some(({ type, output }) => (
+    type === 'duet_pose_target_both_overhead' && output === 'String'
+  )));
   assert.ok(DUET_COMMANDS.filter(({ armPoses }) => armPoses).every(({ args }) => (
     args.every((argument) => argument.kind !== 'choice')
   )));
@@ -134,6 +166,72 @@ test('DUET arm poses use separate commands with bounded durations', () => {
   assert.throws(() => parseDuetProgram('duet.arm_reach(3.1)'), /between 1 and 3/);
 });
 
+test('DUET arm pose targets are bounded and legacy gestures include their available side mirrors', () => {
+  const catalog = getDuetArmCatalog();
+  const poseNames = getDuetArmPoseNames();
+  assert.equal(poseNames.length, new Set(poseNames).size);
+  assert.deepEqual(Object.keys(catalog.gestures), [
+    'legacy_kiss_both',
+    'legacy_kiss_left',
+    'legacy_kiss_right',
+    'legacy_hands_up',
+    'legacy_clap',
+    'legacy_high_five_left',
+    'legacy_high_five_right',
+    'legacy_hug',
+    'legacy_heart_both',
+    'legacy_heart_left',
+    'legacy_heart_right',
+    'legacy_reject_left',
+    'legacy_reject_right',
+    'legacy_hand_up_left',
+    'legacy_hand_up_right',
+    'legacy_xray',
+    'legacy_face_wave_left',
+    'legacy_face_wave_right',
+    'legacy_high_wave_left',
+    'legacy_high_wave_right',
+    'legacy_shake_hand_left',
+    'legacy_shake_hand_right',
+  ]);
+  const left = getDuetArmPoseTarget('left_high_five');
+  const right = getDuetArmPoseTarget('right_high_five');
+  assert.deepEqual(right.slice(5), [
+    left[0],
+    -left[1],
+    -left[2],
+    left[3],
+    -left[4],
+  ]);
+});
+
+test('DUET named-pose holds round-trip, enforce bounds, and require reset before another arm motion', () => {
+  const timedCode = 'duet.hold_pose(duet.pose("left_raise_mid"), 12)';
+  const [timed] = parseDuetProgram(timedCode);
+  assert.equal(timed.poseName, 'left_raise_mid');
+  assert.deepEqual(timed.values, [12]);
+  assert.equal(formatDuetProgram([timed]), timedCode);
+  assert.equal(
+    parseDuetProgram('duet.hold_pose_until_reset(duet.pose("both_overhead"))')[0].poseName,
+    'both_overhead',
+  );
+  assert.throws(() => parseDuetProgram('duet.hold_pose(duet.pose("carry"), 31)'), /between 1 and 30/);
+  assert.throws(() => parseDuetProgram('duet.hold_pose(duet.pose("unknown"), 2)'), /named DUET pose target/);
+  assert.throws(
+    () => parseDuetProgram('duet.hold_pose_until_reset(duet.pose("left_raise_mid"))\nduet.gesture_clap(1)'),
+    /Reset arms/,
+  );
+  assert.throws(
+    () => parseDuetProgram('duet.hold_pose_until_reset(duet.pose("left_raise_mid"))\nwith duet.concurrent():\n    duet.forward(1)\n    duet.arm_carry(1)'),
+    /Reset arms/,
+  );
+  const resetProgram = 'duet.hold_pose_until_reset(duet.pose("left_raise_mid"))\n'
+    + 'duet.wait(1)\n'
+    + 'duet.reset_arms()\n'
+    + 'duet.gesture_clap(1)';
+  assert.equal(formatDuetProgram(parseDuetProgram(resetProgram)), resetProgram);
+});
+
 test('DUET arm motion macros and safe mirrored presets expand only into bounded existing named-pose commands', () => {
   const nodes = parseDuetProgram('duet.receive_hold_return(1.5)');
   assert.equal(nodes[0].method, 'receive_hold_return');
@@ -168,6 +266,7 @@ test('DUET parser rejects legacy commands and unsupported syntax', () => {
   assert.throws(() => parseDuetProgram('robot.walk(1)'), /Unsupported statement/);
   assert.throws(() => parseDuetProgram('duet.raw_joint(1)'), /Unknown DUET command/);
   assert.throws(() => parseDuetProgram('if True:\n    duet.stop()'), /Unsupported statement/);
+  assert.throws(() => parseDuetProgram('duet.stop()\nduet.wait(1)'), /must be the final command/);
 });
 
 test('DUET parser rejects unsafe values instead of silently clamping them', () => {

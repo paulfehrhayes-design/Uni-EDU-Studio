@@ -340,7 +340,7 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertIn("preview limit", bounded["error"])
 
     def test_route_start_requires_enabled_execution_and_current_free_map_targets(self):
-        route = [{"x": -4.975, "y": -3.725}]
+        route = [{"x": -4.975, "y": -3.725, "yaw_rad": 1.2}]
         operation_id = "12345678-1234-1234-1234-123456789abc"
         with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "0"}):
             with self.assertRaisesRegex(NavigationBridgeError, "disabled"):
@@ -363,7 +363,7 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertEqual(result["operation_id"], accepted["operation_id"])
         self.assertEqual(
             request.call_args.kwargs["json"]["goals"],
-            [{"x": route[0]["x"], "y": route[0]["y"], "yaw_rad": 0.0}],
+            [{"x": route[0]["x"], "y": route[0]["y"], "yaw_rad": 1.2}],
         )
 
         with self.mock_bridge(), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}):
@@ -403,6 +403,55 @@ class NavigationBridgeTests(unittest.TestCase):
                     "classroom", "v4", "map", route, operation_id, now=self.now
                 )
         motion_request.assert_not_called()
+
+    def test_return_home_accepts_adaptive_map_version_and_preserves_heading(self):
+        route = [{"x": -4.975, "y": -3.725, "yaw_rad": 1.1}]
+        operation_id = "12345678-1234-1234-1234-123456789abc"
+        accepted = {"operation_id": operation_id, "status": "accepted"}
+        live_status = {
+            **self.status,
+            "live_avoidance_ready": True,
+            "live_obstacles": {
+                "ready": True,
+                "frame_id": "map",
+                "age_ms": 120,
+                "points": [],
+            },
+        }
+        with self.mock_bridge(status=live_status), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}), patch.object(
+            navigation_bridge.httpx,
+            "post",
+            return_value=SimpleNamespace(status_code=202, json=lambda: accepted),
+        ) as request:
+            navigation_bridge.navigation_start_route(
+                "classroom",
+                "captured-old-version",
+                "map",
+                route,
+                operation_id,
+                now=self.now,
+                planner_mode="live",
+                allow_map_version_update=True,
+            )
+
+        payload = request.call_args.kwargs["json"]
+        self.assertEqual(payload["version"], "v4")
+        self.assertEqual(payload["goals"], [
+            {"x": route[0]["x"], "y": route[0]["y"], "yaw_rad": 1.1},
+        ])
+
+        with self.mock_bridge(status=live_status), patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "1"}):
+            with self.assertRaisesRegex(NavigationBridgeError, "map changed"):
+                navigation_bridge.navigation_start_route(
+                    "different-room",
+                    "captured-old-version",
+                    "map",
+                    route,
+                    operation_id,
+                    now=self.now,
+                    planner_mode="live",
+                    allow_map_version_update=True,
+                )
 
     def test_route_preview_validates_targets_and_returns_bounded_map_frame_path(self):
         plan = {

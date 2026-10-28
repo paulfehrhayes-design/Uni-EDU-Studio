@@ -146,6 +146,7 @@ class SaveCodeRequest(BaseModel):
 class QueueSubmissionRequest(SaveCodeRequest):
     controller_version: Literal["legacy", "duet"] = "legacy"
     planner_request: Optional[dict] = None
+    project_snapshot: Optional[dict] = None
 
 
 class QueueRunRequest(BaseModel):
@@ -161,6 +162,18 @@ class ProjectSaveRequest(BaseModel):
     plannerMode: Optional[str] = None
     plannerLabel: Optional[str] = None
     plannerVariants: Optional[dict] = None
+    selectedPlannerVariant: Optional[str] = None
+
+
+class ProjectRenameRequest(BaseModel):
+    owner: str
+    name: str
+    new_name: str
+
+
+class ProjectDeleteRequest(BaseModel):
+    owner: str
+    name: str
 
 class NavigationStartRequest(BaseModel):
     map_id: str
@@ -168,6 +181,8 @@ class NavigationStartRequest(BaseModel):
     frame_id: str
     waypoints: List[dict]
     planner_mode: Optional[Literal["static", "live"]] = None
+    queue_item_id: Optional[str] = None
+    operation_kind: Optional[Literal["return_home"]] = None
 
 
 class CheckpointedPlannerRequest(BaseModel):
@@ -291,6 +306,53 @@ def save_navigation_operation(operation: dict, username: str, route: dict) -> No
     )
     conn.commit()
     conn.close()
+
+
+def get_navigation_home() -> Optional[dict]:
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT map_id, map_version, frame_id, x, y, yaw_rad, set_by, updated_at FROM navigation_home WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "map_id": row["map_id"],
+        "map_version": row["map_version"],
+        "frame_id": row["frame_id"],
+        "x": row["x"],
+        "y": row["y"],
+        "yaw_rad": row["yaw_rad"],
+        "set_by": row["set_by"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def save_navigation_home(home: dict, username: str) -> dict:
+    updated_at = datetime.now(timezone.utc).isoformat()
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO navigation_home (id, map_id, map_version, frame_id, x, y, yaw_rad, set_by, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            map_id = excluded.map_id,
+            map_version = excluded.map_version,
+            frame_id = excluded.frame_id,
+            x = excluded.x,
+            y = excluded.y,
+            yaw_rad = excluded.yaw_rad,
+            set_by = excluded.set_by,
+            updated_at = excluded.updated_at
+        """,
+        (
+            home["map_id"], home["map_version"], home["frame_id"],
+            home["x"], home["y"], home["yaw_rad"], username, updated_at,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {**home, "set_by": username, "updated_at": updated_at}
 
 
 def update_navigation_operation(operation_id: str, status: str) -> None:
@@ -620,6 +682,21 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS navigation_home (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            map_id TEXT NOT NULL,
+            map_version TEXT NOT NULL,
+            frame_id TEXT NOT NULL,
+            x REAL NOT NULL,
+            y REAL NOT NULL,
+            yaw_rad REAL NOT NULL,
+            set_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS lidar_settings (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             show_shared_overlay INTEGER NOT NULL DEFAULT 0
@@ -694,7 +771,10 @@ def init_db():
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
             controller_version TEXT NOT NULL DEFAULT 'legacy',
-            planner_request TEXT
+            planner_request TEXT,
+            project_snapshot TEXT,
+            result_project_owner TEXT,
+            result_project_name TEXT
         )
         """
     )
@@ -707,6 +787,12 @@ def init_db():
         )
     if "planner_request" not in queue_columns:
         conn.execute("ALTER TABLE queue ADD COLUMN planner_request TEXT")
+    if "project_snapshot" not in queue_columns:
+        conn.execute("ALTER TABLE queue ADD COLUMN project_snapshot TEXT")
+    if "result_project_owner" not in queue_columns:
+        conn.execute("ALTER TABLE queue ADD COLUMN result_project_owner TEXT")
+    if "result_project_name" not in queue_columns:
+        conn.execute("ALTER TABLE queue ADD COLUMN result_project_name TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -777,7 +863,8 @@ def get_saved_codes_for_user(username: str):
 def list_queue_items():
     conn = get_db_connection()
     rows = conn.execute(
-        "SELECT id, student, name, code, status, created_at, controller_version, planner_request "
+        "SELECT id, student, name, code, status, created_at, controller_version, planner_request, project_snapshot, "
+        "result_project_owner, result_project_name "
         "FROM queue ORDER BY created_at ASC"
     ).fetchall()
     conn.close()
@@ -787,6 +874,15 @@ def list_queue_items():
             planner_request = json.loads(row["planner_request"]) if row["planner_request"] else None
         except (TypeError, json.JSONDecodeError):
             planner_request = None
+        try:
+            project_snapshot = json.loads(row["project_snapshot"]) if row["project_snapshot"] else None
+        except (TypeError, json.JSONDecodeError):
+            project_snapshot = None
+        result_project = None
+        if row["result_project_owner"] and row["result_project_name"]:
+            result_project = get_project_for_user(row["result_project_owner"], row["result_project_name"])
+            if result_project:
+                result_project["username"] = row["result_project_owner"]
         items.append({
             "id": row["id"],
             "student": row["student"],
@@ -796,6 +892,8 @@ def list_queue_items():
             "created_at": row["created_at"],
             "controller_version": row["controller_version"],
             "planner_request": planner_request,
+            "project_snapshot": project_snapshot,
+            "result_project": result_project,
         })
     return [
         item for item in items
@@ -823,6 +921,7 @@ def insert_queue_item(
     code: str,
     controller_version: Literal["legacy", "duet"] = "legacy",
     planner_request: Optional[dict] = None,
+    project_snapshot: Optional[dict] = None,
 ):
     item_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -831,11 +930,16 @@ def insert_queue_item(
         if planner_request is not None
         else None
     )
+    project_snapshot_json = (
+        json.dumps(project_snapshot, separators=(",", ":"), allow_nan=False)
+        if project_snapshot is not None
+        else None
+    )
     conn = get_db_connection()
     conn.execute(
-        "INSERT INTO queue (id, student, name, code, status, created_at, controller_version, planner_request) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (item_id, student, name, code, "queued", now, controller_version, planner_request_json),
+        "INSERT INTO queue (id, student, name, code, status, created_at, controller_version, planner_request, project_snapshot) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (item_id, student, name, code, "queued", now, controller_version, planner_request_json, project_snapshot_json),
     )
     conn.commit()
     conn.close()
@@ -848,6 +952,8 @@ def insert_queue_item(
         "created_at": now,
         "controller_version": controller_version,
         "planner_request": planner_request,
+        "project_snapshot": project_snapshot,
+        "result_project": None,
     }
 
 
@@ -890,7 +996,7 @@ def list_projects_for_user(username: str):
     ]
 
 
-def list_all_projects_for_teacher():
+def list_all_projects():
     conn = get_db_connection()
     rows = conn.execute(
         "SELECT username, name, scene_objects, planner_waypoints, generated_code, duet_code FROM projects ORDER BY updated_at DESC"
@@ -1000,11 +1106,70 @@ def save_project_for_user(username: str, payload: dict):
     return get_project_for_user(username, name)
 
 
+def save_unique_project_for_user(
+    username: str,
+    payload: dict,
+    queue_item_id: Optional[str] = None,
+) -> dict:
+    base_name = (payload.get("name") or "Executed route").strip() or "Executed route"
+    generated_code = _annotate_generated_code(payload.get("generatedCode", ""), payload)
+    conn = get_db_connection()
+    try:
+        if queue_item_id:
+            queue_row = conn.execute(
+                "SELECT student, result_project_owner, result_project_name FROM queue WHERE id = ?",
+                (queue_item_id,),
+            ).fetchone()
+            if not queue_row:
+                raise HTTPException(status_code=404, detail="Queue item not found for project save.")
+            if queue_row["student"] != username:
+                raise HTTPException(status_code=403, detail="Executed project must be saved under its submitting student.")
+            if queue_row["result_project_owner"] and queue_row["result_project_name"]:
+                existing = get_project_for_user(queue_row["result_project_owner"], queue_row["result_project_name"])
+                if existing:
+                    return {**existing, "username": queue_row["result_project_owner"]}
+        for suffix in range(1, 1000):
+            candidate = base_name if suffix == 1 else f"{base_name} ({suffix})"
+            try:
+                conn.execute(
+                    "INSERT INTO projects (username, name, scene_objects, planner_waypoints, generated_code, duet_code) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        username,
+                        candidate,
+                        json.dumps(payload.get("sceneObjects", [])),
+                        json.dumps(payload.get("plannerWaypoints", [])),
+                        generated_code,
+                        payload.get("duetCode"),
+                    ),
+                )
+                if queue_item_id:
+                    conn.execute(
+                        "UPDATE queue SET result_project_owner = ?, result_project_name = ? WHERE id = ?",
+                        (username, candidate, queue_item_id),
+                    )
+                conn.commit()
+                saved = get_project_for_user(username, candidate)
+                return {**saved, "username": username}
+            except sqlite3.IntegrityError:
+                conn.rollback()
+    finally:
+        conn.close()
+    raise HTTPException(status_code=409, detail="Could not generate a unique project name.")
+
+
 def set_queue_item_status(item_id: str, status: str):
     conn = get_db_connection()
     conn.execute("UPDATE queue SET status = ? WHERE id = ?", (status, item_id))
     conn.commit()
     conn.close()
+
+
+def set_queue_status_after_motion_error(item_id: str, error: HTTPException) -> None:
+    current = next((item for item in list_queue_items() if item["id"] == item_id), None)
+    if current and current["status"] == "paused":
+        return
+    set_queue_item_status(item_id, "queued" if error.status_code == 409 else "failed")
 
 
 init_db()
@@ -1141,19 +1306,24 @@ def classroom_codes(user: dict = Depends(auth_required)):
 
 @app.get("/api/classroom/projects")
 def classroom_projects(user: dict = Depends(auth_required)):
-    return {"projects": list_projects_for_user(user["username"]) }
+    return {"projects": list_all_projects()}
 
 
 @app.get("/api/classroom/projects/all")
 def classroom_all_projects(user: dict = Depends(auth_required)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher role required")
-    return {"projects": list_all_projects_for_teacher()}
+    return {"projects": list_all_projects()}
 
 
 @app.get("/api/classroom/project")
-def classroom_project(user: dict = Depends(auth_required), name: str = "default"):
-    project = get_project_for_user(user["username"], name)
+def classroom_project(
+    user: dict = Depends(auth_required),
+    name: str = "default",
+    owner: Optional[str] = None,
+):
+    project_owner = owner or user["username"]
+    project = get_project_for_user(project_owner, name)
+    if project and project_owner != user["username"]:
+        project["username"] = project_owner
     return {"project": project or {"name": name, "sceneObjects": [], "plannerWaypoints": [], "generatedCode": ""}}
 
 
@@ -1163,6 +1333,84 @@ def save_project(user: dict = Depends(auth_required), request: ProjectSaveReques
         raise HTTPException(status_code=400, detail="Missing project payload")
     project = save_project_for_user(user["username"], request.model_dump())
     return {"status": "saved", "project": project}
+
+
+@app.post("/api/classroom/project/save-execution")
+def save_execution_project(
+    user: dict = Depends(auth_required),
+    request: ProjectSaveRequest = None,
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not request:
+        raise HTTPException(status_code=400, detail="Missing executed project payload.")
+    if request.plannerMode not in {"sensor_corrected", "autonomous"}:
+        raise HTTPException(status_code=400, detail="Only completed sensor-corrected or autonomous routes can be auto-saved.")
+    project = save_unique_project_for_user(user["username"], request.model_dump())
+    return {"status": "saved", "project": project}
+
+
+@app.post("/api/classroom/project/rename")
+def rename_project(request: ProjectRenameRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    new_name = request.new_name.strip()
+    if not new_name or len(new_name) > 120:
+        raise HTTPException(status_code=400, detail="Project name must contain 1 to 120 characters.")
+    conn = get_db_connection()
+    try:
+        existing = conn.execute(
+            "SELECT generated_code FROM projects WHERE username = ? AND name = ?",
+            (request.owner, request.name),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        generated_code = existing["generated_code"] or ""
+        metadata = _project_planner_metadata(generated_code)
+        if metadata.get("plannerLabel"):
+            clean_code = generated_code.split("\n", 1)[1] if "\n" in generated_code else ""
+            metadata["plannerLabel"] = new_name
+            generated_code = _annotate_generated_code(clean_code, metadata)
+        cursor = conn.execute(
+            "UPDATE projects SET name = ?, generated_code = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ? AND name = ?",
+            (new_name, generated_code, request.owner, request.name),
+        )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Project not found.")
+        conn.execute(
+            "UPDATE queue SET result_project_name = ? WHERE result_project_owner = ? AND result_project_name = ?",
+            (new_name, request.owner, request.name),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as error:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail="A project with that name already exists for this owner.") from error
+    finally:
+        conn.close()
+    project = get_project_for_user(request.owner, new_name)
+    return {"status": "renamed", "project": {**project, "username": request.owner}}
+
+
+@app.post("/api/classroom/project/delete")
+def delete_project(request: ProjectDeleteRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE queue SET result_project_owner = NULL, result_project_name = NULL "
+        "WHERE result_project_owner = ? AND result_project_name = ?",
+        (request.owner, request.name),
+    )
+    result = conn.execute(
+        "DELETE FROM projects WHERE username = ? AND name = ?",
+        (request.owner, request.name),
+    )
+    conn.commit()
+    conn.close()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return {"status": "deleted", "owner": request.owner, "name": request.name}
 
 
 @app.post("/api/classroom/save-code")
@@ -1178,14 +1426,88 @@ def submit_code(user: dict = Depends(auth_required), request: QueueSubmissionReq
     if not request:
         raise HTTPException(status_code=400, detail="Missing code payload")
     planner_request = _validated_planner_request(request.planner_request)
+    if planner_request is not None and request.controller_version != "legacy":
+        raise HTTPException(
+            status_code=400,
+            detail="Path planner requests require the G1 SDK controller.",
+        )
+    project_snapshot = _validated_project_snapshot(request.project_snapshot)
     item = insert_queue_item(
         user["username"],
         request.name,
         request.code,
         request.controller_version,
         planner_request,
+        project_snapshot,
     )
     return {"status": "submitted", "item": item}
+
+
+def _validated_project_snapshot(value: Optional[dict]) -> Optional[dict]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Project snapshot must be an object.")
+    allowed_fields = {
+        "name",
+        "sceneObjects",
+        "plannerWaypoints",
+        "generatedCode",
+        "duetCode",
+        "plannerMode",
+        "plannerLabel",
+        "plannerVariants",
+        "selectedPlannerVariant",
+    }
+    if set(value) - allowed_fields:
+        raise HTTPException(status_code=400, detail="Project snapshot contains unsupported fields.")
+    if not isinstance(value.get("name", "default"), str) or len(value.get("name", "default")) > 120:
+        raise HTTPException(status_code=400, detail="Project name is invalid.")
+    scene_objects = value.get("sceneObjects", [])
+    waypoints = value.get("plannerWaypoints", [])
+    if not isinstance(scene_objects, list) or len(scene_objects) > 500 or any(not isinstance(item, dict) for item in scene_objects):
+        raise HTTPException(status_code=400, detail="Project scene objects are invalid.")
+    if not isinstance(waypoints, list) or len(waypoints) > 200 or any(not isinstance(item, dict) for item in waypoints):
+        raise HTTPException(status_code=400, detail="Project planner waypoints are invalid.")
+    for field in ("generatedCode", "duetCode", "plannerLabel"):
+        field_value = value.get(field, "")
+        if not isinstance(field_value, str) or len(field_value) > 40000:
+            raise HTTPException(status_code=400, detail=f"Project {field} is invalid or too large.")
+    mode = value.get("plannerMode")
+    if mode is not None and (
+        not isinstance(mode, str)
+        or mode not in {"manual", "sensor_corrected", "autonomous"}
+    ):
+        raise HTTPException(status_code=400, detail="Project planner mode is invalid.")
+    variants = value.get("plannerVariants", {})
+    if not isinstance(variants, dict) or set(variants) - {"initial", "corrected", "final"}:
+        raise HTTPException(status_code=400, detail="Project planner variants are invalid.")
+    if any(not isinstance(code, str) or len(code) > 40000 for code in variants.values()):
+        raise HTTPException(status_code=400, detail="Project planner variant code is invalid or too large.")
+    selected_variant = value.get("selectedPlannerVariant")
+    if selected_variant is not None and (
+        not isinstance(selected_variant, str)
+        or selected_variant not in {"initial", "corrected", "final"}
+    ):
+        raise HTTPException(status_code=400, detail="Project selected planner variant is invalid.")
+    snapshot = {
+        "name": value.get("name", "default"),
+        "sceneObjects": scene_objects,
+        "plannerWaypoints": waypoints,
+        "generatedCode": value.get("generatedCode", ""),
+        "duetCode": value.get("duetCode", ""),
+        "plannerMode": mode,
+        "plannerLabel": value.get("plannerLabel", ""),
+        "plannerVariants": variants,
+        "selectedPlannerVariant": selected_variant,
+    }
+    try:
+        encoded_snapshot = json.dumps(snapshot, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Project snapshot must contain finite JSON values.") from error
+    if len(encoded_snapshot) > 500000:
+        raise HTTPException(status_code=400, detail="Project snapshot is too large.")
+    return snapshot
 
 
 def _validated_planner_request(value: Optional[dict]) -> Optional[dict]:
@@ -1313,37 +1635,110 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
         item = next((queued for queued in queue if queued["id"] == request.item_id), None)
         if not item or item["status"] != "queued":
             raise HTTPException(status_code=404, detail="The approved queue item is no longer queued.")
-        if item.get("planner_request"):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Planner request {item['name']} must be loaded into the teacher workspace "
-                    "and approved through its matching planner controls; it cannot run as ordinary queue code."
-                ),
-            )
-        if item["controller_version"] != "legacy":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Queue item {item['name']} targets the DUET controller. "
-                    "DUET queue execution is not enabled; it will not be sent to the legacy SDK."
-                ),
-            )
+        planner_request = item.get("planner_request") or {}
+        if planner_request.get("planner_mode") == "sensor_corrected":
+            if item["controller_version"] != "legacy":
+                raise HTTPException(status_code=409, detail="Sensor-corrected routes require the legacy G1 SDK.")
+            set_queue_item_status(item["id"], "running")
+            try:
+                result = run_checkpointed_planner(
+                    CheckpointedPlannerRequest(waypoints=planner_request.get("planner_waypoints") or []),
+                    user,
+                )
+            except HTTPException as error:
+                set_queue_status_after_motion_error(item["id"], error)
+                raise
+            snapshot = item.get("project_snapshot") or {}
+            variants = planner_request.get("route_variants") or {}
+            original_code = variants.get("initial") or item["code"]
+            corrected_code = result.get("correctedCode")
+            if result.get("status") == "completed" and isinstance(corrected_code, str) and corrected_code:
+                project_label = (
+                    snapshot.get("plannerLabel")
+                    or planner_request.get("planner_label")
+                    or snapshot.get("name")
+                    or "Sensor-corrected route"
+                )
+                try:
+                    saved_project = save_unique_project_for_user(
+                        item["student"],
+                        {
+                            "name": project_label,
+                            "sceneObjects": snapshot.get("sceneObjects", []),
+                            "plannerWaypoints": planner_request.get("planner_waypoints", []),
+                            "generatedCode": corrected_code,
+                            "duetCode": snapshot.get("duetCode", ""),
+                            "plannerMode": "sensor_corrected",
+                            "plannerLabel": project_label,
+                            "plannerVariants": {
+                                "initial": original_code,
+                                "corrected": corrected_code,
+                                "final": corrected_code,
+                            },
+                            "selectedPlannerVariant": "corrected",
+                        },
+                        queue_item_id=item["id"],
+                    )
+                    result["saved_project"] = saved_project
+                except (HTTPException, sqlite3.Error, TypeError, ValueError) as error:
+                    result["saved_project_error"] = str(getattr(error, "detail", error))
+            item["status"] = "paused" if result.get("status") == "stopped" else "completed"
+            if result.get("saved_project"):
+                item["result_project"] = result["saved_project"]
+            set_queue_item_status(item["id"], item["status"])
+            return {"status": item["status"], "item": item, "process": result}
+        if planner_request.get("planner_mode") == "autonomous":
+            navigation = planner_request.get("navigation") or {}
+            if not navigation:
+                raise HTTPException(status_code=409, detail="Autonomous request has no saved map goals.")
+            set_queue_item_status(item["id"], "running")
+            try:
+                result = start_navigation(
+                    NavigationStartRequest(
+                        map_id=navigation["map_id"],
+                        version=navigation["version"],
+                        frame_id=navigation["frame_id"],
+                        planner_mode=navigation["planner_mode"],
+                        waypoints=navigation["waypoints"],
+                        queue_item_id=item["id"],
+                    ),
+                    user,
+                )
+            except (HTTPException, KeyError) as error:
+                status_code = error.status_code if isinstance(error, HTTPException) else 400
+                set_queue_item_status(item["id"], "queued" if status_code == 409 else "failed")
+                if isinstance(error, HTTPException):
+                    raise
+                raise HTTPException(status_code=400, detail="Autonomous request map goals are incomplete.") from error
+            item["status"] = "completed" if result.get("status") == "completed" else "running"
+            set_queue_item_status(item["id"], item["status"])
+            return {"status": item["status"], "item": item, "operation": result}
+        if item["controller_version"] not in {"legacy", "duet"}:
+            raise HTTPException(status_code=409, detail="Queue item uses an unsupported robot controller.")
         set_queue_item_status(item["id"], "running")
         item["status"] = "running"
         try:
-            with _MOTION_START_LOCK:
-                ensure_sdk_motion_available()
-                result = execute_robot_program(item["code"])
+            if item["controller_version"] == "duet":
+                with _MOTION_START_LOCK:
+                    if active_navigation_operation() or active_lidar_scan() or robot_status().get("running"):
+                        raise HTTPException(status_code=409, detail="Another robot operation currently owns motion.")
+                    result = execute_duet_program(item["code"])
+            else:
+                with _MOTION_START_LOCK:
+                    ensure_sdk_motion_available()
+                    result = execute_robot_program(item["code"])
         except HTTPException as error:
-            set_queue_item_status(
-                item["id"],
-                "queued" if error.status_code == 409 else "failed",
-            )
+            set_queue_status_after_motion_error(item["id"], error)
             raise
-        set_queue_item_status(item["id"], "completed")
-        item["status"] = "completed"
-        return {"status": "completed", "item": item, "process": result}
+        except DuetProgramValidationError as error:
+            set_queue_item_status(item["id"], "failed")
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except DuetControllerError as error:
+            set_queue_item_status(item["id"], "queued")
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        item["status"] = "paused" if result.get("status") == "stopped" else "completed"
+        set_queue_item_status(item["id"], item["status"])
+        return {"status": item["status"], "item": item, "process": result}
     finally:
         _QUEUE_RUN_LOCK.release()
 
@@ -1889,6 +2284,7 @@ def get_navigation_status(user: dict = Depends(auth_required)):
         **status,
         "knownMapVersions": known_map_versions,
         "activeOperation": active_operation,
+        "home": get_navigation_home(),
     }
 
 
@@ -1898,6 +2294,69 @@ def get_navigation_map(user: dict = Depends(auth_required)):
     if not snapshot["ready"]:
         raise HTTPException(status_code=503, detail=snapshot["error"])
     return {**snapshot, "knownMapVersions": record_navigation_map_version(snapshot["map"])}
+
+
+@app.get("/api/navigation/home")
+def get_navigation_home_route(user: dict = Depends(auth_required)):
+    return {"home": get_navigation_home()}
+
+
+@app.post("/api/navigation/home")
+def set_navigation_home(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if active_navigation_operation() or active_lidar_scan() or robot_status().get("running"):
+        raise HTTPException(status_code=409, detail="Stop active robot motion before setting the shared origin.")
+    status = navigation_bridge_status()
+    if status.get("ready") is not True or status.get("motionReady") is not True:
+        raise HTTPException(
+            status_code=503,
+            detail=status.get("error") or "Fresh localization, map, LiDAR, robot link, and e-stop health are required to set origin.",
+        )
+    map_metadata = status.get("map")
+    localization = status.get("localization")
+    if not isinstance(map_metadata, dict) or not isinstance(localization, dict) or localization.get("ready") is not True:
+        raise HTTPException(status_code=503, detail="A fresh localized pose and live map are required to set origin.")
+    if map_metadata.get("map_id") is None or map_metadata.get("frame_id") != localization.get("frame_id"):
+        raise HTTPException(status_code=503, detail="The current map and localization frames do not match.")
+    pose = localization.get("pose") or {}
+    home = {
+        "map_id": map_metadata["map_id"],
+        "map_version": map_metadata["version"],
+        "frame_id": map_metadata["frame_id"],
+        "x": float(pose["x"]),
+        "y": float(pose["y"]),
+        "yaw_rad": float(pose["yaw_rad"]),
+    }
+    saved = save_navigation_home(home, user["username"])
+    return {"status": "saved", "home": saved}
+
+
+@app.post("/api/navigation/home/return")
+def return_to_navigation_home(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    home = get_navigation_home()
+    if not home:
+        raise HTTPException(status_code=409, detail="Set the shared starting origin before returning to it.")
+    snapshot = navigation_map_snapshot()
+    if not snapshot.get("ready") or not snapshot.get("map"):
+        raise HTTPException(status_code=503, detail=snapshot.get("error") or "The live Nav2 map is unavailable.")
+    current_map = snapshot["map"]
+    if current_map["map_id"] != home["map_id"] or current_map["frame_id"] != home["frame_id"]:
+        raise HTTPException(
+            status_code=409,
+            detail="The live map identity or coordinate frame differs from the saved origin. Set the origin again before returning.",
+        )
+    request = NavigationStartRequest(
+        map_id=current_map["map_id"],
+        version=current_map["version"],
+        frame_id=current_map["frame_id"],
+        waypoints=[{"x": home["x"], "y": home["y"], "yaw_rad": home["yaw_rad"]}],
+        planner_mode="live",
+        operation_kind="return_home",
+    )
+    return start_navigation(request, user)
 
 
 @app.post("/api/lidar/scan")
@@ -2239,6 +2698,10 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
             "waypoints": request.waypoints,
             "planner_mode": request.planner_mode,
         }
+        if request.queue_item_id:
+            route["queue_item_id"] = request.queue_item_id
+        if request.operation_kind:
+            route["operation_kind"] = request.operation_kind
         static_map_snapshot = None
         if request.planner_mode == "static":
             shared_map = get_shared_lidar_map()
@@ -2264,6 +2727,7 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
                 on_dispatch=persist_starting_operation,
                 planner_mode=request.planner_mode,
                 static_map_snapshot=static_map_snapshot,
+                allow_map_version_update=request.operation_kind == "return_home",
             )
         except NavigationBridgeError as error:
             if dispatch_started:
@@ -2306,6 +2770,66 @@ def preview_navigation_route(request: NavigationStartRequest, user: dict = Depen
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
+def _sdk_route_from_navigation_trace(path_trace: list[dict]) -> tuple[str, list[dict]]:
+    if not isinstance(path_trace, list) or len(path_trace) < 2:
+        raise ValueError("Nav2 did not provide enough executed localization samples to save an SDK route.")
+    sampled = [path_trace[0]]
+    for point in path_trace[1:]:
+        previous = sampled[-1]
+        if (
+            math.hypot(point["x"] - previous["x"], point["y"] - previous["y"]) >= 0.2
+            or abs(point["yaw_rad"] - previous["yaw_rad"]) >= 0.2
+        ):
+            sampled.append(point)
+    if len(sampled) < 2:
+        raise ValueError("The recorded Nav2 route contains no measurable movement to save.")
+    if len(sampled) > 200:
+        raise ValueError("The recorded Nav2 route is too detailed to safely convert to SDK commands.")
+
+    commands = ["robot.stand()"]
+    for index in range(1, len(sampled)):
+        from_point = sampled[index - 1]
+        to_point = sampled[index]
+        dx = to_point["x"] - from_point["x"]
+        dy = to_point["y"] - from_point["y"]
+        distance = math.hypot(dx, dy)
+        direction = math.atan2(dy, dx)
+        turn_delta = (direction - from_point["yaw_rad"] + math.pi) % (2 * math.pi) - math.pi
+        if abs(turn_delta) >= 0.08:
+            side = "left" if turn_delta > 0 else "right"
+            degrees = min(180.0, abs(math.degrees(turn_delta)))
+            commands.append(f'robot.turn("{side}", {degrees:.2f})')
+        remaining = distance / 0.4
+        while remaining >= 0.1:
+            duration = min(10.0, remaining)
+            commands.append(f"robot.walktime({duration:.3f})")
+            remaining -= duration
+    commands.append("robot.stand()")
+    if len(commands) > 400:
+        raise ValueError("The recorded Nav2 route exceeds the 400-command SDK editor limit.")
+
+    start = path_trace[0]
+    cosine = math.cos(start["yaw_rad"])
+    sine = math.sin(start["yaw_rad"])
+    waypoints = []
+    for index, point in enumerate(path_trace):
+        if index > 0 and math.hypot(
+            point["x"] - path_trace[index - 1]["x"],
+            point["y"] - path_trace[index - 1]["y"],
+        ) < 0.2:
+            continue
+        dx = point["x"] - start["x"]
+        dy = point["y"] - start["y"]
+        waypoints.append({
+            "id": f"planner-recorded-{index}",
+            "x": round(dx * cosine + dy * sine, 2),
+            "y": round(-dx * sine + dy * cosine, 2),
+        })
+    if len(waypoints) < 2:
+        raise ValueError("The executed Nav2 trace produced fewer than two editable planner waypoints.")
+    return "\n".join(commands), waypoints
+
+
 @app.get("/api/navigation/operation/{operation_id}")
 def get_navigation_operation(operation_id: str, user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
@@ -2326,10 +2850,50 @@ def get_navigation_operation(operation_id: str, user: dict = Depends(auth_requir
     if status == "succeeded":
         status = "completed"
     update_navigation_operation(operation_id, status)
+    route = json.loads(row["route"])
+    queue_item_id = route.get("queue_item_id")
+    if queue_item_id and status in {"completed", "canceled", "failed"}:
+        queue_status = "completed" if status == "completed" else "paused" if status == "canceled" else "failed"
+        set_queue_item_status(queue_item_id, queue_status)
+    if (
+        queue_item_id
+        and status == "completed"
+        and not operation.get("path_trace_truncated")
+        and not operation.get("path_trace_error")
+    ):
+        queue_item = next((item for item in list_queue_items() if item["id"] == queue_item_id), None)
+        if queue_item and not queue_item.get("result_project"):
+            try:
+                generated_code, waypoints = _sdk_route_from_navigation_trace(operation.get("path_trace") or [])
+                planner_request = queue_item.get("planner_request") or {}
+                snapshot = queue_item.get("project_snapshot") or {}
+                project_label = (
+                    snapshot.get("plannerLabel")
+                    or planner_request.get("planner_label")
+                    or snapshot.get("name")
+                    or "Autonomous route"
+                )
+                operation["saved_project"] = save_unique_project_for_user(
+                    queue_item["student"],
+                    {
+                        "name": project_label,
+                        "sceneObjects": snapshot.get("sceneObjects", []),
+                        "plannerWaypoints": waypoints,
+                        "generatedCode": generated_code,
+                        "duetCode": snapshot.get("duetCode", ""),
+                        "plannerMode": "autonomous",
+                        "plannerLabel": project_label,
+                        "plannerVariants": {"corrected": generated_code, "final": generated_code},
+                        "selectedPlannerVariant": "final",
+                    },
+                    queue_item_id=queue_item_id,
+                )
+            except (HTTPException, sqlite3.Error, TypeError, ValueError) as error:
+                operation["saved_project_error"] = str(getattr(error, "detail", error))
     return {
         **operation,
         "status": status,
-        "route": json.loads(row["route"]),
+        "route": route,
         "updated_at": row["updated_at"],
     }
 

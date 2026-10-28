@@ -1239,5 +1239,298 @@ class AccountManagementTests(unittest.TestCase):
         self.assertIsNotNone(server.get_user_by_username('busy_student'))
 
 
+class ProjectLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_patcher = patch.object(
+            server, 'DB_PATH', os.path.join(self.temp_dir.name, 'classroom.db')
+        )
+        self.db_patcher.start()
+        server.SESSION_TOKENS.clear()
+        server.init_db()
+        self.client = TestClient(app)
+        teacher = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        self.teacher_headers = {'Authorization': 'Bearer ' + teacher['token']}
+        self.client.post(
+            '/api/classroom/users',
+            headers=self.teacher_headers,
+            json={'username': 'project_student', 'password': 'long-enough-password'},
+        )
+        student = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'project_student', 'password': 'long-enough-password'},
+        ).json()
+        self.student_headers = {'Authorization': 'Bearer ' + student['token']}
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_all_authenticated_users_can_list_and_open_shared_projects(self):
+        server.save_project_for_user(
+            'project_student',
+            {'name': 'student-route', 'generatedCode': 'robot.stand()'},
+        )
+        server.save_project_for_user(
+            'teacher',
+            {'name': 'teacher-route', 'generatedCode': 'robot.walktime(1)'},
+        )
+
+        for headers in (self.teacher_headers, self.student_headers):
+            response = self.client.get('/api/classroom/projects', headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                {(project['username'], project['name']) for project in response.json()['projects']},
+                {('project_student', 'student-route'), ('teacher', 'teacher-route')},
+            )
+
+        opened = self.client.get(
+            '/api/classroom/project',
+            params={'owner': 'project_student', 'name': 'student-route'},
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(opened.status_code, 200)
+        self.assertEqual(opened.json()['project']['username'], 'project_student')
+        self.assertEqual(opened.json()['project']['generatedCode'], 'robot.stand()')
+
+    def test_only_teachers_can_rename_or_delete_any_owner_project(self):
+        server.save_project_for_user(
+            'project_student',
+            {
+                'name': 'student-route',
+                'generatedCode': 'robot.walktime(1)',
+                'plannerMode': 'sensor_corrected',
+                'plannerLabel': 'student-route',
+                'plannerVariants': {'initial': 'robot.walktime(0.5)', 'corrected': 'robot.walktime(1)'},
+            },
+        )
+        rename_request = {
+            'owner': 'project_student',
+            'name': 'student-route',
+            'new_name': 'reviewed-route',
+        }
+        self.assertEqual(
+            self.client.post(
+                '/api/classroom/project/rename',
+                json=rename_request,
+                headers=self.student_headers,
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                '/api/classroom/project/delete',
+                json={'owner': 'project_student', 'name': 'student-route'},
+                headers=self.student_headers,
+            ).status_code,
+            403,
+        )
+        renamed = self.client.post(
+            '/api/classroom/project/rename',
+            json=rename_request,
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()['project']['name'], 'reviewed-route')
+        self.assertEqual(renamed.json()['project']['plannerLabel'], 'reviewed-route')
+        self.assertEqual(renamed.json()['project']['plannerVariants']['initial'], 'robot.walktime(0.5)')
+        deleted = self.client.post(
+            '/api/classroom/project/delete',
+            json={'owner': 'project_student', 'name': 'reviewed-route'},
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(server.list_all_projects(), [])
+
+    def test_execution_project_names_are_unique_and_never_overwrite(self):
+        original = server.save_unique_project_for_user(
+            'project_student',
+            {'name': 'Sensor-corrected route', 'generatedCode': 'robot.walktime(1)'},
+        )
+        second = server.save_unique_project_for_user(
+            'project_student',
+            {'name': 'Sensor-corrected route', 'generatedCode': 'robot.walktime(2)'},
+        )
+
+        self.assertEqual(original['name'], 'Sensor-corrected route')
+        self.assertEqual(second['name'], 'Sensor-corrected route (2)')
+        self.assertEqual(
+            server.get_project_for_user('project_student', original['name'])['generatedCode'],
+            'robot.walktime(1)',
+        )
+
+    def test_direct_execution_save_preserves_mode_two_original_and_corrected_routes(self):
+        payload = {
+            'name': 'checkpoint route',
+            'sceneObjects': [{'id': 'box-1'}],
+            'plannerWaypoints': [{'x': 0, 'y': 0}, {'x': 1, 'y': 0}],
+            'generatedCode': 'robot.walktime(1.2)',
+            'plannerMode': 'sensor_corrected',
+            'plannerLabel': 'checkpoint route',
+            'plannerVariants': {
+                'initial': 'robot.walktime(1)',
+                'corrected': 'robot.walktime(1.2)',
+                'final': 'robot.walktime(1.2)',
+            },
+            'selectedPlannerVariant': 'corrected',
+        }
+        denied = self.client.post(
+            '/api/classroom/project/save-execution',
+            headers=self.student_headers,
+            json=payload,
+        )
+        self.assertEqual(denied.status_code, 403)
+
+        first = self.client.post(
+            '/api/classroom/project/save-execution',
+            headers=self.teacher_headers,
+            json=payload,
+        )
+        second = self.client.post(
+            '/api/classroom/project/save-execution',
+            headers=self.teacher_headers,
+            json=payload,
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()['project']['plannerVariants']['initial'], 'robot.walktime(1)')
+        self.assertEqual(first.json()['project']['plannerVariants']['corrected'], 'robot.walktime(1.2)')
+        self.assertEqual(second.json()['project']['name'], 'checkpoint route (2)')
+
+    def test_direct_mode_three_execution_save_has_no_original_variant(self):
+        response = self.client.post(
+            '/api/classroom/project/save-execution',
+            headers=self.teacher_headers,
+            json={
+                'name': 'autonomous route',
+                'plannerWaypoints': [{'x': 0, 'y': 0}, {'x': 1, 'y': 0}],
+                'generatedCode': 'robot.stand()\nrobot.walktime(2.5)\nrobot.stand()',
+                'plannerMode': 'autonomous',
+                'plannerLabel': 'autonomous route',
+                'plannerVariants': {
+                    'corrected': 'robot.stand()\nrobot.walktime(2.5)\nrobot.stand()',
+                    'final': 'robot.stand()\nrobot.walktime(2.5)\nrobot.stand()',
+                },
+                'selectedPlannerVariant': 'final',
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('initial', response.json()['project']['plannerVariants'])
+
+
+class NavigationHomeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_patcher = patch.object(
+            server, 'DB_PATH', os.path.join(self.temp_dir.name, 'classroom.db')
+        )
+        self.db_patcher.start()
+        server.SESSION_TOKENS.clear()
+        server.init_db()
+        self.client = TestClient(app)
+        teacher = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        student = self.client.post(
+            '/api/classroom/login',
+            json={'username': 'student1', 'password': 'student1'},
+        ).json()
+        self.teacher_headers = {'Authorization': 'Bearer ' + teacher['token']}
+        self.student_headers = {'Authorization': 'Bearer ' + student['token']}
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_teacher_captures_fresh_shared_origin_and_students_can_read_it(self):
+        status = {
+            'ready': True,
+            'motionReady': True,
+            'map': {'map_id': 'classroom', 'version': 'v4', 'frame_id': 'map'},
+            'localization': {
+                'ready': True,
+                'frame_id': 'map',
+                'pose': {'x': 2.5, 'y': -1.25, 'yaw_rad': 1.1},
+            },
+        }
+        with patch.object(server, 'active_navigation_operation', return_value=None), patch.object(
+            server, 'active_lidar_scan', return_value=None
+        ), patch.object(server, 'robot_status', return_value={'running': False}), patch.object(
+            server, 'navigation_bridge_status', return_value=status
+        ):
+            captured = self.client.post('/api/navigation/home', headers=self.teacher_headers)
+        student_read = self.client.get('/api/navigation/home', headers=self.student_headers)
+        denied_set = self.client.post('/api/navigation/home', headers=self.student_headers)
+
+        self.assertEqual(captured.status_code, 200)
+        self.assertEqual(captured.json()['home']['map_version'], 'v4')
+        self.assertEqual(captured.json()['home']['x'], 2.5)
+        self.assertEqual(captured.json()['home']['y'], -1.25)
+        self.assertEqual(captured.json()['home']['yaw_rad'], 1.1)
+        self.assertEqual(student_read.json()['home'], captured.json()['home'])
+        self.assertEqual(denied_set.status_code, 403)
+
+    def test_return_home_uses_live_nav_and_accepts_newer_version_same_identity(self):
+        server.save_navigation_home(
+            {
+                'map_id': 'classroom',
+                'map_version': 'v4',
+                'frame_id': 'map',
+                'x': 2.5,
+                'y': -1.25,
+                'yaw_rad': 1.1,
+            },
+            'teacher',
+        )
+        with patch.object(server, 'navigation_map_snapshot', return_value={
+            'ready': True,
+            'map': {'map_id': 'classroom', 'version': 'v5', 'frame_id': 'map'},
+        }), patch.object(server, 'ensure_sdk_motion_available'), patch.object(
+            server, 'active_lidar_scan', return_value=None
+        ), patch.object(server, 'robot_status', return_value={'running': False}), patch.object(
+            server,
+            'navigation_start_route',
+            return_value={'operation_id': 'home-return-operation', 'status': 'accepted'},
+        ) as start_route:
+            response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['operation_id'], 'home-return-operation')
+        self.assertEqual(start_route.call_args.args[0:4], (
+            'classroom', 'v5', 'map', [{'x': 2.5, 'y': -1.25, 'yaw_rad': 1.1}],
+        ))
+        self.assertEqual(start_route.call_args.kwargs['planner_mode'], 'live')
+        self.assertTrue(start_route.call_args.kwargs['allow_map_version_update'])
+
+    def test_return_home_rejects_different_map_identity_or_frame(self):
+        server.save_navigation_home(
+            {
+                'map_id': 'classroom',
+                'map_version': 'v4',
+                'frame_id': 'map',
+                'x': 2.5,
+                'y': -1.25,
+                'yaw_rad': 1.1,
+            },
+            'teacher',
+        )
+        for current_map in (
+            {'map_id': 'different-room', 'version': 'v5', 'frame_id': 'map'},
+            {'map_id': 'classroom', 'version': 'v5', 'frame_id': 'odom'},
+        ):
+            with patch.object(server, 'navigation_map_snapshot', return_value={
+                'ready': True,
+                'map': current_map,
+            }), patch.object(server, 'navigation_start_route') as start_route:
+                response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
+            self.assertEqual(response.status_code, 409)
+            start_route.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

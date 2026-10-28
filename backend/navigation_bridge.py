@@ -497,13 +497,12 @@ def _validate_route_targets(
     version: str,
     frame_id: str,
     waypoints: list[dict[str, Any]],
+    allow_map_version_update: bool = False,
 ) -> list[dict[str, float]]:
     metadata = snapshot["map"]
-    if (map_id, version, frame_id) != (
-        metadata["map_id"],
-        metadata["version"],
-        metadata["frame_id"],
-    ):
+    identity_matches = map_id == metadata["map_id"] and frame_id == metadata["frame_id"]
+    version_matches = version == metadata["version"]
+    if not identity_matches or (not allow_map_version_update and not version_matches):
         raise NavigationBridgeError("Navigation map changed; reload the map before starting a route.")
     if not isinstance(waypoints, list) or not 1 <= len(waypoints) <= MAX_NAVIGATION_WAYPOINTS:
         raise NavigationBridgeError(
@@ -521,6 +520,7 @@ def _validate_route_targets(
             raise NavigationBridgeError(f"Navigation waypoint {index} must be an object.")
         x = _finite_number(waypoint.get("x"), f"waypoint {index} x")
         y = _finite_number(waypoint.get("y"), f"waypoint {index} y")
+        yaw = _finite_number(waypoint.get("yaw_rad", 0.0), f"waypoint {index} yaw_rad")
         dx = x - origin["x"]
         dy = y - origin["y"]
         map_x = cosine * dx + sine * dy
@@ -534,7 +534,7 @@ def _validate_route_targets(
             raise NavigationBridgeError(
                 f"Navigation waypoint {index} must be in known free space (occupancy below 65)."
             )
-        normalized.append({"x": x, "y": y})
+        normalized.append({"x": x, "y": y, "yaw_rad": yaw})
     return normalized
 
 
@@ -584,6 +584,7 @@ def navigation_start_route(
     on_dispatch: Callable[[], None] | None = None,
     planner_mode: str | None = None,
     static_map_snapshot: dict[str, Any] | None = None,
+    allow_map_version_update: bool = False,
 ) -> dict[str, Any]:
     if os.getenv("G1_NAV_EXECUTION_ENABLED", "").strip() != "1":
         raise NavigationBridgeError(
@@ -603,7 +604,14 @@ def navigation_start_route(
             snapshot, static_map_snapshot, map_id, version, frame_id, waypoints
         )
         if planner_mode == "static"
-        else _validate_route_targets(snapshot, map_id, version, frame_id, waypoints)
+        else _validate_route_targets(
+            snapshot,
+            map_id,
+            version,
+            frame_id,
+            waypoints,
+            allow_map_version_update=allow_map_version_update,
+        )
     )
     base_url, token = _bridge_credentials()
     requested_operation_id = _navigation_operation_id(operation_id)
@@ -620,7 +628,11 @@ def navigation_start_route(
             "planner_mode": planner_mode or "static",
             "operation_id": requested_operation_id,
             "goals": [
-                {"x": waypoint["x"], "y": waypoint["y"], "yaw_rad": 0.0}
+                {
+                    "x": waypoint["x"],
+                    "y": waypoint["y"],
+                    "yaw_rad": waypoint.get("yaw_rad", 0.0),
+                }
                 for waypoint in route
             ],
         },
@@ -668,7 +680,11 @@ def navigation_plan_route(
             "frame_id": snapshot["map"]["frame_id"],
             "planner_mode": planner_mode or "static",
             "goals": [
-                {"x": waypoint["x"], "y": waypoint["y"], "yaw_rad": 0.0}
+                {
+                    "x": waypoint["x"],
+                    "y": waypoint["y"],
+                    "yaw_rad": waypoint.get("yaw_rad", 0.0),
+                }
                 for waypoint in route
             ],
         },
@@ -954,6 +970,8 @@ def navigation_map_snapshot(now: datetime | None = None) -> dict[str, Any]:
             "map": metadata,
             "data": data,
             "motion_ready": status["motionReady"],
+            "liveAvoidanceReady": status["liveAvoidanceReady"],
+            "liveObstacles": status["liveObstacles"],
             "motion_error": (
                 status["estop"]["error"]
                 or status["robotHealth"]["error"]

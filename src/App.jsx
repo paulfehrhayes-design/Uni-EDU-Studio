@@ -29,6 +29,7 @@ import {
   compileDuetMotionPrompt,
   formatDuetProgram,
   getDuetBlocklyCommandBlocks,
+  getDuetCommandExamples,
   parseDuetProgram,
 } from './sim/duetCommands.js';
 import { simulateDuetG1Edu23Program } from './sim/duetG1Edu23Env.js';
@@ -885,6 +886,7 @@ export default function App() {
   const [plannerWaypoints, setPlannerWaypoints] = useState([]);
   const [pathPlannerMode, setPathPlannerMode] = useState(PLANNER_PATH_MODES.manual);
   const [plannerRouteVariants, setPlannerRouteVariants] = useState({ initial: '', corrected: '', final: '' });
+  const [originalPlannerCode, setOriginalPlannerCode] = useState('');
   const [selectedPlannerVariant, setSelectedPlannerVariant] = useState('final');
   const [plannerProjectLabel, setPlannerProjectLabel] = useState('');
   const [isWaypointPlacementEnabled, setIsWaypointPlacementEnabled] = useState(false);
@@ -900,6 +902,14 @@ export default function App() {
   const currentUser = session?.user ?? { role: 'student', username: 'guest' };
   const [savedCodes, setSavedCodes] = useState([]);
   const [queueItems, setQueueItems] = useState([]);
+  const [queueReviewItem, setQueueReviewItem] = useState(null);
+  const [queueReviewError, setQueueReviewError] = useState('');
+  const [queueReviewStatus, setQueueReviewStatus] = useState('');
+  const [queueReviewSavedProject, setQueueReviewSavedProject] = useState(null);
+  const [queueReviewNavigationPreview, setQueueReviewNavigationPreview] = useState(null);
+  const [queueReviewNavigationOperation, setQueueReviewNavigationOperation] = useState(null);
+  const [isQueueReviewRunning, setIsQueueReviewRunning] = useState(false);
+  const [isQueueReviewPreviewing, setIsQueueReviewPreviewing] = useState(false);
   const [teacherRoster, setTeacherRoster] = useState([]);
   const [loginForm, setLoginForm] = useState({ username: 'teacher', password: 'teacher', role: 'teacher' });
   const [loginError, setLoginError] = useState('');
@@ -1021,15 +1031,17 @@ export default function App() {
         session.user.role === 'teacher' ? apiFetch('/api/classroom/queue') : Promise.resolve({ items: [] }),
         session.user.role === 'teacher' ? apiFetch('/api/classroom/users') : Promise.resolve({ users: [] }),
         apiFetch('/api/classroom/status'),
-        session.user.role === 'teacher' ? apiFetch('/api/classroom/projects/all') : apiFetch('/api/classroom/projects')
+        apiFetch('/api/classroom/projects')
       ]);
       setSavedCodes(codesRes.codes || []);
       setQueueItems(queueRes.items || []);
       setTeacherRoster(usersRes.users || []);
       setClassroomStatus(statusRes.status || 'idle');
       setProjectLibrary(projectsRes.projects || []);
+      return queueRes.items || [];
     } catch (err) {
       console.error('Failed to refresh classroom data:', err);
+      return [];
     }
   }, [session, apiFetch]);
 
@@ -1090,6 +1102,9 @@ export default function App() {
             setPlannerProjectLabel(response.project.plannerLabel || response.project.name || '');
             setPlannerRouteVariants(response.project.plannerVariants || { initial: '', corrected: '', final: '' });
             setSelectedPlannerVariant(response.project.selectedPlannerVariant || 'final');
+            setOriginalPlannerCode(response.project.plannerMode === PLANNER_PATH_MODES.sensor_corrected
+              ? response.project.plannerVariants?.initial || ''
+              : '');
           }
           if (response.project && typeof response.project.generatedCode === 'string') {
             codeByVersionRef.current.legacy = response.project.generatedCode;
@@ -1448,6 +1463,18 @@ export default function App() {
     }
   };
 
+  const buildProjectSnapshot = () => ({
+    name: projectName,
+    sceneObjects,
+    plannerWaypoints,
+    generatedCode: codeByVersionRef.current.legacy || '',
+    duetCode: codeByVersionRef.current.duet || '',
+    plannerMode: pathPlannerMode,
+    plannerLabel: plannerProjectLabel,
+    plannerVariants: plannerRouteVariants,
+    selectedPlannerVariant,
+  });
+
   const handleSubmitToQueue = async () => {
     if (!session) return;
     try {
@@ -1457,6 +1484,7 @@ export default function App() {
           name: `${session.user.username}-submission-${new Date().toLocaleTimeString()}`,
           code: generatedCode || '# No code generated yet',
           controller_version: controllerVersion,
+          project_snapshot: buildProjectSnapshot(),
         })
       });
       await refreshClassroomData();
@@ -1468,6 +1496,10 @@ export default function App() {
 
   const handleSubmitPlannerRequest = async () => {
     if (!session) return;
+    if (controllerVersion !== 'legacy') {
+      setNavigationExecutionStatus('Path planner requests require the G1 SDK controller. DUET programs can still be submitted from Blocks or IDE.');
+      return;
+    }
     if (pathPlannerMode === PLANNER_PATH_MODES.autonomous) {
       if (!navigationMapSnapshot?.map || navigationRouteWaypoints.length < 1) {
         setNavigationExecutionStatus('Load a map and add at least one destination before sending an autonomous request to the teacher.');
@@ -1506,6 +1538,7 @@ export default function App() {
           code: generatedCode || '',
           controller_version: controllerVersion,
           planner_request: plannerRequest,
+          project_snapshot: buildProjectSnapshot(),
         }),
       });
       await refreshClassroomData();
@@ -1517,102 +1550,98 @@ export default function App() {
     }
   };
 
-  const handleLoadQueueItemForReview = async (item) => {
-    if (item.controller_version !== controllerVersion) {
-      setNavigationExecutionStatus(
-        `Request uses ${item.controller_version === 'duet' ? 'DUET v2' : 'legacy SDK'}; switch controller versions before loading it.`,
-      );
-      return;
-    }
-    if (item.planner_request) {
-      const request = item.planner_request;
-      if (!Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, request.planner_mode)) {
-        setNavigationExecutionStatus('Planner request has an unsupported mode and cannot be loaded.');
-        return;
-      }
-      setPathPlannerMode(request.planner_mode);
-      setPlannerProjectLabel(request.planner_label || item.name);
-      setPlannerWaypoints((request.planner_waypoints || []).map((point, index) => ({
-        id: `request-${item.id}-${index}`,
-        x: point.x,
-        y: point.y,
-      })));
-      setPlannerRouteVariants(request.route_variants || { initial: '', corrected: '', final: '' });
-      setSelectedPlannerVariant(request.selected_variant || 'initial');
-      setProjectName(request.planner_label || item.name);
-      setIsWaypointPlacementEnabled(false);
-      compiledPlannerCodeRef.current = item.code || '';
-      updateGeneratedCode(item.code || '', { syncBlocks: true });
-      setMainTab('planner');
+  const handleLoadQueueItemForReview = (item) => {
+    setQueueReviewItem(item);
+    setQueueReviewError('');
+    setQueueReviewStatus('');
+    setQueueReviewSavedProject(item.result_project || null);
+    setQueueReviewNavigationPreview(null);
+    setQueueReviewNavigationOperation(null);
+  };
 
-      if (request.planner_mode === PLANNER_PATH_MODES.autonomous && request.navigation) {
-        const nav = request.navigation;
-        const nextNavMode = nav.planner_mode === 'live' ? 'live' : 'static';
-        setNavigationPlannerMode(nextNavMode);
-        const goals = (nav.waypoints || []).map((point, index) => ({
-          id: `request-${item.id}-goal-${index}`,
-          x: point.x,
-          y: point.y,
-        }));
-        navigationRouteWaypointsRef.current = [];
-        setNavigationRouteWaypoints([]);
-        navigationMapSnapshotRef.current = null;
-        setNavigationMapSnapshot(null);
-        setIsNavigationMapVisible(false);
-        setNavigationRoutePreview(null);
-        try {
-          const result = nextNavMode === 'static'
-            ? (await apiFetch('/api/lidar/map')).map
-            : await apiFetch('/api/navigation/map');
-          const identityMatches = result?.map?.map_id === nav.map_id
-            && result?.map?.version === nav.version
-            && result?.map?.frame_id === nav.frame_id;
-          if (identityMatches) {
-            navigationMapSnapshotRef.current = result;
-            setNavigationMapSnapshot(result);
-            navigationRouteWaypointsRef.current = goals;
-            setNavigationRouteWaypoints(goals);
-            navigationWaypointFrameRef.current = {
-              map_id: nav.map_id,
-              frame_id: nav.frame_id,
-            };
-            setIsNavigationMapVisible(true);
-            setNavigationMapStatus(`Loaded teacher request map • ${nav.map_id} ${nav.version}`);
-            setNavigationExecutionStatus(
-              `Loaded ${PLANNER_MODE_LABELS[request.planner_mode]} request ${item.name} onto the planner grid. Review the ${goals.length} map goal(s) and route before approving any movement.`,
-            );
-          } else {
-            setNavigationRouteWaypoints([]);
-            setNavigationRoutePreview(null);
-            setNavigationExecutionStatus(
-              `Loaded ${item.name} request metadata, but the current map does not match ${nav.map_id} ${nav.version} (${nav.frame_id}). The route is not executable until the matching map is available.`,
-            );
-          }
-        } catch (error) {
-          setNavigationExecutionStatus(`Planner request loaded, but its map could not be restored • ${error.message}`);
-        }
-      } else {
-        setNavigationExecutionStatus(
-          `Loaded ${PLANNER_MODE_LABELS[request.planner_mode]} request ${item.name} onto the planner grid. The exact generated code is in Blocks and IDE for teacher review before execution.`,
-        );
-      }
+  const handlePreviewQueuedNavigation = async () => {
+    const navigation = queueReviewItem?.planner_request?.navigation;
+    if (!navigation) return;
+    setIsQueueReviewPreviewing(true);
+    setQueueReviewError('');
+    try {
+      const preview = await apiFetch('/api/navigation/plan', {
+        method: 'POST',
+        body: JSON.stringify(navigation),
+      });
+      setQueueReviewNavigationPreview(preview);
+      setQueueReviewStatus(`Route preview ready • ${preview.path?.length || 0} path points • no motion sent`);
+    } catch (error) {
+      setQueueReviewNavigationPreview(null);
+      setQueueReviewError(`Route preview unavailable • ${error.message}`);
+    } finally {
+      setIsQueueReviewPreviewing(false);
+    }
+  };
+
+  const handleApproveQueuedExecution = async () => {
+    if (!queueReviewItem || queueReviewItem.status !== 'queued') return;
+    if (queueReviewItem.planner_request?.planner_mode === PLANNER_PATH_MODES.autonomous
+      && !queueReviewNavigationPreview) {
+      setQueueReviewError('Preview the autonomous route before approving movement.');
       return;
     }
-    if (controllerVersion === 'duet') {
-      try {
-        parseDuetProgram(item.code);
-      } catch (error) {
-        setNavigationExecutionStatus(`Request code is invalid and was not loaded • ${error.message}`);
-        return;
-      }
+    setIsQueueReviewRunning(true);
+    setQueueReviewError('');
+    setQueueReviewStatus('Teacher approved • starting the queued request…');
+    try {
+      const result = await apiFetch('/api/classroom/run-next', {
+        method: 'POST',
+        body: JSON.stringify({ item_id: queueReviewItem.id }),
+      });
+      setQueueReviewStatus(result.status === 'completed'
+        ? result.process?.saved_project_error
+          ? `Request completed, but its project could not be saved • ${result.process.saved_project_error}`
+          : result.process?.saved_project
+            ? `Request completed and saved as ${result.process.saved_project.name}. Physical movement is not independently verified.`
+            : 'Request completed. Physical movement is not independently verified.'
+        : result.status === 'paused'
+          ? 'Request was stopped and paused.'
+        : 'Request approved and running. Waiting for the controller terminal status.');
+      if (result.item) setQueueReviewItem(result.item);
+      const savedProject = result.saved_project || result.item?.result_project;
+      if (savedProject) setQueueReviewSavedProject(savedProject);
+      if (result.operation?.operation_id) setQueueReviewNavigationOperation(result.operation);
+      const items = await refreshClassroomData();
+      const refreshedItem = items.find((item) => item.id === queueReviewItem.id);
+      setQueueReviewItem(refreshedItem || result.item || queueReviewItem);
+      if (refreshedItem?.result_project) setQueueReviewSavedProject(refreshedItem.result_project);
+    } catch (error) {
+      setQueueReviewError(`Execution was not started • ${error.message}`);
+      const items = await refreshClassroomData();
+      const refreshedItem = items.find((item) => item.id === queueReviewItem.id);
+      if (refreshedItem) setQueueReviewItem(refreshedItem);
+    } finally {
+      setIsQueueReviewRunning(false);
     }
-    codeByVersionRef.current[controllerVersion] = item.code || '';
-    compiledPlannerCodeRef.current = item.code || '';
-    updateGeneratedCode(item.code || '', { syncBlocks: true });
-    setMainTab('ide');
-    setNavigationExecutionStatus(
-      `Loaded ${item.name} from ${item.student} onto the teacher IDE. Review the exact command preview before approving execution.`,
-    );
+  };
+
+  const handleStopQueuedExecution = async () => {
+    setQueueReviewError('');
+    try {
+      if (queueReviewNavigationOperation?.operation_id) {
+        const operation = await apiFetch(
+          `/api/navigation/operation/${queueReviewNavigationOperation.operation_id}/stop`,
+          { method: 'POST' },
+        );
+        setQueueReviewNavigationOperation(operation);
+        setQueueReviewStatus('Nav2 stop requested. Waiting for its terminal status.');
+      } else if (queueReviewItem?.controller_version === 'duet') {
+        const result = await apiFetch('/api/duet/stop', { method: 'POST' });
+        setQueueReviewStatus(`DUET stop ${result.status || 'requested'}. Waiting for the queue result.`);
+      } else {
+        await apiFetch('/api/classroom/stop-current', { method: 'POST' });
+        setQueueReviewStatus('G1 SDK stop requested. Waiting for the queue result.');
+      }
+      await refreshClassroomData();
+    } catch (error) {
+      setQueueReviewError(`Stop request failed • ${error.message}`);
+    }
   };
 
   const handleRunNext = async () => {
@@ -1621,28 +1650,7 @@ export default function App() {
       alert('There are no queued requests to approve.');
       return;
     }
-    if (nextItem.planner_request) {
-      alert('Planner requests cannot be run as ordinary queue code. Load the request for teacher review, then use its matching planner controls.');
-      return;
-    }
-    if (nextItem.controller_version !== 'legacy') {
-      alert('This queue item does not target the legacy SDK. Load it for teacher review and use the matching controller workflow; it will never be sent to the legacy executor.');
-      return;
-    }
-    if (!window.confirm(
-      `Teacher approval required: run ${nextItem.name} submitted by ${nextItem.student} on ${nextItem.controller_version === 'duet' ? 'DUET v2' : 'the legacy SDK'}?\n\nExact program preview:\n${nextItem.code || '(empty program)'}`,
-    )) return;
-    try {
-      const response = await apiFetch('/api/classroom/run-next', {
-        method: 'POST',
-        body: JSON.stringify({ item_id: nextItem.id }),
-      });
-      setClassroomStatus(response.status || 'running');
-      await refreshClassroomData();
-      alert(`SDK finished sending ${response.process?.commandsExecuted ?? 0} command(s) from ${response.item?.name || 'the queued program'}. Physical movement is not verified by the SDK.`);
-    } catch (e) {
-      alert('Could not start next queue item: ' + e.message);
-    }
+    handleLoadQueueItemForReview(nextItem);
   };
 
   const handleStopCurrent = async () => {
@@ -1661,6 +1669,40 @@ export default function App() {
       await refreshClassroomData();
     } catch (e) {
       alert('Delete failed: ' + e.message);
+    }
+  };
+
+  const handleRenameProject = async (project) => {
+    const newName = window.prompt('Rename project', project.name)?.trim();
+    if (!newName || newName === project.name) return;
+    try {
+      await apiFetch('/api/classroom/project/rename', {
+        method: 'POST',
+        body: JSON.stringify({ owner: project.username, name: project.name, new_name: newName }),
+      });
+      if (project.username === currentUser.username && projectName === project.name) {
+        setProjectName(newName);
+        setPlannerProjectLabel(newName);
+      }
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not rename project: ${error.message}`);
+    }
+  };
+
+  const handleDeleteProject = async (project) => {
+    if (!window.confirm(`Delete ${project.name} from ${project.username}'s project library?`)) return;
+    try {
+      await apiFetch('/api/classroom/project/delete', {
+        method: 'POST',
+        body: JSON.stringify({ owner: project.username, name: project.name }),
+      });
+      if (project.username === currentUser.username && projectName === project.name) {
+        setProjectName('default');
+      }
+      await refreshClassroomData();
+    } catch (error) {
+      alert(`Could not delete project: ${error.message}`);
     }
   };
 
@@ -2478,27 +2520,40 @@ export default function App() {
         && processedAutonomousOperationRef.current !== operationId
       ) {
         processedAutonomousOperationRef.current = operationId;
-        try {
-          if (navigationOperation.path_trace_truncated || navigationOperation.path_trace_error) {
-            throw new Error(navigationOperation.path_trace_error || 'The executed route trace was truncated.');
+        const saveCompletedRoute = async () => {
+          try {
+            if (navigationOperation.path_trace_truncated || navigationOperation.path_trace_error) {
+              throw new Error(navigationOperation.path_trace_error || 'The executed route trace was truncated.');
+            }
+            const pathTrace = navigationOperation.path_trace || [];
+            const code = buildSdkCommandsFromTrace(pathTrace).join('\n');
+            const safeCode = sanitizeRobotCode(code).code;
+            if (!safeCode) throw new Error('The recorded route did not produce validated SDK commands.');
+            const waypoints = relativePlannerWaypointsFromTrace(pathTrace);
+            const projectLabel = (plannerProjectLabel || buildPlannerProjectName(PLANNER_PATH_MODES.autonomous)).trim();
+            const saved = await apiFetch('/api/classroom/project/save-execution', {
+              method: 'POST',
+              body: JSON.stringify({
+                name: projectLabel,
+                sceneObjects,
+                plannerWaypoints: waypoints,
+                generatedCode: safeCode,
+                duetCode: codeByVersionRef.current.duet || '',
+                plannerMode: PLANNER_PATH_MODES.autonomous,
+                plannerLabel: projectLabel,
+                plannerVariants: { corrected: safeCode, final: safeCode },
+                selectedPlannerVariant: 'final',
+              }),
+            });
+            await refreshClassroomData();
+            setNavigationExecutionStatus(
+              `Nav2 completed with ${pathTrace.length} localization feedback samples. Saved ${saved.project.name} to the shared project library; the active Blocks/IDE workspace was left unchanged.`,
+            );
+          } catch (error) {
+            setNavigationExecutionStatus(`Nav2 completed, but its executed path could not be saved as an SDK project • ${error.message}`);
           }
-          const pathTrace = navigationOperation.path_trace || [];
-          const code = buildSdkCommandsFromTrace(pathTrace).join('\n');
-          const safeCode = sanitizeRobotCode(code).code;
-          if (!safeCode) throw new Error('The recorded route did not produce validated SDK commands.');
-          const waypoints = relativePlannerWaypointsFromTrace(pathTrace);
-          setPlannerWaypoints(waypoints);
-          setPlannerRouteVariants({ initial: '', corrected: safeCode, final: safeCode });
-          setSelectedPlannerVariant('final');
-          setPlannerProjectLabel((previous) => previous || buildPlannerProjectName(pathPlannerMode));
-          compiledPlannerCodeRef.current = safeCode;
-          applyGeneratedCodeRef.current?.(safeCode, { syncBlocks: true });
-          setNavigationExecutionStatus(
-            `Nav2 completed with ${pathTrace.length} localization feedback samples. The recorded path was translated to editable SDK commands in Blocks and IDE; review before rerunning.`,
-          );
-        } catch (error) {
-          setNavigationExecutionStatus(`Nav2 completed, but its executed path could not be converted to editable SDK commands • ${error.message}`);
-        }
+        };
+        saveCompletedRoute();
       }
       return undefined;
     }
@@ -2525,7 +2580,7 @@ export default function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [navigationOperation, pathPlannerMode, apiFetch]);
+  }, [navigationOperation, pathPlannerMode, plannerProjectLabel, sceneObjects, apiFetch, refreshClassroomData]);
 
   useEffect(() => {
     const handleClickOutside = () => setActiveMenu(null);
@@ -2658,6 +2713,7 @@ export default function App() {
       delete definition.stringFields;
       delete definition.category;
       delete definition.armPreset;
+      delete definition.poseName;
       definition.extensions = definition.extensions || undefined;
       return definition;
     });
@@ -2884,6 +2940,7 @@ export default function App() {
       setSceneObjects([]);
       setSelectedSceneObjectId(null);
       setPlannerWaypoints([]);
+      setOriginalPlannerCode('');
       setIsWaypointPlacementEnabled(false);
       applyGeneratedCode('', { syncBlocks: false });
       setIsPreviewPlaying(false);
@@ -2913,12 +2970,31 @@ export default function App() {
         return;
       }
     }
-    setProjectName(project.name || meta.plannerLabel || 'default');
-    setPlannerProjectLabel(meta.plannerLabel || project.name || 'default');
+    const projectOwner = project.username || currentUser.username;
+    const sourceName = project.name || meta.plannerLabel || 'default';
+    let destinationName = sourceName;
+    if (projectOwner !== currentUser.username) {
+      const ownedNames = new Set(projectLibrary
+        .filter((entry) => entry.username === currentUser.username)
+        .map((entry) => entry.name));
+      let suffix = 1;
+      destinationName = `${sourceName} (copy)`;
+      while (ownedNames.has(destinationName)) {
+        suffix += 1;
+        destinationName = `${sourceName} (copy ${suffix})`;
+      }
+    }
+    setProjectName(destinationName);
+    setPlannerProjectLabel(projectOwner !== currentUser.username
+      ? destinationName
+      : meta.plannerLabel || project.name || 'default');
     if (meta.plannerMode && Object.prototype.hasOwnProperty.call(PLANNER_PATH_MODES, meta.plannerMode)) {
       setPathPlannerMode(meta.plannerMode);
     }
     setPlannerRouteVariants(meta.plannerVariants || { initial: cleanLegacyCode, corrected: cleanLegacyCode, final: cleanLegacyCode });
+    setOriginalPlannerCode(meta.plannerMode === PLANNER_PATH_MODES.sensor_corrected
+      ? meta.plannerVariants?.initial || ''
+      : '');
     setSelectedPlannerVariant(meta.selectedPlannerVariant || 'final');
     setSceneObjects(Array.isArray(project.sceneObjects) ? project.sceneObjects : []);
     setSelectedSceneObjectId(null);
@@ -3025,17 +3101,28 @@ export default function App() {
         throw new Error('Backend did not confirm completion with a recorded SDK command sequence.');
       }
       const correctedCode = result.correctedCode;
-      setPlannerRouteVariants({
-        initial: plannerRouteVariants.initial,
-        corrected: correctedCode,
-        final: correctedCode,
+      const projectLabel = (plannerProjectLabel || buildPlannerProjectName(pathPlannerMode)).trim();
+      const saved = await apiFetch('/api/classroom/project/save-execution', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: projectLabel,
+          sceneObjects,
+          plannerWaypoints,
+          generatedCode: correctedCode,
+          duetCode: codeByVersionRef.current.duet || '',
+          plannerMode: PLANNER_PATH_MODES.sensor_corrected,
+          plannerLabel: projectLabel,
+          plannerVariants: {
+            initial: plannerRouteVariants.initial,
+            corrected: correctedCode,
+            final: correctedCode,
+          },
+          selectedPlannerVariant: 'corrected',
+        }),
       });
-      setSelectedPlannerVariant('corrected');
-      setPlannerProjectLabel((previous) => previous || buildPlannerProjectName(pathPlannerMode));
-      compiledPlannerCodeRef.current = correctedCode;
-      updateGeneratedCode(correctedCode);
+      await refreshClassroomData();
       setNavigationExecutionStatus(
-        `SDK route completed • ${result.checkpoints.length} waypoint checkpoints confirmed within 0.25 m. Corrected executed commands are now in Blocks and IDE; physical accuracy remains unverified.`,
+        `SDK route completed • ${result.checkpoints.length} waypoint checkpoints confirmed. Saved ${saved.project.name} to the shared project library; the original compiled route is retained there. Physical accuracy remains unverified.`,
       );
     } catch (error) {
       setNavigationExecutionStatus(`Checkpointed SDK route stopped or rejected • ${error.message}`);
@@ -3119,6 +3206,53 @@ export default function App() {
   };
 
   const activeObstacles = useMemo(() => sceneObjects, [sceneObjects]);
+  const queueReviewSnapshot = queueReviewItem?.project_snapshot || {};
+  const queueReviewPlannerRequest = queueReviewItem?.planner_request;
+  const queueReviewWaypoints = queueReviewPlannerRequest?.planner_waypoints
+    || queueReviewSnapshot.plannerWaypoints
+    || [];
+
+  useEffect(() => {
+    const operationId = queueReviewNavigationOperation?.operation_id;
+    if (!operationId) return undefined;
+    let active = true;
+    let timer;
+    const pollOperation = async () => {
+      try {
+        const operation = await apiFetch(`/api/navigation/operation/${operationId}`);
+        if (!active) return;
+        setQueueReviewNavigationOperation(operation);
+        if (operation.saved_project) setQueueReviewSavedProject(operation.saved_project);
+        if (['completed', 'succeeded', 'canceled', 'failed'].includes(operation.status)) {
+          window.clearInterval(timer);
+          const completed = ['completed', 'succeeded'].includes(operation.status);
+          const queueStatus = completed ? 'completed' : operation.status === 'canceled' ? 'paused' : 'failed';
+          setQueueReviewStatus(completed
+            ? operation.saved_project
+              ? `Autonomous request completed and saved as ${operation.saved_project.name}. Physical movement is not independently verified.`
+              : operation.saved_project_error
+                ? `Autonomous request completed, but its project could not be saved • ${operation.saved_project_error}`
+                : 'Autonomous request completed. Physical movement is not independently verified.'
+            : `Autonomous request ${operation.status}.`);
+          setQueueReviewItem((item) => item?.id === operation.route?.queue_item_id
+            ? { ...item, status: queueStatus }
+            : item);
+          const items = await refreshClassroomData();
+          const item = items.find((entry) => entry.id === operation.route?.queue_item_id);
+          if (item) setQueueReviewItem(item);
+          if (item?.result_project) setQueueReviewSavedProject(item.result_project);
+        }
+      } catch (error) {
+        if (active) setQueueReviewError(`Could not refresh operation status • ${error.message}`);
+      }
+    };
+    pollOperation();
+    timer = window.setInterval(pollOperation, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [queueReviewNavigationOperation?.operation_id, apiFetch, refreshClassroomData]);
 
   const previewPreviewState = useCallback(() => {
     try {
@@ -3258,14 +3392,21 @@ export default function App() {
           } else if (node.type === 'command') {
             const definition = (controllerVersion === 'duet' ? DUET_COMMANDS : G1_COMMANDS)
               .find((entry) => entry.method === node.method);
-            definition.args.forEach((argument, index) => {
-              if (block.getField(argument.name)) {
-                block.setFieldValue(String(node.values[index]), argument.name);
+            definition?.args.forEach((argument, index) => {
+              const valueIndex = node.poseName && definition.poseInput ? index - 1 : index;
+              if (block.getField(argument.name) && node.values[valueIndex] !== undefined) {
+                block.setFieldValue(String(node.values[valueIndex]), argument.name);
               }
             });
           }
           block.initSvg();
           block.render();
+          if (node.type === 'command' && node.poseName) {
+            const poseBlock = workspace.newBlock(`duet_pose_target_${node.poseName}`);
+            poseBlock.initSvg();
+            poseBlock.render();
+            block.getInput('POSE').connection.connect(poseBlock.outputConnection);
+          }
           if (previousBlock) previousBlock.nextConnection.connect(block.previousConnection);
           else if (parentConnection) parentConnection.connect(block.previousConnection);
           if (node.type === 'repeat') createBlocks(node.body, block.getInput('DO').connection);
@@ -4400,24 +4541,31 @@ export default function App() {
                       onClick={() => handleLoadQueueItemForReview(item)}
                       className="mt-2 rounded-md border border-blue-200 px-2 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-50"
                     >
-                      Load for teacher review
+                      Review request
                     </button>
                     <button onClick={() => handleDeleteQueueItem(item.id)} className="mt-2 text-xs text-red-600 hover:text-red-700">Delete</button>
                   </div>
                 ))}
 
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Student projects</p>
+                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Shared project library</p>
                   <div className="mt-2 space-y-2">
                     {projectLibrary.length === 0 ? (
-                      <p className="text-xs text-slate-500">No student projects yet.</p>
+                      <p className="text-xs text-slate-500">No saved projects yet.</p>
                     ) : projectLibrary.map((project) => (
                       <div key={`${project.username}-${project.name}`} className="rounded-lg border border-slate-200 bg-white p-2">
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-sm font-medium text-slate-800">{project.name}</span>
-                          <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{project.username}</span>
+                          <div className="flex shrink-0 items-center gap-1">
+                            {project.plannerMode && <span className="text-[9px] uppercase rounded-full bg-cyan-100 text-cyan-800 px-2 py-1">{PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}</span>}
+                            <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{project.username}</span>
+                          </div>
                         </div>
-                        <button type="button" onClick={() => loadProjectFromLibrary(project)} className="mt-2 text-xs text-blue-600 hover:text-blue-700">Open project</button>
+                        <div className="mt-2 flex flex-wrap items-center gap-3">
+                          <button type="button" onClick={() => loadProjectFromLibrary(project)} className="text-xs text-blue-600 hover:text-blue-700">Open project</button>
+                          <button type="button" onClick={() => handleRenameProject(project)} className="text-xs text-slate-600 hover:text-slate-900">Rename</button>
+                          <button type="button" onClick={() => handleDeleteProject(project)} className="text-xs text-red-600 hover:text-red-700">Delete</button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -4426,19 +4574,18 @@ export default function App() {
             ) : (
               <>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">My saved path projects</p>
+                  <p className="text-[10px] uppercase tracking-wide text-slate-600 font-semibold">Shared project library</p>
                   <div className="mt-2 space-y-2">
                     {projectLibrary.length === 0 ? (
                       <p className="text-xs text-slate-500">No saved projects yet.</p>
                     ) : projectLibrary.map((project) => (
-                      <div key={project.name} className="rounded-lg border border-slate-200 bg-white p-2">
+                      <div key={`${project.username}-${project.name}`} className="rounded-lg border border-slate-200 bg-white p-2">
                         <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-medium text-slate-800">{project.plannerLabel || project.name}</span>
-                          {project.plannerMode && (
-                            <span className="text-[10px] uppercase rounded-full bg-cyan-100 text-cyan-800 px-2 py-1">
-                              {PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}
-                            </span>
-                          )}
+                          <span className="min-w-0 truncate text-sm font-medium text-slate-800">{project.name}</span>
+                          <div className="flex shrink-0 items-center gap-1">
+                            {project.plannerMode && <span className="text-[9px] uppercase rounded-full bg-cyan-100 text-cyan-800 px-2 py-1">{PLANNER_MODE_LABELS[project.plannerMode] || project.plannerMode}</span>}
+                            <span className="text-[10px] uppercase rounded-full bg-slate-100 text-slate-600 px-2 py-1">{project.username}</span>
+                          </div>
                         </div>
                         <button type="button" onClick={() => loadProjectFromLibrary(project)} className="mt-2 text-xs text-blue-600 hover:text-blue-700">Open project</button>
                       </div>
@@ -4936,6 +5083,12 @@ export default function App() {
                         {generatedCode || '# Python code will appear here'}
                       </pre>
                     </div>
+                    {originalPlannerCode && pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && (
+                      <details open className="rounded-xl border border-amber-800 bg-amber-950/30 p-3">
+                        <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-amber-200">Original route · read only</summary>
+                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-amber-100">{originalPlannerCode}</pre>
+                      </details>
+                    )}
                 </div>
 
                 {mainTab === 'planner' && (
@@ -5701,12 +5854,7 @@ export default function App() {
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-xs text-slate-200">
                         {(controllerVersion === 'duet'
-                          ? DUET_COMMANDS.map((command) => [
-                            command.label,
-                            `duet.${command.method}(${command.args.map((argument) => argument.kind === 'choice'
-                              ? JSON.stringify(argument.value)
-                              : String(argument.value)).join(', ')})`,
-                          ])
+                          ? getDuetCommandExamples().map(({ label, code }) => [label, code])
                           : [
                             ['Stand / Ready', 'robot.stand()'],
                             ['Walk Forward (3 steps)', 'robot.walk(3)'],
@@ -5734,15 +5882,17 @@ export default function App() {
                         {controllerVersion === 'duet' ? 'Executable DUET commands' : 'Executable robot commands'}
                       </p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-[10px]">
-                        {(controllerVersion === 'duet' ? DUET_COMMANDS : G1_EXECUTABLE_COMMANDS).flatMap((command) => {
+                        {(controllerVersion === 'duet'
+                          ? getDuetCommandExamples().map((example) => ({
+                            ...example,
+                            method: example.key,
+                            description: example.label,
+                            script: example.code,
+                          }))
+                          : G1_EXECUTABLE_COMMANDS).flatMap((command) => {
                           if (controllerVersion === 'duet') {
-                            const args = command.args.map((argument) => argument.kind === 'choice'
-                              ? JSON.stringify(argument.value)
-                              : String(argument.value));
                             return [{
                               ...command,
-                              key: command.method,
-                              script: `duet.${command.method}(${args.join(', ')})`,
                             }];
                           }
                           if (command.method === 'arm_action') {
@@ -5800,6 +5950,12 @@ export default function App() {
                     {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
                     {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
                     <p className="text-[10px] text-slate-400">IDE text is synchronized to Blocks when you leave the editor. Incomplete or unsupported lines remain editable here but cannot be shown as Blocks.</p>
+                    {originalPlannerCode && pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && (
+                      <details open className="rounded-xl border border-amber-800 bg-amber-950/30 p-3">
+                        <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-amber-200">Original route · read only</summary>
+                        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-amber-100">{originalPlannerCode}</pre>
+                      </details>
+                    )}
                     {controllerVersion === 'duet'
                       ? <p className="text-[10px] text-amber-300">DUET supports bounded base-velocity commands, fixed carry/forward/box-hold arm poses and sequences built only from those poses, waits, and stop. These are not arbitrary joint targets; physical arm commands require the controller&apos;s separate DUET_ARM_ACCEPT gate. Simulator motion is a preview only.</p>
                       : <p className="text-[10px] text-slate-400">The IDE and Blocks support front-obstacle distance conditions. Physical conditions require a fresh MID-360 reading (500 ms maximum) from the configured provider; missing or stale readings abort and request a stop.</p>}
@@ -5814,6 +5970,189 @@ export default function App() {
           )}
         </div>
       </div>
+      {queueReviewItem && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/70 p-3 sm:p-6"
+          role="presentation"
+          onClick={() => {
+            if (!isQueueReviewRunning && !queueReviewNavigationOperation) setQueueReviewItem(null);
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="queue-review-title"
+            className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-slate-700 bg-slate-950 text-slate-100 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-300">Teacher approval required</p>
+                <h2 id="queue-review-title" className="mt-1 truncate text-base font-semibold">{queueReviewItem.name}</h2>
+                <p className="mt-1 text-xs text-slate-400">
+                  Submitted by {queueReviewItem.student} · {queueReviewItem.controller_version === 'duet' ? 'DUET v2' : 'G1 SDK'} · {queueReviewItem.status}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setQueueReviewItem(null)}
+                disabled={isQueueReviewRunning || Boolean(queueReviewNavigationOperation && !['completed', 'succeeded', 'canceled', 'failed'].includes(queueReviewNavigationOperation.status))}
+                aria-label="Close request review"
+                className="rounded-md p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40"
+              >
+                <X size={18} />
+              </button>
+            </header>
+
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+              {queueReviewPlannerRequest && (
+                <div className="rounded-md border border-cyan-900 bg-cyan-950/40 p-3">
+                  <p className="text-xs font-semibold text-cyan-200">
+                    {PLANNER_MODE_LABELS[queueReviewPlannerRequest.planner_mode] || queueReviewPlannerRequest.planner_mode}
+                  </p>
+                  <p className="mt-1 text-[11px] text-slate-300">
+                    {queueReviewPlannerRequest.planner_mode === PLANNER_PATH_MODES.autonomous
+                      ? `${queueReviewPlannerRequest.navigation?.waypoints?.length || 0} map goals · ${queueReviewPlannerRequest.navigation?.map_id || 'map unavailable'} ${queueReviewPlannerRequest.navigation?.version || ''}`
+                      : `${queueReviewWaypoints.length} planner-grid waypoints`}
+                  </p>
+                </div>
+              )}
+
+              <details open className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                <summary className="cursor-pointer text-xs font-semibold text-slate-200">Exact command preview</summary>
+                <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded bg-black/50 p-3 font-mono text-[11px] leading-5 text-emerald-200">
+                  {queueReviewItem.code || '(No direct SDK commands; review planner goals and generated route data below.)'}
+                </pre>
+              </details>
+
+              {queueReviewPlannerRequest && queueReviewPlannerRequest.planner_mode !== PLANNER_PATH_MODES.autonomous && (
+                <section className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                  <h3 className="text-xs font-semibold text-slate-200">Submitted planner grid</h3>
+                  {queueReviewWaypoints.length > 0 ? (
+                    <svg viewBox="0 0 400 240" role="img" aria-label="Submitted planner waypoints" className="mt-2 h-48 w-full rounded bg-slate-950">
+                      <path d="M 40 120 H 360 M 200 20 V 220" stroke="#334155" strokeWidth="1" />
+                      {queueReviewWaypoints.length > 1 && (
+                        <polyline
+                          points={queueReviewWaypoints.map((point) => `${200 + Number(point.x) * 16},${120 - Number(point.y) * 10}`).join(' ')}
+                          fill="none"
+                          stroke="#22d3ee"
+                          strokeWidth="3"
+                        />
+                      )}
+                      {queueReviewWaypoints.map((point, index) => (
+                        <g key={`${point.x}:${point.y}:${index}`}>
+                          <circle cx={200 + Number(point.x) * 16} cy={120 - Number(point.y) * 10} r="7" fill={index === 0 ? '#34d399' : '#f59e0b'} />
+                          <text x={208 + Number(point.x) * 16} y={116 - Number(point.y) * 10} fill="#e2e8f0" fontSize="10">{index + 1}</text>
+                        </g>
+                      ))}
+                    </svg>
+                  ) : <p className="mt-2 text-xs text-slate-400">No planner-grid waypoints were saved with this request.</p>}
+                  <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-black/40 p-2 font-mono text-[10px] text-slate-300">
+                    {JSON.stringify(queueReviewWaypoints, null, 2)}
+                  </pre>
+                </section>
+              )}
+
+              {queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && (
+                <section className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-xs font-semibold text-slate-200">Autonomous route preview</h3>
+                    <button
+                      type="button"
+                      onClick={handlePreviewQueuedNavigation}
+                      disabled={isQueueReviewPreviewing || isQueueReviewRunning}
+                      className="rounded-md border border-emerald-700 px-2.5 py-1.5 text-[10px] font-semibold text-emerald-200 disabled:opacity-50"
+                    >
+                      {isQueueReviewPreviewing ? 'Planning…' : 'Preview route · no motion'}
+                    </button>
+                  </div>
+                  <p className="mt-2 text-[10px] text-slate-400">
+                    Map {queueReviewPlannerRequest.navigation?.map_id} · version {queueReviewPlannerRequest.navigation?.version} · frame {queueReviewPlannerRequest.navigation?.frame_id}
+                  </p>
+                  <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-black/40 p-2 font-mono text-[10px] text-slate-300">
+                    {JSON.stringify(queueReviewPlannerRequest.navigation?.waypoints || [], null, 2)}
+                  </pre>
+                  {queueReviewNavigationPreview && (
+                    <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-black/40 p-2 font-mono text-[10px] text-cyan-200">
+                      {JSON.stringify(queueReviewNavigationPreview.path || [], null, 2)}
+                    </pre>
+                  )}
+                </section>
+              )}
+
+              <details open className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                <summary className="cursor-pointer text-xs font-semibold text-slate-200">Complete submitted project state</summary>
+                <dl className="mt-2 grid grid-cols-1 gap-2 text-[11px] sm:grid-cols-2">
+                  <div><dt className="text-slate-500">Project name</dt><dd className="break-words text-slate-200">{queueReviewSnapshot.name || queueReviewPlannerRequest?.planner_label || queueReviewItem.name}</dd></div>
+                  <div><dt className="text-slate-500">Planner mode</dt><dd className="text-slate-200">{PLANNER_MODE_LABELS[queueReviewSnapshot.plannerMode] || queueReviewSnapshot.plannerMode || queueReviewPlannerRequest?.planner_mode || 'Not set'}</dd></div>
+                  <div><dt className="text-slate-500">Planner label</dt><dd className="break-words text-slate-200">{queueReviewSnapshot.plannerLabel || queueReviewPlannerRequest?.planner_label || 'Not set'}</dd></div>
+                  <div><dt className="text-slate-500">Selected route variant</dt><dd className="text-slate-200">{queueReviewSnapshot.selectedPlannerVariant || queueReviewPlannerRequest?.selected_variant || 'Not set'}</dd></div>
+                </dl>
+                {[
+                  ['Scene objects', queueReviewSnapshot.sceneObjects || []],
+                  ['Saved planner waypoints', queueReviewSnapshot.plannerWaypoints || []],
+                  ['Planner route variants', queueReviewSnapshot.plannerVariants || queueReviewPlannerRequest?.route_variants || {}],
+                  ['Legacy generated code', queueReviewSnapshot.generatedCode || ''],
+                  ['DUET generated code', queueReviewSnapshot.duetCode || ''],
+                ].map(([label, value]) => (
+                  <details key={label} open className="mt-2 rounded bg-black/30 p-2">
+                    <summary className="cursor-pointer text-[10px] font-semibold text-slate-300">{label}</summary>
+                    <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] text-slate-400">
+                      {typeof value === 'string' ? value || '(empty)' : JSON.stringify(value, null, 2)}
+                    </pre>
+                  </details>
+                ))}
+              </details>
+
+              {queueReviewError && <p role="alert" className="text-xs text-red-300">{queueReviewError}</p>}
+              {queueReviewStatus && <p role="status" aria-live="polite" className="text-xs text-cyan-200">{queueReviewStatus}</p>}
+              {queueReviewSavedProject && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-emerald-800 bg-emerald-950/40 p-3">
+                  <p className="min-w-0 text-xs text-emerald-200">Saved project: {queueReviewSavedProject.name}</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      loadProjectFromLibrary(queueReviewSavedProject);
+                      setQueueReviewItem(null);
+                    }}
+                    className="rounded-md bg-emerald-700 px-2.5 py-1.5 text-[10px] font-semibold text-white hover:bg-emerald-600"
+                  >
+                    Open project
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <footer className="flex flex-wrap justify-end gap-2 border-t border-slate-800 px-4 py-3">
+              {(isQueueReviewRunning || Boolean(queueReviewNavigationOperation && !['completed', 'succeeded', 'canceled', 'failed'].includes(queueReviewNavigationOperation.status))) && (
+                <button
+                  type="button"
+                  onClick={handleStopQueuedExecution}
+                  className="mr-auto rounded-md bg-red-700 px-3 py-2 text-xs font-semibold text-white hover:bg-red-600"
+                >
+                  Request stop
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setQueueReviewItem(null)}
+                disabled={isQueueReviewRunning || Boolean(queueReviewNavigationOperation && !['completed', 'succeeded', 'canceled', 'failed'].includes(queueReviewNavigationOperation.status))}
+                className="rounded-md border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 disabled:opacity-50"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                onClick={handleApproveQueuedExecution}
+                disabled={isQueueReviewRunning || queueReviewItem.status !== 'queued' || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
+                className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isQueueReviewRunning ? 'Starting…' : 'Approve & run queued request'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

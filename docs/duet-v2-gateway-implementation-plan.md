@@ -14,7 +14,7 @@ The physical base-motion allowlist is:
 - `wait(duration)` as a program-timing operation.
 - `stop()` as an explicit stop request.
 
-Arm control is limited to the existing named `carry`, `forward`, and `box_hold` presets. It accepts a bounded lease, never arbitrary joint values, and is exposed by the gateway only when the controller process has the separate `DUET_ARM_ACCEPT=1` gate enabled. The app preflights that capability before running any program that contains an arm command. A pose lease/status is not feedback that the robot reached the target; the live `rt/arm_targets` stream retains priority. The separate arm gate must remain off until supervised arm acceptance on the exact robot and policy. Simulator output remains an approximate command-space preview and is not evidence of hardware safety.
+The original `arm_pose` protocol is limited to the named `carry`, `forward`, and `box_hold` presets and the separate `DUET_ARM_ACCEPT=1` gate. The V2 named-pose and legacy-gesture extension uses a distinct `arm_targets` capability: a bounded, catalog-validated ten-joint target and an explicit reset request. That protocol is not implemented by the gateway source present in this checkout, so the backend must reject physical arm-target programs unless a controller advertises the capability. Neither a lease nor status is feedback that the robot reached a target; simulator output is only an approximate command-space preview.
 
 ## Implementation phases
 
@@ -33,7 +33,7 @@ Arm control is limited to the existing named `carry`, `forward`, and `box_hold` 
 3. **Wire the app and backend**
    - Replace the placeholder external-gateway assumption with the concrete local service transport and protocol.
    - Keep separate DUET connect/status/run/stop/disconnect routes and preserve the existing SDK path unchanged.
-   - Enforce the same base-motion limits and named-pose-only arm allowlist in the browser, backend, and controller ingress; reject arm programs before execution if the controller does not advertise the arm capability.
+   - Enforce the same base-motion limits and catalog/workspace-bounded arm-target allowlist in the browser, backend, and controller ingress; reject arm programs before execution if the controller does not advertise the required arm capability.
    - Add an additive ownership interlock across legacy SDK routes, navigation, scans, and other physical motion entry points; fail closed if ownership cannot be verified.
    - Add controller-version metadata to queued classroom programs or explicitly disallow DUET queue execution until queue routing is version-aware; never send DUET code through the legacy SDK executor.
 
@@ -106,3 +106,10 @@ Arm control is limited to the existing named `carry`, `forward`, and `box_hold` 
 - **Blocks/IDE behavior:** The paired action is shown under **Concurrent actions** and is also available from the DUET IDE command catalog. All other commands remain sequential. Place the paired action inside the existing bounded repeat/`for _ in range(n)` block to repeat concurrent pairs; each iteration completes both leases before the next command begins. There is no unbounded `while` loop.
 - **Backend behavior:** The runner requests the named arm-pose lease, refreshes bounded base velocity while checking that both leases remain active, then requests zero base velocity while preserving the arm lease until it ends. It fails closed with a stop request if controller readiness or either lease is lost.
 - **Not hardware-verified:** This repository does not include the robot-side gateway source or deployment artifact needed to verify that `ARM_POSE` and `MOVE` remain independent simultaneously. The target gateway must preserve both leases and report arm-lease status during every `MOVE` response before this feature can be considered physically executable. Keep `DUET_PHYSICAL_ENABLED` and `DUET_ARM_ACCEPT` unset until that controller integration is built and supervised acceptance is completed on the exact robot and policy.
+
+## Latest status — Named arm targets, mirrored gestures, and pose holds
+
+- **V2 UI/catalog:** DUET V2 has a shared arm catalog in `src/sim/duetArmCatalog.json`, containing bounded ten-joint targets, left/right mirrors, static pose targets, and trajectories corresponding to the legacy arm-action names. Each gesture is a separate Blockly/IDE command; static poses are draggable output blocks for the shared timed-hold and until-reset commands.
+- **Hold/reset behavior:** Timed holds accept 1–30 seconds and return to carry. Until-reset holds require `duet.reset_arms()` before another arm motion; the backend also requests a return to carry/default when a program completes, is stopped, or is disconnected. The simulator previews these paths but does not validate physical safety or target attainment.
+- **Backend protocol and deployment gap:** DUET backend arm targets require the controller to advertise `arm_targets`; requests use `ARM_TARGETS <lease_ms> <10 joint positions in radians>` and `RESET_ARMS`. Existing gateway support for the separate `arm_pose` capability does not imply support for these new requests. The matching gateway implementation is not present in this checkout, so physical arm-target execution remains fail-closed until that controller protocol is implemented and accepted.
+- **Physical gate:** Keep `DUET_PHYSICAL_ENABLED` unset until the target gateway implements the advertised arm-target contract and supervised acceptance is completed on the exact robot and policy. Catalog targets and simulator previews are not hardware acceptance.
