@@ -33,4 +33,35 @@ export class DuetRobotConnection {
   async stop() {
     return this.request('/api/duet/stop', { method: 'POST' });
   }
+
+  async commissioningStatus() {
+    return this.request('/api/duet/commissioning', { cache: 'no-store' });
+  }
+
+  async startCommissioning() {
+    return this.request('/api/duet/commissioning/start', { method: 'POST' });
+  }
+
+  async runCommissioningStep(stepIndex) {
+    return this.request('/api/duet/commissioning/step', {
+      method: 'POST',
+      body: JSON.stringify({ step_index: stepIndex }),
+    });
+  }
+
+  async reviewCommissioningStep(stepIndex, { passed, observed, notes = '' }) {
+    return this.request('/api/duet/commissioning/review', {
+      method: 'POST',
+      body: JSON.stringify({
+        step_index: stepIndex,
+        passed,
+        observed,
+        notes,
+      }),
+    });
+  }
+
+  async abortCommissioning() {
+    return this.request('/api/duet/commissioning/abort', { method: 'POST' });
+  }
 }

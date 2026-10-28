@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -27,7 +28,12 @@ except ImportError:
 DUET_ROBOT_MODEL = "g1_23dof"
 DUET_PROTOCOL = "uni-edu-duet-v1"
 DUET_BASE_CAPABILITIES = {"base_velocity", "wait", "stop"}
-DUET_ALLOWED_CAPABILITIES = DUET_BASE_CAPABILITIES | {"arm_pose", "arm_targets"}
+DUET_ALLOWED_CAPABILITIES = DUET_BASE_CAPABILITIES | {
+    "arm_pose",
+    "arm_targets",
+    "arm_feedback",
+    "gateway_identity",
+}
 DUET_MOVEMENT_PRESETS = {
     "forward": (0.15, 0.0, 0.0),
     "backward": (-0.1, 0.0, 0.0),
@@ -155,6 +161,8 @@ COMMAND_REFRESH_SECONDS = 0.1
 _run_lock = threading.Lock()
 _run_state_lock = threading.Lock()
 _stop_requested = threading.Event()
+_commissioning_lock = threading.RLock()
+_commissioning_state: dict | None = None
 
 
 class DuetControllerError(RuntimeError):
@@ -171,6 +179,82 @@ def _gateway_configuration() -> tuple[Path, Path]:
     if not control_dir.is_absolute():
         raise DuetControllerError("DUET_CONTROL_DIR must be an absolute local directory path.")
     return control_dir / "controller.sock", control_dir / "controller.lock"
+
+
+def _commissioning_report_path() -> Path:
+    socket_path, _ = _gateway_configuration()
+    return socket_path.parent / "commissioning_report.json"
+
+
+def _commissioning_log_path() -> Path:
+    socket_path, _ = _gateway_configuration()
+    return socket_path.parent / "commissioning.jsonl"
+
+
+def _catalog_digest() -> str:
+    return hashlib.sha256(DUET_ARM_CATALOG_PATH.read_bytes()).hexdigest()
+
+
+def _backend_digest() -> str:
+    source_files = (Path(__file__), Path(__file__).with_name("server.py"))
+    digest = hashlib.sha256()
+    for source_file in source_files:
+        digest.update(source_file.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(source_file.read_bytes())
+    return digest.hexdigest()
+
+
+def _require_commissioning_enabled() -> None:
+    if os.getenv("DUET_PHYSICAL_ENABLED", "").strip().lower() != "true":
+        raise DuetControllerError(
+            "DUET physical movement is disabled. Enable the backend physical master switch before commissioning."
+        )
+    if os.getenv("DUET_COMMISSIONING_ENABLED", "").strip().lower() != "true":
+        raise DuetControllerError(
+            "Teacher commissioning is disabled. Set DUET_COMMISSIONING_ENABLED=true to permit the supervised test workflow."
+        )
+
+
+def _read_commissioning_report() -> dict:
+    report_path = _commissioning_report_path()
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise DuetControllerError(
+            "DUET physical execution is locked: complete and review the teacher commissioning test first."
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise DuetControllerError(f"Could not read the DUET commissioning acceptance report: {error}") from error
+    if not isinstance(report, dict):
+        raise DuetControllerError("DUET commissioning acceptance report has an invalid format.")
+    return report
+
+
+def _write_commissioning_report(report: dict, event: str, details: dict | None = None) -> None:
+    report_path = _commissioning_report_path()
+    log_path = _commissioning_log_path()
+    report_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary_path = report_path.with_name(f".{report_path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary_path.open("x", encoding="utf-8") as report_file:
+        os.chmod(temporary_path, 0o600)
+        report_file.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        report_file.flush()
+        os.fsync(report_file.fileno())
+    os.replace(temporary_path, report_path)
+    log_entry = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+        "report_id": report.get("report_id"),
+        "status": report.get("status"),
+        **(details or {}),
+    }
+    with log_path.open("a", encoding="utf-8") as log_file:
+        os.chmod(log_path, 0o600)
+        log_file.write(json.dumps(log_entry, sort_keys=True) + "\n")
+        log_file.flush()
+        os.fsync(log_file.fileno())
+    print(f"[DUET commissioning] {json.dumps(log_entry, sort_keys=True)}", flush=True)
 
 
 def _gateway_request(command: str) -> dict:
@@ -225,15 +309,429 @@ def _controller_process_lock_held(lock_path: Path) -> bool:
 def _require_hardware_acceptance() -> str:
     if os.getenv("DUET_PHYSICAL_ENABLED", "").strip().lower() != "true":
         raise DuetControllerError(
-            "DUET physical execution is disabled until supervised G1 hardware acceptance is completed."
+            "DUET physical execution is disabled by the backend physical master switch."
         )
     policy_id = os.getenv("DUET_EXPECTED_POLICY_ID", "").strip()
-    acceptance_id = os.getenv("DUET_HARDWARE_ACCEPTANCE_ID", "").strip()
-    if not policy_id or policy_id == "unverified" or not acceptance_id:
+    if not policy_id or policy_id == "unverified":
         raise DuetControllerError(
-            "A verified DUET_EXPECTED_POLICY_ID and DUET_HARDWARE_ACCEPTANCE_ID are required after hardware acceptance."
+            "DUET_EXPECTED_POLICY_ID must be the SHA-256 identity of the deployed policy."
+        )
+    report = _read_commissioning_report()
+    steps = report.get("steps")
+    if (
+        report.get("status") != "passed"
+        or not isinstance(report.get("acceptance_id"), str)
+        or not report.get("acceptance_id")
+        or report.get("policy_id") != policy_id
+        or report.get("robot_model") != DUET_ROBOT_MODEL
+        or report.get("robot_id") != os.getenv("DUET_ROBOT_ID", "").strip()
+        or not report.get("robot_id")
+        or report.get("catalog_sha256") != _catalog_digest()
+        or report.get("backend_sha256") != _backend_digest()
+        or not isinstance(report.get("gateway_build_id"), str)
+        or not report.get("gateway_build_id")
+        or report.get("teacher_reviewed") is not True
+        or not isinstance(steps, list)
+        or not steps
+        or any(
+            step.get("status") != "passed"
+            or not isinstance(step.get("review"), dict)
+            or step["review"].get("passed") is not True
+            or step["review"].get("physical_result_observed") is not True
+            for step in steps
+            if isinstance(step, dict)
+        )
+        or any(not isinstance(step, dict) for step in steps)
+        or not isinstance(report.get("capabilities"), list)
+        or "arm_targets" not in report.get("capabilities", [])
+        or not {"arm_feedback", "gateway_identity"}.issubset(report.get("capabilities", []))
+    ):
+        raise DuetControllerError(
+            "DUET physical execution is locked: the passed commissioning report does not match the deployed policy, robot, and arm catalog."
+        )
+    controller = _validate_controller_status(_gateway_request("STATUS"))
+    if controller.get("gateway_build_id") != report["gateway_build_id"]:
+        raise DuetControllerError(
+            "DUET physical execution is locked: the controller gateway binary differs from the commissioned build."
         )
     return policy_id
+
+
+def _commissioning_steps() -> list[dict]:
+    steps = [
+        {
+            "id": f"base-{name}",
+            "title": f"Base movement: {name.replace('_', ' ')}",
+            "category": "base",
+            "code": (
+                f"duet.move({velocity[0]}, {velocity[1]}, {velocity[2]}, 0.5)"
+            ),
+            "expected": "Controller accepts the bounded command, produces the requested brief movement, then confirms zero velocity.",
+        }
+        for name, velocity in DUET_MOVEMENT_PRESETS.items()
+    ]
+    steps.append({
+        "id": "concurrent-base-arm",
+        "title": "Concurrent base and arm control",
+        "category": "concurrent",
+        "code": (
+            "with duet.concurrent():\n"
+            "    duet.move(0.05, 0, 0, 0.5)\n"
+            "    duet.arm_carry(2.5)"
+        ),
+        "expected": "The base moves briefly while the approved arm target is active; both return to rest/carry.",
+    })
+    steps.append({
+        "id": "move-and-arm",
+        "title": "Combined move-and-arm command",
+        "category": "concurrent",
+        "code": 'duet.move_and_arm(0.05, 0, 0, 0.5, "left_raise_mid", 1)',
+        "expected": "The base moves while the bounded arm target stays active, then the base stops and the arms return to carry.",
+    })
+    steps.append({
+        "id": "hold-until-reset",
+        "title": "Hold pose until explicit reset",
+        "category": "arm_reset",
+        "code": (
+            'duet.hold_pose_until_reset(duet.pose("both_chest_hold"))\n'
+            "duet.wait(1)\n"
+            "duet.reset_arms()"
+        ),
+        "expected": "The target remains active until reset; measured target feedback is logged and the arms return to carry.",
+    })
+    steps.extend(
+        {
+            "id": f"pose-{pose}",
+            "title": f"Pose: {pose.replace('_', ' ')}",
+            "category": "pose",
+            "code": f'duet.hold_pose(duet.pose("{pose}"), 2.5)',
+            "expected": "Arms move to the named target, measured joints approach it, and the timed hold returns to carry.",
+        }
+        for pose in sorted(DUET_ARM_POSES)
+    )
+    steps.extend(
+        {
+            "id": f"command-{name}",
+            "title": f"Arm command: {name.replace('_', ' ')}",
+            "category": "arm_command",
+            "code": f"duet.{name}(2.5)",
+            "expected": "Every authored stage is issued in order, measured arm feedback is logged, and arms return to carry.",
+        }
+        for name in sorted(DUET_ARM_COMMANDS)
+    )
+    steps.extend(
+        {
+            "id": f"gesture-{name}",
+            "title": f"Legacy gesture: {name.removeprefix('gesture_').replace('_', ' ')}",
+            "category": "legacy_gesture",
+            "code": f"duet.{name}(2.5)",
+            "expected": "Each mirrored DUET target is issued in order with measured feedback, then arms return to carry.",
+        }
+        for name in sorted(DUET_ARM_GESTURES)
+    )
+    steps.extend((
+        {
+            "id": "velocity-lease-expiry",
+            "title": "Velocity lease expiry",
+            "category": "lease",
+            "code": None,
+            "expected": "A single 100 ms base lease becomes inactive without refresh.",
+        },
+        {
+            "id": "explicit-stop",
+            "title": "Explicit stop and arm reset",
+            "category": "stop",
+            "code": None,
+            "expected": "STOP clears velocity and arm leases; measured arms return to carry/default.",
+        },
+    ))
+    return steps
+
+
+def _load_commissioning_report_or_none() -> dict | None:
+    try:
+        report = json.loads(_commissioning_report_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise DuetControllerError(f"Could not read the DUET commissioning report: {error}") from error
+    if not isinstance(report, dict):
+        raise DuetControllerError("DUET commissioning report has an invalid format.")
+    return report
+
+
+def commissioning_status() -> dict:
+    with _commissioning_lock:
+        report = _commissioning_state or _load_commissioning_report_or_none()
+        if report is None:
+            return {"status": "not_started", "steps": [], "current_step": None}
+        return json.loads(json.dumps(report))
+
+
+def start_commissioning(teacher: str) -> dict:
+    global _commissioning_state
+    _require_commissioning_enabled()
+    if not isinstance(teacher, str) or not teacher.strip():
+        raise DuetControllerError("A signed-in teacher identity is required to start commissioning.")
+    if _run_lock.locked():
+        raise DuetControllerError("Stop the active DUET program before starting commissioning.")
+    status = _validate_controller_status(_gateway_request("STATUS"))
+    required_capabilities = {
+        "base_velocity",
+        "wait",
+        "stop",
+        "arm_targets",
+        "arm_feedback",
+        "gateway_identity",
+    }
+    if (
+        status.get("connected") is not True
+        or status.get("ready") is not True
+        or status.get("control_lease") is not True
+        or status.get("lowcmd_owner") != "duet"
+    ):
+        raise DuetControllerError(
+            "Commissioning requires a ready DUET control lease and sole DUET rt/lowcmd ownership."
+        )
+    if status.get("motion_active") is not False:
+        raise DuetControllerError("Commissioning can start only after current DUET motion has stopped.")
+    if status.get("external_arm_active") is not False:
+        raise DuetControllerError("Stop the external rt/arm_targets publisher before commissioning DUET arm control.")
+    missing_capabilities = required_capabilities.difference(status["capabilities"])
+    if missing_capabilities:
+        raise DuetControllerError(
+            "The DUET gateway is missing commissioning capabilities: "
+            + ", ".join(sorted(missing_capabilities))
+            + "."
+        )
+    policy_id = os.getenv("DUET_EXPECTED_POLICY_ID", "").strip()
+    if not policy_id or policy_id == "unverified":
+        raise DuetControllerError("Configure DUET_EXPECTED_POLICY_ID to the deployed policy SHA-256 before commissioning.")
+    robot_id = os.getenv("DUET_ROBOT_ID", "").strip()
+    if not robot_id or len(robot_id) > 120:
+        raise DuetControllerError(
+            "Configure DUET_ROBOT_ID to the target G1 serial number or classroom asset label before commissioning."
+        )
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    report = {
+        "report_id": str(uuid.uuid4()),
+        "status": "in_progress",
+        "robot_model": DUET_ROBOT_MODEL,
+        "robot_id": robot_id,
+        "policy_id": policy_id,
+        "gateway_build_id": status["gateway_build_id"],
+        "catalog_sha256": _catalog_digest(),
+        "backend_sha256": _backend_digest(),
+        "log_path": str(_commissioning_log_path()),
+        "capabilities": status["capabilities"],
+        "teacher": teacher.strip()[:120],
+        "teacher_reviewed": False,
+        "started_at": now,
+        "updated_at": now,
+        "current_step": 0,
+        "steps": [
+            {**step, "status": "pending", "result": None, "review": None}
+            for step in _commissioning_steps()
+        ],
+    }
+    with _commissioning_lock:
+        _commissioning_state = report
+        _write_commissioning_report(report, "started", {
+            "teacher": report["teacher"],
+            "step_count": len(report["steps"]),
+            "policy_id": policy_id,
+            "catalog_sha256": report["catalog_sha256"],
+            "backend_sha256": report["backend_sha256"],
+        })
+        return json.loads(json.dumps(report))
+
+
+def run_commissioning_step(step_index: int) -> dict:
+    global _commissioning_state
+    _require_commissioning_enabled()
+    with _commissioning_lock:
+        if _commissioning_state is None:
+            raise DuetControllerError("Start a commissioning run before running a test step.")
+        report = _commissioning_state
+        if not isinstance(step_index, int) or isinstance(step_index, bool) or not 0 <= step_index < len(report["steps"]):
+            raise DuetControllerError("Commissioning step index is invalid.")
+        if report.get("status") != "in_progress" or report.get("current_step") != step_index:
+            raise DuetControllerError("Only the current pending commissioning step can be run.")
+        step = report["steps"][step_index]
+        if step.get("status") != "pending":
+            raise DuetControllerError("The current commissioning step has already been run.")
+        step["status"] = "running"
+        report["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_commissioning_report(report, "step_started", {
+            "step_index": step_index,
+            "step_id": step["id"],
+            "code": step["code"],
+        })
+
+    try:
+        if step["category"] == "lease":
+            moving_status = _validate_controller_status(_gateway_request("MOVE 0.05 0 0 100"))
+            if moving_status.get("motion_active") is not True:
+                raise DuetControllerError("Controller did not confirm motion before the 100 ms lease-expiry check.")
+            time.sleep(0.35)
+            result = _validate_controller_status(_gateway_request("STATUS"))
+            if result.get("motion_active") is not False:
+                raise DuetControllerError("Velocity remained active after its 100 ms lease expired.")
+            _stop_gateway_command()
+            test_result = {"status": "completed", "motion_active_after_expiry": False}
+        elif step["category"] == "stop":
+            moving_status = _validate_controller_status(_gateway_request("MOVE 0.05 0 0 500"))
+            if moving_status.get("motion_active") is not True:
+                raise DuetControllerError("Controller did not confirm the brief movement before STOP test.")
+            stopped_status = _stop_gateway_command()
+            test_result = {
+                "status": "completed",
+                "motion_active_after_stop": stopped_status.get("motion_active") is True,
+                "measured_joints": stopped_status.get("measured_joints"),
+            }
+        else:
+            test_result = execute_program(step["code"], commissioning=True)
+            if test_result.get("status") != "completed":
+                raise DuetControllerError("Commissioning test command did not complete normally.")
+        with _commissioning_lock:
+            report = _commissioning_state
+            step = report["steps"][step_index]
+            step["status"] = "awaiting_review"
+            step["result"] = test_result
+            feedback = test_result.get("armTelemetry", [])
+            step["feedback_within_tolerance"] = all(
+                item.get("maximumErrorRad", float("inf")) <= 0.25
+                for item in feedback
+            )
+            report["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _write_commissioning_report(report, "step_completed", {
+                "step_index": step_index,
+                "step_id": step["id"],
+                "result": test_result,
+                "feedback_within_tolerance": step["feedback_within_tolerance"],
+            })
+            return json.loads(json.dumps(report))
+    except Exception as error:
+        failure = error if isinstance(error, DuetControllerError) else DuetControllerError(
+            f"Unexpected commissioning runtime error ({type(error).__name__}): {error}"
+        )
+        stop_error = None
+        try:
+            _stop_gateway_command()
+        except DuetControllerError as caught_stop_error:
+            stop_error = caught_stop_error
+        with _commissioning_lock:
+            report = _commissioning_state
+            if (
+                report is not None
+                and report.get("status") == "in_progress"
+                and report.get("current_step") == step_index
+                and report["steps"][step_index].get("status") == "running"
+            ):
+                report["steps"][step_index]["status"] = "failed"
+                report["steps"][step_index]["error"] = str(failure)
+                report["status"] = "failed"
+                report["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                _write_commissioning_report(report, "step_failed", {
+                    "step_index": step_index,
+                    "step_id": report["steps"][step_index]["id"],
+                    "error": str(failure),
+                    "stop_error": str(stop_error) if stop_error else None,
+                })
+        if stop_error:
+            raise DuetControllerError(
+                f"Commissioning step failed: {failure}. Controller stop confirmation also failed: {stop_error}"
+            ) from stop_error
+        if failure is error:
+            raise
+        raise failure from error
+
+
+def review_commissioning_step(
+    step_index: int,
+    passed: bool,
+    observed: bool,
+    teacher: str,
+    notes: str = "",
+) -> dict:
+    global _commissioning_state
+    if not isinstance(step_index, int) or isinstance(step_index, bool) or step_index < 0:
+        raise DuetControllerError("Commissioning step index is invalid.")
+    if not isinstance(passed, bool) or not isinstance(observed, bool):
+        raise DuetControllerError("Commissioning review requires explicit pass/fail and physical-observation answers.")
+    if not isinstance(teacher, str) or not teacher.strip():
+        raise DuetControllerError("A signed-in teacher identity is required to review commissioning.")
+    if not isinstance(notes, str) or len(notes) > 1000:
+        raise DuetControllerError("Commissioning review notes must be no more than 1000 characters.")
+    if passed and not observed:
+        raise DuetControllerError("A commissioning step cannot pass until the teacher confirms observing its physical result.")
+    with _commissioning_lock:
+        if _commissioning_state is None:
+            raise DuetControllerError("No active commissioning run is available to review.")
+        report = _commissioning_state
+        if report.get("status") != "in_progress" or report.get("current_step") != step_index:
+            raise DuetControllerError("Only the current commissioning step can be reviewed.")
+        step = report["steps"][step_index]
+        if step.get("status") != "awaiting_review":
+            raise DuetControllerError("Run the current commissioning step before reviewing it.")
+        if passed and step.get("feedback_within_tolerance") is False:
+            raise DuetControllerError(
+                "Arm feedback exceeded 0.25 rad from at least one requested target; mark this step failed and review the logs."
+            )
+    stop_result = None if passed else stop_controller()
+    with _commissioning_lock:
+        report = _commissioning_state
+        if report is None or report.get("status") != "in_progress" or report.get("current_step") != step_index:
+            raise DuetControllerError("Commissioning state changed while saving the teacher review.")
+        step = report["steps"][step_index]
+        step["review"] = {
+            "passed": passed,
+            "physical_result_observed": observed,
+            "notes": notes.strip(),
+            "teacher": teacher.strip()[:120],
+            "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if not passed:
+            step["status"] = "failed"
+            report["status"] = "failed"
+        else:
+            step["status"] = "passed"
+            report["current_step"] += 1
+            if report["current_step"] == len(report["steps"]):
+                report["status"] = "passed"
+                report["teacher_reviewed"] = True
+                report["acceptance_id"] = str(uuid.uuid4())
+                report["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        report["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_commissioning_report(report, "step_reviewed", {
+            "step_index": step_index,
+            "step_id": step["id"],
+            "passed": passed,
+            "physical_result_observed": observed,
+            "teacher": teacher.strip()[:120],
+            "notes": notes.strip(),
+            "acceptance_id": report.get("acceptance_id"),
+            "controller_stop": stop_result,
+        })
+        return json.loads(json.dumps(report))
+
+
+def abort_commissioning(teacher: str) -> dict:
+    global _commissioning_state
+    if not isinstance(teacher, str) or not teacher.strip():
+        raise DuetControllerError("A signed-in teacher identity is required to abort commissioning.")
+    stopped = stop_controller()
+    with _commissioning_lock:
+        if _commissioning_state is None:
+            raise DuetControllerError("No active commissioning run is available to abort.")
+        _commissioning_state["status"] = "aborted"
+        _commissioning_state["aborted_by"] = teacher.strip()[:120]
+        _commissioning_state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _write_commissioning_report(_commissioning_state, "aborted", {
+            "teacher": teacher.strip()[:120],
+            "controller_stop": stopped,
+        })
+        return json.loads(json.dumps(_commissioning_state))
 
 
 def _finite_number(value: ast.AST, label: str) -> float:
@@ -360,25 +858,20 @@ def _distance_condition_result(sample: dict, operator: str, threshold: float) ->
     )
 
 
-def _arm_motion_command(method: str, poses: tuple[str, ...], duration: float) -> dict | list[dict]:
-    if any(pose not in {"carry", "forward", "box_hold"} for pose in poses):
-        return {
-            "type": "arm_trajectory",
-            "gesture": method,
-            "arm_commands": [
-                {
-                    "type": "arm_target",
-                    "pose": pose,
-                    "target": DUET_ARM_POSE_TARGETS[pose],
-                    "duration_s": duration,
-                }
-                for pose in poses
-            ],
-        }
-    return [
-        {"type": "arm_pose", "pose": pose, "duration_s": duration}
-        for pose in poses
-    ]
+def _arm_motion_command(method: str, poses: tuple[str, ...], duration: float) -> dict:
+    return {
+        "type": "arm_trajectory",
+        "gesture": method,
+        "arm_commands": [
+            {
+                "type": "arm_target",
+                "pose": pose,
+                "target": DUET_ARM_POSE_TARGETS[pose],
+                "duration_s": duration,
+            }
+            for pose in poses
+        ],
+    }
 
 
 def _command_from_call(call: ast.Call, line_number: int) -> dict:
@@ -490,7 +983,7 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict:
         duration = _finite_number(args[1], "arm pose lease duration")
         if not 1 <= duration <= 3:
             raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
-        return {"type": "arm_pose", "pose": pose_name, "duration_s": duration}
+        return _arm_motion_command(method, (pose_name,), duration)
     if method in DUET_ARM_GESTURES and len(args) == 1:
         duration = _finite_number(args[0], "seconds per gesture pose")
         if not 1 <= duration <= 3:
@@ -787,6 +1280,30 @@ def _validate_controller_status(status: dict) -> dict:
         raise DuetControllerError("An arm-pose capable controller must report boolean arm_pose_active status.")
     if "arm_targets" in capabilities and not isinstance(status.get("arm_targets_active"), bool):
         raise DuetControllerError("An arm-target capable controller must report boolean arm_targets_active status.")
+    if "arm_targets" in capabilities and not isinstance(status.get("external_arm_active"), bool):
+        raise DuetControllerError("An arm-target capable controller must report external rt/arm_targets activity.")
+    if "arm_feedback" in capabilities:
+        measured_joints = status.get("measured_joints")
+        if (
+            not isinstance(measured_joints, list)
+            or len(measured_joints) != 10
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in measured_joints
+            )
+        ):
+            raise DuetControllerError("An arm-feedback capable controller must report ten finite measured joint positions.")
+    if "gateway_identity" in capabilities:
+        gateway_build_id = status.get("gateway_build_id")
+        if (
+            not isinstance(gateway_build_id, str)
+            or len(gateway_build_id) != 71
+            or not gateway_build_id.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in gateway_build_id[7:])
+        ):
+            raise DuetControllerError("A gateway-identity capable controller must report its SHA-256 build identity.")
     if status.get("ready") is True and status.get("connected") is not True:
         raise DuetControllerError("A ready DUET controller must also report connected.")
     if status.get("control_lease") is True and status.get("ready") is not True:
@@ -876,9 +1393,12 @@ def controller_status() -> dict:
         "motionActive": status.get("motion_active") is True,
         "armPoseActive": status.get("arm_pose_active") is True,
         "armTargetsActive": status.get("arm_targets_active") is True,
+        "externalArmActive": status.get("external_arm_active") is True,
+        "measuredJoints": status.get("measured_joints"),
         "programActive": _run_lock.locked(),
         "robotModel": status.get("robot_model"),
         "policyId": status.get("policy_id"),
+        "gatewayBuildId": status.get("gateway_build_id"),
         "capabilities": status.get("capabilities", []),
         "error": None,
     }
@@ -889,6 +1409,29 @@ def controller_owns_motion() -> tuple[bool, str | None]:
     if status["motionOwner"] == "unknown":
         return True, f"DUET ownership could not be verified: {status['error']}"
     return status["motionOwner"] == "duet", None
+
+
+def _wait_for_arm_target(target: list[float], timeout_s: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    latest_status: dict | None = None
+    while time.monotonic() < deadline:
+        latest_status = _validate_controller_status(_gateway_request("STATUS"))
+        if latest_status.get("external_arm_active") is True:
+            raise DuetControllerError(
+                "Measured arm reset cannot be confirmed while an external rt/arm_targets stream is active."
+            )
+        measured = latest_status.get("measured_joints")
+        if isinstance(measured, list) and len(measured) == 10:
+            maximum_error = max(abs(float(actual) - expected) for actual, expected in zip(measured, target))
+            if maximum_error <= 0.12:
+                return {
+                    "status": latest_status,
+                    "maximum_error_rad": maximum_error,
+                }
+        time.sleep(0.1)
+    raise DuetControllerError(
+        "DUET did not report measured arm joints within 0.12 rad of the requested target before timeout."
+    )
 
 
 def _stop_gateway_command() -> dict:
@@ -907,11 +1450,12 @@ def _stop_gateway_command() -> dict:
             or "arm_pose" in status["capabilities"] and status.get("arm_pose_active") is not False
         ):
             raise DuetControllerError("DUET gateway did not confirm the arms returned to carry/default after STOP.")
+        if "arm_feedback" in status["capabilities"]:
+            status = _wait_for_arm_target(DUET_ARM_POSE_TARGETS["carry"])["status"]
     return status
 
 
 def connect_controller() -> dict:
-    _require_hardware_acceptance()
     result = _gateway_request("ACQUIRE")
     _validate_controller_status(result)
     if (
@@ -930,17 +1474,22 @@ def connect_controller() -> dict:
         "motionActive": result.get("motion_active") is True,
         "armPoseActive": result.get("arm_pose_active") is True,
         "armTargetsActive": result.get("arm_targets_active") is True,
+        "measuredJoints": result.get("measured_joints"),
         "programActive": _run_lock.locked(),
         "robotModel": result.get("robot_model"),
         "policyId": result.get("policy_id"),
+        "gatewayBuildId": result.get("gateway_build_id"),
         "capabilities": result.get("capabilities", []),
         "error": None,
     }
 
 
-def execute_program(code: str) -> dict:
+def execute_program(code: str, *, commissioning: bool = False) -> dict:
     commands = parse_duet_program(code)
-    _require_hardware_acceptance()
+    if commissioning:
+        _require_commissioning_enabled()
+    else:
+        _require_hardware_acceptance()
     with _run_state_lock:
         if not _run_lock.acquire(blocking=False):
             raise DuetControllerError("A DUET program is already running.")
@@ -965,7 +1514,7 @@ def execute_program(code: str) -> dict:
 
         program_commands = list(all_commands(commands))
         requires_arm_pose = any(
-            command.get("type") in {"arm_pose", "move_and_arm"}
+            command.get("type") == "arm_pose"
             or command.get("type") == "concurrent"
             and any(item.get("type") == "arm_pose" for item in command.get("arm_commands", []))
             for command in program_commands
@@ -973,7 +1522,9 @@ def execute_program(code: str) -> dict:
         if requires_arm_pose and "arm_pose" not in status["capabilities"]:
             raise DuetControllerError("The DUET controller has not enabled its separately accepted arm-pose capability.")
         if any(
-            command.get("type") in {"arm_target", "arm_target_hold", "arm_trajectory", "reset_arms"}
+            command.get("type") in {
+                "arm_target", "arm_target_hold", "arm_trajectory", "move_and_arm", "reset_arms"
+            }
             or any(item.get("type") in {"arm_target", "arm_target_hold"} for item in command.get("arm_commands", []))
             for command in program_commands
         ) and "arm_targets" not in status["capabilities"]:
@@ -1001,9 +1552,10 @@ def execute_program(code: str) -> dict:
                 or result.get("ready") is not True
                 or active_field not in result
                 or result.get(active_field) is not True
+                or result.get("external_arm_active") is True
             ):
                 raise DuetControllerError(
-                    f"DUET gateway did not confirm the requested {active_field.replace('_active', '').replace('_', ' ')} lease."
+                    f"DUET gateway did not confirm the requested {active_field.replace('_active', '').replace('_', ' ')} lease without an external arm stream."
                 )
             return result
 
@@ -1016,17 +1568,54 @@ def execute_program(code: str) -> dict:
             while time.monotonic() < deadline:
                 if _stop_requested.is_set():
                     return True
+                if active_arm_command is not None:
+                    arm_status = _validate_controller_status(_gateway_request("STATUS"))
+                    if arm_status.get("external_arm_active") is True:
+                        raise DuetControllerError(
+                            "An external rt/arm_targets stream became active during the DUET arm command."
+                        )
+                    active_field = (
+                        "arm_pose_active"
+                        if active_arm_command.get("type") == "arm_pose"
+                        else "arm_targets_active"
+                    )
+                    if arm_status.get(active_field) is not True:
+                        raise DuetControllerError(
+                            f"DUET gateway lost the active {active_field.replace('_active', '').replace('_', ' ')} lease."
+                        )
                 refresh_arm_command()
                 remaining = deadline - time.monotonic()
                 if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                     return True
             return _stop_requested.is_set()
 
+        arm_telemetry: list[dict] = []
+
+        def capture_arm_measurement(arm_command: dict) -> None:
+            if "arm_feedback" not in status["capabilities"]:
+                return
+            measured_status = _validate_controller_status(_gateway_request("STATUS"))
+            measured = measured_status["measured_joints"]
+            target = arm_command.get("target")
+            if target is None:
+                target = DUET_ARM_POSE_TARGETS[arm_command["pose"]]
+            max_error = max(abs(float(actual) - expected) for actual, expected in zip(measured, target))
+            arm_telemetry.append({
+                "pose": arm_command.get("pose"),
+                "target": target,
+                "measured": measured,
+                "maximumErrorRad": max_error,
+            })
+
         def reset_arms() -> dict:
             nonlocal active_arm_command
+            if active_arm_command is not None and active_arm_command.get("until_reset") is True:
+                capture_arm_measurement(active_arm_command)
             result = _validate_controller_status(_gateway_request("RESET_ARMS"))
             if result.get("arm_targets_active") is True or result.get("arm_pose_active") is True:
                 raise DuetControllerError("DUET gateway did not confirm that the arms reset to carry/default.")
+            if "arm_feedback" in result["capabilities"]:
+                result = _wait_for_arm_target(DUET_ARM_POSE_TARGETS["carry"])["status"]
             active_arm_command = None
             return result
 
@@ -1079,6 +1668,14 @@ def execute_program(code: str) -> dict:
                     status = _validate_controller_status(_gateway_request(request))
                     if status.get("control_lease") is not True or status.get("ready") is not True:
                         raise DuetControllerError("DUET control lease or controller readiness was lost during motion.")
+                    expected_motion = any(
+                        abs(value) > 0.001
+                        for value in (command["vx_mps"], command["vy_mps"], command["yaw_rate_rps"])
+                    )
+                    if status.get("motion_active") is not expected_motion:
+                        raise DuetControllerError(
+                            "DUET gateway did not confirm the requested base velocity state."
+                        )
                     refresh_arm_command()
                     remaining = deadline - time.monotonic()
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
@@ -1143,8 +1740,16 @@ def execute_program(code: str) -> dict:
                         )
                     if now < arm_deadline:
                         refresh_arm_command()
-                    if status.get("motion_active") is not moving:
-                        expectation = "active" if moving else "inactive"
+                    expected_motion = moving and any(
+                        abs(value) > 0.001
+                        for value in (
+                            movement["vx_mps"],
+                            movement["vy_mps"],
+                            movement["yaw_rate_rps"],
+                        )
+                    )
+                    if status.get("motion_active") is not expected_motion:
+                        expectation = "active" if expected_motion else "inactive"
                         raise DuetControllerError(
                             f"DUET gateway did not confirm {expectation} base motion during concurrent execution."
                         )
@@ -1190,21 +1795,19 @@ def execute_program(code: str) -> dict:
                 if _stop_requested.is_set():
                     break
             elif command["type"] == "move_and_arm":
-                arm_duration_ms = int(command["arm_duration_s"] * 1000)
-                status = _validate_controller_status(_gateway_request(
-                    f"ARM_POSE {command['pose']} {arm_duration_ms}"
-                ))
-                if (
-                    status.get("control_lease") is not True
-                    or status.get("ready") is not True
-                    or "arm_pose" not in status["capabilities"]
-                    or status.get("arm_pose_active") is not True
-                ):
-                    raise DuetControllerError(
-                        "DUET gateway did not confirm the arm pose lease before concurrent movement."
-                    )
-                deadline = time.monotonic() + command["duration_s"]
-                while time.monotonic() < deadline:
+                arm_command = {
+                    "type": "arm_target",
+                    "pose": command["pose"],
+                    "target": DUET_ARM_POSE_TARGETS[command["pose"]],
+                    "duration_s": command["arm_duration_s"],
+                }
+                active_arm_command = arm_command
+                started_at = time.monotonic()
+                move_deadline = started_at + command["duration_s"]
+                arm_deadline = started_at + command["arm_duration_s"]
+                send_arm_command(arm_command)
+
+                while time.monotonic() < move_deadline:
                     if _stop_requested.is_set():
                         break
                     request = (
@@ -1214,29 +1817,38 @@ def execute_program(code: str) -> dict:
                     status = _validate_controller_status(_gateway_request(request))
                     if status.get("control_lease") is not True or status.get("ready") is not True:
                         raise DuetControllerError("DUET control lease or controller readiness was lost during concurrent motion.")
-                    if status.get("motion_active") is not True:
-                        raise DuetControllerError("DUET gateway did not confirm active base motion during concurrent execution.")
-                    if status.get("arm_pose_active") is not True:
-                        raise DuetControllerError("DUET arm-pose lease ended before concurrent movement completed.")
-                    remaining = deadline - time.monotonic()
+                    expected_motion = any(
+                        abs(value) > 0.001
+                        for value in (command["vx_mps"], command["vy_mps"], command["yaw_rate_rps"])
+                    )
+                    if status.get("motion_active") is not expected_motion:
+                        raise DuetControllerError("DUET gateway did not confirm the requested concurrent base velocity.")
+                    if status.get("arm_targets_active") is not True:
+                        raise DuetControllerError("DUET arm-target lease ended before concurrent movement completed.")
+                    if status.get("external_arm_active") is True:
+                        raise DuetControllerError("An external rt/arm_targets stream became active during concurrent movement.")
+                    refresh_arm_command()
+                    remaining = move_deadline - time.monotonic()
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
                 if _stop_requested.is_set():
-                    _stop_gateway_command()
                     break
-                status = _validate_controller_status(_gateway_request(
-                    f"MOVE 0 0 0 {COMMAND_LEASE_MS}"
-                ))
+
+                status = _validate_controller_status(
+                    _gateway_request(f"MOVE 0 0 0 {COMMAND_LEASE_MS}")
+                )
                 if (
                     status.get("control_lease") is not True
                     or status.get("ready") is not True
                     or status.get("motion_active") is not False
-                    or status.get("arm_pose_active") is not True
+                    or status.get("arm_targets_active") is not True
+                    or status.get("external_arm_active") is True
                 ):
                     raise DuetControllerError(
-                        "DUET gateway did not confirm zero base velocity while preserving the arm-pose lease."
+                        "DUET gateway did not confirm stopped locomotion while retaining the arm-target lease."
                     )
-                arm_deadline = time.monotonic() + command["arm_duration_s"] - command["duration_s"]
+                refresh_arm_command()
+
                 while time.monotonic() < arm_deadline:
                     if _stop_requested.is_set():
                         break
@@ -1247,17 +1859,23 @@ def execute_program(code: str) -> dict:
                         status.get("control_lease") is not True
                         or status.get("ready") is not True
                         or status.get("motion_active") is not False
-                        or status.get("arm_pose_active") is not True
+                        or status.get("arm_targets_active") is not True
+                        or status.get("external_arm_active") is True
                     ):
                         raise DuetControllerError(
-                            "DUET gateway lost zero base velocity or the arm-pose lease during concurrent execution."
+                            "DUET gateway lost zero base velocity or the arm-target lease during concurrent execution."
                         )
+                    refresh_arm_command()
                     remaining = arm_deadline - time.monotonic()
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
-                _stop_gateway_command()
                 if _stop_requested.is_set():
                     break
+                _validate_controller_status(_gateway_request(
+                    f"MOVE 0 0 0 {COMMAND_LEASE_MS}"
+                ))
+                capture_arm_measurement(arm_command)
+                reset_arms()
             elif command["type"] == "wait":
                 if wait_with_arm_refresh(command["duration_s"]):
                     break
@@ -1267,6 +1885,7 @@ def execute_program(code: str) -> dict:
                     send_arm_command(arm_command)
                     if wait_with_arm_refresh(arm_command["duration_s"]):
                         break
+                    capture_arm_measurement(arm_command)
                 if _stop_requested.is_set():
                     break
             elif command["type"] == "arm_target_hold":
@@ -1274,6 +1893,8 @@ def execute_program(code: str) -> dict:
                 send_arm_command(command)
                 if not command["until_reset"] and wait_with_arm_refresh(command["duration_s"]):
                     break
+                if not command["until_reset"]:
+                    capture_arm_measurement(command)
                 if not command["until_reset"]:
                     reset_arms()
             elif command["type"] == "reset_arms":
@@ -1293,6 +1914,18 @@ def execute_program(code: str) -> dict:
                 active_arm_command = command
                 if wait_with_arm_refresh(command["duration_s"]):
                     break
+                if "arm_feedback" in status["capabilities"]:
+                    pose_status = _validate_controller_status(_gateway_request("STATUS"))
+                    measured = pose_status["measured_joints"]
+                    target = DUET_ARM_POSE_TARGETS[command["pose"]]
+                    arm_telemetry.append({
+                        "pose": command["pose"],
+                        "target": target,
+                        "measured": measured,
+                        "maximumErrorRad": max(
+                            abs(float(actual) - expected) for actual, expected in zip(measured, target)
+                        ),
+                    })
                 active_arm_command = None
             elif command["type"] == "stop":
                 _stop_requested.set()
@@ -1311,6 +1944,7 @@ def execute_program(code: str) -> dict:
             "commandsExecuted": executed,
             "physicalMovementVerified": False,
             "conditionsEvaluated": conditions_evaluated,
+            "armTelemetry": arm_telemetry,
         }
     except DuetControllerError as error:
         try:

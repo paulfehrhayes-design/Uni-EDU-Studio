@@ -1,5 +1,6 @@
 import os
 import fcntl
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -144,9 +145,14 @@ class DuetProgramValidationTests(unittest.TestCase):
     def test_parser_accepts_only_fixed_arm_poses_and_bounded_lease_duration(self):
         command = duet_robot.parse_duet_program('duet.arm_pose("forward", 1.5)')[0]
         self.assertEqual(command, {
-            "type": "arm_pose",
-            "pose": "forward",
-            "duration_s": 1.5,
+            "type": "arm_trajectory",
+            "gesture": "arm_pose",
+            "arm_commands": [{
+                "type": "arm_target",
+                "pose": "forward",
+                "target": duet_robot.DUET_ARM_POSE_TARGETS["forward"],
+                "duration_s": 1.5,
+            }],
         })
         for code in (
             'duet.arm_pose("wave", 1)',
@@ -197,8 +203,9 @@ class DuetProgramValidationTests(unittest.TestCase):
             'duet.arm_motion("receive_hold_return", 1.5)'
         )
 
+        self.assertEqual(commands[0]["type"], "arm_trajectory")
         self.assertEqual(
-            [(command["pose"], command["duration_s"]) for command in commands],
+            [(command["pose"], command["duration_s"]) for command in commands[0]["arm_commands"]],
             [("forward", 1.5), ("box_hold", 1.5), ("carry", 1.5)],
         )
         left_wave = duet_robot.parse_duet_program('duet.wave_left("mid", 1.5)')
@@ -228,6 +235,27 @@ class DuetProgramValidationTests(unittest.TestCase):
         ):
             with self.subTest(code=code), self.assertRaises(duet_robot.DuetProgramValidationError):
                 duet_robot.parse_duet_program(code)
+
+    def test_every_named_arm_command_uses_catalog_targets(self):
+        for name in duet_robot.DUET_ARM_COMMANDS:
+            with self.subTest(command=name):
+                command = duet_robot.parse_duet_program(f"duet.{name}(1)")[0]
+                self.assertEqual(command["type"], "arm_trajectory")
+                self.assertTrue(command["arm_commands"])
+                self.assertTrue(all(
+                    arm_command["type"] == "arm_target"
+                    and len(arm_command["target"]) == 10
+                    for arm_command in command["arm_commands"]
+                ))
+        for name in duet_robot.DUET_ARM_GESTURES:
+            with self.subTest(gesture=name):
+                command = duet_robot.parse_duet_program(f"duet.{name}(1)")[0]
+                self.assertEqual(command["type"], "arm_trajectory")
+                self.assertTrue(all(
+                    arm_command["type"] == "arm_target"
+                    and len(arm_command["target"]) == 10
+                    for arm_command in command["arm_commands"]
+                ))
 
     def test_parser_rejects_legacy_syntax_and_out_of_bounds_values(self):
         for code in (
@@ -281,15 +309,215 @@ class DuetProgramValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(duet_robot.DuetControllerError, "disabled"):
                 duet_robot._require_hardware_acceptance()
 
-        with patch.dict(os.environ, {
+        with tempfile.TemporaryDirectory() as control_dir, patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": control_dir,
             "DUET_PHYSICAL_ENABLED": "true",
             "DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot",
-            "DUET_HARDWARE_ACCEPTANCE_ID": "G1-acceptance-2026-01",
-        }, clear=True):
+            "DUET_ROBOT_ID": "g1-test-unit",
+        }, clear=True), patch.object(duet_robot, "_gateway_request", return_value={
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "gateway_build_id": "sha256:" + ("a" * 64),
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "arm_targets_active": False,
+            "external_arm_active": False,
+            "measured_joints": [0.0] * 10,
+            "capabilities": [
+                "base_velocity",
+                "wait",
+                "stop",
+                "arm_targets",
+                "arm_feedback",
+                "gateway_identity",
+            ],
+        }):
+            report = {
+                "status": "passed",
+                "policy_id": "policy-reviewed-on-robot",
+                "robot_model": duet_robot.DUET_ROBOT_MODEL,
+                "robot_id": "g1-test-unit",
+                "catalog_sha256": duet_robot._catalog_digest(),
+                "backend_sha256": duet_robot._backend_digest(),
+                "gateway_build_id": "sha256:" + ("a" * 64),
+                "teacher_reviewed": True,
+                "acceptance_id": "test-acceptance",
+                "steps": [{
+                    "status": "passed",
+                    "review": {"passed": True, "physical_result_observed": True},
+                }],
+                "capabilities": [
+                    "base_velocity",
+                    "wait",
+                    "stop",
+                    "arm_targets",
+                    "arm_feedback",
+                    "gateway_identity",
+                ],
+            }
+            duet_robot._commissioning_report_path().write_text(
+                json.dumps(report),
+                encoding="utf-8",
+            )
             self.assertEqual(
                 duet_robot._require_hardware_acceptance(),
                 "policy-reviewed-on-robot",
             )
+            report["catalog_sha256"] = "stale-catalog"
+            duet_robot._commissioning_report_path().write_text(
+                json.dumps(report),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "does not match"):
+                duet_robot._require_hardware_acceptance()
+
+
+class DuetCommissioningTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _controller_status(self):
+        return {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "sha256:commission-policy",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "arm_targets_active": False,
+            "external_arm_active": False,
+            "measured_joints": [0.0] * 10,
+            "capabilities": [
+                "base_velocity",
+                "wait",
+                "stop",
+                "arm_targets",
+                "arm_feedback",
+                "gateway_identity",
+            ],
+            "gateway_build_id": "sha256:" + ("a" * 64),
+        }
+
+    def test_commissioning_plan_covers_all_pose_and_gesture_mappings(self):
+        steps = duet_robot._commissioning_steps()
+        step_ids = {step["id"] for step in steps}
+
+        for pose in duet_robot.DUET_ARM_POSES:
+            self.assertIn(f"pose-{pose}", step_ids)
+        for command in duet_robot.DUET_ARM_COMMANDS:
+            self.assertIn(f"command-{command}", step_ids)
+        for gesture in duet_robot.DUET_ARM_GESTURES:
+            self.assertIn(f"gesture-{gesture}", step_ids)
+        for movement in duet_robot.DUET_MOVEMENT_PRESETS:
+            self.assertIn(f"base-{movement}", step_ids)
+        for step in steps:
+            if step["code"]:
+                with self.subTest(step=step["id"]):
+                    self.assertTrue(duet_robot.parse_duet_program(step["code"]))
+        self.assertIn("velocity-lease-expiry", step_ids)
+        self.assertIn("explicit-stop", step_ids)
+        self.assertIn("concurrent-base-arm", step_ids)
+        self.assertIn("move-and-arm", step_ids)
+
+    def test_commissioning_requires_physical_and_supervised_gates_and_feedback(self):
+        with patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": self.temp_dir.name,
+            "DUET_EXPECTED_POLICY_ID": "sha256:commission-policy",
+        }, clear=True), patch.object(
+            duet_robot, "_gateway_request", return_value=self._controller_status()
+        ):
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "physical master switch"):
+                duet_robot.start_commissioning("teacher")
+
+        with patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": self.temp_dir.name,
+            "DUET_EXPECTED_POLICY_ID": "sha256:commission-policy",
+            "DUET_PHYSICAL_ENABLED": "true",
+        }, clear=True), patch.object(
+            duet_robot, "_gateway_request", return_value=self._controller_status()
+        ):
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "DUET_COMMISSIONING_ENABLED"):
+                duet_robot.start_commissioning("teacher")
+
+        status = self._controller_status()
+        status["capabilities"].remove("arm_feedback")
+        status["measured_joints"] = None
+        with patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": self.temp_dir.name,
+            "DUET_EXPECTED_POLICY_ID": "sha256:commission-policy",
+            "DUET_PHYSICAL_ENABLED": "true",
+            "DUET_COMMISSIONING_ENABLED": "true",
+            "DUET_ROBOT_ID": "g1-test-unit",
+        }, clear=True), patch.object(duet_robot, "_gateway_request", return_value=status):
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "arm_feedback"):
+                duet_robot.start_commissioning("teacher")
+
+    def test_one_step_requires_observation_and_creates_matching_acceptance_report(self):
+        step = {
+            "id": "test-single-step",
+            "title": "Single bounded test",
+            "category": "base",
+            "code": "duet.move(0.05, 0, 0, 0.5)",
+            "expected": "Brief movement and stop.",
+        }
+        with patch.object(duet_robot, "_commissioning_state", None), patch.object(
+            duet_robot, "_commissioning_steps", return_value=[step]
+        ), patch.dict(os.environ, {
+            "DUET_CONTROL_DIR": self.temp_dir.name,
+            "DUET_EXPECTED_POLICY_ID": "sha256:commission-policy",
+            "DUET_PHYSICAL_ENABLED": "true",
+            "DUET_COMMISSIONING_ENABLED": "true",
+            "DUET_ROBOT_ID": "g1-test-unit",
+        }, clear=True), patch.object(
+            duet_robot, "_gateway_request", return_value=self._controller_status()
+        ), patch.object(
+            duet_robot, "execute_program", return_value={
+                "status": "completed",
+                "commandsExecuted": 1,
+                "armTelemetry": [],
+            }
+        ) as execute:
+            report = duet_robot.start_commissioning("teacher")
+            self.assertEqual(report["status"], "in_progress")
+            self.assertEqual(report["current_step"], 0)
+            report = duet_robot.run_commissioning_step(0)
+            self.assertEqual(report["steps"][0]["status"], "awaiting_review")
+            execute.assert_called_once_with(step["code"], commissioning=True)
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "confirms observing"):
+                duet_robot.review_commissioning_step(0, True, False, "teacher")
+            report = duet_robot.review_commissioning_step(0, True, True, "teacher", "Verified")
+            self.assertEqual(report["status"], "passed")
+            self.assertTrue(report["teacher_reviewed"])
+            self.assertTrue(report["acceptance_id"])
+            self.assertEqual(
+                duet_robot._require_hardware_acceptance(),
+                "sha256:commission-policy",
+            )
+
+    def test_arm_feedback_mismatch_cannot_be_teacher_passed(self):
+        report = {
+            "status": "in_progress",
+            "current_step": 0,
+            "teacher": "teacher",
+            "steps": [{
+                "id": "pose-check",
+                "status": "awaiting_review",
+                "feedback_within_tolerance": False,
+                "result": {"armTelemetry": [{"maximumErrorRad": 0.5}]},
+            }],
+        }
+        with patch.object(duet_robot, "_commissioning_state", report):
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "exceeded 0.25 rad"):
+                duet_robot.review_commissioning_step(0, True, True, "teacher")
 
 
 class DuetOwnershipTests(unittest.TestCase):
@@ -363,7 +591,7 @@ class DuetOwnershipTests(unittest.TestCase):
         rear_sample.assert_called_once_with()
         self.assertIn(call("STOP"), gateway_request.call_args_list)
 
-    def test_arm_run_is_rejected_before_program_execution_when_gateway_gate_is_disabled(self):
+    def test_arm_run_is_rejected_before_program_execution_without_arm_targets(self):
         status = {
             "protocol": duet_robot.DUET_PROTOCOL,
             "robot_model": duet_robot.DUET_ROBOT_MODEL,
@@ -382,7 +610,7 @@ class DuetOwnershipTests(unittest.TestCase):
         ) as gateway_request:
             with self.assertRaisesRegex(
                 duet_robot.DuetControllerError,
-                "separately accepted arm-pose capability",
+                "bounded arm-target capability",
             ):
                 duet_robot.execute_program(
                     'duet.forward(1)\nduet.arm_motion("receive_hold_return", 1.5)'
@@ -428,6 +656,7 @@ class DuetOwnershipTests(unittest.TestCase):
             "ready": True,
             "motion_active": False,
             "arm_targets_active": False,
+            "external_arm_active": False,
             "control_lease": True,
             "lowcmd_owner": "duet",
             "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
@@ -464,6 +693,7 @@ class DuetOwnershipTests(unittest.TestCase):
             "ready": True,
             "motion_active": False,
             "arm_targets_active": False,
+            "external_arm_active": False,
             "control_lease": True,
             "lowcmd_owner": "duet",
             "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
@@ -487,6 +717,7 @@ class DuetOwnershipTests(unittest.TestCase):
             "ready": True,
             "motion_active": False,
             "arm_targets_active": False,
+            "external_arm_active": False,
             "control_lease": True,
             "lowcmd_owner": "duet",
             "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
@@ -511,7 +742,7 @@ class DuetOwnershipTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(requests[-1], "RESET_ARMS")
 
-    def test_arm_run_uses_only_the_named_preset_protocol(self):
+    def test_named_arm_pose_runs_through_bounded_arm_targets(self):
         status = {
             "protocol": duet_robot.DUET_PROTOCOL,
             "robot_model": duet_robot.DUET_ROBOT_MODEL,
@@ -519,27 +750,50 @@ class DuetOwnershipTests(unittest.TestCase):
             "connected": True,
             "ready": True,
             "motion_active": False,
-            "arm_pose_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
             "control_lease": True,
             "lowcmd_owner": "duet",
-            "capabilities": ["base_velocity", "wait", "stop", "arm_pose"],
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
         }
-        accepted = {**status, "arm_pose_active": True}
+        accepted = {**status, "arm_targets_active": True}
+        requests = []
+        clock = {"now": 0.0}
+        target_active = {"value": False}
+
+        def gateway_response(request):
+            requests.append(request)
+            if request.startswith("ARM_TARGETS 250 "):
+                target_active["value"] = True
+                return accepted
+            if request == "RESET_ARMS":
+                target_active["value"] = False
+                return status
+            if request == "STATUS" and target_active["value"]:
+                return accepted
+            return status
+
+        def advance_clock():
+            clock["now"] += 0.1
+            return clock["now"]
+
         with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
             duet_robot, "_require_hardware_acceptance"
         ), patch.object(
-            duet_robot, "_gateway_request", side_effect=[status, accepted]
-        ) as gateway_request, patch.object(duet_robot._stop_requested, "wait", return_value=False):
+            duet_robot, "_gateway_request", side_effect=gateway_response
+        ), patch.object(
+            duet_robot.time, "monotonic", side_effect=advance_clock
+        ), patch.object(duet_robot._stop_requested, "wait", return_value=False):
             result = duet_robot.execute_program('duet.arm_pose("box_hold", 1)')
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["commandsExecuted"], 1)
-        self.assertEqual(
-            [call.args[0] for call in gateway_request.call_args_list],
-            ["STATUS", "ARM_POSE box_hold 1000"],
-        )
+        self.assertEqual(requests[0], "STATUS")
+        self.assertTrue(requests[1].startswith("ARM_TARGETS 250 "))
+        self.assertNotIn("ARM_POSE", " ".join(requests))
+        self.assertEqual(requests[-1], "RESET_ARMS")
 
-    def test_concurrent_move_keeps_arm_lease_active_while_refreshing_base_velocity(self):
+    def test_move_and_arm_uses_arm_targets_while_refreshing_base_velocity(self):
         status = {
             "protocol": duet_robot.DUET_PROTOCOL,
             "robot_model": duet_robot.DUET_ROBOT_MODEL,
@@ -547,26 +801,25 @@ class DuetOwnershipTests(unittest.TestCase):
             "connected": True,
             "ready": True,
             "motion_active": False,
-            "arm_pose_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
             "control_lease": True,
             "lowcmd_owner": "duet",
-            "capabilities": ["base_velocity", "wait", "stop", "arm_pose"],
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
         }
-        pose_active = {**status, "arm_pose_active": True}
-        moving = {**pose_active, "motion_active": True}
-        stopped = {**status, "motion_active": False}
+        targets_active = {**status, "arm_targets_active": True}
 
         def gateway_response(request):
             if request == "STATUS":
                 return status
-            if request.startswith("ARM_POSE "):
-                return pose_active
+            if request.startswith("ARM_TARGETS "):
+                return targets_active
             if request.startswith("MOVE 0 0 0 "):
-                return pose_active
+                return targets_active
             if request.startswith("MOVE "):
-                return moving
-            if request == "STOP":
-                return stopped
+                return {**targets_active, "motion_active": True}
+            if request == "RESET_ARMS":
+                return status
             raise AssertionError(f"Unexpected gateway request: {request}")
 
         clock = {"now": 0.0}
@@ -593,13 +846,11 @@ class DuetOwnershipTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["commandsExecuted"], 1)
         requests = [request.args[0] for request in gateway_request.call_args_list]
-        self.assertEqual(requests[:3], [
-            "STATUS",
-            "ARM_POSE forward 1000",
-            "MOVE 0.150000 0.000000 0.000000 250",
-        ])
+        self.assertEqual(requests[0], "STATUS")
+        self.assertTrue(requests[1].startswith("ARM_TARGETS 250 "))
+        self.assertIn("MOVE 0.150000 0.000000 0.000000 250", requests)
         self.assertIn("MOVE 0 0 0 250", requests)
-        self.assertEqual(requests[-1], "STOP")
+        self.assertEqual(requests[-1], "RESET_ARMS")
 
     def test_concurrent_locomotion_runs_through_a_multi_pose_gesture(self):
         initial = {
@@ -610,6 +861,7 @@ class DuetOwnershipTests(unittest.TestCase):
             "ready": True,
             "motion_active": False,
             "arm_targets_active": False,
+            "external_arm_active": False,
             "control_lease": True,
             "lowcmd_owner": "duet",
             "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
@@ -662,7 +914,7 @@ class DuetOwnershipTests(unittest.TestCase):
         self.assertIn("MOVE 0.000000 0.000000 0.000000 250", requests)
         self.assertEqual(requests[-1], "RESET_ARMS")
 
-    def test_concurrent_move_stops_if_controller_drops_either_motion_lease(self):
+    def test_move_and_arm_stops_if_controller_drops_either_motion_lease(self):
         status = {
             "protocol": duet_robot.DUET_PROTOCOL,
             "robot_model": duet_robot.DUET_ROBOT_MODEL,
@@ -670,28 +922,34 @@ class DuetOwnershipTests(unittest.TestCase):
             "connected": True,
             "ready": True,
             "motion_active": False,
-            "arm_pose_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
             "control_lease": True,
             "lowcmd_owner": "duet",
-            "capabilities": ["base_velocity", "wait", "stop", "arm_pose"],
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
         }
-        pose_active = {**status, "arm_pose_active": True}
-        arm_expired = {**pose_active, "motion_active": True, "arm_pose_active": False}
+        targets_active = {**status, "arm_targets_active": True}
+        arm_expired = {**targets_active, "motion_active": True, "arm_targets_active": False}
         with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
             duet_robot, "_require_hardware_acceptance"
         ), patch.object(
-            duet_robot, "_gateway_request", side_effect=[status, pose_active, arm_expired, status]
+            duet_robot,
+            "_gateway_request",
+            side_effect=[status, targets_active, arm_expired, status, status],
         ) as gateway_request, patch.object(
             duet_robot.time, "monotonic", side_effect=[0.0, 0.0, 0.2, 2.0]
         ), patch.object(
             duet_robot._stop_requested, "wait", return_value=False
         ):
-            with self.assertRaisesRegex(duet_robot.DuetControllerError, "arm-pose lease ended"):
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "arm-target lease ended"):
                 duet_robot.execute_program(
                     'duet.move_and_arm(0.15, 0, 0, 0.1, "forward", 1)'
                 )
 
-        self.assertEqual(gateway_request.call_args_list[-1], call("STOP"))
+        self.assertEqual(
+            gateway_request.call_args_list[-2:],
+            [call("STOP"), call("RESET_ARMS")],
+        )
 
     def test_connect_returns_the_acquired_controller_snapshot(self):
         acquired = {

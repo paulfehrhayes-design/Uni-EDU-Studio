@@ -31,10 +31,15 @@ try:
         DuetControllerError,
         DuetProgramValidationError,
         connect_controller as connect_duet_controller,
+        abort_commissioning as abort_duet_commissioning,
+        commissioning_status as duet_commissioning_status,
         controller_owns_motion as duet_controller_owns_motion,
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        review_commissioning_step as review_duet_commissioning_step,
+        run_commissioning_step as run_duet_commissioning_step,
+        start_commissioning as start_duet_commissioning,
         stop_controller as stop_duet_controller,
     )
     from .camera_discovery import discover_camera_sources
@@ -62,10 +67,15 @@ except ImportError:
         DuetControllerError,
         DuetProgramValidationError,
         connect_controller as connect_duet_controller,
+        abort_commissioning as abort_duet_commissioning,
+        commissioning_status as duet_commissioning_status,
         controller_owns_motion as duet_controller_owns_motion,
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        review_commissioning_step as review_duet_commissioning_step,
+        run_commissioning_step as run_duet_commissioning_step,
+        start_commissioning as start_duet_commissioning,
         stop_controller as stop_duet_controller,
     )
     from camera_discovery import discover_camera_sources
@@ -125,6 +135,17 @@ class CodeRequest(BaseModel):
 
 class DuetProgramRequest(BaseModel):
     code: str
+
+
+class DuetCommissioningReviewRequest(BaseModel):
+    step_index: int
+    passed: bool
+    observed: bool
+    notes: str = ""
+
+
+class DuetCommissioningStepRequest(BaseModel):
+    step_index: int
 
 
 class ConnectRobotRequest(BaseModel):
@@ -2158,6 +2179,91 @@ def stop_duet_code(user: dict = Depends(auth_required)):
         return stop_duet_controller()
     except DuetControllerError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.get("/api/duet/commissioning")
+def get_duet_commissioning(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    try:
+        return duet_commissioning_status()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/api/duet/commissioning/start")
+def start_duet_commissioning_route(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
+    try:
+        if active_navigation_operation():
+            raise HTTPException(status_code=409, detail="Stop ROS navigation before starting DUET commissioning.")
+        if active_lidar_scan():
+            raise HTTPException(status_code=409, detail="Stop LiDAR scanning before starting DUET commissioning.")
+        if robot_status().get("running"):
+            raise HTTPException(status_code=409, detail="Stop the legacy SDK program before DUET commissioning.")
+        return start_duet_commissioning(user["username"])
+    except DuetProgramValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.post("/api/duet/commissioning/step")
+def run_duet_commissioning_route(request: DuetCommissioningStepRequest, user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
+    try:
+        if active_navigation_operation():
+            raise HTTPException(status_code=409, detail="Stop ROS navigation before running a DUET test step.")
+        if active_lidar_scan():
+            raise HTTPException(status_code=409, detail="Stop LiDAR scanning before running a DUET test step.")
+        if robot_status().get("running"):
+            raise HTTPException(status_code=409, detail="Stop the legacy SDK program before running a DUET test step.")
+        return run_duet_commissioning_step(request.step_index)
+    except DuetProgramValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.post("/api/duet/commissioning/review")
+def review_duet_commissioning_route(
+    request: DuetCommissioningReviewRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    try:
+        return review_duet_commissioning_step(
+            request.step_index,
+            request.passed,
+            request.observed,
+            user["username"],
+            request.notes,
+        )
+    except DuetProgramValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@app.post("/api/duet/commissioning/abort")
+def abort_duet_commissioning_route(user: dict = Depends(auth_required)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    try:
+        return abort_duet_commissioning(user["username"])
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 def _require_teacher(user):

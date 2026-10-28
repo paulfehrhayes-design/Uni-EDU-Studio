@@ -977,6 +977,11 @@ export default function App() {
   const navigationWaypointFrameRef = useRef(null);
   const [isRobotConnected, setIsRobotConnected] = useState(false);
   const [isRobotConnecting, setIsRobotConnecting] = useState(false);
+  const [duetCommissioning, setDuetCommissioning] = useState(null);
+  const [isDuetCommissioningBusy, setIsDuetCommissioningBusy] = useState(false);
+  const [isDuetCommissioningAborting, setIsDuetCommissioningAborting] = useState(false);
+  const [duetCommissioningObserved, setDuetCommissioningObserved] = useState(false);
+  const [duetCommissioningNotes, setDuetCommissioningNotes] = useState('');
   const [isLidarTesting, setIsLidarTesting] = useState(false);
   const [sensorDiagnostics, setSensorDiagnostics] = useState(null);
   const [isSensorDiscovering, setIsSensorDiscovering] = useState(false);
@@ -1047,6 +1052,24 @@ export default function App() {
     [apiFetch],
   );
   const activeRobotConnection = controllerVersion === 'duet' ? duetRobotConnection : robotConnection;
+
+  useEffect(() => {
+    if (controllerVersion !== 'duet' || session?.user?.role !== 'teacher') {
+      setDuetCommissioning(null);
+      return undefined;
+    }
+    let active = true;
+    duetRobotConnection.commissioningStatus()
+      .then((report) => {
+        if (active) setDuetCommissioning(report);
+      })
+      .catch((error) => {
+        if (active) setRobotConnectionStatus(`DUET commissioning report unavailable: ${error.message}`);
+      });
+    return () => {
+      active = false;
+    };
+  }, [controllerVersion, session?.user?.role, duetRobotConnection]);
 
   const refreshClassroomData = useCallback(async () => {
     if (!session?.token) return;
@@ -1777,9 +1800,9 @@ export default function App() {
         duetProgramActiveRef.current = connection.motionActive === true;
         setIsDuetProgramActive(duetProgramActiveRef.current);
         setIsRunning(duetProgramActiveRef.current);
-        const armCapability = connection.capabilities?.includes('arm_pose')
-          ? 'arm-pose gateway enabled'
-          : 'arm-pose blocks are preview-only (controller acceptance gate disabled)';
+        const armCapability = connection.capabilities?.includes('arm_targets')
+          ? 'bounded arm-target gateway enabled'
+          : 'bounded arm targets unavailable on this gateway';
         setRobotConnectionStatus(`Connected • DUET ${connection.policyId} • ${connection.robotModel} • sole lowcmd owner confirmed • ${armCapability}`);
       } else {
         const sensorText = `MID-360 distance conditions ${connection.distanceSensor?.ready ? 'ready' : 'disabled'} • ${formatLidarDistanceStatus(connection.distanceSensor)}`;
@@ -1831,6 +1854,104 @@ export default function App() {
       alert(`Motion test failed: ${error.message}`);
     } finally {
       if (!keepDuetRunLock) setIsRunning(false);
+    }
+  };
+
+  const handleStartDuetCommissioning = async () => {
+    if (!isRobotConnected || currentUser.role !== 'teacher') {
+      setRobotConnectionStatus('Connect DUET and sign in as a teacher before commissioning.');
+      return;
+    }
+    const confirmed = window.confirm(
+      'Start the teacher-only DUET commissioning sequence? It tests every approved arm pose, authored arm command, legacy gesture and mirror, bounded base direction, concurrent control, velocity lease expiry, and STOP/reset. Each movement will pause for your physical review. Keep the G1 upright, clear the full arm and walking area, stay at the emergency stop, and stop immediately if motion is unexpected.',
+    );
+    if (!confirmed) return;
+    setIsDuetCommissioningBusy(true);
+    setRobotConnectionStatus('Starting DUET commissioning preflight…');
+    try {
+      const report = await duetRobotConnection.startCommissioning();
+      setDuetCommissioning(report);
+      setDuetCommissioningObserved(false);
+      setDuetCommissioningNotes('');
+      setRobotConnectionStatus(
+        `DUET commissioning started • ${report.steps.length} supervised test steps • report ${report.report_id}`,
+      );
+    } catch (error) {
+      setRobotConnectionStatus(`Could not start DUET commissioning: ${error.message}`);
+    } finally {
+      setIsDuetCommissioningAborting(false);
+    }
+  };
+
+  const handleRunDuetCommissioningStep = async () => {
+    const stepIndex = duetCommissioning?.current_step;
+    const step = duetCommissioning?.steps?.[stepIndex];
+    if (!step || !isRobotConnected || currentUser.role !== 'teacher') return;
+    const confirmed = window.confirm(
+      `Run test ${stepIndex + 1} of ${duetCommissioning.steps.length}: ${step.title}\n\n${step.expected}\n\nCommand:\n${step.code || 'Gateway lease/STOP test'}\n\nProceed only while the robot and area are clear and you can reach the emergency stop.`,
+    );
+    if (!confirmed) return;
+    setIsDuetCommissioningBusy(true);
+    setRobotConnectionStatus(`Running DUET commissioning step ${stepIndex + 1}/${duetCommissioning.steps.length}…`);
+    try {
+      const report = await duetRobotConnection.runCommissioningStep(stepIndex);
+      setDuetCommissioning(report);
+      setDuetCommissioningObserved(false);
+      setDuetCommissioningNotes('');
+      setRobotConnectionStatus(`Step ${stepIndex + 1} completed at the controller; physically review the robot and logged joint feedback before continuing.`);
+    } catch (error) {
+      let failureMessage = `DUET commissioning step failed: ${error.message}`;
+      try {
+        setDuetCommissioning(await duetRobotConnection.commissioningStatus());
+      } catch (refreshError) {
+        failureMessage += ` The saved report could not be refreshed: ${refreshError.message}`;
+      }
+      setRobotConnectionStatus(failureMessage);
+    } finally {
+      setIsDuetCommissioningBusy(false);
+    }
+  };
+
+  const handleReviewDuetCommissioningStep = async (passed) => {
+    const stepIndex = duetCommissioning?.current_step;
+    if (!Number.isInteger(stepIndex) || currentUser.role !== 'teacher') return;
+    if (passed && !duetCommissioningObserved) {
+      setRobotConnectionStatus('Confirm that you physically observed the expected result before passing this step.');
+      return;
+    }
+    setIsDuetCommissioningBusy(true);
+    try {
+      const report = await duetRobotConnection.reviewCommissioningStep(stepIndex, {
+        passed,
+        observed: duetCommissioningObserved,
+        notes: duetCommissioningNotes,
+      });
+      setDuetCommissioning(report);
+      setDuetCommissioningObserved(false);
+      setDuetCommissioningNotes('');
+      setRobotConnectionStatus(report.status === 'passed'
+        ? `DUET commissioning passed and teacher-reviewed • acceptance ${report.acceptance_id}. Normal DUET execution is now unlocked while the physical master switch remains enabled.`
+        : passed
+          ? `Step passed • ${report.current_step} of ${report.steps.length} reviewed.`
+          : `Commissioning failed at step ${stepIndex + 1}; controller STOP/reset was requested. Review the report before restarting.`);
+    } catch (error) {
+      setRobotConnectionStatus(`Could not save DUET commissioning review: ${error.message}`);
+    } finally {
+      setIsDuetCommissioningBusy(false);
+    }
+  };
+
+  const handleAbortDuetCommissioning = async () => {
+    if (!window.confirm('Abort DUET commissioning and request controller STOP plus arm reset?')) return;
+    setIsDuetCommissioningAborting(true);
+    try {
+      const report = await duetRobotConnection.abortCommissioning();
+      setDuetCommissioning(report);
+      setRobotConnectionStatus('DUET commissioning aborted; controller STOP/reset was requested. Physical immobility is not verified.');
+    } catch (error) {
+      setRobotConnectionStatus(`Could not abort DUET commissioning safely: ${error.message}`);
+    } finally {
+      setIsDuetCommissioningBusy(false);
     }
   };
 
@@ -4328,14 +4449,14 @@ export default function App() {
                 <div>
                   <p className="text-sm font-semibold text-gray-800">DUET version two preview</p>
                   <p className="text-xs text-gray-600">
-                    Switches Blocks, IDE, simulation, and connection to the separate DUET path. Legacy programs stay unchanged. Physical DUET motion remains unavailable until a separately validated controller gateway is installed.
+                    Switches Blocks, IDE, simulation, and connection to the separate DUET path. Legacy programs stay unchanged. Teacher-only commissioning unlocks normal physical runs only after every bounded test is physically reviewed.
                   </p>
                 </div>
                 <input
                   type="checkbox"
                   aria-label="Enable DUET version two"
                   checked={controllerVersion === 'duet'}
-                  disabled={isRunning || isRobotConnecting}
+                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting}
                   onChange={(event) => handleControllerVersionChange(event.target.checked)}
                   className="h-5 w-5 accent-blue-700"
                 />
@@ -4438,7 +4559,7 @@ export default function App() {
                   <div className="mt-2 flex gap-2">
                     <button
                       onClick={handleConnectRobot}
-                      disabled={isRobotConnecting || isRunning}
+                      disabled={isRobotConnecting || isRunning || isDuetCommissioningBusy}
                       className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
                     >
                       {isRobotConnecting
@@ -4447,14 +4568,14 @@ export default function App() {
                           ? 'Disconnect DUET'
                           : isRobotConnected ? 'Reconnect' : 'Connect'}
                     </button>
-                    {isRobotConnected && (
+                    {isRobotConnected && controllerVersion !== 'duet' && (
                       <button
                         type="button"
                         onClick={handleTestRobotMotion}
                         disabled={isRunning || isRobotConnecting}
                         className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
                       >
-                        {isRunning ? 'Motion test running…' : controllerVersion === 'duet' ? 'Test DUET motion' : 'Test motion'}
+                        {isRunning ? 'Motion test running…' : 'Test motion'}
                       </button>
                     )}
                   </div>
@@ -4473,11 +4594,152 @@ export default function App() {
                   </div>
                   <p className="mt-2 text-[10px] text-slate-600">
                     {controllerVersion === 'duet'
-                      ? 'Connect uses the separate DUET controller gateway. The SDK connection path is unchanged and is not used for DUET commands.'
+                      ? 'Connect acquires the DUET command lease without starting movement. Teacher-only commissioning is required before normal physical runs; the legacy SDK path is not used.'
                       : 'Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.'}
                   </p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
                 </div>
+
+                {controllerVersion === 'duet' && currentUser.role === 'teacher' && (
+                  <div className="rounded-xl border border-amber-300 bg-amber-50 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] uppercase tracking-wide text-amber-900 font-semibold">Teacher-only DUET commissioning</p>
+                        <p className="mt-1 text-[10px] text-slate-700">
+                          Runs one bounded test at a time and pauses for your physical pass/fail review. It tests every catalog pose, authored arm command, legacy gesture and mirror, base direction, concurrent control, lease expiry, and STOP/reset.
+                        </p>
+                      </div>
+                      <span className="shrink-0 rounded-full bg-white px-2 py-1 text-[10px] font-semibold text-slate-700">
+                        {duetCommissioning?.status || 'loading'}
+                      </span>
+                    </div>
+                    {duetCommissioning?.status === 'not_started' && (
+                      <p className="mt-2 text-[10px] text-slate-700">No commissioning report exists. Physical DUET program execution remains locked until the sequence is completed and teacher-reviewed.</p>
+                    )}
+                    {duetCommissioning?.status === 'passed' && (
+                      <p className="mt-2 rounded-lg border border-green-200 bg-green-50 p-2 text-[10px] text-green-900">
+                        Teacher-reviewed acceptance: {duetCommissioning.acceptance_id}. Normal DUET execution is eligible when the backend physical master switch is enabled. Acceptance is bound to the reported robot model, configured robot label, policy, controller binary, backend implementation, and arm catalog recorded below.
+                      </p>
+                    )}
+                    {duetCommissioning?.steps?.length > 0 && (
+                      <div className="mt-2">
+                        <div className="flex justify-between text-[10px] text-slate-600">
+                          <span>{duetCommissioning.steps.filter((step) => step.status === 'passed').length} / {duetCommissioning.steps.length} steps passed</span>
+                          <span>Policy {duetCommissioning.policy_id}</span>
+                        </div>
+                        <div className="mt-1 h-1.5 overflow-hidden rounded bg-white">
+                          <div
+                            className="h-full bg-green-600 transition-all"
+                            style={{ width: `${(duetCommissioning.steps.filter((step) => step.status === 'passed').length / duetCommissioning.steps.length) * 100}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                    {duetCommissioning?.status === 'in_progress' && (() => {
+                      const stepIndex = duetCommissioning.current_step;
+                      const step = duetCommissioning.steps?.[stepIndex];
+                      if (!step) return null;
+                      return (
+                        <div className="mt-3 rounded-lg border border-amber-200 bg-white p-2">
+                          <p className="text-xs font-semibold text-slate-900">Step {stepIndex + 1} of {duetCommissioning.steps.length}: {step.title}</p>
+                          <p className="mt-1 text-[10px] text-slate-700">{step.expected}</p>
+                          {step.status === 'pending' && (
+                            <button
+                              type="button"
+                              onClick={handleRunDuetCommissioningStep}
+                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting}
+                              className="mt-2 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                            >
+                              {isDuetCommissioningBusy ? 'Running…' : `Run test ${stepIndex + 1}`}
+                            </button>
+                          )}
+                          {step.status === 'running' && (
+                            <p role="status" className="mt-2 text-xs font-semibold text-amber-800">Test is running. Stop remains available.</p>
+                          )}
+                          {step.status === 'awaiting_review' && (
+                            <div className="mt-2 space-y-2">
+                              <pre className="max-h-40 overflow-auto rounded bg-slate-950 p-2 text-[9px] text-green-200">
+                                {JSON.stringify(step.result, null, 2)}
+                              </pre>
+                              {step.feedback_within_tolerance === false && (
+                                <p className="rounded bg-red-50 p-2 text-[10px] text-red-800">
+                                  Measured joints exceeded 0.25 rad error for at least one requested target. Passing is disabled; fail this step and inspect the terminal JSONL log.
+                                </p>
+                              )}
+                              <label className="flex items-start gap-2 text-[10px] text-slate-800">
+                                <input
+                                  type="checkbox"
+                                  checked={duetCommissioningObserved}
+                                  onChange={(event) => setDuetCommissioningObserved(event.target.checked)}
+                                  className="mt-0.5 accent-amber-700"
+                                />
+                                I physically observed the expected robot response for this test.
+                              </label>
+                              <textarea
+                                aria-label="DUET commissioning review notes"
+                                value={duetCommissioningNotes}
+                                onChange={(event) => setDuetCommissioningNotes(event.target.value)}
+                                maxLength={1000}
+                                placeholder="Optional notes for the terminal and saved commissioning report"
+                                className="w-full rounded border border-slate-300 px-2 py-1.5 text-[10px]"
+                                rows={2}
+                              />
+                              <div className="flex gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => handleReviewDuetCommissioningStep(true)}
+                                  disabled={!duetCommissioningObserved || step.feedback_within_tolerance === false || isDuetCommissioningBusy}
+                                  className="flex-1 rounded-lg bg-green-700 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                                >
+                                  Pass and continue
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleReviewDuetCommissioningStep(false)}
+                                  disabled={isDuetCommissioningAborting}
+                                  className="flex-1 rounded-lg bg-red-700 px-2 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                                >
+                                  Fail and stop sequence
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                    <div className="mt-2 flex gap-2">
+                      {['not_started', 'failed', 'aborted', 'passed'].includes(duetCommissioning?.status) && (
+                        <button
+                          type="button"
+                          onClick={handleStartDuetCommissioning}
+                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting}
+                          className="rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                        >
+                          {duetCommissioning?.status === 'not_started' ? 'Start full test sequence' : 'Start a new full test'}
+                        </button>
+                      )}
+                      {duetCommissioning?.status === 'in_progress' && (
+                        <button
+                          type="button"
+                          onClick={handleAbortDuetCommissioning}
+                          disabled={isDuetCommissioningBusy}
+                          className="rounded-lg border border-red-400 bg-white px-3 py-1.5 text-xs font-semibold text-red-800 disabled:opacity-50"
+                        >
+                          Abort and request STOP
+                        </button>
+                      )}
+                    </div>
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-[10px] font-medium text-slate-700">Report identity and reviewed test history</summary>
+                      <pre className="mt-1 max-h-40 overflow-auto rounded bg-white p-2 text-[9px] text-slate-700">
+                        {JSON.stringify(duetCommissioning, null, 2)}
+                      </pre>
+                    </details>
+                    <p className="mt-2 text-[9px] text-slate-600">
+                      Logs are written to the backend terminal and {duetCommissioning?.log_path || 'the DUET control directory commissioning.jsonl'}. This sequence cannot certify balance, every environment, future motion, or emergency-stop hardware; acceptance applies only to the reviewed test run.
+                    </p>
+                  </div>
+                )}
 
                 <div className="rounded-xl border border-cyan-200 bg-cyan-50 p-3">
                   <div className="flex items-center justify-between gap-2">

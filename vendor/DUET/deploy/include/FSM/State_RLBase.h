@@ -5,10 +5,12 @@
 
 #include <vector>
 #include <chrono>
+#include <atomic>
 
 #include "FSMState.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
 #include "isaaclab/envs/mdp/terminations.h"
+#include "DuetCommandGateway.h"
 
 class State_RLBase : public FSMState
 {
@@ -27,6 +29,9 @@ public:
         }
 
         env->robot->update();
+        arm_ramp_init_ = false;
+        arm_first_run_ = true;
+        arm_pose_ = ArmPose::DEFAULT;
         // Start policy thread
         policy_thread_running = true;
         policy_thread = std::thread([this]{
@@ -47,12 +52,14 @@ public:
                 sleepTill += dt;
             }
         });
+        if (gateway_) gateway_->start();
     }
 
     void run();
     
     void exit()
     {
+        if (gateway_) gateway_->stop();
         policy_thread_running = false;
         if (policy_thread.joinable()) {
             policy_thread.join();
@@ -63,7 +70,7 @@ private:
     std::unique_ptr<isaaclab::ManagerBasedRLEnv> env;
 
     std::thread policy_thread;
-    bool policy_thread_running = false;
+    std::atomic<bool> policy_thread_running{false};
 
     // Upper-body (arm) targets from the IL / GR00T manipulation policy. These are
     // published as a LowCmd on a SEPARATE topic ("rt/arm_targets") so they do not
@@ -71,7 +78,9 @@ private:
     // fresh the arm joints follow these targets; otherwise they hold the default
     // (carry) pose. A velocity-limited ramp smooths the carry <-> IL handoff.
     std::shared_ptr<unitree::robot::g1::subscription::LowCmd> arm_sub_;
+    std::unique_ptr<DuetCommandGateway> gateway_;
     std::vector<float> arm_q_applied_;
+    std::vector<float> arm_velocity_applied_;
     bool arm_ramp_init_ = false;
     bool arm_first_run_ = true;
     std::chrono::steady_clock::time_point arm_last_tp_;

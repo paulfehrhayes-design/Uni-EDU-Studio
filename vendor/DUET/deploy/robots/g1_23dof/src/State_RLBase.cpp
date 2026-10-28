@@ -3,6 +3,7 @@
 #include "isaaclab/envs/mdp/observations/observations.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
 
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 
@@ -30,10 +31,27 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
     // message arrives within the timeout the arms fall back to the carry pose.
     arm_sub_ = std::make_shared<unitree::robot::g1::subscription::LowCmd>("rt/arm_targets");
     arm_sub_->set_timeout_ms(200);
+    gateway_ = std::make_unique<DuetCommandGateway>(
+        (policy_dir / "exported" / "policy.onnx").string(),
+        [this]() {
+            std::array<float, 10> measured{};
+            const auto & joint_ids = env->robot->data.joint_ids_map;
+            const int lower_count = (int)env->action_manager->processed_actions().size();
+            std::lock_guard<std::mutex> lock(FSMState::lowstate->mutex_);
+            for (int i = 0; i < 10; ++i) {
+                measured[i] = FSMState::lowstate->msg_.motor_state()[joint_ids[lower_count + i]].q();
+            }
+            return measured;
+        },
+        [this]() { return policy_thread_running.load() && !FSMState::lowstate->isTimeout(); },
+        [this]() { return !arm_sub_->isTimeout(); }
+    );
 }
 
 void State_RLBase::run()
 {
+    if (duet_gateway::consume_arm_reset_request()) arm_pose_ = ArmPose::DEFAULT;
+
     auto action = env->action_manager->processed_actions();
     auto & jmap = env->robot->data.joint_ids_map;
     auto & qdef = env->robot->data.default_joint_pos;
@@ -44,7 +62,14 @@ void State_RLBase::run()
     // One-time init of the ramp buffer to the default (carry) arm pose.
     if (!arm_ramp_init_) {
         arm_q_applied_.assign(n_arm, 0.0f);
-        for (int k = 0; k < n_arm; ++k) arm_q_applied_[k] = (float)qdef[n_lower + k];
+        arm_velocity_applied_.assign(n_arm, 0.0f);
+        {
+            std::lock_guard<std::mutex> lock(FSMState::lowstate->mutex_);
+            for (int k = 0; k < n_arm; ++k) {
+                const int motor = (int)jmap[n_lower + k];
+                arm_q_applied_[k] = FSMState::lowstate->msg_.motor_state()[motor].q();
+            }
+        }
         arm_ramp_init_ = true;
     }
 
@@ -56,7 +81,12 @@ void State_RLBase::run()
     arm_last_tp_ = now;
     arm_first_run_ = false;
     // "Active" = an IL (GR00T) message arrived within the subscriber timeout.
-    const bool arm_active = !arm_sub_->isTimeout();
+    const bool external_arm_active = !arm_sub_->isTimeout();
+    const auto requested_app_arm_target = duet_gateway::arm_target_override();
+    const auto app_arm_target = external_arm_active
+        ? std::optional<std::array<float, 10>>{}
+        : requested_app_arm_target;
+    const bool arm_active = app_arm_target.has_value() || external_arm_active;
 
     // Remote arm-pose selection via the gamepad (imported from arm.py). A live
     // rt/arm_targets (IL/GR00T) stream still overrides these when present.
@@ -92,17 +122,18 @@ void State_RLBase::run()
     // default/carry pose (finger-safe); moderate for a deliberate button pose.
     const float ARM_RATE_ACTIVE = 20.0f;  // rad/s, transparent tracking of IL
     const float ARM_RATE_RETURN = 0.7f;   // rad/s, gentle homing to default/carry
-    const float ARM_RATE_POSE   = 2.0f;   // rad/s, deliberate button-selected pose
+    const float ARM_RATE_POSE   = 2.0f;   // rad/s, deliberate bounded pose motion
+    const float ARM_ACCEL_RETURN = 2.0f;  // rad/s^2, smooth return to carry/default
+    const float ARM_ACCEL_POSE = 4.0f;    // rad/s^2, smooth app and gamepad targets
     float arm_rate;
-    if (arm_active)                         arm_rate = ARM_RATE_ACTIVE;
+    if (app_arm_target)                     arm_rate = ARM_RATE_POSE;
+    else if (arm_active)                    arm_rate = ARM_RATE_ACTIVE;
     else if (arm_pose_ == ArmPose::DEFAULT) arm_rate = ARM_RATE_RETURN;
     else                                    arm_rate = ARM_RATE_POSE;
-    const float max_step = arm_rate * dt;
-
     // Snapshot the IL arm command once (the DDS callback writes msg_ on another
     // thread).
     std::vector<float> il_q(n_arm), il_kp(n_arm), il_kd(n_arm), il_tau(n_arm);
-    if (arm_active) {
+    if (external_arm_active && !app_arm_target) {
         std::lock_guard<std::mutex> lock(arm_sub_->mutex_);
         for (int k = 0; k < n_arm; ++k) {
             const int motor = (int)jmap[n_lower + k];
@@ -124,17 +155,47 @@ void State_RLBase::run()
         // (FORWARD / BOX_HOLD), else the default carry pose.
         const int k = i - n_lower;
         float target;
-        if (arm_active)                                     target = il_q[k];
+        if (app_arm_target)                                 target = (*app_arm_target)[k];
+        else if (external_arm_active)                       target = il_q[k];
         else if (pose_ok && arm_pose_ == ArmPose::FORWARD)  target = POSE_FORWARD[k];
         else if (pose_ok && arm_pose_ == ArmPose::BOX_HOLD) target = POSE_BOXHOLD[k];
         else                                                target = (float)qdef[i];
         const float err = target - arm_q_applied_[k];
-        if (std::fabs(err) <= max_step) arm_q_applied_[k] = target;
-        else arm_q_applied_[k] += std::copysign(max_step, err);
+        if (external_arm_active && !app_arm_target) {
+            const float max_step = ARM_RATE_ACTIVE * dt;
+            if (std::fabs(err) <= max_step) {
+                arm_q_applied_[k] = target;
+                arm_velocity_applied_[k] = 0.0f;
+            } else {
+                const float step = std::copysign(max_step, err);
+                arm_q_applied_[k] += step;
+                arm_velocity_applied_[k] = dt > 0.0f ? step / dt : 0.0f;
+            }
+        } else {
+            const float acceleration = arm_pose_ == ArmPose::DEFAULT && !app_arm_target
+                ? ARM_ACCEL_RETURN
+                : ARM_ACCEL_POSE;
+            const float desired_velocity = std::clamp(err / std::max(dt, 0.001f), -arm_rate, arm_rate);
+            const float max_velocity_delta = acceleration * dt;
+            arm_velocity_applied_[k] += std::clamp(
+                desired_velocity - arm_velocity_applied_[k],
+                -max_velocity_delta,
+                max_velocity_delta
+            );
+            const float step = arm_velocity_applied_[k] * dt;
+            if (std::fabs(err) <= std::fabs(step)) {
+                arm_q_applied_[k] = target;
+                arm_velocity_applied_[k] = 0.0f;
+            } else {
+                arm_q_applied_[k] += step;
+            }
+        }
 
         lowcmd->msg_.motor_cmd()[motor].q() = arm_q_applied_[k];
-        lowcmd->msg_.motor_cmd()[motor].dq() = 0;
-        if (arm_active) {
+        lowcmd->msg_.motor_cmd()[motor].dq() = external_arm_active && !app_arm_target
+            ? 0.0f
+            : arm_velocity_applied_[k];
+        if (external_arm_active && !app_arm_target) {
             lowcmd->msg_.motor_cmd()[motor].kp() = il_kp[k];
             lowcmd->msg_.motor_cmd()[motor].kd() = il_kd[k];
             lowcmd->msg_.motor_cmd()[motor].tau() = il_tau[k];

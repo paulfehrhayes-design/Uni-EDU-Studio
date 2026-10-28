@@ -38,6 +38,59 @@ class DuetRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_duet_commissioning_routes_are_teacher_only(self):
+        requests = (
+            ("get", "/api/duet/commissioning", None),
+            ("post", "/api/duet/commissioning/start", None),
+            ("post", "/api/duet/commissioning/step", {"step_index": 0}),
+            ("post", "/api/duet/commissioning/review", {
+                "step_index": 0,
+                "passed": True,
+                "observed": True,
+                "notes": "",
+            }),
+            ("post", "/api/duet/commissioning/abort", None),
+        )
+        for method, path, body in requests:
+            with self.subTest(path=path):
+                if method == "get":
+                    response = self.client.get(path, headers=self.student)
+                else:
+                    response = self.client.post(path, headers=self.student, json=body)
+                self.assertEqual(response.status_code, 403)
+
+    def test_teacher_commissioning_routes_use_duet_service_only(self):
+        report = {"status": "in_progress", "steps": [], "current_step": 0}
+        with patch.object(server, "active_navigation_operation", return_value=None), patch.object(
+            server, "active_lidar_scan", return_value=None
+        ), patch.object(server, "robot_status", return_value={"running": False}), patch.object(
+            server, "start_duet_commissioning", return_value=report
+        ) as start, patch.object(
+            server, "run_duet_commissioning_step", return_value=report
+        ) as run_step, patch.object(
+            server, "review_duet_commissioning_step", return_value=report
+        ) as review, patch.object(
+            server, "abort_duet_commissioning", return_value=report
+        ) as abort:
+            started = self.client.post("/api/duet/commissioning/start", headers=self.teacher)
+            stepped = self.client.post(
+                    "/api/duet/commissioning/step",
+                    headers=self.teacher,
+                    json={"step_index": 0},
+            )
+            reviewed = self.client.post(
+                    "/api/duet/commissioning/review",
+                    headers=self.teacher,
+                    json={"step_index": 0, "passed": True, "observed": True, "notes": "clear"},
+            )
+            aborted = self.client.post("/api/duet/commissioning/abort", headers=self.teacher)
+
+        self.assertEqual([started.status_code, stepped.status_code, reviewed.status_code, aborted.status_code], [200] * 4)
+        start.assert_called_once_with("teacher")
+        run_step.assert_called_once_with(0)
+        review.assert_called_once_with(0, True, True, "teacher", "clear")
+        abort.assert_called_once_with("teacher")
+
     def test_duet_run_rejects_legacy_commands_before_gateway_access(self):
         with patch.object(server, "active_navigation_operation", return_value=None), patch.object(
             server, "active_lidar_scan", return_value=None
@@ -55,7 +108,7 @@ class DuetRouteTests(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
             self.assertIn("duet", response.json()["detail"].lower())
 
-    def test_duet_connect_fails_closed_without_gateway_and_does_not_use_sdk(self):
+    def test_duet_connect_reports_missing_gateway_and_does_not_use_sdk(self):
         with patch.dict(os.environ, {
             "DUET_CONTROL_DIR": os.path.join(self.temp_dir.name, "duet-control"),
             "DUET_PHYSICAL_ENABLED": "",
@@ -67,7 +120,31 @@ class DuetRouteTests(unittest.TestCase):
             response = self.client.post("/api/duet/connect", headers=self.teacher)
 
         self.assertEqual(response.status_code, 503)
-        self.assertIn("disabled until supervised", response.json()["detail"])
+        self.assertIn("gateway is unreachable", response.json()["detail"])
+        connect_sdk.assert_not_called()
+
+    def test_duet_connect_is_available_before_motion_acceptance_without_using_sdk(self):
+        connected = {
+            "status": "connected",
+            "connected": True,
+            "ready": True,
+            "controlLease": True,
+            "motionOwner": "duet",
+        }
+        with patch.dict(os.environ, {"DUET_PHYSICAL_ENABLED": ""}), patch.object(
+            server, "active_navigation_operation", return_value=None
+        ), patch.object(server, "active_lidar_scan", return_value=None), patch.object(
+            server, "robot_status", return_value={"running": False}
+        ), patch.object(
+            server, "duet_controller_status", return_value={"motionOwner": "none", "controlLease": False}
+        ), patch.object(
+            server, "connect_duet_controller", return_value=connected
+        ) as connect_duet, patch.object(server, "connect_robot") as connect_sdk:
+            response = self.client.post("/api/duet/connect", headers=self.teacher)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), connected)
+        connect_duet.assert_called_once_with()
         connect_sdk.assert_not_called()
 
     def test_legacy_run_remains_on_sdk_route(self):
