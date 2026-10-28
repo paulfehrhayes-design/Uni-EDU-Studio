@@ -32,6 +32,12 @@ import {
   getDuetCommandExamples,
   parseDuetProgram,
 } from './sim/duetCommands.js';
+import {
+  getDuetArmMotionsStorageKey,
+  MAX_SAVED_DUET_ARM_MOTIONS,
+  parseSavedDuetArmMotions,
+  validateDuetArmMotion,
+} from './sim/duetArmMotions.js';
 import { simulateDuetG1Edu23Program } from './sim/duetG1Edu23Env.js';
 import { createRobotConnection } from './robot/RobotConnection';
 import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
@@ -900,6 +906,9 @@ export default function App() {
     }
   });
   const currentUser = session?.user ?? { role: 'student', username: 'guest' };
+  const [savedDuetArmMotions, setSavedDuetArmMotions] = useState([]);
+  const [duetArmMotionName, setDuetArmMotionName] = useState('');
+  const [duetArmMotionError, setDuetArmMotionError] = useState('');
   const [savedCodes, setSavedCodes] = useState([]);
   const [queueItems, setQueueItems] = useState([]);
   const [queueReviewItem, setQueueReviewItem] = useState(null);
@@ -944,7 +953,11 @@ export default function App() {
   const [isNavigationGoalPlacementEnabled, setIsNavigationGoalPlacementEnabled] = useState(false);
   const [navigationOperation, setNavigationOperation] = useState(null);
   const [navigationExecutionStatus, setNavigationExecutionStatus] = useState('No navigation operation');
+  const [navigationHome, setNavigationHome] = useState(null);
+  const [navigationHomeStatus, setNavigationHomeStatus] = useState('No shared starting origin');
   const [isNavigationStarting, setIsNavigationStarting] = useState(false);
+  const [isSettingNavigationHome, setIsSettingNavigationHome] = useState(false);
+  const [isReturningNavigationHome, setIsReturningNavigationHome] = useState(false);
   const [lidarScanJob, setLidarScanJob] = useState(null);
   const [lidarScanStatus, setLidarScanStatus] = useState('No room scan');
   const [liveLidarScanPoints, setLiveLidarScanPoints] = useState([]);
@@ -981,6 +994,18 @@ export default function App() {
 
   const t = UI_TEXT[lang];
   const sceneObjectsKey = session?.user?.username ? `edu-scene-objects:${session.user.username}` : 'edu-scene-objects';
+  const duetArmMotionsKey = getDuetArmMotionsStorageKey(currentUser.username);
+
+  useEffect(() => {
+    if (controllerVersion !== 'duet') return;
+    try {
+      setSavedDuetArmMotions(parseSavedDuetArmMotions(localStorage.getItem(duetArmMotionsKey)));
+      setDuetArmMotionError('');
+    } catch (error) {
+      setSavedDuetArmMotions([]);
+      setDuetArmMotionError(`Could not load saved DUET arm sequences: ${error.message}`);
+    }
+  }, [controllerVersion, duetArmMotionsKey]);
 
   useEffect(() => {
     generatedCodeRef.current = generatedCode;
@@ -2060,6 +2085,7 @@ export default function App() {
       } else {
         setNavigationOperation(null);
       }
+      setNavigationHome(result.home || null);
       if (!result.ready) {
         setNavigationBridgeStatus(`Unavailable • ${result.error || 'Bridge is not ready.'}`);
         return;
@@ -2078,6 +2104,79 @@ export default function App() {
       setNavigationBridgeStatus(`Check failed • ${error.message}`);
     } finally {
       setIsNavigationBridgeChecking(false);
+    }
+  };
+
+  const handleSetNavigationHome = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationHomeStatus('Teacher login is required to set the shared origin.');
+      return;
+    }
+    if (navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status)) {
+      setNavigationHomeStatus('Stop the active navigation before setting a new shared origin.');
+      return;
+    }
+    if (lidarScanJob?.status === 'scanning') {
+      setNavigationHomeStatus('Complete or cancel the active LiDAR scan before saving a new origin.');
+      return;
+    }
+    setIsSettingNavigationHome(true);
+    setNavigationHomeStatus('Capturing the current localized pose as the shared starting origin…');
+    try {
+      const result = await apiFetch('/api/navigation/home', {
+        method: 'POST',
+      });
+      setNavigationHome(result.home);
+      setNavigationHomeStatus(
+        `Shared origin saved • ${result.home.map_id} ${result.home.map_version} • (${result.home.x.toFixed(2)}, ${result.home.y.toFixed(2)}) • yaw ${result.home.yaw_rad.toFixed(2)} rad`,
+      );
+    } catch (error) {
+      setNavigationHomeStatus(`Origin was not saved • ${error.message}`);
+    } finally {
+      setIsSettingNavigationHome(false);
+    }
+  };
+
+  const handleReturnNavigationHome = async () => {
+    if (!session || session.user.role !== 'teacher') {
+      setNavigationHomeStatus('Teacher login is required to return to the shared origin.');
+      return;
+    }
+    if (!navigationHome) {
+      setNavigationHomeStatus('Set the shared starting origin before returning to it.');
+      return;
+    }
+    if (!isNavigationMotionReady) {
+      setNavigationHomeStatus(
+        `Return blocked • ${navigationDiagnostics?.execution_enabled === false
+          ? 'physical motion is disabled by deployment configuration.'
+          : navigationDiagnostics?.controller?.error || 'verify fresh localization, robot-link, and e-stop readiness first.'}`,
+      );
+      return;
+    }
+    if (navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status)) {
+      setNavigationHomeStatus('A navigation operation is already active. Stop it before returning to the origin.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Teacher approval required: return to the saved origin at ${navigationHome.map_id} ${navigationHome.map_version} (${navigationHome.x.toFixed(2)}, ${navigationHome.y.toFixed(2)}) with heading ${navigationHome.yaw_rad.toFixed(2)} rad using live adaptive Nav2?`,
+    );
+    if (!confirmed) return;
+    setIsReturningNavigationHome(true);
+    setNavigationHomeStatus('Submitting a live Nav2 return to the saved origin…');
+    try {
+      const result = await apiFetch('/api/navigation/home/return', {
+        method: 'POST',
+      });
+      setNavigationOperation(result);
+      setNavigationHomeStatus(`Return to origin requested • operation ${result.operation_id} • ${result.status}`);
+      setNavigationExecutionStatus(
+        `Return to origin ${result.operation_id} • ${result.status}; controller status will be polled.`,
+      );
+    } catch (error) {
+      setNavigationHomeStatus(`Return to origin rejected • ${error.message}`);
+    } finally {
+      setIsReturningNavigationHome(false);
     }
   };
 
@@ -2651,7 +2750,16 @@ export default function App() {
     return `
     <xml xmlns="https://developers.google.com/blockly/xml">
       ${commandCategoriesXml}
-      ${isDuetVersion ? '' : `
+      ${isDuetVersion ? `
+        <category name="Distance conditions" colour="200">
+          <block type="controls_if"></block>
+          <block type="controls_if"><mutation else="1"></mutation></block>
+          <block type="logic_compare"></block>
+          <block type="duet_front_distance_m"></block>
+          <block type="duet_rear_distance_m"></block>
+          <block type="math_number"><field name="NUM">1</field></block>
+        </category>
+      ` : `
         <category name="${language === 'zh' ? '距离条件' : 'Distance conditions'}" colour="200">
           <block type="controls_if"></block>
           <block type="controls_if"><mutation else="1"></mutation></block>
@@ -3257,7 +3365,7 @@ export default function App() {
   const previewPreviewState = useCallback(() => {
     try {
       const state = controllerVersion === 'duet'
-        ? simulateDuetG1Edu23Program(generatedCode).at(-1)
+        ? simulateDuetG1Edu23Program(generatedCode, { obstacles: activeObstacles }).at(-1)
         : simulateG1Edu23Program(generatedCode, {
           mode: simulatorMode,
           obstacles: activeObstacles,
@@ -3365,9 +3473,8 @@ export default function App() {
               block.getInput('IF0').connection.connect(variableBlock.outputConnection);
             } else {
               const comparison = workspace.newBlock('logic_compare');
-              const distance = workspace.newBlock(node.sensor === 'rear_distance_m'
-                ? 'g1_rear_distance_m'
-                : 'g1_front_distance_m');
+              const distancePrefix = controllerVersion === 'duet' ? 'duet_' : 'g1_';
+              const distance = workspace.newBlock(`${distancePrefix}${node.sensor}`);
               const threshold = workspace.newBlock('math_number');
               const operatorFields = { '<': 'LT', '<=': 'LTE', '>': 'GT', '>=': 'GTE', '==': 'EQ', '!=': 'NEQ' };
               comparison.setFieldValue(operatorFields[node.operator], 'OP');
@@ -3588,6 +3695,61 @@ export default function App() {
     updateGeneratedCode(nextCode);
   };
 
+  const saveDuetArmMotion = () => {
+    try {
+      const motion = validateDuetArmMotion(duetArmMotionName, generatedCode);
+      if (savedDuetArmMotions.some(({ name }) => name.toLocaleLowerCase() === motion.name.toLocaleLowerCase())) {
+        throw new Error(`A saved sequence named "${motion.name}" already exists.`);
+      }
+      if (savedDuetArmMotions.length >= MAX_SAVED_DUET_ARM_MOTIONS) {
+        throw new Error(`The saved arm sequence library is limited to ${MAX_SAVED_DUET_ARM_MOTIONS} items.`);
+      }
+      const nextMotions = [...savedDuetArmMotions, motion];
+      localStorage.setItem(duetArmMotionsKey, JSON.stringify(nextMotions));
+      setSavedDuetArmMotions(nextMotions);
+      setDuetArmMotionName('');
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(error.message);
+    }
+  };
+
+  const insertSavedDuetArmMotion = (motion) => {
+    try {
+      const currentProgram = generatedCode.trim()
+        ? formatDuetProgram(parseDuetProgram(generatedCode))
+        : '';
+      const combinedCode = [currentProgram, motion.code].filter(Boolean).join('\n');
+      const normalizedCode = formatDuetProgram(parseDuetProgram(combinedCode));
+      applyGeneratedCode(normalizedCode);
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(`Could not insert "${motion.name}": ${error.message}`);
+    }
+  };
+
+  const deleteSavedDuetArmMotion = (motionName) => {
+    try {
+      const nextMotions = savedDuetArmMotions.filter(({ name }) => name !== motionName);
+      localStorage.setItem(duetArmMotionsKey, JSON.stringify(nextMotions));
+      setSavedDuetArmMotions(nextMotions);
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(`Could not delete "${motionName}": ${error.message}`);
+    }
+  };
+
+  const clearSavedDuetArmMotions = () => {
+    if (!window.confirm('Clear all saved DUET arm sequences for this user in this browser?')) return;
+    try {
+      localStorage.removeItem(duetArmMotionsKey);
+      setSavedDuetArmMotions([]);
+      setDuetArmMotionError('');
+    } catch (error) {
+      setDuetArmMotionError(`Could not clear saved DUET arm sequences: ${error.message}`);
+    }
+  };
+
   const handleRecordMotionCapture = () => {
     const sampleScript = controllerVersion === 'duet'
       ? [
@@ -3614,7 +3776,7 @@ export default function App() {
   useEffect(() => {
     try {
       const state = controllerVersion === 'duet'
-        ? simulateDuetG1Edu23Program(generatedCode).at(-1)
+        ? simulateDuetG1Edu23Program(generatedCode, { obstacles: activeObstacles }).at(-1)
         : simulateG1Edu23Program(generatedCode, { mode: simulatorMode, obstacles: activeObstacles });
       setSimulatorState(state);
     } catch (error) {
@@ -5032,6 +5194,34 @@ export default function App() {
                         <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
                       </div>
                       {currentUser.role === 'teacher' && (
+                        <div className="mt-3 space-y-2 rounded-lg border border-slate-700 bg-slate-950/50 p-2">
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={handleSetNavigationHome}
+                              disabled={isSettingNavigationHome}
+                              className="flex-1 rounded-md border border-cyan-600 bg-cyan-950/60 px-2 py-1.5 text-[10px] font-semibold text-cyan-100 disabled:opacity-50"
+                            >
+                              {isSettingNavigationHome ? 'Saving…' : 'Set Origin'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleReturnNavigationHome}
+                              disabled={isReturningNavigationHome || !navigationHome}
+                              className="flex-1 rounded-md border border-emerald-600 bg-emerald-950/60 px-2 py-1.5 text-[10px] font-semibold text-emerald-100 disabled:opacity-50"
+                            >
+                              {isReturningNavigationHome ? 'Returning…' : 'Return to Origin'}
+                            </button>
+                          </div>
+                          <p className="text-[10px] text-slate-300">
+                            {navigationHome
+                              ? `Origin ${navigationHome.map_id} ${navigationHome.map_version} • (${navigationHome.x.toFixed(2)}, ${navigationHome.y.toFixed(2)}) • yaw ${navigationHome.yaw_rad.toFixed(2)} rad`
+                              : 'No shared origin saved yet.'}
+                          </p>
+                          <p className="text-[10px] text-slate-400" role="status" aria-live="polite">{navigationHomeStatus}</p>
+                        </div>
+                      )}
+                      {currentUser.role === 'teacher' && (
                         <p className="mt-2 text-[10px] text-slate-400" role="status" aria-live="polite">
                           {lidarScanJob?.status === 'scanning'
                             ? 'SDK motion is locked while the room scan captures data.'
@@ -5947,6 +6137,59 @@ export default function App() {
                       spellCheck={false}
                       className="h-64 w-full resize-none rounded-xl border border-slate-700 bg-slate-900 p-3 font-mono text-[11px] leading-6 text-slate-100 outline-none"
                     />
+                    {controllerVersion === 'duet' && (
+                      <section className="rounded-xl border border-slate-700 bg-slate-900 p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-300">Saved arm sequences</p>
+                            <p className="mt-1 text-[10px] leading-4 text-slate-400">
+                              Save an arm-only program assembled from approved DUET pose and gesture blocks. Stored in this browser for this user.
+                            </p>
+                          </div>
+                          <span className="shrink-0 text-[10px] text-slate-500">
+                            {savedDuetArmMotions.length}/{MAX_SAVED_DUET_ARM_MOTIONS}
+                          </span>
+                        </div>
+                        <div className="mt-3 flex gap-2">
+                          <input
+                            aria-label="Saved arm sequence name"
+                            value={duetArmMotionName}
+                            onChange={(event) => setDuetArmMotionName(event.target.value)}
+                            maxLength={40}
+                            placeholder="Sequence name"
+                            className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-blue-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={saveDuetArmMotion}
+                            disabled={duetArmMotionError.startsWith('Could not load saved DUET arm sequences:')}
+                            className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Save current sequence
+                          </button>
+                        </div>
+                        {duetArmMotionError && (
+                          <div className="mt-2 flex items-start justify-between gap-3" role="alert">
+                            <p className="text-[10px] text-amber-300">{duetArmMotionError}</p>
+                            {duetArmMotionError.startsWith('Could not load saved DUET arm sequences:')
+                              && <button type="button" onClick={clearSavedDuetArmMotions} className="shrink-0 text-[10px] text-amber-200 underline">Clear corrupt library</button>}
+                          </div>
+                        )}
+                        {savedDuetArmMotions.length > 0 && (
+                          <ul className="mt-3 space-y-2">
+                            {savedDuetArmMotions.map((motion) => (
+                              <li key={motion.name} className="flex items-center justify-between gap-2 rounded-md bg-slate-800 px-2 py-1.5">
+                                <span className="min-w-0 truncate text-xs text-slate-200">{motion.name}</span>
+                                <div className="flex shrink-0 gap-2">
+                                  <button type="button" onClick={() => insertSavedDuetArmMotion(motion)} className="text-[10px] font-semibold text-cyan-300 hover:text-cyan-200">Insert</button>
+                                  <button type="button" onClick={() => deleteSavedDuetArmMotion(motion.name)} className="text-[10px] text-slate-400 hover:text-red-300">Delete</button>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </section>
+                    )}
                     {blockSyncError && <p role="alert" className="text-xs text-amber-300">{blockSyncError}</p>}
                     {safetyNotice && <p className="text-[10px] text-amber-300">{safetyNotice}</p>}
                     <p className="text-[10px] text-slate-400">IDE text is synchronized to Blocks when you leave the editor. Incomplete or unsupported lines remain editable here but cannot be shown as Blocks.</p>
@@ -5957,7 +6200,7 @@ export default function App() {
                       </details>
                     )}
                     {controllerVersion === 'duet'
-                      ? <p className="text-[10px] text-amber-300">DUET supports bounded base-velocity commands, fixed carry/forward/box-hold arm poses and sequences built only from those poses, waits, and stop. These are not arbitrary joint targets; physical arm commands require the controller&apos;s separate DUET_ARM_ACCEPT gate. Simulator motion is a preview only.</p>
+                      ? <p className="text-[10px] text-amber-300">DUET arm poses and gestures use an approved, mirrored 23-DOF target catalog. Timed holds return to carry; hold-until-reset requires an explicit reset. Physical arm targets remain unavailable unless the deployed gateway advertises arm_targets and the separate hardware acceptance gates are satisfied. Simulator motion is only a command-space preview; direct posture/height control is not exposed.</p>
                       : <p className="text-[10px] text-slate-400">The IDE and Blocks support front-obstacle distance conditions. Physical conditions require a fresh MID-360 reading (500 ms maximum) from the configured provider; missing or stale readings abort and request a stop.</p>}
                   </div>
                 )}

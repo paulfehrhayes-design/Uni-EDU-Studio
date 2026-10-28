@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getDuetSimulationModelInfo, simulateDuetG1Edu23Program } from './duetG1Edu23Env.js';
+import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
 
 test('DUET simulator uses the exact 23-DOF project model mapping', () => {
   const info = getDuetSimulationModelInfo();
@@ -66,6 +67,49 @@ test('DUET simulator previews named arm-pose presets', () => {
   assert.ok(final.joints.left_shoulder_pitch_joint < 0);
   assert.equal(final.joints.left_elbow_joint, Number((0.87 * 180 / Math.PI).toFixed(2)));
   assert.equal(final.joints.right_shoulder_roll_joint < 0, true);
+});
+
+test('DUET simulator selects front and rear distance branches from obstacle clearance', () => {
+  const frontFrames = simulateDuetG1Edu23Program(
+    'if duet.front_distance_m() < 0.5:\n'
+    + '    duet.stop()\n'
+    + 'else:\n'
+    + '    duet.forward(1)',
+    { obstacles: [{ x: 0.5, y: 0, radius: 0.1 }] },
+  );
+  const rearFrames = simulateDuetG1Edu23Program(
+    'if duet.rear_distance_m() <= 0.5:\n'
+    + '    duet.stop()\n'
+    + 'else:\n'
+    + '    duet.backward(1)',
+    { obstacles: [{ x: -0.5, y: 0, radius: 0.1 }] },
+  );
+
+  assert.equal(frontFrames.at(-1).status, 'Stopped');
+  assert.match(frontFrames.at(-1).timeline[0].summary, /forward obstacle: 0\.40 m < 0\.5 m -> then/);
+  assert.equal(rearFrames.at(-1).status, 'Stopped');
+  assert.match(rearFrames.at(-1).timeline[0].summary, /rear obstacle: 0\.40 m <= 0\.5 m -> then/);
+});
+
+test('expanded approved pose targets are exposed to Blockly and simulated as arm targets', () => {
+  const poseNames = ['both_forward_low', 'both_open_bent', 'left_arm_forward', 'right_arm_forward'];
+  const catalog = getDuetArmCatalog();
+
+  poseNames.forEach((poseName) => {
+    const target = getDuetArmPoseTarget(poseName);
+    const frames = simulateDuetG1Edu23Program(
+      `duet.hold_pose(duet.pose("${poseName}"), 1)`,
+    );
+    const targetFrame = frames.find((frame) => frame.time === 1);
+    assert.ok(targetFrame, `${poseName} should have a target frame`);
+    catalog.jointOrder.forEach((jointName, index) => {
+      assert.equal(
+        targetFrame.joints[jointName],
+        Number((target[index] * 180 / Math.PI).toFixed(2)),
+        `${poseName} should target ${jointName}`,
+      );
+    });
+  });
 });
 
 test('DUET simulator previews fixed arm sequences using named targets', () => {

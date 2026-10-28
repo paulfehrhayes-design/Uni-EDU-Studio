@@ -11,6 +11,19 @@ import time
 import uuid
 from pathlib import Path
 
+try:
+    from .lidar_distance import (
+        DistanceSensorError,
+        get_front_distance_sample,
+        get_rear_distance_sample,
+    )
+except ImportError:
+    from lidar_distance import (
+        DistanceSensorError,
+        get_front_distance_sample,
+        get_rear_distance_sample,
+    )
+
 DUET_ROBOT_MODEL = "g1_23dof"
 DUET_PROTOCOL = "uni-edu-duet-v1"
 DUET_BASE_CAPABILITIES = {"base_velocity", "wait", "stop"}
@@ -259,6 +272,94 @@ def _named_pose_argument(value: ast.AST, label: str) -> str:
     return pose_name
 
 
+def _distance_condition(statement: ast.If) -> dict:
+    comparison = statement.test
+    if (
+        not isinstance(comparison, ast.Compare)
+        or len(comparison.ops) != 1
+        or len(comparison.comparators) != 1
+    ):
+        raise DuetProgramValidationError(
+            "DUET conditions must compare a front or rear distance sensor with one numeric threshold."
+        )
+    sensor = comparison.left
+    if (
+        not isinstance(sensor, ast.Call)
+        or not isinstance(sensor.func, ast.Attribute)
+        or not isinstance(sensor.func.value, ast.Name)
+        or sensor.func.value.id != "duet"
+        or sensor.func.attr not in {"front_distance_m", "rear_distance_m"}
+        or sensor.args
+        or sensor.keywords
+    ):
+        raise DuetProgramValidationError(
+            "Distance conditions may only read duet.front_distance_m() or duet.rear_distance_m()."
+        )
+    operator_map = {
+        ast.Lt: "<",
+        ast.LtE: "<=",
+        ast.Gt: ">",
+        ast.GtE: ">=",
+        ast.Eq: "==",
+        ast.NotEq: "!=",
+    }
+    operator = operator_map.get(type(comparison.ops[0]))
+    threshold_node = comparison.comparators[0]
+    if operator is None:
+        raise DuetProgramValidationError(
+            "Distance conditions support <, <=, >, >=, ==, and != comparisons only."
+        )
+    if (
+        not isinstance(threshold_node, ast.Constant)
+        or isinstance(threshold_node.value, bool)
+        or not isinstance(threshold_node.value, (int, float))
+        or not math.isfinite(float(threshold_node.value))
+        or not 0.1 <= float(threshold_node.value) <= 40
+    ):
+        raise DuetProgramValidationError(
+            "Distance thresholds must be numeric literals between 0.1 and 40 meters."
+        )
+    return {
+        "type": "distance_condition",
+        "sensor": sensor.func.attr,
+        "operator": operator,
+        "threshold": float(threshold_node.value),
+    }
+
+
+def _distance_condition_result(sample: dict, operator: str, threshold: float) -> bool:
+    operators = {
+        "<": lambda measured, target: measured < target,
+        "<=": lambda measured, target: measured <= target,
+        ">": lambda measured, target: measured > target,
+        ">=": lambda measured, target: measured >= target,
+        "==": lambda measured, target: measured == target,
+        "!=": lambda measured, target: measured != target,
+    }
+    if not sample.get("clear"):
+        return operators[operator](float(sample["distance_m"]), threshold)
+
+    minimum_clearance = float(sample["max_range_m"])
+    if not math.isfinite(minimum_clearance) or minimum_clearance <= 0:
+        raise DistanceSensorError("Clear LiDAR sample did not include a valid minimum clearance.")
+    if operator == "<" and minimum_clearance >= threshold:
+        return False
+    if operator == "<=" and minimum_clearance > threshold:
+        return False
+    if operator == ">" and minimum_clearance > threshold:
+        return True
+    if operator == ">=" and minimum_clearance >= threshold:
+        return True
+    if operator == "==" and minimum_clearance > threshold:
+        return False
+    if operator == "!=" and minimum_clearance > threshold:
+        return True
+    raise DistanceSensorError(
+        f"No-return LiDAR sample only confirms clearance of at least {minimum_clearance:.2f} m; "
+        f"comparison {operator} {threshold:g} m is ambiguous."
+    )
+
+
 def _arm_motion_command(method: str, poses: tuple[str, ...], duration: float) -> dict | list[dict]:
     if any(pose not in {"carry", "forward", "box_hold"} for pose in poses):
         return {
@@ -460,6 +561,18 @@ def _parse_duet_program(code: str) -> list[dict]:
     except SyntaxError as error:
         raise DuetControllerError(f"Invalid DUET program syntax on line {error.lineno}.") from error
 
+    def command_count(command: dict) -> int:
+        if command.get("type") == "distance_condition":
+            return 1 + max(
+                sum(command_count(child) for child in command["then"]),
+                sum(command_count(child) for child in command["else"]),
+            )
+        if command.get("type") == "concurrent":
+            return 1 + len(command["arm_commands"])
+        if command.get("type") == "arm_trajectory":
+            return len(command["arm_commands"])
+        return 1
+
     def visit(statements: list[ast.stmt], depth: int = 0) -> list[dict]:
         if depth > 5:
             raise DuetControllerError("DUET programs may be nested at most five levels.")
@@ -468,6 +581,15 @@ def _parse_duet_program(code: str) -> list[dict]:
             if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
                 command = _command_from_call(statement.value, statement.lineno)
                 parsed.extend(command if isinstance(command, list) else [command])
+            elif isinstance(statement, ast.If):
+                condition = _distance_condition(statement)
+                if not statement.body:
+                    raise DuetProgramValidationError(
+                        f"Distance condition on line {statement.lineno} has no body."
+                    )
+                condition["then"] = visit(statement.body, depth + 1)
+                condition["else"] = visit(statement.orelse, depth + 1) if statement.orelse else []
+                parsed.append(condition)
             elif (
                 isinstance(statement, ast.With)
                 and len(statement.items) == 1
@@ -547,12 +669,7 @@ def _parse_duet_program(code: str) -> list[dict]:
                 parsed.extend(nested * repeat_count)
             else:
                 raise DuetControllerError(f"Unsupported DUET statement on line {getattr(statement, 'lineno', 1)}.")
-            expanded_count = sum(
-                1 + len(item["arm_commands"]) if item.get("type") == "concurrent" else (
-                    len(item["arm_commands"]) if item.get("type") == "arm_trajectory" else 1
-                )
-                for item in parsed
-            )
+            expanded_count = sum(command_count(item) for item in parsed)
             if expanded_count > MAX_EXPANDED_COMMANDS:
                 raise DuetControllerError(f"DUET programs may contain at most {MAX_EXPANDED_COMMANDS} expanded commands.")
         return parsed
@@ -578,9 +695,54 @@ def _parse_duet_program(code: str) -> list[dict]:
             pose_held_until_reset = False
         elif any(item.get("type") == "arm_target_hold" and item.get("until_reset") for item in arm_commands):
             pose_held_until_reset = True
-    for index, command in enumerate(commands[:-1]):
-        if command["type"] == "stop":
-            raise DuetControllerError("duet.stop() must be the final command in a program.")
+    def validate_stop_placement(sequence: list[dict], final_in_parent: bool = True) -> None:
+        for index, command in enumerate(sequence):
+            final = final_in_parent and index == len(sequence) - 1
+            if command["type"] == "stop" and not final:
+                raise DuetProgramValidationError(
+                    "duet.stop() must be the final command on every execution path."
+                )
+            if command["type"] == "distance_condition":
+                validate_stop_placement(command["then"], final)
+                validate_stop_placement(command["else"], final)
+            elif command["type"] == "concurrent":
+                continue
+
+    validate_stop_placement(commands)
+
+    def validate_arm_reset_flow(sequence: list[dict], possible_states: set[bool]) -> set[bool]:
+        states = possible_states
+        for command in sequence:
+            if command["type"] == "distance_condition":
+                states = (
+                    validate_arm_reset_flow(command["then"], set(states))
+                    | validate_arm_reset_flow(command["else"], set(states))
+                )
+                continue
+            if command["type"] == "concurrent":
+                arm_commands = command["arm_commands"]
+            elif command["type"] == "arm_trajectory":
+                arm_commands = command["arm_commands"]
+            else:
+                arm_commands = [command]
+            starts_arm_motion = any(
+                item.get("type") in {"arm_pose", "arm_target", "arm_target_hold", "arm_trajectory"}
+                for item in arm_commands
+            )
+            if True in states and starts_arm_motion:
+                raise DuetProgramValidationError(
+                    "Reset arms with duet.reset_arms() before starting another arm motion."
+                )
+            if command["type"] == "reset_arms":
+                states = {False}
+            elif any(
+                item.get("type") == "arm_target_hold" and item.get("until_reset")
+                for item in arm_commands
+            ):
+                states = {True}
+        return states
+
+    validate_arm_reset_flow(commands, {False})
     return commands
 
 
@@ -794,18 +956,26 @@ def execute_program(code: str) -> dict:
             or status.get("lowcmd_owner") != "duet"
         ):
             raise DuetControllerError("DUET controller must be ready and connected before running a program.")
+        def all_commands(sequence: list[dict]):
+            for item in sequence:
+                yield item
+                if item.get("type") == "distance_condition":
+                    yield from all_commands(item["then"])
+                    yield from all_commands(item["else"])
+
+        program_commands = list(all_commands(commands))
         requires_arm_pose = any(
             command.get("type") in {"arm_pose", "move_and_arm"}
             or command.get("type") == "concurrent"
             and any(item.get("type") == "arm_pose" for item in command.get("arm_commands", []))
-            for command in commands
+            for command in program_commands
         )
         if requires_arm_pose and "arm_pose" not in status["capabilities"]:
             raise DuetControllerError("The DUET controller has not enabled its separately accepted arm-pose capability.")
         if any(
             command.get("type") in {"arm_target", "arm_target_hold", "arm_trajectory", "reset_arms"}
             or any(item.get("type") in {"arm_target", "arm_target_hold"} for item in command.get("arm_commands", []))
-            for command in commands
+            for command in program_commands
         ) and "arm_targets" not in status["capabilities"]:
             raise DuetControllerError(
                 "The installed DUET gateway does not advertise the required bounded arm-target capability."
@@ -860,9 +1030,43 @@ def execute_program(code: str) -> dict:
             active_arm_command = None
             return result
 
-        for command in commands:
+        conditions_evaluated: list[dict] = []
+        pending_commands = list(reversed(commands))
+        while pending_commands:
+            command = pending_commands.pop()
             if _stop_requested.is_set():
                 break
+            if command["type"] == "distance_condition":
+                sensor = command["sensor"]
+                try:
+                    sample = (
+                        get_front_distance_sample()
+                        if sensor == "front_distance_m"
+                        else get_rear_distance_sample()
+                    )
+                    selected_then = _distance_condition_result(
+                        sample,
+                        command["operator"],
+                        command["threshold"],
+                    )
+                except DistanceSensorError as error:
+                    raise DuetControllerError(
+                        f"DUET distance condition aborted safely: {error}. A controller stop was requested."
+                    ) from error
+                decision = {
+                    "sensor": sensor,
+                    "operator": command["operator"],
+                    "threshold_m": command["threshold"],
+                    "distance_m": sample["distance_m"],
+                    "clear": bool(sample.get("clear")),
+                    "max_range_m": sample.get("max_range_m", 40.0),
+                    "age_ms": sample["age_ms"],
+                    "branch": "then" if selected_then else "else",
+                }
+                conditions_evaluated.append(decision)
+                pending_commands.extend(reversed(command["then"] if selected_then else command["else"]))
+                executed += 1
+                continue
             if command["type"] == "move":
                 deadline = time.monotonic() + command["duration_s"]
                 while time.monotonic() < deadline:
@@ -1106,6 +1310,7 @@ def execute_program(code: str) -> dict:
             "programId": program_id,
             "commandsExecuted": executed,
             "physicalMovementVerified": False,
+            "conditionsEvaluated": conditions_evaluated,
         }
     except DuetControllerError as error:
         try:

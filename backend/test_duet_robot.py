@@ -9,6 +9,55 @@ import duet_robot
 
 
 class DuetProgramValidationTests(unittest.TestCase):
+    def test_parser_accepts_bounded_front_and_rear_distance_conditions(self):
+        for sensor, operator in (
+            ("front", "<"),
+            ("front", "<="),
+            ("front", ">"),
+            ("front", ">="),
+            ("front", "=="),
+            ("front", "!="),
+            ("rear", "<"),
+        ):
+            with self.subTest(sensor=sensor, operator=operator):
+                command = duet_robot.parse_duet_program(
+                    f"if duet.{sensor}_distance_m() {operator} 0.1:\n"
+                    "    duet.stop()\n"
+                    "else:\n"
+                    "    duet.wait(0.1)"
+                )[0]
+                self.assertEqual(command["type"], "distance_condition")
+                self.assertEqual(command["sensor"], f"{sensor}_distance_m")
+                self.assertEqual(command["operator"], operator)
+                self.assertEqual(command["threshold"], 0.1)
+                self.assertEqual(command["then"][0]["type"], "stop")
+                self.assertEqual(command["else"][0]["type"], "wait")
+
+        for code in (
+            "if duet.front_distance_m() < 0.09:\n    duet.stop()",
+            "if duet.rear_distance_m() > 40.1:\n    duet.stop()",
+            "if duet.front_distance_m() < True:\n    duet.stop()",
+            "if duet.front_distance_m() in [1, 2]:\n    duet.stop()",
+            "if robot.front_distance_m() < 1:\n    duet.stop()",
+            "if duet.front_distance_m() < 1:\n    pass",
+        ):
+            with self.subTest(code=code), self.assertRaises(
+                duet_robot.DuetProgramValidationError
+            ):
+                duet_robot.parse_duet_program(code)
+
+    def test_clear_sample_comparisons_only_return_when_clearance_proves_the_result(self):
+        clear_sample = {
+            "distance_m": None,
+            "clear": True,
+            "max_range_m": 4.0,
+            "age_ms": 10,
+        }
+        self.assertFalse(duet_robot._distance_condition_result(clear_sample, "<", 1.0))
+        self.assertTrue(duet_robot._distance_condition_result(clear_sample, ">", 1.0))
+        with self.assertRaisesRegex(duet_robot.DistanceSensorError, "ambiguous"):
+            duet_robot._distance_condition_result(clear_sample, "<=", 4.0)
+
     def test_parser_accepts_only_bounded_duet_commands_and_loops(self):
         commands = duet_robot.parse_duet_program(
             'for _ in range(2):\n'
@@ -124,10 +173,11 @@ class DuetProgramValidationTests(unittest.TestCase):
         self.assertEqual(held[1]["type"], "wait")
         self.assertEqual(held[2]["type"], "reset_arms")
         timed = duet_robot.parse_duet_program(
-            'duet.hold_pose(duet.pose("both_overhead"), 30)'
+            'duet.hold_pose(duet.pose("both_forward_low"), 30)'
         )[0]
         self.assertEqual(timed["duration_s"], 30)
         self.assertEqual(len(timed["target"]), 10)
+        self.assertIn("right_arm_cross_body", duet_robot.DUET_ARM_POSES)
 
         for code in (
             'duet.hold_pose(duet.pose("carry"), 31)',
@@ -243,6 +293,76 @@ class DuetProgramValidationTests(unittest.TestCase):
 
 
 class DuetOwnershipTests(unittest.TestCase):
+    def test_distance_condition_samples_front_sensor_and_executes_selected_branch(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop"],
+        }
+        sample = {
+            "distance_m": 0.4,
+            "clear": False,
+            "max_range_m": 40.0,
+            "age_ms": 12,
+        }
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", return_value=status
+        ) as gateway_request, patch.object(
+            duet_robot, "get_front_distance_sample", return_value=sample
+        ) as front_sample:
+            result = duet_robot.execute_program(
+                "if duet.front_distance_m() < 0.5:\n"
+                "    duet.stop()\n"
+                "else:\n"
+                "    duet.wait(0.1)"
+            )
+
+        front_sample.assert_called_once_with()
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["conditionsEvaluated"][0]["branch"], "then")
+        self.assertEqual(result["conditionsEvaluated"][0]["distance_m"], 0.4)
+        self.assertEqual([item.args[0] for item in gateway_request.call_args_list], ["STATUS", "STOP"])
+
+    def test_distance_condition_provider_error_aborts_and_requests_stop(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop"],
+        }
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", return_value=status
+        ) as gateway_request, patch.object(
+            duet_robot,
+            "get_rear_distance_sample",
+            side_effect=duet_robot.DistanceSensorError("sample is stale"),
+        ) as rear_sample:
+            with self.assertRaisesRegex(duet_robot.DuetControllerError, "sample is stale"):
+                duet_robot.execute_program(
+                    "if duet.rear_distance_m() < 1:\n"
+                    "    duet.stop()\n"
+                    "else:\n"
+                    "    duet.wait(0.1)"
+                )
+
+        rear_sample.assert_called_once_with()
+        self.assertIn(call("STOP"), gateway_request.call_args_list)
+
     def test_arm_run_is_rejected_before_program_execution_when_gateway_gate_is_disabled(self):
         status = {
             "protocol": duet_robot.DUET_PROTOCOL,

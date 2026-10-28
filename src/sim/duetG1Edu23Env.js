@@ -1,6 +1,5 @@
 import { createEmptyG1Edu23State, G1_EDU_23_ENV } from './g1Edu23Env.js';
 import {
-  flattenDuetCommands,
   getDuetCommand,
   parseDuetProgram,
 } from './duetCommands.js';
@@ -156,10 +155,35 @@ function simulateConcurrent(movement, gesture, frames, state, joints, actions, t
   }
 }
 
-export function simulateDuetG1Edu23Program(code) {
+function closestObstacleDistance(state, obstacles, sector) {
+  const radians = (state.heading * Math.PI) / 180;
+  const direction = sector === 'rear' ? -1 : 1;
+  let closestDistance = 40;
+  obstacles.forEach((obstacle) => {
+    const dx = Number(obstacle.x) - state.x;
+    const dy = Number(obstacle.y) - state.y;
+    const forward = direction * (dx * Math.cos(radians) + dy * Math.sin(radians));
+    const lateral = direction * (-dx * Math.sin(radians) + dy * Math.cos(radians));
+    if (forward <= 0 || Math.abs(Math.atan2(lateral, forward)) > Math.PI / 6) return;
+    const radius = Number.isFinite(Number(obstacle.radius)) ? Math.max(0, Number(obstacle.radius)) : 0;
+    closestDistance = Math.min(closestDistance, Math.max(0, Math.hypot(forward, lateral) - radius));
+  });
+  return closestDistance;
+}
+
+function containsCommands(nodes) {
+  return nodes.some((node) => (
+    node.type === 'condition'
+      ? containsCommands(node.then) || containsCommands(node.else)
+      : node.type === 'repeat'
+        ? containsCommands(node.body)
+        : true
+  ));
+}
+
+export function simulateDuetG1Edu23Program(code, { obstacles = G1_EDU_23_ENV.defaultObstacles } = {}) {
   const nodes = parseDuetProgram(code);
-  const commands = flattenDuetCommands(nodes);
-  if (!commands.length) {
+  if (!containsCommands(nodes)) {
     return [{
       ...createEmptyG1Edu23State(),
       status: 'Idle',
@@ -176,7 +200,37 @@ export function simulateDuetG1Edu23Program(code) {
   const heldPose = { name: null };
   appendFrame(frames, state, joints, actions, timeline, elapsed.value);
 
-  for (const command of commands) {
+  const pendingCommands = [...nodes].reverse();
+  while (pendingCommands.length) {
+    const command = pendingCommands.pop();
+    if (command.type === 'repeat') {
+      for (let iteration = 0; iteration < command.times; iteration += 1) {
+        pendingCommands.push(...[...command.body].reverse());
+      }
+      continue;
+    }
+    if (command.type === 'condition') {
+      const sector = command.sensor === 'rear_distance_m' ? 'rear' : 'forward';
+      const distance = closestObstacleDistance(state, obstacles, sector);
+      const operators = {
+        '<': (left, right) => left < right,
+        '<=': (left, right) => left <= right,
+        '>': (left, right) => left > right,
+        '>=': (left, right) => left >= right,
+        '==': (left, right) => left === right,
+        '!=': (left, right) => left !== right,
+      };
+      const selectedThen = operators[command.operator](distance, command.threshold);
+      actions.push({
+        label: 'Distance condition',
+        summary: `Nearest ${sector} obstacle: ${distance.toFixed(2)} m ${command.operator} ${command.threshold} m -> ${selectedThen ? 'then' : 'else'}`,
+      });
+      timeline.push(actions[actions.length - 1]);
+      elapsed.value += 1 / FRAME_RATE;
+      appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+      pendingCommands.push(...[...(selectedThen ? command.then : command.else)].reverse());
+      continue;
+    }
     const preset = getDuetCommand(command.method)?.motion;
     if (command.method === 'move' || preset) {
       const movement = preset

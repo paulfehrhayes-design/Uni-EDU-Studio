@@ -117,6 +117,22 @@ const holdPoseCommand = (method, label, description, args) => ({
   ...command(method, label, description, args),
   poseInput: true,
 });
+const MIN_DISTANCE_METERS = 0.1;
+const MAX_DISTANCE_METERS = 40;
+const DUET_DISTANCE_SENSORS = Object.freeze([
+  {
+    type: 'duet_front_distance_m',
+    sensor: 'front_distance_m',
+    message0: 'Front obstacle distance (m)',
+    tooltip: 'Read fresh, calibrated MID-360 forward footprint clearance.',
+  },
+  {
+    type: 'duet_rear_distance_m',
+    sensor: 'rear_distance_m',
+    message0: 'Rear obstacle distance (m)',
+    tooltip: 'Read fresh, calibrated MID-360 rear footprint clearance.',
+  },
+]);
 
 const DUET_ARM_POSE_BLOCKS = Object.freeze(getDuetArmPoseNames().map((poseName) => Object.freeze({
   type: `duet_pose_target_${poseName}`,
@@ -361,6 +377,51 @@ function parseLines(lines, start, indent, depth) {
     if (line.indent < indent) break;
     if (line.indent > indent) throw new Error(`Unexpected indentation on line ${line.lineNumber}.`);
 
+    const distanceCondition = line.text.match(
+      /^if\s+duet\.(front|rear)_distance_m\(\)\s*(<=|>=|==|!=|<|>)\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\s*:\s*$/,
+    );
+    if (distanceCondition) {
+      const [, sector, operator, rawThreshold] = distanceCondition;
+      const threshold = Number(rawThreshold);
+      if (!Number.isFinite(threshold) || threshold < MIN_DISTANCE_METERS || threshold > MAX_DISTANCE_METERS) {
+        throw new Error(
+          `Distance threshold on line ${line.lineNumber} must be between ${MIN_DISTANCE_METERS} and ${MAX_DISTANCE_METERS} meters.`,
+        );
+      }
+      let bodyStart = lineIndexAfter(lines, index + 1);
+      if (bodyStart >= lines.length || lines[bodyStart].indent <= indent) {
+        throw new Error(`Distance condition on line ${line.lineNumber} has no body.`);
+      }
+      const [then, next] = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+      if (!then.length) throw new Error(`Distance condition on line ${line.lineNumber} has no body.`);
+      index = lineIndexAfter(lines, next);
+      let otherwise = [];
+      if (index < lines.length && lines[index].indent === indent && lines[index].text === 'else:') {
+        bodyStart = lineIndexAfter(lines, index + 1);
+        if (bodyStart >= lines.length || lines[bodyStart].indent <= indent) {
+          throw new Error(`Else branch on line ${lines[index].lineNumber} has no body.`);
+        }
+        [otherwise, index] = parseLines(lines, bodyStart, lines[bodyStart].indent, depth + 1);
+        if (!otherwise.length) throw new Error(`Else branch on line ${line.lineNumber} has no body.`);
+      }
+      const sensor = `${sector}_distance_m`;
+      nodes.push({
+        type: 'condition',
+        sensor,
+        operator,
+        threshold,
+        code: `duet.${sensor}() ${operator} ${threshold}`,
+        then,
+        else: otherwise,
+      });
+      continue;
+    }
+    if (/^if\b/.test(line.text)) {
+      throw new Error(
+        `Unsupported condition on line ${line.lineNumber}. Compare duet.front_distance_m() or duet.rear_distance_m() with a numeric threshold.`,
+      );
+    }
+
     if (line.text === 'with duet.concurrent():') {
       let bodyStart = index + 1;
       while (bodyStart < lines.length && (!lines[bodyStart].text || lines[bodyStart].text.startsWith('#'))) bodyStart += 1;
@@ -411,14 +472,65 @@ function parseLines(lines, start, indent, depth) {
   return [nodes, index];
 }
 
+function lineIndexAfter(lines, index) {
+  while (index < lines.length && (!lines[index].text || lines[index].text.startsWith('#'))) index += 1;
+  return index;
+}
+
 function countCommands(nodes) {
   return nodes.reduce((total, node) => (
     total + (node.type === 'repeat'
       ? node.times * countCommands(node.body)
       : node.type === 'concurrent'
         ? 1 + (getDuetCommand(node.gesture.method)?.armPoses?.length || 1)
+        : node.type === 'condition'
+          ? 1 + Math.max(countCommands(node.then), countCommands(node.else))
         : getDuetCommand(node.method)?.armPoses?.length || 1)
   ), 0);
+}
+
+function validateStopPlacement(nodes, finalInParent = true) {
+  nodes.forEach((node, index) => {
+    const isFinal = finalInParent && index === nodes.length - 1;
+    if (node.type === 'command' && node.method === 'stop' && !isFinal) {
+      throw new Error('duet.stop() must be the final command on every execution path.');
+    }
+    if (node.type === 'condition') {
+      validateStopPlacement(node.then, isFinal);
+      validateStopPlacement(node.else, isFinal);
+    } else if (node.type === 'repeat') {
+      validateStopPlacement(node.body, isFinal && node.times === 1);
+    }
+  });
+}
+
+function validateArmResetFlow(nodes, possibleHeldStates = new Set([false])) {
+  let states = possibleHeldStates;
+  nodes.forEach((node) => {
+    if (node.type === 'condition') {
+      const thenStates = validateArmResetFlow(node.then, new Set(states));
+      const elseStates = validateArmResetFlow(node.else, new Set(states));
+      states = new Set([...thenStates, ...elseStates]);
+      return;
+    }
+    if (node.type === 'repeat') {
+      for (let iteration = 0; iteration < node.times; iteration += 1) {
+        states = validateArmResetFlow(node.body, states);
+      }
+      return;
+    }
+    const commands = node.type === 'concurrent' ? [node.gesture] : [node];
+    const startsArmMotion = commands.some(({ method }) => {
+      const definition = getDuetCommand(method);
+      return definition?.armPoses || definition?.poseInput;
+    });
+    if (states.has(true) && startsArmMotion) {
+      throw new Error('Reset arms with duet.reset_arms() before starting another arm motion.');
+    }
+    if (node.type === 'command' && node.method === 'reset_arms') states = new Set([false]);
+    else if (commands.some(({ method }) => method === 'hold_pose_until_reset')) states = new Set([true]);
+  });
+  return states;
 }
 
 export function parseDuetProgram(code = '') {
@@ -434,23 +546,8 @@ export function parseDuetProgram(code = '') {
   if (countCommands(nodes) > 400) {
     throw new Error('DUET programs may contain at most 400 expanded commands.');
   }
-  const flattened = flattenDuetCommands(nodes);
-  if (flattened.some((node, index) => node.method === 'stop' && index !== flattened.length - 1)) {
-    throw new Error('duet.stop() must be the final command in a program.');
-  }
-  let poseHeldUntilReset = false;
-  flattened.forEach((node) => {
-    const commands = node.type === 'concurrent' ? [node.gesture] : [node];
-    const startsArmMotion = commands.some(({ method }) => {
-      const definition = getDuetCommand(method);
-      return definition?.armPoses || definition?.poseInput;
-    });
-    if (poseHeldUntilReset && startsArmMotion) {
-      throw new Error('Reset arms with duet.reset_arms() before starting another arm motion.');
-    }
-    if (node.type === 'command' && node.method === 'reset_arms') poseHeldUntilReset = false;
-    else if (commands.some(({ method }) => method === 'hold_pose_until_reset')) poseHeldUntilReset = true;
-  });
+  validateStopPlacement(nodes);
+  validateArmResetFlow(nodes);
   return nodes;
 }
 
@@ -459,6 +556,9 @@ export function flattenDuetCommands(nodes, result = []) {
     if (node.type === 'command' || node.type === 'concurrent') {
       result.push(node);
       return;
+    }
+    if (node.type === 'condition') {
+      throw new Error('Programs with distance conditions cannot be flattened without sensor data.');
     }
     for (let count = 0; count < node.times; count += 1) flattenDuetCommands(node.body, result);
   });
@@ -472,7 +572,11 @@ export function formatDuetProgram(nodes, indent = 0) {
       ? `${padding}with duet.concurrent():\n${padding}    ${node.movement.code}\n${padding}    ${node.gesture.code}`
       : node.type === 'command'
       ? `${padding}${node.code}`
-      : `${padding}for _ in range(${node.times}):\n${formatDuetProgram(node.body, indent + 4)}`
+      : node.type === 'condition'
+        ? `${padding}if ${node.code}:\n${formatDuetProgram(node.then, indent + 4)}${node.else.length
+          ? `\n${padding}else:\n${formatDuetProgram(node.else, indent + 4)}`
+          : ''}`
+        : `${padding}for _ in range(${node.times}):\n${formatDuetProgram(node.body, indent + 4)}`
   )).join('\n');
 }
 
@@ -514,6 +618,15 @@ export function getDuetBlocklyCommandBlocks() {
       output: 'String',
       colour: 280,
     })),
+    ...DUET_DISTANCE_SENSORS.map(({ type, sensor, message0, tooltip }) => ({
+      type,
+      category: 'Sensors',
+      message0,
+      output: 'Number',
+      colour: 200,
+      tooltip,
+      codeTemplate: `duet.${sensor}()`,
+    })),
     {
       type: 'duet_concurrent_action',
       category: 'Concurrent actions',
@@ -534,7 +647,7 @@ export function getDuetCommand(method) {
 }
 
 export function getDuetCommandExamples() {
-  return DUET_COMMANDS.flatMap((definition) => {
+  const commandExamples = DUET_COMMANDS.flatMap((definition) => {
     if (definition.poseInput) {
       return getDuetArmPoseNames().map((poseName) => {
         const poseCode = `duet.pose(${JSON.stringify(poseName)})`;
@@ -556,12 +669,75 @@ export function getDuetCommandExamples() {
       )).join(', ')})`,
     }];
   });
+  return [
+    ...commandExamples,
+    {
+      key: 'front_distance_condition',
+      label: 'Front distance condition example',
+      code: 'if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.forward(1)',
+    },
+    {
+      key: 'rear_distance_condition',
+      label: 'Rear distance condition example',
+      code: 'if duet.rear_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.backward(1)',
+    },
+  ];
 }
 
 export function compileDuetMotionPrompt(prompt = '') {
   const normalized = prompt.toLowerCase().replace(/[,.!?;:]/g, ' ');
   const steps = [];
   const unknown = [];
+  const timedPoseMatch = normalized.match(
+    /\b(?:hold|keep|maintain)\s+(?:the\s+)?(.+?)\s+for\s+(\d+(?:\.\d+)?)\s*(s|secs?|seconds?)\b/,
+  );
+  const untilResetPoseMatch = normalized.match(
+    /\b(?:hold|keep|maintain)\s+(?:the\s+)?(.+?)\s+until\s+reset\b/,
+  );
+  const heldPoseMatch = timedPoseMatch || untilResetPoseMatch;
+  const posePromptAliases = getDuetArmPoseNames().flatMap((poseName) => {
+    const words = poseName.replaceAll('_', ' ');
+    const aliases = [words];
+    if (poseName.startsWith('left_') || poseName.startsWith('right_')) {
+      const side = poseName.startsWith('left_') ? 'left' : 'right';
+      const pose = poseName.slice(side.length + 1).replaceAll('_', ' ');
+      aliases.push(`${side} arm ${pose}`);
+      if (pose.startsWith('raise ')) aliases.push(`${side} arm raised ${pose.slice(6)}`);
+    } else if (poseName.startsWith('both_')) {
+      const pose = poseName.slice(5).replaceAll('_', ' ');
+      aliases.push(`both arms ${pose}`);
+      if (poseName === 'both_hands_up') aliases.push('both arms up');
+      if (poseName === 'both_overhead') aliases.push('both arms above head', 'arms overhead');
+      if (poseName === 'both_sideways') aliases.push('both arms out sideways', 'arms out sideways');
+      if (poseName === 'both_hold_object') aliases.push('both arms carrying something');
+    }
+    return aliases.map((phrase) => ({ poseName, phrase }));
+  }).sort((left, right) => right.phrase.length - left.phrase.length);
+
+  if (heldPoseMatch) {
+    const requestedPose = heldPoseMatch[1].trim();
+    const matchedPose = posePromptAliases.find(({ phrase }) => phrase === requestedPose);
+    if (!matchedPose) {
+      unknown.push(`Unknown DUET arm pose "${requestedPose}"; choose a named pose from the V2 arm-pose library.`);
+    } else if (untilResetPoseMatch) {
+      steps.push({
+        label: `Hold ${matchedPose.poseName.replaceAll('_', ' ') } until reset`,
+        code: `duet.hold_pose_until_reset(duet.pose(${JSON.stringify(matchedPose.poseName)}))`,
+        detail: 'The pose remains requested until duet.reset_arms() or program completion.',
+      });
+    } else {
+      const holdDuration = Number(timedPoseMatch[2]);
+      if (holdDuration < 1 || holdDuration > 30) {
+        unknown.push('Timed arm poses must be held for 1 to 30 seconds.');
+      } else {
+        steps.push({
+          label: `Hold ${matchedPose.poseName.replaceAll('_', ' ')} for ${holdDuration} seconds`,
+          code: `duet.hold_pose(duet.pose(${JSON.stringify(matchedPose.poseName)}), ${holdDuration})`,
+          detail: 'The named pose holds for the requested interval, then returns to carry.',
+        });
+      }
+    }
+  }
   const durationMatch = normalized.match(/\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(s|secs?|seconds?)\b/);
   const durationValue = durationMatch ? Number(durationMatch[1]) : 1;
   const durationError = durationMatch && (durationValue < 0.1 || durationValue > 3)
@@ -672,7 +848,7 @@ export function compileDuetMotionPrompt(prompt = '') {
     }
   });
 
-  if (!supportedArmGestureMatches.length && /\b(wave|raise|lift)\b/.test(normalized)) {
+  if (!heldPoseMatch && !supportedArmGestureMatches.length && /\b(wave|raise|lift)\b/.test(normalized)) {
     unknown.push('Arm gestures are only supported as safe bounded left/right and both-arm presets that use the validated DUET arm gate.');
   }
   if (/\b(kick|knee|dance|mimic)\b/.test(normalized)) {

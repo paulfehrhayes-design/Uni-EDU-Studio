@@ -257,14 +257,17 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertFalse(frame_result["ready"])
         self.assertIn("does not match", frame_result["error"])
 
-    def test_missing_or_stale_pointcloud_fails_navigation_readiness(self):
+    def test_missing_or_stale_pointcloud_reduces_coverage_without_blocking_navigation_readiness(self):
         for sensor_status in (
             {**self.status, "pointcloud_ready": False},
             {**self.status, "pointcloud_age_ms": 1_501},
+            {**self.status, "pointcloud_age_ms": None},
         ):
             with self.mock_bridge(status=sensor_status):
                 result = navigation_bridge_status(now=self.now)
-            self.assertFalse(result["ready"])
+            self.assertTrue(result["ready"])
+            self.assertFalse(result["pointcloudReady"])
+            self.assertIsNone(result["pointcloudAgeMs"])
 
     def test_map_dimensions_are_bounded(self):
         too_large = {**self.map_metadata, "width": 100_000, "height": 100_000}

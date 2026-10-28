@@ -25,7 +25,8 @@ Configuration overrides are ``G1_NAV_ACTION_NAME`` (default
 ``/compute_path_through_poses``), ``G1_NAV_PLANNER_ID`` (default
 ``GridBased``), ``G1_NAV_PLAN_TIMEOUT_SECONDS`` (1–60, default 15),
 ``G1_NAV_SPIN_ACTION_NAME`` (default ``/spin``), ``G1_NAV_MAP_TOPIC`` (``/map``),
-``G1_NAV_POINTCLOUD_TOPIC`` (``/mid360/livox/lidar``),
+``G1_NAV_POINTCLOUD_TOPICS`` (comma-separated; defaults to
+``G1_NAV_POINTCLOUD_TOPIC`` or ``/mid360/livox/lidar``),
 ``G1_NAV_MAP_FRAME`` (``map``), ``G1_NAV_BASE_FRAME`` (``base_link``),
 ``G1_NAV_MAP_ID`` (``nav2-map``), and
 ``G1_NAV_OCCUPIED_THRESHOLD`` (65, valid values 1 through 100). Unknown
@@ -34,7 +35,7 @@ threshold are occupied. Map versions are SHA-256 identities of the current
 map metadata and all occupancy cells.
 
 All routes require ``Authorization: Bearer <G1_NAV_GATEWAY_TOKEN>``.
-``GET /api/v1/status`` reports action-server, map, fresh point-cloud, and TF readiness;
+``GET /api/v1/status`` reports action-server, map, TF, and per-sensor point-cloud readiness;
 ``GET /api/v1/map/metadata`` and ``GET /api/v1/map`` return the current
 map and identity. Route previews use
 ``POST /api/v1/navigation/plan`` and Nav2's ComputePathThroughPoses action;
@@ -86,6 +87,47 @@ SCAN_SENSOR_MAX_AGE_SECONDS = 1.5
 SCAN_MAP_MAX_AGE_SECONDS = 2.0
 POINTCLOUD_MAX_FUTURE_SKEW_SECONDS = 0.1
 POINTCLOUD_RATE_WINDOW_SECONDS = 5.0
+MAX_POINTCLOUD_TOPICS = 16
+
+
+def _aggregate_pointcloud_health(
+    sources: list[dict[str, Any]],
+    *,
+    now_monotonic: float | None = None,
+) -> dict[str, Any]:
+    """Return the freshest healthy point-cloud signal across all configured sensors.
+
+    The live map and route planning should continue whenever any configured sensor is
+    still fresh. A single missing or stale source must never force a hard failure for
+    the entire planner stack when the remaining sensors still provide usable coverage.
+    """
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    fresh_sources: list[dict[str, Any]] = []
+    freshest_received_monotonic: float | None = None
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        received_monotonic = source.get("received_monotonic")
+        if received_monotonic is None:
+            continue
+        ready = bool(source.get("ready")) and now - float(received_monotonic) <= SCAN_SENSOR_MAX_AGE_SECONDS
+        if ready:
+            fresh_sources.append({**source, "ready": True})
+            if freshest_received_monotonic is None or float(received_monotonic) > freshest_received_monotonic:
+                freshest_received_monotonic = float(received_monotonic)
+    age_ms = None
+    if fresh_sources:
+        age_ms = min(
+            int(round((now - float(source["received_monotonic"])) * 1000))
+            for source in fresh_sources
+            if isinstance(source.get("received_monotonic"), (int, float))
+        )
+    return {
+        "ready": bool(fresh_sources),
+        "age_ms": age_ms,
+        "latest_received_monotonic": freshest_received_monotonic,
+        "fresh_sources": fresh_sources,
+    }
 
 
 class GatewayConfigurationError(ValueError):
@@ -177,7 +219,12 @@ def _configuration() -> dict[str, Any]:
         "G1_NAV_PLAN_ACTION_NAME", "/compute_path_through_poses"
     ).strip()
     map_topic = os.getenv("G1_NAV_MAP_TOPIC", "/map").strip()
-    pointcloud_topic = os.getenv("G1_NAV_POINTCLOUD_TOPIC", "/mid360/livox/lidar").strip()
+    pointcloud_topics_value = os.getenv("G1_NAV_POINTCLOUD_TOPICS", "").strip()
+    pointcloud_topics = (
+        [topic.strip() for topic in pointcloud_topics_value.split(",") if topic.strip()]
+        if pointcloud_topics_value
+        else [os.getenv("G1_NAV_POINTCLOUD_TOPIC", "/mid360/livox/lidar").strip()]
+    )
     local_costmap_topic = os.getenv(
         "G1_NAV_LOCAL_COSTMAP_TOPIC", "/local_costmap/costmap"
     ).strip()
@@ -187,9 +234,21 @@ def _configuration() -> dict[str, Any]:
     locomotion_owner = os.getenv("G1_NAV_LOCOMOTION_OWNER", "unverified").strip()
     if not all((
         action_name, spin_action_name, plan_action_name, map_topic,
-        pointcloud_topic, local_costmap_topic, map_frame, base_frame, map_id, locomotion_owner,
+        *pointcloud_topics, local_costmap_topic, map_frame, base_frame, map_id, locomotion_owner,
     )):
         raise GatewayConfigurationError("Action, map, frame, and map ID settings cannot be empty.")
+    if (
+        len(pointcloud_topics) > MAX_POINTCLOUD_TOPICS
+        or len(set(pointcloud_topics)) != len(pointcloud_topics)
+        or any(
+            not topic.startswith("/")
+            or any(not part or not all(character.isalnum() or character == "_" for character in part) for part in topic[1:].split("/"))
+            for topic in pointcloud_topics
+        )
+    ):
+        raise GatewayConfigurationError(
+            f"G1_NAV_POINTCLOUD_TOPICS must contain at most {MAX_POINTCLOUD_TOPICS} unique absolute ROS topic names."
+        )
     try:
         threshold = float(os.getenv("G1_NAV_OCCUPIED_THRESHOLD", str(DEFAULT_OCCUPIED_THRESHOLD)))
     except ValueError as error:
@@ -209,7 +268,7 @@ def _configuration() -> dict[str, Any]:
             "G1_NAV_SCAN_ROTATION_TIMEOUT_SECONDS", 180, 30, 300
         ),
         "map_topic": map_topic,
-        "pointcloud_topic": pointcloud_topic,
+        "pointcloud_topics": pointcloud_topics,
         "local_costmap_topic": local_costmap_topic,
         "live_avoidance_enabled": os.getenv(
             "G1_NAV_LIVE_AVOIDANCE_ENABLED", "0"
@@ -298,14 +357,20 @@ def _make_ros_node(config: dict[str, Any]):
             self.active_operation_id: str | None = None
             self.scans: dict[str, dict[str, Any]] = {}
             self.active_scan_id: str | None = None
+            self.pointcloud_sources: dict[str, dict[str, Any]] = {
+                topic: {
+                    "received_monotonic": None,
+                    "frame_id": None,
+                    "stamp_age_ms": None,
+                    "rate_started_monotonic": time.monotonic(),
+                    "rate_window_count": 0,
+                    "count": 0,
+                    "rate_hz": None,
+                    "callback_duration_ms": None,
+                }
+                for topic in config["pointcloud_topics"]
+            }
             self.pointcloud_received_monotonic: float | None = None
-            self.pointcloud_frame_id: str | None = None
-            self.pointcloud_stamp_age_ms: float | None = None
-            self.pointcloud_rate_started_monotonic = time.monotonic()
-            self.pointcloud_rate_window_count = 0
-            self.pointcloud_count = 0
-            self.pointcloud_rate_hz: float | None = None
-            self.pointcloud_callback_duration_ms: float | None = None
             self.local_costmap: dict[str, Any] | None = None
             self.local_costmap_received_monotonic: float | None = None
             self.local_costmap_error: str | None = None
@@ -324,9 +389,15 @@ def _make_ros_node(config: dict[str, Any]):
             self.map_subscription = self.create_subscription(
                 OccupancyGrid, config["map_topic"], self._map_callback, 10
             )
-            self.pointcloud_subscription = self.create_subscription(
-                PointCloud2, config["pointcloud_topic"], self._pointcloud_callback, 10
-            )
+            self.pointcloud_subscriptions = [
+                self.create_subscription(
+                    PointCloud2,
+                    topic,
+                    lambda message, source_topic=topic: self._pointcloud_callback(message, source_topic),
+                    10,
+                )
+                for topic in config["pointcloud_topics"]
+            ]
             self.local_costmap_subscription = self.create_subscription(
                 OccupancyGrid, config["local_costmap_topic"], self._local_costmap_callback, 10
             )
@@ -406,7 +477,7 @@ def _make_ros_node(config: dict[str, Any]):
                 z + qw * tz + (qx * ty - qy * tx),
             )
 
-        def _pointcloud_callback(self, message):
+        def _pointcloud_callback(self, message, source_topic):
             callback_started = time.monotonic()
             source_frame = str(message.header.frame_id).strip()
             if not source_frame:
@@ -437,6 +508,7 @@ def _make_ros_node(config: dict[str, Any]):
                     )
                     return
                 self._record_pointcloud(
+                    source_topic,
                     source_frame,
                     stamp_age_seconds,
                     time.monotonic() - callback_started,
@@ -488,6 +560,7 @@ def _make_ros_node(config: dict[str, Any]):
                 if not scan or scan["state"] != "scanning":
                     return
                 self._record_pointcloud(
+                    source_topic,
                     source_frame,
                     stamp_age_seconds,
                     time.monotonic() - callback_started,
@@ -503,23 +576,57 @@ def _make_ros_node(config: dict[str, Any]):
 
         def _record_pointcloud(
             self,
+            source_topic: str,
             source_frame: str,
             stamp_age_seconds: float,
             callback_duration_seconds: float,
         ) -> None:
             now = time.monotonic()
             with self.lock:
-                self.pointcloud_received_monotonic = now
-                self.pointcloud_frame_id = source_frame
-                self.pointcloud_stamp_age_ms = stamp_age_seconds * 1000
-                self.pointcloud_callback_duration_ms = callback_duration_seconds * 1000
-                self.pointcloud_count += 1
-                self.pointcloud_rate_window_count += 1
-                elapsed = now - self.pointcloud_rate_started_monotonic
+                source = self.pointcloud_sources[source_topic]
+                source["received_monotonic"] = now
+                source["frame_id"] = source_frame
+                source["stamp_age_ms"] = stamp_age_seconds * 1000
+                source["callback_duration_ms"] = callback_duration_seconds * 1000
+                source["count"] += 1
+                source["rate_window_count"] += 1
+                elapsed = now - source["rate_started_monotonic"]
                 if elapsed >= POINTCLOUD_RATE_WINDOW_SECONDS:
-                    self.pointcloud_rate_hz = self.pointcloud_rate_window_count / elapsed
-                    self.pointcloud_rate_started_monotonic = now
-                    self.pointcloud_rate_window_count = 0
+                    source["rate_hz"] = source["rate_window_count"] / elapsed
+                    source["rate_started_monotonic"] = now
+                    source["rate_window_count"] = 0
+
+        def _pointcloud_snapshot(self) -> dict[str, Any]:
+            now = time.monotonic()
+            with self.lock:
+                sources = [
+                    {
+                        "topic": topic,
+                        "frame_id": source["frame_id"],
+                        "ready": source["received_monotonic"] is not None
+                        and now - source["received_monotonic"] <= SCAN_SENSOR_MAX_AGE_SECONDS,
+                        "age_ms": round((now - source["received_monotonic"]) * 1000)
+                        if source["received_monotonic"] is not None else None,
+                        "stamp_age_ms": round(source["stamp_age_ms"], 1)
+                        if source["stamp_age_ms"] is not None else None,
+                        "count": source["count"],
+                        "rate_hz": source["rate_hz"],
+                        "callback_duration_ms": round(source["callback_duration_ms"], 1)
+                        if source["callback_duration_ms"] is not None else None,
+                    }
+                    for topic, source in self.pointcloud_sources.items()
+                ]
+            for source in sources:
+                if not source["ready"]:
+                    source["error"] = "No recent transform-valid point cloud from this sensor."
+            health = _aggregate_pointcloud_health(sources, now_monotonic=now)
+            self.pointcloud_received_monotonic = health["latest_received_monotonic"]
+            fresh_sources = health["fresh_sources"]
+            return {
+                "ready": health["ready"],
+                "age_ms": health["age_ms"],
+                "sources": sources,
+            }
 
         def _scan_health_tick(self):
             motion_health = self._motion_health_snapshot()
@@ -769,12 +876,16 @@ def _make_ros_node(config: dict[str, Any]):
                     or time.monotonic() - self.grid_received_monotonic > SCAN_MAP_MAX_AGE_SECONDS
                 ):
                     raise GatewayHTTPError(503, "The SLAM occupancy map is stale; refresh it before scanning.")
-                if self.pointcloud_received_monotonic is None or (
-                    time.monotonic() - self.pointcloud_received_monotonic > SCAN_SENSOR_MAX_AGE_SECONDS
-                ):
-                    raise GatewayHTTPError(503, "A fresh MID-360 point cloud is required before starting the scan.")
-                if not self.pointcloud_frame_id:
-                    raise GatewayHTTPError(503, "The MID-360 point-cloud frame is missing.")
+                pointcloud_sources = [
+                    source for source in self._pointcloud_snapshot()["sources"]
+                    if source["ready"] and source["frame_id"]
+                ]
+                if not pointcloud_sources:
+                    raise GatewayHTTPError(
+                        503,
+                        "No configured point-cloud sensor is currently fresh and transform-valid. "
+                        "Navigation can still use the live map and Nav2 costmap; a 3D scan needs at least one sensor.",
+                    )
                 if not self.spin_action_client.server_is_ready():
                     raise GatewayHTTPError(503, "Nav2 Spin action server is not ready; no scan motion was started.")
                 localization = self._localization_snapshot()
@@ -783,18 +894,23 @@ def _make_ros_node(config: dict[str, Any]):
                         503,
                         localization.get("error") or "Fresh robot localization is required before scanning.",
                     )
-                try:
-                    self.tf_buffer.lookup_transform(
-                        self.config["map_frame"],
-                        self.pointcloud_frame_id,
-                        Time(),
-                        timeout=Duration(seconds=0.1),
-                    )
-                except self._transform_exception as error:
+                transformable_sources = []
+                for source in pointcloud_sources:
+                    try:
+                        self.tf_buffer.lookup_transform(
+                            self.config["map_frame"],
+                            source["frame_id"],
+                            Time(),
+                            timeout=Duration(seconds=0.1),
+                        )
+                    except (self._transform_exception, TypeError, ValueError):
+                        continue
+                    transformable_sources.append(source)
+                if not transformable_sources:
                     raise GatewayHTTPError(
                         503,
-                        f"LiDAR-to-map transform is unavailable; no scan motion was started: {error}",
-                    ) from error
+                        "No live point-cloud sensor has a valid map transform; unavailable sensors were skipped.",
+                    )
                 if self.active_operation_id:
                     raise GatewayHTTPError(409, "Cannot scan while a Nav2 route owns locomotion.")
                 if self.active_scan_id:
@@ -1165,32 +1281,26 @@ def _make_ros_node(config: dict[str, Any]):
             localization = self._localization_snapshot()
             motion_health = self._motion_health_snapshot()
             live_obstacles = self._local_costmap_snapshot()
+            pointcloud_status = self._pointcloud_snapshot()
             with self.lock:
                 grid = self.grid
                 grid_age = (
                     time.monotonic() - self.grid_received_monotonic
                     if self.grid_received_monotonic is not None else math.inf
                 )
-                pointcloud_age = (
-                    time.monotonic() - self.pointcloud_received_monotonic
-                    if self.pointcloud_received_monotonic is not None else math.inf
-                )
-                pointcloud_frame = self.pointcloud_frame_id
-                pointcloud_stamp_age_ms = self.pointcloud_stamp_age_ms
-                pointcloud_rate_hz = self.pointcloud_rate_hz
-                pointcloud_count = self.pointcloud_count
-                pointcloud_callback_duration_ms = self.pointcloud_callback_duration_ms
                 active = self.operations.get(self.active_operation_id) if self.active_operation_id else None
             map_ready = grid is not None and grid_age <= SCAN_MAP_MAX_AGE_SECONDS
-            pointcloud_ready = pointcloud_age <= SCAN_SENSOR_MAX_AGE_SECONDS
+            pointcloud_ready = pointcloud_status["ready"]
             action_ready = self.action_client.server_is_ready()
-            ready = bool(map_ready and pointcloud_ready and localization["ready"] and action_ready)
+            ready = bool(map_ready and localization["ready"] and action_ready)
             ownership_ready = controller_ownership_ready(
                 self.config["locomotion_owner"],
                 self.config["controller_ownership_confirmed"],
             )
             motion_ready = bool(ready and motion_health["ready"] and ownership_ready)
             map_metadata = self._metadata(grid) if grid else None
+            ready_sources = [source for source in pointcloud_status["sources"] if source["ready"]]
+            source_count = len(pointcloud_status["sources"])
             return {
                 "ready": ready,
                 "status": "ready" if ready else "unavailable",
@@ -1206,29 +1316,33 @@ def _make_ros_node(config: dict[str, Any]):
                 "map_ready": map_ready,
                 "map_age_ms": round(max(0.0, grid_age) * 1000) if math.isfinite(grid_age) else None,
                 "pointcloud_ready": pointcloud_ready,
-                "pointcloud_age_ms": round(max(0.0, pointcloud_age) * 1000) if math.isfinite(pointcloud_age) else None,
+                "pointcloud_age_ms": pointcloud_status["age_ms"],
+                "pointcloud_sources": pointcloud_status["sources"],
                 "localization": localization,
                 "map": map_metadata,
                 "diagnostics": {
                     "topics": {
-                        "pointcloud": self.config["pointcloud_topic"],
+                        "pointcloud": ", ".join(self.config["pointcloud_topics"]),
+                        "pointcloud_sources": self.config["pointcloud_topics"],
                         "map": self.config["map_topic"],
                         "local_costmap": self.config["local_costmap_topic"],
                     },
                     "frames": {
-                        "pointcloud": pointcloud_frame,
+                        "pointcloud": ", ".join(sorted({
+                            source["frame_id"] for source in ready_sources if source["frame_id"]
+                        })) or None,
                         "map": self.config["map_frame"],
                         "base": self.config["base_frame"],
                     },
                     "pointcloud": {
-                        "count": pointcloud_count,
-                        "rate_hz": pointcloud_rate_hz,
-                        "age_ms": round(max(0.0, pointcloud_age) * 1000)
-                        if math.isfinite(pointcloud_age) else None,
-                        "stamp_age_ms": round(pointcloud_stamp_age_ms, 1)
-                        if pointcloud_stamp_age_ms is not None else None,
-                        "callback_duration_ms": round(pointcloud_callback_duration_ms, 1)
-                        if pointcloud_callback_duration_ms is not None else None,
+                        "ready": pointcloud_ready,
+                        "ready_sources": len(ready_sources),
+                        "configured_sources": source_count,
+                        "count": sum(source["count"] for source in pointcloud_status["sources"]),
+                        "rate_hz": sum(source["rate_hz"] or 0 for source in ready_sources)
+                        if ready_sources else None,
+                        "age_ms": pointcloud_status["age_ms"],
+                        "sources": pointcloud_status["sources"],
                     },
                     "map": {
                         "occupied_threshold": self.config["occupied_threshold"],

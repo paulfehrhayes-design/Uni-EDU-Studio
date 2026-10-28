@@ -170,7 +170,7 @@ def _finite_number(value: Any, name: str) -> float:
     return float(value)
 
 
-def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float) -> dict[str, Any]:
+def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float | None) -> dict[str, Any]:
     raw = payload.get("diagnostics")
     raw = raw if isinstance(raw, dict) else {}
     topics = raw.get("topics") if isinstance(raw.get("topics"), dict) else {}
@@ -201,6 +201,20 @@ def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float) -> 
         isinstance(count, bool) or not isinstance(count, int) or count < 0
     ):
         raise NavigationBridgeError("Navigation bridge diagnostic point-cloud count is invalid.")
+    raw_sources = pointcloud.get("sources", [])
+    if not isinstance(raw_sources, list) or len(raw_sources) > 16:
+        raise NavigationBridgeError("Navigation bridge point-cloud source list is invalid or oversized.")
+    pointcloud_sources = []
+    for index, source in enumerate(raw_sources):
+        if not isinstance(source, dict):
+            raise NavigationBridgeError(f"Navigation bridge point-cloud source {index + 1} is invalid.")
+        pointcloud_sources.append({
+            "topic": optional_text(source.get("topic"), f"point-cloud source {index + 1} topic"),
+            "frame_id": optional_text(source.get("frame_id"), f"point-cloud source {index + 1} frame"),
+            "ready": source.get("ready") is True,
+            "age_ms": optional_number(source.get("age_ms"), f"point-cloud source {index + 1} age"),
+            "error": optional_text(source.get("error"), f"point-cloud source {index + 1} error"),
+        })
     threshold = map_diagnostics.get("occupied_threshold")
     if threshold is not None and (
         isinstance(threshold, bool)
@@ -239,7 +253,13 @@ def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float) -> 
             "count": count,
             "rate_hz": optional_number(pointcloud.get("rate_hz"), "point-cloud rate"),
             "age_ms": optional_number(pointcloud.get("age_ms"), "point-cloud age")
-            if pointcloud.get("age_ms") is not None else round(pointcloud_age_ms),
+            if pointcloud.get("age_ms") is not None else (
+                round(pointcloud_age_ms) if pointcloud_age_ms is not None else None
+            ),
+            "ready": pointcloud.get("ready") is True,
+            "ready_sources": pointcloud.get("ready_sources", 0),
+            "configured_sources": pointcloud.get("configured_sources", len(pointcloud_sources)),
+            "sources": pointcloud_sources,
             "stamp_age_ms": optional_number(pointcloud.get("stamp_age_ms"), "point-cloud timestamp age"),
             "callback_duration_ms": optional_number(
                 pointcloud.get("callback_duration_ms"), "point-cloud callback duration"
@@ -308,18 +328,25 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         )
     localization_ready = localization.get("ready") is True
     pointcloud_age_ms = payload.get("pointcloud_age_ms")
-    if (
+    if pointcloud_age_ms is not None and (
         isinstance(pointcloud_age_ms, bool)
         or not isinstance(pointcloud_age_ms, (int, float))
         or not math.isfinite(float(pointcloud_age_ms))
         or pointcloud_age_ms < 0
         or pointcloud_age_ms > MAX_POINTCLOUD_AGE_SECONDS * 1000
     ):
-        raise NavigationBridgeError("Navigation bridge MID-360 point-cloud stream is missing or stale.")
-    pointcloud_ready = payload.get("pointcloud_ready") is True
+        pointcloud_age_ms = None
+    pointcloud_ready = payload.get("pointcloud_ready") is True and (
+        pointcloud_age_ms is not None and pointcloud_age_ms <= MAX_POINTCLOUD_AGE_SECONDS * 1000
+    )
+    if not pointcloud_ready:
+        pointcloud_age_ms = None
     planner_ready = payload.get("planner_ready") is True
     bridge_ready = payload.get("ready") is True
-    diagnostics = _validate_diagnostics(payload, float(pointcloud_age_ms))
+    diagnostics = _validate_diagnostics(
+        payload,
+        float(pointcloud_age_ms) if pointcloud_age_ms is not None else None,
+    )
     raw_live_obstacles = payload.get("live_obstacles")
     if not isinstance(raw_live_obstacles, dict):
         raw_live_obstacles = {}
@@ -383,12 +410,11 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         else "Robot-control health is missing, stale, or invalid."
     )
     return {
-        "ready": bridge_ready and localization_ready and planner_ready and pointcloud_ready,
+        "ready": bridge_ready and localization_ready and planner_ready,
         "motionReady": (
             bridge_ready
             and localization_ready
             and planner_ready
-            and pointcloud_ready
             and estop_ready
             and robot_ready
             and diagnostics["controller"]["ready"]
@@ -396,7 +422,8 @@ def _validate_status(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
         ),
         "bridgeReady": bridge_ready,
         "pointcloudReady": pointcloud_ready,
-        "pointcloudAgeMs": round(float(pointcloud_age_ms)),
+        "pointcloudAgeMs": round(float(pointcloud_age_ms)) if pointcloud_age_ms is not None else None,
+        "pointcloudSources": diagnostics["pointcloud"]["sources"],
         "localization": {
             "ready": localization_ready,
             "frame_id": frame_id,
@@ -929,11 +956,7 @@ def navigation_bridge_status(now: datetime | None = None) -> dict[str, Any]:
             "robotHealth": status["robotHealth"],
             "motionReady": status["motionReady"],
             "map": map_metadata,
-            "error": None if status["ready"] else (
-                "MID-360 point-cloud stream is not fresh."
-                if not status["pointcloudReady"]
-                else "Bridge, localization, or planner is not ready."
-            ),
+            "error": None if status["ready"] else "Bridge, localization, or planner is not ready.",
         }
     except NavigationBridgeError as error:
         return {

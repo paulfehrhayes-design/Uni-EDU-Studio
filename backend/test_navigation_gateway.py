@@ -50,6 +50,31 @@ class NavigationGatewayScanTests(unittest.TestCase):
             with self.subTest(stamp=stamp), self.assertRaisesRegex(ValueError, expected):
                 validate_pointcloud_timestamp(*stamp, now_seconds=100)
 
+    def test_multiple_pointcloud_topics_are_all_accepted_and_aggregated(self):
+        with patch.dict(
+            os.environ,
+            {
+                "G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token",
+                "G1_NAV_POINTCLOUD_TOPICS": "/lidar/front,/lidar/rear",
+            },
+            clear=True,
+        ):
+            config = _configuration()
+        self.assertEqual(config["pointcloud_topics"], ["/lidar/front", "/lidar/rear"])
+
+        now = 1000.0
+        health = __import__("backend.ros.navigation_gateway", fromlist=["_aggregate_pointcloud_health"])._aggregate_pointcloud_health(
+            [
+                {"received_monotonic": now - 0.25, "ready": True},
+                {"received_monotonic": now - 10.0, "ready": True},
+                {"received_monotonic": None, "ready": False},
+            ],
+            now_monotonic=now,
+        )
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["age_ms"], 250)
+        self.assertEqual(health["latest_received_monotonic"], now - 0.25)
+
     def test_scan_rotation_accumulates_wrapped_yaw_in_signed_direction(self):
         rotation = accumulate_scan_rotation(0.0, 3.1, -3.1)
         self.assertAlmostEqual(rotation, 0.08318530717958605)
