@@ -519,31 +519,8 @@ def _live_report_matches_model(model, report):
         return False
     if report.get("model_fingerprint") != model["model_fingerprint"]:
         return False
-    transform = report.get("transform")
-    if not isinstance(transform, dict):
-        return False
-    mount = model["mount"]
-    if transform.get("parent_frame") != mount["parent_frame"] or not isinstance(
-        transform.get("sensor_frame"), str
-    ) or not transform["sensor_frame"].strip():
-        return False
-    translation_error = transform.get("translation_error_m")
-    rotation_error = transform.get("rotation_error_rad")
-    if (
-        isinstance(translation_error, bool)
-        or not isinstance(translation_error, (int, float))
-        or not math.isfinite(translation_error)
-        or isinstance(rotation_error, bool)
-        or not isinstance(rotation_error, (int, float))
-        or not math.isfinite(rotation_error)
-        or translation_error > TRANSFORM_TRANSLATION_TOLERANCE_M
-        or rotation_error > TRANSFORM_ROTATION_TOLERANCE_RAD
-    ):
-        return False
     footprint = report.get("footprint")
-    if not isinstance(footprint, dict):
-        return False
-    return all(
+    footprint_matches = isinstance(footprint, dict) and all(
         not isinstance(footprint.get(key), bool)
         and isinstance(footprint.get(key), (int, float))
         and math.isfinite(footprint[key])
@@ -555,6 +532,72 @@ def _live_report_matches_model(model, report):
         )
         for key in ("front", "rear", "half_width")
     )
+    if not footprint_matches:
+        return False
+    transform = report.get("transform")
+    mount = model["mount"]
+    if isinstance(transform, dict):
+        translation_error = transform.get("translation_error_m")
+        rotation_error = transform.get("rotation_error_rad")
+        if (
+            transform.get("parent_frame") == mount["parent_frame"]
+            and isinstance(transform.get("sensor_frame"), str)
+            and transform["sensor_frame"].strip()
+            and not isinstance(translation_error, bool)
+            and isinstance(translation_error, (int, float))
+            and math.isfinite(translation_error)
+            and not isinstance(rotation_error, bool)
+            and isinstance(rotation_error, (int, float))
+            and math.isfinite(rotation_error)
+            and translation_error <= TRANSFORM_TRANSLATION_TOLERANCE_M
+            and rotation_error <= TRANSFORM_ROTATION_TOLERANCE_RAD
+        ):
+            return True
+
+    if report.get("base_frame_id") != model["root_frame"]:
+        return False
+    sources = report.get("sources")
+    if not isinstance(sources, list):
+        return False
+    for source in sources:
+        if (
+            not isinstance(source, dict)
+            or source.get("status") != "ready"
+            or source.get("contributing") is not True
+        ):
+            continue
+        source_frame = source.get("sensor_frame_id")
+        transform = source.get("transform")
+        if (
+            not isinstance(source_frame, str)
+            or not source_frame.strip()
+            or not isinstance(transform, dict)
+            or transform.get("target_frame") != model["root_frame"]
+            or transform.get("source_frame") != source_frame
+        ):
+            continue
+        translation = transform.get("translation_m")
+        rotation = transform.get("rotation_xyzw")
+        if (
+            not isinstance(translation, list)
+            or len(translation) != 3
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in translation)
+            or not isinstance(rotation, list)
+            or len(rotation) != 4
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in rotation)
+            or math.sqrt(sum(value * value for value in rotation)) <= 1e-9
+        ):
+            continue
+        calibration_source = transform.get("calibration_source")
+        if calibration_source == "live_tf":
+            return True
+        if (
+            calibration_source == "model_derived"
+            and source.get("model_mount") is True
+            and source_frame == mount["sensor_frame"]
+        ):
+            return True
+    return False
 
 
 def calibration_status(
@@ -574,32 +617,21 @@ def calibration_status(
     except ValueError as error:
         model = None
         model_error = str(error)
-    report_verified = False
+    report_matches_model = False
+    mount_confirmed = environment.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
     persisted_status = None
     if model_error:
         reason = model_error
     else:
         path_warnings = model["path_warnings"]
         configured_base_frame = environment.get("G1_DISTANCE_BASE_FRAME", model["root_frame"]).strip()
-        mount_confirmed = environment.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
-        persisted_status = _read_persisted_calibration(environment)
-        persisted_valid = (
-            isinstance(persisted_status, dict)
-            and persisted_status.get("ready") is True
-            and persisted_status.get("model_fingerprint") == model["model_fingerprint"]
-            and persisted_status.get("root_frame") == model["root_frame"]
-        )
-        if persisted_valid:
-            mount_confirmed = True
         if configured_base_frame != model["root_frame"]:
             reason = (
                 "Distance base frame {!r} is not the supported G1 model root {!r}."
             ).format(configured_base_frame, model["root_frame"])
         else:
             report_error = None
-            if persisted_valid and live_report is None:
-                live_report = persisted_status
-            elif live_report is None:
+            if live_report is None:
                 live_report, report_error = _live_provider_calibration_report(environment)
             if report_error:
                 reason = report_error
@@ -608,7 +640,7 @@ def calibration_status(
             elif live_report.get("model_fingerprint") != model["model_fingerprint"]:
                 reason = "Live calibration evidence was produced by a different G1 model."
             elif live_report.get("ready") is True and _live_report_matches_model(model, live_report):
-                report_verified = True
+                report_matches_model = True
                 reason = (
                     live_report.get("reason")
                     or "Live ROS transform matches the nominal G1 model mount; distances use model-derived geometry."
@@ -625,28 +657,13 @@ def calibration_status(
                 )
         if path_warnings:
             reason = "{} {}".format(reason, " ".join(path_warnings))
-        if report_verified and mount_confirmed:
-            _write_persisted_calibration(
-                {
-                    "ready": True,
-                    "status": "verified",
-                    "calibration_source": "live_transform_match",
-                    "reason": reason,
-                    "model_fingerprint": model["model_fingerprint"],
-                    "root_frame": model["root_frame"],
-                    "footprint": model["footprint"],
-                    "transform": (live_report or {}).get("transform"),
-                },
-                environment,
-            )
-    ready = bool(model and report_verified)
+    ready = bool(model and report_matches_model)
     mounts = {} if not model else {"mid360": model["mount"]}
     missing_footprint = [] if model else ["automatic G1 footprint geometry"]
     return {
         "status": (
             "unavailable" if model_error
-            else "model_derived" if ready and not mount_confirmed
-            else "verified" if ready
+            else "model_derived" if ready
             else "awaiting_live_validation"
         ),
         "ready": ready,
@@ -674,15 +691,20 @@ def calibration_status(
         "missing_footprint": missing_footprint,
         "reason": reason,
         "calibration_method": "model_derived_footprint_and_live_ros_transform_check",
-        "calibration_source": "model_derived" if ready and not mount_confirmed else "live_transform_match",
+        "calibration_source": "model_derived" if ready else None,
         "verification_note": (
             "Footprint dimensions are derived from the G1 EDU 23-DOF model. "
-            "The sensor mount still requires explicit physical confirmation; a live "
-            "ROS transform check is model-based and is not independent LiDAR-camera "
-            "extrinsic calibration or supervised hardware acceptance."
+            "Sensor distances and mounts are model-derived/provisional until compared "
+            "against the target robot and known references; a matching live ROS transform "
+            "is not independent physical calibration or supervised hardware acceptance."
         ),
         "live_transform": (
             live_report.get("transform") if isinstance(live_report, dict) else None
+        ),
+        "source_status": (
+            live_report.get("sources", [])
+            if isinstance(live_report, dict) and isinstance(live_report.get("sources"), list)
+            else []
         ),
         "persisted_calibration": persisted_status,
     }

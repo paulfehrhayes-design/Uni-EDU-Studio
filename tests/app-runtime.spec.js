@@ -448,11 +448,85 @@ test('device camera preview stops when switching to a robot camera source', asyn
   await page.getByRole('button', { name: 'Vision to Motion' }).click();
   await page.getByRole('button', { name: 'Start preview' }).click();
   await expect(page.getByRole('button', { name: 'Stop preview' })).toBeVisible();
-  await page.getByLabel('Camera source').selectOption('unitree');
+  await page.getByLabel('Camera source').selectOption('robot');
 
   await expect.poll(() => page.evaluate(() => window.cameraSourceTestState.stopCount())).toBe(1);
-  await expect(page.getByText('ROS camera topics can be discovered, but this app does not yet provide a browser stream for the G1 camera.')).toBeVisible();
+  await expect(page.getByText('Run teacher sensor discovery and select one fresh image topic.')).toBeVisible();
   expect(apiRequests.some((path) => path.includes('camera'))).toBe(false);
+  expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => /camera|video/i.test(key)))).toEqual([]);
+});
+
+test('teacher can preview one explicitly selected fresh robot camera topic', async ({ page }) => {
+  const topic = '/camera/color/image_raw';
+  let frameRequests = 0;
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-camera-stream-token',
+      user: { role: 'teacher', username: 'teacher' },
+    }));
+  });
+  await page.route('**/api/sensors/discover', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        lidar: { discovery: { ros: { pointclouds: [], sources: [], diagnostics: [] } }, distance: {}, calibration: {} },
+        cameras: {
+          sources: {
+            unitree: {
+              image_topics: [{
+                name: topic,
+                type: 'sensor_msgs/msg/Image',
+                frame_id: 'camera_color_optical_frame',
+                fresh: true,
+                age_ms: 20,
+              }],
+              camera_info_topics: [],
+            },
+          },
+        },
+      }),
+    });
+  });
+  await page.route('**/api/sensors/camera/frame**', async (route) => {
+    frameRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/octet-stream',
+      headers: {
+        'X-Camera-Topic': topic,
+        'X-Camera-Frame-Id': 'camera_color_optical_frame',
+        'X-Camera-Encoding': 'rgb8',
+        'X-Camera-Width': '1',
+        'X-Camera-Height': '1',
+        'X-Camera-Step': '3',
+        'X-Camera-Timestamp': '2026-10-29T00:00:00+00:00',
+        'X-Camera-Receive-Age-Ms': '4',
+        'X-Camera-Stamp-Age-Ms': '20',
+        'Cache-Control': 'no-store',
+      },
+      body: Buffer.from([255, 0, 0]),
+    });
+  });
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/sensors/discover' || path === '/api/sensors/camera/frame') {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open queue' }).click();
+  await page.getByRole('button', { name: 'Discover sensors' }).click();
+  await page.getByRole('button', { name: 'Vision to Motion' }).click();
+  await page.getByLabel('Camera source').selectOption('robot');
+  await page.getByLabel('Robot camera topic').selectOption(topic);
+
+  await expect(page.getByRole('status').filter({ hasText: topic })).toContainText('stamp 20 ms');
+  await expect.poll(() => frameRequests).toBeGreaterThan(0);
+  expect(await page.locator('canvas[aria-label="Transient G1 ROS camera preview"]').evaluate((canvas) => canvas.width)).toBe(1);
   expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => /camera|video/i.test(key)))).toEqual([]);
 });
 
@@ -478,6 +552,8 @@ test('student queue does not expose teacher sensor diagnostics or call sensor AP
   await page.getByRole('button', { name: 'Library' }).click();
   await expect(page.getByText('My Saved Code')).toBeVisible();
   await expect(page.getByText('Sensors and diagnostics')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Set Origin' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Return to Origin' })).toHaveCount(0);
   expect(sensorRequests).toEqual([]);
 });
 
@@ -525,7 +601,36 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
       distance: {
         ready: true,
         front: { ready: true, distance_m: 0.84 },
-        rear: { ready: true, distance_m: 1.14 },
+        sources: [
+          {
+            id: 'mid360-front',
+            topic: '/mid360/livox/lidar',
+            status: 'ready',
+            contributing: true,
+            sensor_frame_id: 'mid360_link',
+            age_ms: 42,
+            receive_age_ms: 4,
+            stamp_age_ms: 42,
+            coverage: ['forward', 'rear'],
+          },
+          {
+            id: 'front-depth',
+            topic: '/camera/depth/points',
+            status: 'timestamp_skew',
+            contributing: false,
+            sensor_frame_id: 'camera_depth_frame',
+            age_ms: 155,
+            receive_age_ms: 3,
+            stamp_age_ms: 155,
+            coverage: ['forward'],
+            error: 'Cloud capture time differs from the newest usable source by more than 100 ms.',
+          },
+        ],
+        rear: {
+          ready: true,
+          distance_m: 1.14,
+          sources: [],
+        },
       },
     },
     cameras: { sources: {} },
@@ -543,6 +648,10 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Open queue' }).click();
+  const robotSettings = page.getByTestId('teacher-robot-settings');
+  await expect(robotSettings.getByRole('button', { name: 'Connect', exact: true })).toBeVisible();
+  await expect(robotSettings.getByRole('button', { name: 'Set Origin' })).toBeVisible();
+  await expect(robotSettings.getByRole('button', { name: 'Return to Origin' })).toBeVisible();
   await page.getByRole('button', { name: 'Discover sensors' }).click();
   await expect(page.getByText(/direct_livox.*model-derived \(provisional\)/)).toBeVisible();
   await expect(page.getByText('/lidar/front · fresh · frame front_lidar · 42 ms old')).toBeVisible();
@@ -551,6 +660,9 @@ test('teacher sensor diagnostics label model-derived distance readings as provis
   await expect(page.getByText('joint state: /joint_states · fresh · frame pelvis · 40 ms old')).toBeVisible();
   await expect(page.getByText('local costmap: /local_costmap/costmap · unavailable · frame map · 1800 ms old · OccupancyGrid sample is stale.')).toBeVisible();
   await expect(page.getByText(/Forward distance: ready.*Rear distance: ready/)).toBeVisible();
+  await expect(page.getByText('forward · /mid360/livox/lidar · contributing · frame mid360_link · 42 ms old · forward/rear')).toBeVisible();
+  await expect(page.getByText(/forward · \/mid360\/livox\/lidar .*receive 4 ms · stamp 42 ms/)).toBeVisible();
+  await expect(page.getByText(/forward · \/camera\/depth\/points · timestamp_skew/)).toBeVisible();
   await expect(page.getByText(/Unverified model mount candidate/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Restart managed LiDAR driver' })).toBeVisible();
 });

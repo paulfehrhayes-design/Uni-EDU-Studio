@@ -66,6 +66,88 @@ class LidarDistanceTests(unittest.TestCase):
             follow_redirects=False,
         )
 
+    def test_supplemental_live_tf_source_can_supply_front_clearance(self):
+        payload = {
+            **self.payload,
+            "sensor_frame_id": "camera_depth_frame",
+            "source_ids": ["front-depth"],
+            "sources": [
+                {
+                    "id": "front-depth",
+                    "status": "ready",
+                    "contributing": True,
+                    "sensor_frame_id": "camera_depth_frame",
+                    "expected_frame_id": "camera_depth_frame",
+                    "coverage": ["forward"],
+                    "age_ms": 30,
+                    "receive_age_ms": 5,
+                    "stamp_age_ms": 30,
+                    "model_mount": False,
+                    "transform": {
+                        "target_frame": "base_link",
+                        "source_frame": "camera_depth_frame",
+                        "calibration_source": "live_tf",
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            lidar_distance.httpx,
+            "get",
+            return_value=SimpleNamespace(status_code=200, json=lambda: payload),
+        ):
+            sample = get_front_distance_sample(now=self.now)
+
+        self.assertEqual(sample["distance_m"], 0.85)
+        self.assertEqual(sample["source_ids"], ["front-depth"])
+        self.assertEqual(sample["sensor_frame_id"], "camera_depth_frame")
+
+    def test_fused_source_cannot_use_mid360_fallback_for_another_frame(self):
+        payload = {
+            **self.payload,
+            "source_ids": ["other-source"],
+            "sources": [
+                {
+                    "id": "other-source",
+                    "status": "ready",
+                    "contributing": True,
+                    "sensor_frame_id": "camera_frame",
+                    "expected_frame_id": "camera_frame",
+                    "coverage": ["forward"],
+                    "age_ms": 30,
+                    "receive_age_ms": 5,
+                    "stamp_age_ms": 30,
+                    "model_mount": True,
+                    "transform": {
+                        "target_frame": "base_link",
+                        "source_frame": "camera_frame",
+                        "calibration_source": "model_derived",
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            lidar_distance.httpx,
+            "get",
+            return_value=SimpleNamespace(status_code=200, json=lambda: payload),
+        ):
+            with self.assertRaisesRegex(DistanceSensorError, "fallback is not valid"):
+                get_front_distance_sample(now=self.now)
+
+    def test_fused_sample_rejects_malformed_source_id_list(self):
+        payload = {
+            **self.payload,
+            "source_ids": [{"id": "front-depth"}],
+            "sources": [],
+        }
+        with patch.object(
+            lidar_distance.httpx,
+            "get",
+            return_value=SimpleNamespace(status_code=200, json=lambda: payload),
+        ):
+            with self.assertRaisesRegex(DistanceSensorError, "source diagnostics"):
+                get_front_distance_sample(now=self.now)
+
     def test_clear_sample_is_valid_when_no_object_is_within_40_meters(self):
         clear_payload = {
             **self.payload,

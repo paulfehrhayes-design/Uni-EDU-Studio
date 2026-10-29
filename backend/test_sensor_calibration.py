@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -278,7 +279,9 @@ class SensorCalibrationTests(unittest.TestCase):
         )
 
         self.assertTrue(status["ready"])
-        self.assertEqual(status["status"], "verified")
+        self.assertEqual(status["status"], "model_derived")
+        self.assertEqual(status["calibration_source"], "model_derived")
+        self.assertIn("provisional", status["verification_note"])
         self.assertTrue(status["axis_confirmed"])
         self.assertTrue(status["calibration_confirmed"])
         self.assertEqual(status["live_transform"]["translation_error_m"], 0.001)
@@ -305,6 +308,69 @@ class SensorCalibrationTests(unittest.TestCase):
         )
 
         self.assertTrue(status["ready"])
+
+    def test_supplemental_live_tf_source_can_use_the_supported_model_footprint(self):
+        model = automatic_calibration_model()
+        status = calibration_status(
+            env={"G1_DISTANCE_BASE_FRAME": model["root_frame"]},
+            live_report={
+                "ready": True,
+                "model_fingerprint": model["model_fingerprint"],
+                "base_frame_id": model["root_frame"],
+                "footprint": model["footprint"],
+                "sources": [
+                    {
+                        "id": "front-depth",
+                        "status": "ready",
+                        "contributing": True,
+                        "sensor_frame_id": "camera_depth_frame",
+                        "model_mount": False,
+                        "transform": {
+                            "target_frame": model["root_frame"],
+                            "source_frame": "camera_depth_frame",
+                            "translation_m": [0.2, 0.0, 0.3],
+                            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                            "calibration_source": "live_tf",
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["status"], "model_derived")
+        self.assertFalse(status["physical_mount_confirmed"])
+
+    def test_model_mount_fallback_is_rejected_for_a_different_sensor_frame(self):
+        model = automatic_calibration_model()
+        status = calibration_status(
+            env={"G1_DISTANCE_BASE_FRAME": model["root_frame"]},
+            live_report={
+                "ready": True,
+                "model_fingerprint": model["model_fingerprint"],
+                "base_frame_id": model["root_frame"],
+                "footprint": model["footprint"],
+                "sources": [
+                    {
+                        "id": "wrong-frame",
+                        "status": "ready",
+                        "contributing": True,
+                        "sensor_frame_id": "other_sensor_frame",
+                        "model_mount": True,
+                        "transform": {
+                            "target_frame": model["root_frame"],
+                            "source_frame": "other_sensor_frame",
+                            "translation_m": [0.2, 0.0, 0.3],
+                            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                            "calibration_source": "model_derived",
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertFalse(status["ready"])
+        self.assertIn("without a matching live transform", status["reason"])
 
     def test_calibration_rejects_evidence_from_a_different_model(self):
         model = automatic_calibration_model()
@@ -385,7 +451,7 @@ class SensorCalibrationTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertIn("supported G1 model root 'pelvis'", status["reason"])
 
-    def test_verified_calibration_can_persist_and_restore_for_same_model(self):
+    def test_persisted_model_match_does_not_replace_live_provider_evidence(self):
         model = automatic_calibration_model()
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = os.path.join(temp_dir, "sensor-calibration.json")
@@ -410,7 +476,20 @@ class SensorCalibrationTests(unittest.TestCase):
             }
             status = calibration_status(env=env, live_report=live_report)
             self.assertTrue(status["ready"])
+            self.assertEqual(status["status"], "model_derived")
+            self.assertFalse(os.path.exists(cache_path))
 
+            with open(cache_path, "w", encoding="utf-8") as cache_file:
+                json.dump(
+                    {
+                        "ready": True,
+                        "status": "verified",
+                        "model_fingerprint": model["model_fingerprint"],
+                        "root_frame": model["root_frame"],
+                        "footprint": model["footprint"],
+                    },
+                    cache_file,
+                )
             restored = calibration_status(
                 env={
                     "G1_DISTANCE_BASE_FRAME": model["root_frame"],
@@ -418,7 +497,8 @@ class SensorCalibrationTests(unittest.TestCase):
                     "G1_SENSOR_CALIBRATION_CACHE_PATH": cache_path,
                 }
             )
-            self.assertTrue(restored["ready"])
+            self.assertFalse(restored["ready"])
+            self.assertEqual(restored["status"], "awaiting_live_validation")
             self.assertEqual(restored["model_fingerprint"], model["model_fingerprint"])
 
 

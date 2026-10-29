@@ -62,6 +62,80 @@ def _parse_timestamp(value: Any) -> datetime:
     return timestamp.astimezone(timezone.utc)
 
 
+def _validate_fused_sources(
+    payload: dict[str, Any],
+    sector: str,
+    expected_sensor_frame_id: str,
+    expected_base_frame_id: str,
+) -> list[dict[str, Any]]:
+    sources = payload.get("sources")
+    source_ids = payload.get("source_ids")
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or not isinstance(source_ids, list)
+        or not source_ids
+        or any(not isinstance(source_id, str) or not source_id for source_id in source_ids)
+        or len(set(source_ids)) != len(source_ids)
+    ):
+        raise DistanceSensorError("MID-360 fused sample has no source diagnostics.")
+    configured_ids = set()
+    for source in sources:
+        if not isinstance(source, dict) or not isinstance(source.get("id"), str):
+            raise DistanceSensorError("MID-360 fused sample contains an invalid source record.")
+        source_id = source["id"]
+        if source_id in configured_ids:
+            raise DistanceSensorError("MID-360 fused sample contains duplicate source IDs.")
+        configured_ids.add(source_id)
+
+    contributing = []
+    for source in sources:
+        if source.get("contributing") is not True:
+            continue
+        frame_id = source.get("sensor_frame_id")
+        expected_frame_id = source.get("expected_frame_id")
+        coverage = source.get("coverage")
+        transform = source.get("transform")
+        if (
+            source.get("status") != "ready"
+            or not isinstance(frame_id, str)
+            or not frame_id
+            or expected_frame_id != frame_id
+            or not isinstance(coverage, list)
+            or sector not in coverage
+            or not isinstance(transform, dict)
+            or transform.get("target_frame") != expected_base_frame_id
+            or transform.get("source_frame") != frame_id
+        ):
+            raise DistanceSensorError("MID-360 fused sample contains an invalid contributing source.")
+        ages = [source.get("age_ms"), source.get("receive_age_ms"), source.get("stamp_age_ms")]
+        if any(
+            isinstance(age_ms, bool)
+            or not isinstance(age_ms, (int, float))
+            or not math.isfinite(float(age_ms))
+            or not 0 <= float(age_ms) <= MAX_SAMPLE_AGE_SECONDS * 1000
+            for age_ms in ages
+        ):
+            raise DistanceSensorError("MID-360 fused source sample is stale or has an invalid age.")
+        calibration_source = transform.get("calibration_source")
+        if calibration_source == "model_derived":
+            if (
+                source.get("model_mount") is not True
+                or source["id"] != os.getenv("G1_DISTANCE_SENSOR_ID", "").strip()
+                or frame_id != expected_sensor_frame_id
+            ):
+                raise DistanceSensorError(
+                    "MID-360 model-mount fallback is not valid for this source ID/frame."
+                )
+        elif calibration_source != "live_tf":
+            raise DistanceSensorError("MID-360 fused source has no valid transform provenance.")
+        contributing.append(source)
+
+    if not contributing or set(source_ids) != {source["id"] for source in contributing}:
+        raise DistanceSensorError("MID-360 fused sample has no consistent contributing sources.")
+    return contributing
+
+
 def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, Any]:
     url, token, expected_sensor_id, expected_sensor_frame_id, expected_base_frame_id = _provider_configuration(sector)
     expected_provider_sector = "forward" if sector == "forward" else "rear"
@@ -107,7 +181,15 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
         raise DistanceSensorError(f"MID-360 provider sample is not from the configured {sector} sector.")
     if payload.get("sensor_id") != expected_sensor_id:
         raise DistanceSensorError("MID-360 sample sensor ID does not match the configured sensor.")
-    if payload.get("sensor_frame_id") != expected_sensor_frame_id:
+    fused_sources = None
+    if "sources" in payload or "source_ids" in payload:
+        fused_sources = _validate_fused_sources(
+            payload,
+            expected_provider_sector,
+            expected_sensor_frame_id,
+            expected_base_frame_id,
+        )
+    elif payload.get("sensor_frame_id") != expected_sensor_frame_id:
         raise DistanceSensorError("MID-360 sample sensor frame does not match the configured frame.")
     if payload.get("frame_id") != expected_base_frame_id:
         raise DistanceSensorError("MID-360 measurement frame does not match the configured robot base frame.")
@@ -156,10 +238,16 @@ def get_distance_sample(sector: str, now: datetime | None = None) -> dict[str, A
         "timestamp": timestamp.isoformat(),
         "age_ms": max(0, round(age_seconds * 1000)),
         "sensor_id": expected_sensor_id,
-        "sensor_frame_id": expected_sensor_frame_id,
+        "sensor_frame_id": (
+            payload.get("sensor_frame_id", expected_sensor_frame_id)
+            if fused_sources
+            else expected_sensor_frame_id
+        ),
         "frame_id": expected_base_frame_id,
         "measurement": "footprint_clearance",
         "calibrated": True,
+        "source_ids": [source["id"] for source in fused_sources] if fused_sources else [expected_sensor_id],
+        "sources": fused_sources,
     }
 
 

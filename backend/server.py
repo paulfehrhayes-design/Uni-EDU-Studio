@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
 import os
@@ -16,7 +17,7 @@ import logging
 import subprocess
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, WebSocket, WebSocketDisconnect
@@ -44,7 +45,13 @@ try:
     )
     from .camera_discovery import discover_camera_sources
     from .lidar_distance import distance_sensor_status
-    from .sensor_calibration import calibration_status
+    from .ros_lidar_provider import (
+        MAX_CAMERA_FRAME_BYTES,
+        MAX_CAMERA_HEIGHT,
+        MAX_CAMERA_WIDTH,
+        parse_camera_source_specs,
+    )
+    from .sensor_calibration import automatic_calibration_model, calibration_status
     from .sensor_discovery import discover_sensors
     from .navigation_bridge import (
         NavigationBridgeError,
@@ -61,6 +68,7 @@ try:
         navigation_start_scan,
         navigation_start_route,
     )
+    from .map_alignment import MapAlignmentError, align_occupancy_maps, transform_pose_between_maps
 except ImportError:
     from g1_robot import clear_robot_stop_request, connect_robot, execute_robot_program, robot_status, stop_robot
     from duet_robot import (
@@ -80,7 +88,13 @@ except ImportError:
     )
     from camera_discovery import discover_camera_sources
     from lidar_distance import distance_sensor_status
-    from sensor_calibration import calibration_status
+    from ros_lidar_provider import (
+        MAX_CAMERA_FRAME_BYTES,
+        MAX_CAMERA_HEIGHT,
+        MAX_CAMERA_WIDTH,
+        parse_camera_source_specs,
+    )
+    from sensor_calibration import automatic_calibration_model, calibration_status
     from sensor_discovery import discover_sensors
     from navigation_bridge import (
         NavigationBridgeError,
@@ -97,6 +111,7 @@ except ImportError:
         navigation_start_scan,
         navigation_start_route,
     )
+    from map_alignment import MapAlignmentError, align_occupancy_maps, transform_pose_between_maps
 
 # 确保 unitree_sdk2py 在路径中
 # 假设 backend 文件夹与 unitree_sdk2py 同级，或者已安装
@@ -106,6 +121,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
 G1_URDF_PATH = os.path.join(PROJECT_ROOT, "g1_23dof.urdf.txt")
+MAX_NAVIGATION_HOME_REFERENCE_CELLS = 65_536
+MAX_NAVIGATION_HOME_REFERENCE_JSON_BYTES = 262_144
+CAMERA_FRAME_MIN_INTERVAL_SECONDS = 0.25
+CAMERA_FRAME_MAX_AGE_MS = 500
+CAMERA_FRAME_MAX_FUTURE_MS = 100
+_CAMERA_FRAME_REQUEST_LOCK = threading.Lock()
+_CAMERA_FRAME_LAST_REQUEST: dict[tuple[str, str], float] = {}
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -329,15 +351,113 @@ def save_navigation_operation(operation: dict, username: str, route: dict) -> No
     conn.close()
 
 
-def get_navigation_home() -> Optional[dict]:
+def _pack_navigation_home_reference(snapshot: dict) -> dict:
+    metadata = snapshot.get("map") if isinstance(snapshot, dict) else None
+    data = snapshot.get("data") if isinstance(snapshot, dict) else None
+    if not isinstance(metadata, dict) or not isinstance(data, list):
+        raise ValueError("A validated map snapshot is required to save an origin reference.")
+    width = metadata.get("width")
+    height = metadata.get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width < 1
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height < 1
+        or width * height != len(data)
+    ):
+        raise ValueError("Origin reference map dimensions are invalid.")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < -1 or value > 100
+        for value in data
+    ):
+        raise ValueError("Origin reference occupancy values are invalid.")
+    stride = max(1, math.ceil(max(width, height) / 256))
+    reference_width = math.ceil(width / stride)
+    reference_height = math.ceil(height / stride)
+    if reference_width * reference_height > MAX_NAVIGATION_HOME_REFERENCE_CELLS:
+        raise ValueError("Origin reference map exceeds the bounded storage size.")
+    compact_values = bytearray()
+    for row_start in range(0, height, stride):
+        row_end = min(height, row_start + stride)
+        for column_start in range(0, width, stride):
+            column_end = min(width, column_start + stride)
+            known = False
+            occupied = False
+            for row in range(row_start, row_end):
+                cell_start = row * width + column_start
+                for value in data[cell_start:cell_start + column_end - column_start]:
+                    known = known or value >= 0
+                    occupied = occupied or value >= 65
+            compact_values.append(101 if occupied else 1 if known else 0)
+    reference_metadata = {
+        key: metadata[key]
+        for key in (
+            "map_id",
+            "version",
+            "frame_id",
+            "resolution_m",
+            "origin",
+            "updated_at",
+        )
+        if key in metadata
+    }
+    reference_metadata.update(
+        width=reference_width,
+        height=reference_height,
+        resolution_m=float(metadata["resolution_m"]) * stride,
+    )
+    reference = {
+        "map": reference_metadata,
+        "stride": stride,
+        "occupancy_zlib_b64": base64.b64encode(zlib.compress(bytes(compact_values), 6)).decode("ascii"),
+    }
+    if len(json.dumps(reference, separators=(",", ":")).encode("utf-8")) > MAX_NAVIGATION_HOME_REFERENCE_JSON_BYTES:
+        raise ValueError("Origin reference map exceeds the bounded storage size.")
+    return reference
+
+
+def _unpack_navigation_home_reference(reference: object) -> dict:
+    if not isinstance(reference, dict) or not isinstance(reference.get("map"), dict):
+        raise ValueError("The saved origin has no compatible reference map; set the origin again.")
+    metadata = reference["map"]
+    width = metadata.get("width")
+    height = metadata.get("height")
+    encoded = reference.get("occupancy_zlib_b64")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width < 1
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height < 1
+        or width * height > MAX_NAVIGATION_HOME_REFERENCE_CELLS
+        or not isinstance(encoded, str)
+        or len(encoded) > MAX_NAVIGATION_HOME_REFERENCE_JSON_BYTES
+    ):
+        raise ValueError("The saved origin reference map is invalid or too large.")
+    expected_size = width * height
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(compressed, expected_size + 1)
+    except (ValueError, zlib.error) as error:
+        raise ValueError("The saved origin reference map is corrupt.") from error
+    if len(raw) != expected_size or not decompressor.eof or decompressor.unused_data:
+        raise ValueError("The saved origin reference map has an invalid compressed size.")
+    return {"map": metadata, "data": [value - 1 for value in raw]}
+
+
+def get_navigation_home(include_reference: bool = False) -> Optional[dict]:
     conn = get_db_connection()
     row = conn.execute(
-        "SELECT map_id, map_version, frame_id, x, y, yaw_rad, set_by, updated_at FROM navigation_home WHERE id = 1"
+        "SELECT map_id, map_version, frame_id, x, y, yaw_rad, set_by, updated_at, reference_map FROM navigation_home WHERE id = 1"
     ).fetchone()
     conn.close()
     if not row:
         return None
-    return {
+    home = {
         "map_id": row["map_id"],
         "map_version": row["map_version"],
         "frame_id": row["frame_id"],
@@ -347,15 +467,27 @@ def get_navigation_home() -> Optional[dict]:
         "set_by": row["set_by"],
         "updated_at": row["updated_at"],
     }
+    if include_reference:
+        try:
+            home["reference_map"] = json.loads(row["reference_map"]) if row["reference_map"] else None
+        except (TypeError, json.JSONDecodeError):
+            home["reference_map"] = None
+    return home
 
 
 def save_navigation_home(home: dict, username: str) -> dict:
     updated_at = datetime.now(timezone.utc).isoformat()
+    reference_map = home.get("reference_map")
+    reference_json = (
+        json.dumps(reference_map, separators=(",", ":"))
+        if isinstance(reference_map, dict)
+        else None
+    )
     conn = get_db_connection()
     conn.execute(
         """
-        INSERT INTO navigation_home (id, map_id, map_version, frame_id, x, y, yaw_rad, set_by, updated_at)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO navigation_home (id, map_id, map_version, frame_id, x, y, yaw_rad, set_by, updated_at, reference_map)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             map_id = excluded.map_id,
             map_version = excluded.map_version,
@@ -364,16 +496,21 @@ def save_navigation_home(home: dict, username: str) -> dict:
             y = excluded.y,
             yaw_rad = excluded.yaw_rad,
             set_by = excluded.set_by,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            reference_map = excluded.reference_map
         """,
         (
             home["map_id"], home["map_version"], home["frame_id"],
-            home["x"], home["y"], home["yaw_rad"], username, updated_at,
+            home["x"], home["y"], home["yaw_rad"], username, updated_at, reference_json,
         ),
     )
     conn.commit()
     conn.close()
-    return {**home, "set_by": username, "updated_at": updated_at}
+    return {
+        **{key: value for key, value in home.items() if key != "reference_map"},
+        "set_by": username,
+        "updated_at": updated_at,
+    }
 
 
 def update_navigation_operation(operation_id: str, status: str) -> None:
@@ -712,10 +849,16 @@ def init_db():
             y REAL NOT NULL,
             yaw_rad REAL NOT NULL,
             set_by TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            reference_map TEXT
         )
         """
     )
+    navigation_home_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(navigation_home)").fetchall()
+    }
+    if "reference_map" not in navigation_home_columns:
+        conn.execute("ALTER TABLE navigation_home ADD COLUMN reference_map TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS lidar_settings (
@@ -2276,6 +2419,57 @@ def _require_teacher(user):
         raise HTTPException(status_code=403, detail="Teacher role required")
 
 
+def _validate_navigation_home_target(snapshot: dict, pose: dict[str, float]) -> None:
+    metadata = snapshot.get("map")
+    data = snapshot.get("data")
+    if not isinstance(metadata, dict) or not isinstance(data, list):
+        raise HTTPException(status_code=503, detail="The active map occupancy snapshot is unavailable.")
+    try:
+        footprint = automatic_calibration_model()["footprint"]
+    except ValueError as error:
+        raise HTTPException(status_code=503, detail="The supported G1 footprint model is unavailable.") from error
+    resolution = float(metadata["resolution_m"])
+    origin = metadata["origin"]
+    delta_x = pose["x"] - float(origin["x"])
+    delta_y = pose["y"] - float(origin["y"])
+    origin_yaw = float(origin.get("yaw_rad", 0.0))
+    cosine = math.cos(origin_yaw)
+    sine = math.sin(origin_yaw)
+    map_x = cosine * delta_x + sine * delta_y
+    map_y = -sine * delta_x + cosine * delta_y
+    column = math.floor(map_x / resolution)
+    row = math.floor(map_y / resolution)
+    robot_yaw = pose["yaw_rad"] - origin_yaw
+    yaw_cosine = abs(math.cos(robot_yaw))
+    yaw_sine = abs(math.sin(robot_yaw))
+    longitudinal_extent = max(footprint["front"], footprint["rear"])
+    radius_x = math.ceil(
+        (longitudinal_extent * yaw_cosine + footprint["half_width"] * yaw_sine)
+        / resolution
+    )
+    radius_y = math.ceil(
+        (longitudinal_extent * yaw_sine + footprint["half_width"] * yaw_cosine)
+        / resolution
+    )
+    width = metadata["width"]
+    height = metadata["height"]
+    if (
+        column - radius_x < 0
+        or column + radius_x >= width
+        or row - radius_y < 0
+        or row + radius_y >= height
+    ):
+        raise HTTPException(status_code=409, detail="Aligned origin footprint is outside the active map.")
+    for cell_row in range(row - radius_y, row + radius_y + 1):
+        for cell_column in range(column - radius_x, column + radius_x + 1):
+            occupancy = data[cell_row * width + cell_column]
+            if occupancy < 0 or occupancy >= 65:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Aligned origin footprint is unknown or occupied in the active map.",
+                )
+
+
 def _sensor_diagnostics():
     return {
         "lidar": {
@@ -2285,6 +2479,148 @@ def _sensor_diagnostics():
         },
         "cameras": discover_camera_sources(),
     }
+
+
+@app.get("/api/sensors/camera/frame")
+def get_robot_camera_frame(
+    response: Response,
+    topic: str = Query(..., min_length=2, max_length=256),
+    user: dict = Depends(auth_required),
+):
+    _require_teacher(user)
+    response.headers["Cache-Control"] = "no-store, no-cache, max-age=0"
+    try:
+        configured_sources = parse_camera_source_specs(
+            os.getenv("G1_CAMERA_TOPICS_JSON", "[]")
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=503, detail="Camera relay configuration is invalid.") from error
+    if topic not in {source["topic"] for source in configured_sources}:
+        raise HTTPException(status_code=404, detail="Camera topic is not configured for streaming.")
+    now_monotonic = time.monotonic()
+    request_key = (user["username"], topic)
+    with _CAMERA_FRAME_REQUEST_LOCK:
+        last_request = _CAMERA_FRAME_LAST_REQUEST.get(request_key)
+        if last_request is not None and now_monotonic - last_request < CAMERA_FRAME_MIN_INTERVAL_SECONDS:
+            raise HTTPException(status_code=429, detail="Camera frame request rate limit exceeded.")
+        _CAMERA_FRAME_LAST_REQUEST[request_key] = now_monotonic
+        if len(_CAMERA_FRAME_LAST_REQUEST) > 128:
+            oldest_key = min(_CAMERA_FRAME_LAST_REQUEST, key=_CAMERA_FRAME_LAST_REQUEST.get)
+            _CAMERA_FRAME_LAST_REQUEST.pop(oldest_key, None)
+    provider_url = os.getenv("G1_DISTANCE_PROVIDER_URL", "").strip()
+    provider_token = os.getenv("G1_DISTANCE_PROVIDER_TOKEN", "").strip()
+    parsed_provider = urlsplit(provider_url)
+    if not provider_url or not provider_token or parsed_provider.scheme not in {"http", "https"} or not parsed_provider.netloc:
+        raise HTTPException(status_code=503, detail="Authenticated sensor provider is not configured.")
+    if parsed_provider.scheme == "http" and parsed_provider.hostname not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=503, detail="Remote camera relays require HTTPS.")
+    provider_path = parsed_provider.path.rstrip("/")
+    for suffix in ("/distance/front", "/distance/rear"):
+        if provider_path.endswith(suffix):
+            provider_path = provider_path[:-len(suffix)]
+            break
+    else:
+        raise HTTPException(status_code=503, detail="Sensor provider URL has an unsupported path.")
+    frame_url = urlunsplit(
+        (
+            parsed_provider.scheme,
+            parsed_provider.netloc,
+            f"{provider_path}/camera/frame",
+            f"topic={quote(topic, safe='')}",
+            "",
+        )
+    )
+    try:
+        provider_response = httpx.get(
+            frame_url,
+            headers={"Authorization": f"Bearer {provider_token}", "Accept": "application/json"},
+            timeout=1.0,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=503, detail="Camera provider could not be reached.") from error
+    try:
+        payload = provider_response.json()
+    except ValueError:
+        payload = {}
+    if provider_response.status_code != 200:
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        raise HTTPException(
+            status_code=503,
+            detail=detail if isinstance(detail, str) else "Camera frame is unavailable.",
+        )
+    if not isinstance(payload, dict) or payload.get("topic") != topic:
+        raise HTTPException(status_code=502, detail="Camera provider returned an invalid source frame.")
+    encoding = payload.get("encoding")
+    channel_count = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}.get(encoding)
+    width = payload.get("width")
+    height = payload.get("height")
+    step = payload.get("step")
+    frame_id = payload.get("frame_id")
+    frame_data = payload.get("data_base64")
+    if (
+        encoding not in {"rgb8", "bgr8", "rgba8", "bgra8", "mono8"}
+        or isinstance(width, bool)
+        or not isinstance(width, int)
+        or not 1 <= width <= MAX_CAMERA_WIDTH
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or not 1 <= height <= MAX_CAMERA_HEIGHT
+        or isinstance(step, bool)
+        or not isinstance(step, int)
+        or channel_count is None
+        or step < width * channel_count
+        or not isinstance(frame_id, str)
+        or not isinstance(frame_data, str)
+        or len(frame_data) > (MAX_CAMERA_FRAME_BYTES * 4 // 3) + 8
+    ):
+        raise HTTPException(status_code=502, detail="Camera provider returned invalid frame metadata.")
+    expected_frame = next(source["frame_id"] for source in configured_sources if source["topic"] == topic)
+    if frame_id != expected_frame:
+        raise HTTPException(status_code=502, detail="Camera provider frame does not match the configured camera frame.")
+    try:
+        raw_data = base64.b64decode(frame_data, validate=True)
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=502, detail="Camera provider returned invalid frame data.") from error
+    if step * height != len(raw_data) or len(raw_data) > MAX_CAMERA_FRAME_BYTES:
+        raise HTTPException(status_code=502, detail="Camera provider frame exceeds its configured bounds.")
+    receive_age_ms = payload.get("receive_age_ms")
+    stamp_age_ms = payload.get("stamp_age_ms")
+    if any(
+        isinstance(age, bool)
+        or not isinstance(age, (int, float))
+        or not math.isfinite(float(age))
+        for age in (receive_age_ms, stamp_age_ms)
+    ):
+        raise HTTPException(status_code=502, detail="Camera provider frame ages are invalid.")
+    if (
+        not 0 <= float(receive_age_ms) <= CAMERA_FRAME_MAX_AGE_MS
+        or not -CAMERA_FRAME_MAX_FUTURE_MS <= float(stamp_age_ms) <= CAMERA_FRAME_MAX_AGE_MS
+    ):
+        raise HTTPException(status_code=503, detail="Camera provider frame is stale or future-dated.")
+    try:
+        frame_timestamp = datetime.fromisoformat(str(payload.get("timestamp", "")).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail="Camera provider timestamp is invalid.") from error
+    if frame_timestamp.tzinfo is None:
+        raise HTTPException(status_code=502, detail="Camera provider timestamp must include a timezone.")
+    actual_stamp_age_ms = (datetime.now(timezone.utc) - frame_timestamp.astimezone(timezone.utc)).total_seconds() * 1000
+    if not -CAMERA_FRAME_MAX_FUTURE_MS <= actual_stamp_age_ms <= CAMERA_FRAME_MAX_AGE_MS:
+        raise HTTPException(status_code=503, detail="Camera provider frame timestamp is stale or future-dated.")
+    response.headers.update(
+        {
+            "X-Camera-Topic": topic,
+            "X-Camera-Frame-Id": frame_id,
+            "X-Camera-Encoding": encoding,
+            "X-Camera-Width": str(width),
+            "X-Camera-Height": str(height),
+            "X-Camera-Step": str(step),
+            "X-Camera-Timestamp": str(payload.get("timestamp", "")),
+            "X-Camera-Receive-Age-Ms": str(payload.get("receive_age_ms", "")),
+            "X-Camera-Stamp-Age-Ms": str(payload.get("stamp_age_ms", "")),
+        }
+    )
+    return Response(content=raw_data, media_type="application/octet-stream", headers=response.headers)
 
 
 @app.get("/api/sensors/status")
@@ -2430,6 +2766,15 @@ def set_navigation_home(user: dict = Depends(auth_required)):
         raise HTTPException(status_code=503, detail="A fresh localized pose and live map are required to set origin.")
     if map_metadata.get("map_id") is None or map_metadata.get("frame_id") != localization.get("frame_id"):
         raise HTTPException(status_code=503, detail="The current map and localization frames do not match.")
+    reference_snapshot = navigation_map_snapshot()
+    if (
+        reference_snapshot.get("ready") is not True
+        or not isinstance(reference_snapshot.get("map"), dict)
+        or reference_snapshot["map"].get("map_id") != map_metadata.get("map_id")
+        or reference_snapshot["map"].get("version") != map_metadata.get("version")
+        or reference_snapshot["map"].get("frame_id") != map_metadata.get("frame_id")
+    ):
+        raise HTTPException(status_code=503, detail="A fresh occupancy snapshot matching localization is required to save origin.")
     pose = localization.get("pose") or {}
     home = {
         "map_id": map_metadata["map_id"],
@@ -2439,6 +2784,10 @@ def set_navigation_home(user: dict = Depends(auth_required)):
         "y": float(pose["y"]),
         "yaw_rad": float(pose["yaw_rad"]),
     }
+    try:
+        home["reference_map"] = _pack_navigation_home_reference(reference_snapshot)
+    except (TypeError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=503, detail=f"Could not save a bounded origin map reference: {error}") from error
     saved = save_navigation_home(home, user["username"])
     return {"status": "saved", "home": saved}
 
@@ -2447,27 +2796,65 @@ def set_navigation_home(user: dict = Depends(auth_required)):
 def return_to_navigation_home(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
-    home = get_navigation_home()
+    home = get_navigation_home(include_reference=True)
     if not home:
         raise HTTPException(status_code=409, detail="Set the shared starting origin before returning to it.")
     snapshot = navigation_map_snapshot()
     if not snapshot.get("ready") or not snapshot.get("map"):
         raise HTTPException(status_code=503, detail=snapshot.get("error") or "The live Nav2 map is unavailable.")
     current_map = snapshot["map"]
-    if current_map["map_id"] != home["map_id"] or current_map["frame_id"] != home["frame_id"]:
+    try:
+        stored_reference_map = home.get("reference_map")
+        reference_map = _unpack_navigation_home_reference(stored_reference_map)
+        active_reference = _pack_navigation_home_reference(snapshot)
+        exact_same_grid = (
+            current_map.get("map_id") == home["map_id"]
+            and current_map.get("frame_id") == home["frame_id"]
+            and all(
+                reference_map["map"][key] == active_reference["map"][key]
+                for key in ("map_id", "frame_id", "resolution_m", "width", "height", "origin")
+            )
+            and stored_reference_map.get("occupancy_zlib_b64") == active_reference.get("occupancy_zlib_b64")
+        )
+        if exact_same_grid:
+            origin_alignment = {
+                "ready": True,
+                "status": "same_reference_grid",
+                "score": 1.0,
+                "overlap_ratio": 1.0,
+                "unique_margin": 1.0,
+                "rotation_rad": 0.0,
+                "translation_m": {"x": 0.0, "y": 0.0},
+            }
+            transformed_pose = {
+                "x": home["x"],
+                "y": home["y"],
+                "yaw_rad": home["yaw_rad"],
+            }
+        else:
+            origin_alignment = align_occupancy_maps(reference_map, snapshot)
+            transformed_pose = transform_pose_between_maps(
+                home,
+                reference_map,
+                snapshot,
+                origin_alignment,
+            )
+    except (MapAlignmentError, TypeError, ValueError, KeyError) as error:
         raise HTTPException(
             status_code=409,
-            detail="The live map identity or coordinate frame differs from the saved origin. Set the origin again before returning.",
-        )
+            detail=f"Saved origin could not be aligned confidently to the active map: {error}. Set the origin again.",
+        ) from error
+    _validate_navigation_home_target(snapshot, transformed_pose)
     request = NavigationStartRequest(
         map_id=current_map["map_id"],
         version=current_map["version"],
         frame_id=current_map["frame_id"],
-        waypoints=[{"x": home["x"], "y": home["y"], "yaw_rad": home["yaw_rad"]}],
+        waypoints=[transformed_pose],
         planner_mode="live",
         operation_kind="return_home",
     )
-    return start_navigation(request, user)
+    result = start_navigation(request, user)
+    return {**result, "origin_alignment": origin_alignment}
 
 
 @app.post("/api/lidar/scan")

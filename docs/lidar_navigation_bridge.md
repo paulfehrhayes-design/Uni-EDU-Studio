@@ -148,6 +148,39 @@ publishers, terminals, or other controllers. Ensure the commissioned Nav2
 stack is the only active ROS locomotion owner, and do not start SDK motion
 from another process during navigation or scanning.
 
+## Shared Origin and Map Continuity
+
+**Set Origin** and **Return to Origin** are teacher-only controls in the Robot
+connection settings panel. Setting the origin requires stopped motion, fresh
+localization, map, LiDAR, robot-link and e-stop health. The backend stores the
+pose and a compressed, size-bounded occupancy reference; the reference grid is
+private and is not included in ordinary student origin reads. Existing saved
+origins created before this reference was added have no alignment evidence and
+must be reset by a teacher before return is allowed.
+
+When active map content/layout, map ID or frame differs, the backend runs a
+bounded 2D SE(2) occupancy alignment against the saved reference. It reports
+the algorithm, overlap, score, uniqueness margin, rotation and translation.
+Only matches meeting overlap, confidence and uniqueness thresholds proceed.
+The current matcher requires at least 60% known-cell overlap, an occupied-cell
+IoU score of at least 0.50, and a best-to-next-distinct-candidate margin of at
+least 0.05. Its candidate grid is bounded to 128 cells per side; these software
+thresholds are conservative gates, not proof of physical localization.
+The saved position and heading are transformed into the active map frame, then
+the checked-in G1 EDU 23-DoF footprint is checked against known free cells.
+Weak/ambiguous matches, corrupt or oversized references, unknown or occupied
+target footprints, and out-of-map targets fail closed and require the teacher
+to set the origin again. A successful return uses the existing commissioned
+live Nav2 route and teacher confirmation; alignment creates no motion publisher
+and does not authorize blind navigation.
+
+The aligner uses the project's G1 model for footprint validation; it estimates
+the map transform from occupancy data. Vendor point-cloud registration examples
+are not treated as 2D map alignment or evidence that two locations are the
+same. The algorithm is software-tested on synthetic maps but still requires
+supervised map/target verification on the actual classroom and G1 before
+physical rollout.
+
 ## Bridge API
 
 ### 3D scan lifecycle
@@ -217,6 +250,9 @@ The classroom API exposes the workflow as:
 | `GET /api/lidar/settings` | Authenticated | Read the central overlay setting. |
 | `PUT /api/lidar/settings` | Teacher | Persist `{"show_shared_overlay":true|false}` for all student clients. |
 | `WS /api/lidar/live` | Authenticated | Stream navigation readiness, scan progress, and shared-map version changes. |
+| `GET /api/navigation/home` | Authenticated | Read saved origin pose metadata; map reference contents remain private. |
+| `POST /api/navigation/home` | Teacher | Save current pose and bounded occupancy reference while stopped and healthy. |
+| `POST /api/navigation/home/return` | Teacher | Align the saved origin if required, validate the footprint, and request a teacher-confirmed live Nav2 return. |
 
 The gateway implements authenticated status/map, scan-capture, and Nav2 route
 endpoints:

@@ -988,10 +988,14 @@ export default function App() {
   const [sensorOperationStatus, setSensorOperationStatus] = useState('');
   const [sensorOperationBusy, setSensorOperationBusy] = useState('');
   const [cameraInputSource, setCameraInputSource] = useState('device');
+  const [selectedRobotCameraTopic, setSelectedRobotCameraTopic] = useState('');
+  const [robotCameraStatus, setRobotCameraStatus] = useState('No robot camera selected');
+  const [robotCameraError, setRobotCameraError] = useState('');
   const [deviceCameraStatus, setDeviceCameraStatus] = useState('Camera is off');
   const [isDeviceCameraActive, setIsDeviceCameraActive] = useState(false);
   const [deviceCameraError, setDeviceCameraError] = useState('');
   const deviceCameraVideoRef = useRef(null);
+  const robotCameraCanvasRef = useRef(null);
   const deviceCameraStreamRef = useRef(null);
   const deviceCameraRequestRef = useRef(0);
   const [safetyNotice, setSafetyNotice] = useState('');
@@ -2001,6 +2005,105 @@ export default function App() {
     return () => stopDeviceCamera();
   }, [mainTab, cameraInputSource, stopDeviceCamera]);
 
+  useEffect(() => {
+    if (
+      mainTab !== 'camera'
+      || cameraInputSource !== 'robot'
+      || currentUser.role !== 'teacher'
+      || !selectedRobotCameraTopic
+      || !session?.token
+    ) {
+      setRobotCameraStatus('No robot camera selected');
+      setRobotCameraError('');
+      return undefined;
+    }
+    let active = true;
+    let timer = null;
+    const abortController = new AbortController();
+    const fetchFrame = async () => {
+      try {
+        const response = await fetch(
+          `/api/sensors/camera/frame?topic=${encodeURIComponent(selectedRobotCameraTopic)}`,
+          {
+            headers: { Authorization: `Bearer ${session.token}` },
+            cache: 'no-store',
+            signal: abortController.signal,
+          },
+        );
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || `Camera frame request failed (${response.status}).`);
+        }
+        const width = Number(response.headers.get('X-Camera-Width'));
+        const height = Number(response.headers.get('X-Camera-Height'));
+        const step = Number(response.headers.get('X-Camera-Step'));
+        const encoding = response.headers.get('X-Camera-Encoding');
+        const frameId = response.headers.get('X-Camera-Frame-Id') || 'unknown frame';
+        const stampAgeMs = Number(response.headers.get('X-Camera-Stamp-Age-Ms'));
+        const receiveAgeMs = Number(response.headers.get('X-Camera-Receive-Age-Ms'));
+        const channelCount = { rgb8: 3, bgr8: 3, rgba8: 4, bgra8: 4, mono8: 1 }[encoding];
+        if (
+          !Number.isInteger(width) || width < 1 || width > 1280
+          || !Number.isInteger(height) || height < 1 || height > 720
+          || !Number.isInteger(step) || step < width * channelCount
+          || !channelCount
+        ) {
+          throw new Error('Camera frame metadata is invalid or unsupported.');
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length !== step * height || bytes.length > 4 * 1024 * 1024) {
+          throw new Error('Camera frame payload exceeds its configured bounds.');
+        }
+        if (!active || !robotCameraCanvasRef.current) return;
+        const canvas = robotCameraCanvasRef.current;
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext('2d');
+        const image = context.createImageData(width, height);
+        for (let row = 0; row < height; row += 1) {
+          for (let column = 0; column < width; column += 1) {
+            const input = row * step + column * channelCount;
+            const output = (row * width + column) * 4;
+            if (encoding === 'rgb8' || encoding === 'rgba8') {
+              image.data[output] = bytes[input];
+              image.data[output + 1] = bytes[input + 1];
+              image.data[output + 2] = bytes[input + 2];
+            } else if (encoding === 'bgr8' || encoding === 'bgra8') {
+              image.data[output] = bytes[input + 2];
+              image.data[output + 1] = bytes[input + 1];
+              image.data[output + 2] = bytes[input];
+            } else {
+              image.data[output] = bytes[input];
+              image.data[output + 1] = bytes[input];
+              image.data[output + 2] = bytes[input];
+            }
+            image.data[output + 3] = channelCount === 4
+              ? bytes[input + 3]
+              : 255;
+          }
+        }
+        context.putImageData(image, 0, 0);
+        setRobotCameraError('');
+        setRobotCameraStatus(
+          `${selectedRobotCameraTopic} · ${frameId} · stamp ${Math.round(stampAgeMs)} ms · receive ${Math.round(receiveAgeMs)} ms`,
+        );
+      } catch (error) {
+        if (active) {
+          setRobotCameraError(error.message);
+          setRobotCameraStatus('Camera stream unavailable');
+        }
+      } finally {
+        if (active) timer = window.setTimeout(fetchFrame, 750);
+      }
+    };
+    fetchFrame();
+    return () => {
+      active = false;
+      abortController.abort();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [cameraInputSource, currentUser.role, mainTab, selectedRobotCameraTopic, session?.token]);
+
   const startDeviceCamera = async () => {
     setDeviceCameraError('');
     if (!window.isSecureContext && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
@@ -2290,7 +2393,13 @@ export default function App() {
         method: 'POST',
       });
       setNavigationOperation(result);
-      setNavigationHomeStatus(`Return to origin requested • operation ${result.operation_id} • ${result.status}`);
+      const alignment = result.origin_alignment;
+      const alignmentText = alignment?.status === 'same_reference_grid'
+        ? 'saved map reference matches'
+        : alignment
+          ? `map aligned • score ${Number(alignment.score).toFixed(2)} • overlap ${Math.round(Number(alignment.overlap_ratio) * 100)}%`
+          : 'map alignment unavailable';
+      setNavigationHomeStatus(`Return to origin requested • ${alignmentText} • operation ${result.operation_id} • ${result.status}`);
       setNavigationExecutionStatus(
         `Return to origin ${result.operation_id} • ${result.status}; controller status will be polled.`,
       );
@@ -4539,7 +4648,7 @@ export default function App() {
           <div className="p-3 space-y-3">
             {currentUser.role === 'teacher' && (
               <>
-                <div className="rounded-xl border border-blue-200 bg-blue-50 p-3">
+                <div data-testid="teacher-robot-settings" className="rounded-xl border border-blue-200 bg-blue-50 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-[10px] uppercase tracking-wide text-blue-700 font-semibold">Robot connection</p>
                     <span
@@ -4598,6 +4707,32 @@ export default function App() {
                       : 'Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.'}
                   </p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
+                  <div className="mt-3 space-y-2 rounded-lg border border-blue-100 bg-white p-2">
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={handleSetNavigationHome}
+                        disabled={isSettingNavigationHome}
+                        className="flex-1 rounded-md border border-cyan-600 bg-cyan-50 px-2 py-1.5 text-[10px] font-semibold text-cyan-900 disabled:opacity-50"
+                      >
+                        {isSettingNavigationHome ? 'Saving…' : 'Set Origin'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleReturnNavigationHome}
+                        disabled={isReturningNavigationHome || !navigationHome}
+                        className="flex-1 rounded-md border border-emerald-600 bg-emerald-50 px-2 py-1.5 text-[10px] font-semibold text-emerald-900 disabled:opacity-50"
+                      >
+                        {isReturningNavigationHome ? 'Returning…' : 'Return to Origin'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-slate-700">
+                      {navigationHome
+                        ? `Origin ${navigationHome.map_id} ${navigationHome.map_version} • (${navigationHome.x.toFixed(2)}, ${navigationHome.y.toFixed(2)}) • yaw ${navigationHome.yaw_rad.toFixed(2)} rad`
+                        : 'No shared origin saved yet.'}
+                    </p>
+                    <p className="text-[10px] text-slate-500" role="status" aria-live="polite">{navigationHomeStatus}</p>
+                  </div>
                 </div>
 
                 {controllerVersion === 'duet' && currentUser.role === 'teacher' && (
@@ -4803,6 +4938,23 @@ export default function App() {
                           {' · '}
                           Rear distance: {sensorDiagnostics.lidar?.distance?.rear?.ready ? 'ready' : sensorDiagnostics.lidar?.distance?.rear?.error || 'unavailable'}
                         </p>
+                        {(
+                          sensorDiagnostics.lidar?.distance?.sources?.length
+                            ? sensorDiagnostics.lidar.distance.sources.map((source) => ({ sector: 'forward', source }))
+                            : (sensorDiagnostics.lidar?.calibration?.source_status || []).map((source) => ({ sector: 'source', source }))
+                        ).concat(
+                          (sensorDiagnostics.lidar?.distance?.rear?.sources || []).map((source) => ({ sector: 'rear', source })),
+                        ).map(({ sector, source }) => (
+                          <p key={`${sector}:${source.id}`} className="mt-1 break-all text-[10px] text-slate-500">
+                            {sector} · {source.topic || source.id} · {source.contributing ? 'contributing' : source.status || 'unavailable'}
+                            {source.sensor_frame_id ? ` · frame ${source.sensor_frame_id}` : ''}
+                            {source.age_ms != null ? ` · ${Math.round(source.age_ms)} ms old` : ''}
+                            {source.receive_age_ms != null ? ` · receive ${Math.round(source.receive_age_ms)} ms` : ''}
+                            {source.stamp_age_ms != null ? ` · stamp ${Math.round(source.stamp_age_ms)} ms` : ''}
+                            {source.coverage?.length ? ` · ${source.coverage.join('/')}` : ''}
+                            {source.error ? ` · ${source.error}` : ''}
+                          </p>
+                        ))}
                         {['direct_livox', 'existing_driver'].includes(
                           sensorDiagnostics.lidar?.discovery?.connection?.method,
                         ) && (
@@ -5473,34 +5625,6 @@ export default function App() {
                         )}
                         <button type="button" onClick={handleClear} className="flex-1 rounded-md bg-slate-700 px-2 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-600">Clear</button>
                       </div>
-                      {currentUser.role === 'teacher' && (
-                        <div className="mt-3 space-y-2 rounded-lg border border-slate-700 bg-slate-950/50 p-2">
-                          <div className="flex gap-2">
-                            <button
-                              type="button"
-                              onClick={handleSetNavigationHome}
-                              disabled={isSettingNavigationHome}
-                              className="flex-1 rounded-md border border-cyan-600 bg-cyan-950/60 px-2 py-1.5 text-[10px] font-semibold text-cyan-100 disabled:opacity-50"
-                            >
-                              {isSettingNavigationHome ? 'Saving…' : 'Set Origin'}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={handleReturnNavigationHome}
-                              disabled={isReturningNavigationHome || !navigationHome}
-                              className="flex-1 rounded-md border border-emerald-600 bg-emerald-950/60 px-2 py-1.5 text-[10px] font-semibold text-emerald-100 disabled:opacity-50"
-                            >
-                              {isReturningNavigationHome ? 'Returning…' : 'Return to Origin'}
-                            </button>
-                          </div>
-                          <p className="text-[10px] text-slate-300">
-                            {navigationHome
-                              ? `Origin ${navigationHome.map_id} ${navigationHome.map_version} • (${navigationHome.x.toFixed(2)}, ${navigationHome.y.toFixed(2)}) • yaw ${navigationHome.yaw_rad.toFixed(2)} rad`
-                              : 'No shared origin saved yet.'}
-                          </p>
-                          <p className="text-[10px] text-slate-400" role="status" aria-live="polite">{navigationHomeStatus}</p>
-                        </div>
-                      )}
                       {currentUser.role === 'teacher' && (
                         <p className="mt-2 text-[10px] text-slate-400" role="status" aria-live="polite">
                           {lidarScanJob?.status === 'scanning'
@@ -6272,8 +6396,9 @@ export default function App() {
                           className="mt-1 block w-full rounded-md border border-slate-600 bg-slate-800 px-2 py-2 text-xs text-white"
                         >
                           <option value="device">This device (private preview)</option>
-                          <option value="unitree">G1 Unitree camera</option>
-                          <option value="realsense">G1 USB RealSense</option>
+                          {currentUser.role === 'teacher' && (
+                            <option value="robot">G1 ROS camera (teacher preview)</option>
+                          )}
                         </select>
                       </label>
                       {cameraInputSource === 'device' ? (
@@ -6308,25 +6433,44 @@ export default function App() {
                             The preview stays in this browser tab. Frames are not sent to Uni-EDU-Studio, recorded, or saved. Safari requires HTTPS except on localhost.
                           </p>
                         </>
-                      ) : (
-                        (() => {
-                          const sourceId = cameraInputSource === 'unitree' ? 'unitree' : 'realsense';
-                          const source = sensorDiagnostics?.cameras?.sources?.[sourceId];
-                          return (
-                            <div className="mt-3 rounded-lg border border-slate-700 bg-slate-800 p-3">
-                              <p className="text-xs font-semibold text-slate-200">
-                                {source?.status || 'Not discovered'}
-                              </p>
-                              <p className="mt-1 text-[10px] text-slate-400">
-                                {source?.reason || 'A teacher must run sensor discovery before this source can be diagnosed.'}
-                              </p>
-                              <p className="mt-2 text-[10px] text-amber-300">
-                                ROS camera topics can be discovered, but this app does not yet provide a browser stream for the G1 camera.
-                              </p>
-                            </div>
-                          );
-                        })()
-                      )}
+                      ) : currentUser.role === 'teacher' && cameraInputSource === 'robot' ? (
+                        <div className="mt-3 space-y-2">
+                          <label className="block text-xs text-slate-300">
+                            ROS image topic
+                            <select
+                              aria-label="Robot camera topic"
+                              value={selectedRobotCameraTopic}
+                              onChange={(event) => setSelectedRobotCameraTopic(event.target.value)}
+                              className="mt-1 block w-full rounded-md border border-slate-600 bg-slate-800 px-2 py-2 text-xs text-white"
+                            >
+                              <option value="">Select a fresh discovered topic</option>
+                              {Object.values(sensorDiagnostics?.cameras?.sources || {}).flatMap((source) => (
+                                (source.image_topics || [])
+                                  .filter((topic) => topic.fresh && topic.type === 'sensor_msgs/msg/Image')
+                                  .map((topic) => (
+                                    <option key={topic.name} value={topic.name}>
+                                      {topic.name} · {topic.frame_id}
+                                    </option>
+                                  ))
+                              ))}
+                            </select>
+                          </label>
+                          <canvas
+                            ref={robotCameraCanvasRef}
+                            aria-label="Transient G1 ROS camera preview"
+                            className="aspect-video w-full rounded-lg bg-black object-contain"
+                          />
+                          <p role="status" aria-live="polite" className="text-[10px] text-slate-300">
+                            {selectedRobotCameraTopic ? robotCameraStatus : 'Run teacher sensor discovery and select one fresh image topic.'}
+                          </p>
+                          {robotCameraError && (
+                            <p role="alert" className="text-[10px] text-rose-300">{robotCameraError}</p>
+                          )}
+                          <p className="text-[10px] text-slate-400">
+                            Frames are transient, authenticated, and not recorded or uploaded to storage. Camera data is diagnostic-only.
+                          </p>
+                        </div>
+                      ) : null}
                       <p className="mt-3 text-[10px] text-amber-300">
                         Camera-to-motion pose inference is not implemented. No pose is recognized or derived from these frames.
                       </p>

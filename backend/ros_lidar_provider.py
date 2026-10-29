@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import math
 import os
+import re
 import statistics
 import threading
 import time
@@ -11,6 +13,7 @@ from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
+from urllib.parse import parse_qs, urlsplit
 
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
@@ -19,6 +22,232 @@ TF_WARNING_INTERVAL_SECONDS = 5.0
 SENSOR_CLOCK_MAX_OFFSET_SECONDS = 30.0
 SENSOR_CLOCK_MAX_JITTER_SECONDS = 0.1
 SENSOR_CLOCK_STABLE_SAMPLES = 5
+MAX_CLOUD_FUSION_SKEW_SECONDS = 0.1
+MAX_POINTCLOUD_SOURCES = 16
+MAX_CAMERA_SOURCES = 8
+MAX_CAMERA_WIDTH = 1280
+MAX_CAMERA_HEIGHT = 720
+MAX_CAMERA_FRAME_BYTES = 4 * 1024 * 1024
+MAX_CAMERA_FRAME_AGE_SECONDS = 0.5
+MIN_CAMERA_CAPTURE_INTERVAL_SECONDS = 0.5
+SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
+ROS_TOPIC_PATTERN = re.compile(r"^/[A-Za-z0-9_/-]+$")
+ROS_FRAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_/]*$")
+
+
+def parse_pointcloud_source_specs(
+    primary_topic: str,
+    primary_sensor_id: str,
+    primary_frame_id: str,
+    extra_sources_json: str | None = None,
+) -> list[dict[str, object]]:
+    if not ROS_TOPIC_PATTERN.fullmatch(primary_topic) or "//" in primary_topic:
+        raise ValueError("Primary PointCloud2 topic is invalid.")
+    if not SOURCE_ID_PATTERN.fullmatch(primary_sensor_id):
+        raise ValueError("Primary PointCloud2 sensor ID is invalid.")
+    if not ROS_FRAME_PATTERN.fullmatch(primary_frame_id):
+        raise ValueError("Primary PointCloud2 frame ID is invalid.")
+    sources: list[dict[str, object]] = [
+        {
+            "id": primary_sensor_id,
+            "topic": primary_topic,
+            "frame_id": primary_frame_id,
+            "coverage": ["forward", "rear"],
+            "model_mount": True,
+        }
+    ]
+    if not extra_sources_json or not extra_sources_json.strip():
+        return sources
+    try:
+        extras = json.loads(extra_sources_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("Supplemental point-cloud source configuration must be valid JSON.") from error
+    if not isinstance(extras, list):
+        raise ValueError("Supplemental point-cloud sources must be a JSON array.")
+    if len(extras) + 1 > MAX_POINTCLOUD_SOURCES:
+        raise ValueError(f"At most {MAX_POINTCLOUD_SOURCES} point-cloud sources may be configured.")
+    known_ids = {primary_sensor_id}
+    known_topics = {primary_topic}
+    for index, source in enumerate(extras, start=1):
+        if not isinstance(source, dict):
+            raise ValueError(f"Supplemental point-cloud source {index} must be an object.")
+        source_id = source.get("id")
+        topic = source.get("topic")
+        frame_id = source.get("frame_id")
+        coverage = source.get("coverage")
+        if not isinstance(source_id, str) or not SOURCE_ID_PATTERN.fullmatch(source_id):
+            raise ValueError(f"Supplemental point-cloud source {index} has an invalid ID.")
+        if source_id in known_ids:
+            raise ValueError(f"Supplemental point-cloud source ID {source_id!r} is duplicated.")
+        if not isinstance(topic, str) or not ROS_TOPIC_PATTERN.fullmatch(topic) or "//" in topic:
+            raise ValueError(f"Supplemental point-cloud source {source_id!r} has an invalid topic.")
+        if topic in known_topics:
+            raise ValueError(f"PointCloud2 topic {topic!r} is configured more than once.")
+        if not isinstance(frame_id, str) or not ROS_FRAME_PATTERN.fullmatch(frame_id):
+            raise ValueError(f"Supplemental point-cloud source {source_id!r} has an invalid expected frame.")
+        if not isinstance(coverage, list) or not coverage or any(
+            sector not in {"forward", "rear"} for sector in coverage
+        ) or len(set(coverage)) != len(coverage):
+            raise ValueError(
+                f"Supplemental point-cloud source {source_id!r} must declare unique forward/rear coverage."
+            )
+        if "model_mount" in source:
+            raise ValueError(
+                "Only the configured primary MID-360 may use a model-mount fallback."
+            )
+        sources.append(
+            {
+                "id": source_id,
+                "topic": topic,
+                "frame_id": frame_id,
+                "coverage": list(coverage),
+                "model_mount": False,
+            }
+        )
+        known_ids.add(source_id)
+        known_topics.add(topic)
+    return sources
+
+
+def parse_camera_source_specs(camera_sources_json: str | None = None) -> list[dict[str, str]]:
+    if not camera_sources_json or not camera_sources_json.strip():
+        return []
+    try:
+        sources = json.loads(camera_sources_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("Camera source configuration must be valid JSON.") from error
+    if not isinstance(sources, list) or len(sources) > MAX_CAMERA_SOURCES:
+        raise ValueError(f"Camera source configuration must be an array of at most {MAX_CAMERA_SOURCES} topics.")
+    result = []
+    seen_topics = set()
+    for index, source in enumerate(sources, start=1):
+        if not isinstance(source, dict):
+            raise ValueError(f"Camera source {index} must be an object.")
+        topic = source.get("topic")
+        frame_id = source.get("frame_id")
+        if not isinstance(topic, str) or not ROS_TOPIC_PATTERN.fullmatch(topic) or "//" in topic:
+            raise ValueError(f"Camera source {index} has an invalid topic.")
+        if topic in seen_topics:
+            raise ValueError(f"Camera topic {topic!r} is configured more than once.")
+        if not isinstance(frame_id, str) or not ROS_FRAME_PATTERN.fullmatch(frame_id):
+            raise ValueError(f"Camera source {topic!r} has an invalid expected frame.")
+        result.append({"topic": topic, "frame_id": frame_id})
+        seen_topics.add(topic)
+    return result
+
+
+class CameraFrameCache:
+    def __init__(self, source_specs: list[dict[str, str]]):
+        self._specs = {source["topic"]: dict(source) for source in source_specs}
+        self._frames: dict[str, dict[str, object]] = {}
+        self._errors: dict[str, str] = {}
+        self._last_capture_allowed: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def should_accept_image(self, topic: str) -> bool:
+        if topic not in self._specs:
+            raise ValueError("Camera topic is not configured for streaming.")
+        now = time.monotonic()
+        with self._lock:
+            last_allowed = self._last_capture_allowed.get(topic)
+            if (
+                last_allowed is not None
+                and now - last_allowed < MIN_CAMERA_CAPTURE_INTERVAL_SECONDS
+            ):
+                return False
+            self._last_capture_allowed[topic] = now
+            return True
+
+    def mark_unavailable(self, topic: str, reason: str) -> None:
+        if topic not in self._specs:
+            raise ValueError("Camera topic is not configured for streaming.")
+        with self._lock:
+            self._errors[topic] = reason
+
+    def update_image(
+        self,
+        topic: str,
+        frame_id: str,
+        captured_at: datetime,
+        encoding: str,
+        width: int,
+        height: int,
+        step: int,
+        data: bytes,
+    ) -> None:
+        spec = self._specs.get(topic)
+        if spec is None:
+            raise ValueError("Camera topic is not configured for streaming.")
+        if frame_id != spec["frame_id"]:
+            raise ValueError(
+                f"Camera topic {topic} frame {frame_id!r} does not match expected {spec['frame_id']!r}."
+            )
+        channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}
+        if encoding not in channels:
+            raise ValueError(f"Camera image encoding {encoding!r} is not supported for preview.")
+        if (
+            isinstance(width, bool)
+            or not isinstance(width, int)
+            or width < 1
+            or width > MAX_CAMERA_WIDTH
+            or isinstance(height, bool)
+            or not isinstance(height, int)
+            or height < 1
+            or height > MAX_CAMERA_HEIGHT
+            or isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < width * channels[encoding]
+            or len(data) != step * height
+            or len(data) > MAX_CAMERA_FRAME_BYTES
+        ):
+            raise ValueError("Camera frame dimensions, row stride, or data size are invalid or too large.")
+        if captured_at.tzinfo is None:
+            raise ValueError("Camera frame timestamp must include a timezone.")
+        received_at = datetime.now(timezone.utc)
+        with self._lock:
+            self._frames[topic] = {
+                "topic": topic,
+                "frame_id": frame_id,
+                "timestamp": captured_at.astimezone(timezone.utc),
+                "received_at": received_at,
+                "received_monotonic": time.monotonic(),
+                "encoding": encoding,
+                "width": width,
+                "height": height,
+                "step": step,
+                "data": bytes(data),
+            }
+            self._errors.pop(topic, None)
+
+    def current_frame(self, topic: str) -> dict[str, object]:
+        if topic not in self._specs:
+            raise KeyError("Camera topic is not configured for streaming.")
+        with self._lock:
+            frame = self._frames.get(topic)
+            error = self._errors.get(topic)
+        if error:
+            raise LookupError(error)
+        if frame is None:
+            raise LookupError(error or "No camera image frame has been received.")
+        receive_age = time.monotonic() - float(frame["received_monotonic"])
+        stamp_age = (datetime.now(timezone.utc) - frame["timestamp"]).total_seconds()
+        if receive_age < 0 or stamp_age < -MAX_FUTURE_SKEW_SECONDS:
+            raise ValueError("Camera frame timestamp is invalid or in the future.")
+        if receive_age > MAX_CAMERA_FRAME_AGE_SECONDS or stamp_age > MAX_CAMERA_FRAME_AGE_SECONDS:
+            raise LookupError("Camera frame is stale.")
+        return {
+            "topic": topic,
+            "frame_id": frame["frame_id"],
+            "timestamp": frame["timestamp"].isoformat(),
+            "received_at": frame["received_at"].isoformat(),
+            "receive_age_ms": max(0, round(receive_age * 1000)),
+            "stamp_age_ms": round(stamp_age * 1000),
+            "encoding": frame["encoding"],
+            "width": frame["width"],
+            "height": frame["height"],
+            "step": frame["step"],
+            "data_base64": base64.b64encode(frame["data"]).decode("ascii"),
+        }
 
 
 def should_log_tf_warning(last_warning_at: float | None, now: float) -> bool:
@@ -450,6 +679,7 @@ class SampleCache:
         sensor_id: str,
         frame_id: str,
         max_ranges_m: dict[str, float] | None = None,
+        source_specs: list[dict[str, object]] | None = None,
     ):
         self.sensor_id = sensor_id
         self.frame_id = frame_id
@@ -458,6 +688,17 @@ class SampleCache:
             "rear": MAX_DISTANCE_METERS,
         }
         self._lock = threading.Lock()
+        specs = source_specs or [
+            {
+                "id": sensor_id,
+                "topic": None,
+                "frame_id": None,
+                "coverage": ["forward", "rear"],
+            }
+        ]
+        self._source_specs = {str(spec["id"]): dict(spec) for spec in specs}
+        self._source_samples: dict[str, dict[str, object]] = {}
+        self._source_errors: dict[str, str] = {}
         self._distances_m: dict[str, float | None] = {"forward": None, "rear": None}
         self._received_at: datetime | None = None
         self._received_monotonic: float | None = None
@@ -491,14 +732,55 @@ class SampleCache:
         calibrated: bool = False,
         max_ranges_m: dict[str, float] | None = None,
     ) -> None:
+        self.update_source_distances(
+            self.sensor_id,
+            front_distance,
+            rear_distance,
+            frame_id,
+            sensor_frame_id,
+            captured_at,
+            calibrated,
+            max_ranges_m,
+        )
+
+    def update_source_distances(
+        self,
+        source_id: str,
+        front_distance: float | None,
+        rear_distance: float | None,
+        frame_id: str,
+        sensor_frame_id: str | None = None,
+        captured_at: datetime | None = None,
+        calibrated: bool = False,
+        max_ranges_m: dict[str, float] | None = None,
+        transform: dict[str, object] | None = None,
+        valid_points: int | None = None,
+    ) -> None:
+        if source_id not in self._source_specs:
+            raise ValueError(f"Point-cloud source {source_id!r} is not configured.")
+        captured_at = captured_at or datetime.now(timezone.utc)
+        if captured_at.tzinfo is None:
+            raise ValueError("Point-cloud capture timestamp must include a timezone.")
+        received_at = datetime.now(timezone.utc)
+        received_monotonic = time.monotonic()
+        spec = self._source_specs[source_id]
+        source_sample = {
+            "distances_m": {"forward": front_distance, "rear": rear_distance},
+            "captured_at": captured_at.astimezone(timezone.utc),
+            "received_at": received_at,
+            "received_monotonic": received_monotonic,
+            "frame_id": frame_id,
+            "sensor_frame_id": sensor_frame_id or frame_id,
+            "calibrated": calibrated,
+            "max_ranges_m": dict(max_ranges_m or self.max_ranges_m),
+            "coverage": list(spec.get("coverage", ["forward", "rear"])),
+            "transform": transform,
+            "valid_points": valid_points,
+        }
         with self._lock:
             self._distances_m = {"forward": front_distance, "rear": rear_distance}
-            self._received_at = captured_at or datetime.now(timezone.utc)
-            acquisition_age = max(
-                0.0,
-                (datetime.now(timezone.utc) - self._received_at).total_seconds(),
-            )
-            self._received_monotonic = time.monotonic() - acquisition_age
+            self._received_at = captured_at
+            self._received_monotonic = received_monotonic
             self._sample_frame_id = frame_id
             self._sensor_frame_id = sensor_frame_id or frame_id
             self._calibrated = calibrated
@@ -506,10 +788,17 @@ class SampleCache:
                 self.max_ranges_m = max_ranges_m
             self._last_error = None
             self._cloud_count += 1
+            self._source_samples[source_id] = source_sample
+            self._source_errors.pop(source_id, None)
 
-    def mark_unavailable(self, reason: str) -> None:
+    def mark_unavailable(self, reason: str, source_id: str | None = None) -> None:
         with self._lock:
-            self._last_error = reason
+            if source_id is None:
+                self._last_error = reason
+            else:
+                if source_id not in self._source_specs:
+                    raise ValueError(f"Point-cloud source {source_id!r} is not configured.")
+                self._source_errors[source_id] = reason
 
     def update_calibration_status(self, status: dict[str, object]) -> None:
         with self._lock:
@@ -518,86 +807,230 @@ class SampleCache:
     def current_calibration_status(self) -> dict[str, object]:
         with self._lock:
             status = dict(self._calibration_status)
-            received_monotonic = self._received_monotonic
-            last_error = self._last_error
+        sources = self.source_status()
+        status["sources"] = sources
         if status.get("ready") is True:
-            if last_error:
-                status.update(ready=False, status="unavailable", reason=last_error)
-            elif (
-                received_monotonic is None
-                or time.monotonic() - received_monotonic > MAX_SAMPLE_AGE_SECONDS
-            ):
+            if not any(source["contributing"] for source in sources):
+                stale = any(source["status"] == "stale" for source in sources)
+                reason = next(
+                    (
+                        source["error"]
+                        for source in sources
+                        if source["error"]
+                    ),
+                    "No fresh, transform-valid point-cloud source is contributing.",
+                )
                 status.update(
                     ready=False,
-                    status="stale",
-                    reason="Live LiDAR calibration evidence is stale.",
+                    status="stale" if stale else "unavailable",
+                    reason=reason,
                 )
         return status
 
-    def unavailable_reason(self) -> str:
-        with self._lock:
-            received_at = self._received_at
-            received_monotonic = self._received_monotonic
-            frame_id = self._sample_frame_id
-            cloud_count = self._cloud_count
-            last_error = self._last_error
-        if last_error:
-            return last_error
-        if cloud_count == 0 or received_at is None or received_monotonic is None:
+    def unavailable_reason(self, sector: str | None = None) -> str:
+        sources = self.source_status(sector)
+        if any(source["contributing"] for source in sources):
+            return "Provider sample is temporarily unavailable."
+        if all(source["status"] == "waiting_for_data" for source in sources):
             return "Provider has not received a point cloud yet."
-        if frame_id != self.frame_id:
-            return f"Received point-cloud frame {frame_id!r}; expected {self.frame_id!r}."
-        age_seconds = time.monotonic() - received_monotonic
-        if age_seconds < 0:
-            return "Provider monotonic clock moved backwards; sample freshness cannot be verified."
-        if age_seconds > MAX_SAMPLE_AGE_SECONDS:
+        stale = next(
+            (source for source in sources if source["status"] == "stale"),
+            None,
+        )
+        if stale:
+            age = stale.get("age_ms")
             return (
-                f"Latest point cloud is stale ({age_seconds * 1000:.0f} ms old; "
-                f"maximum is {MAX_SAMPLE_AGE_SECONDS * 1000:.0f} ms)."
+                "Latest point cloud is stale ({} ms old; maximum is {:.0f} ms).".format(
+                    age if age is not None else "unknown",
+                    MAX_SAMPLE_AGE_SECONDS * 1000,
+                )
             )
-        return "Provider sample is temporarily unavailable."
+        return next(
+            (
+                source["error"]
+                for source in sources
+                if isinstance(source.get("error"), str) and source["error"]
+            ),
+            "No fresh, transform-valid point-cloud source covers the requested sector.",
+        )
+
+    def source_status(self, sector: str | None = None) -> list[dict[str, object]]:
+        if sector not in {None, "forward", "rear"}:
+            raise ValueError("Distance sector must be forward or rear.")
+        with self._lock:
+            specs = {key: dict(value) for key, value in self._source_specs.items()}
+            samples = {key: dict(value) for key, value in self._source_samples.items()}
+            errors = dict(self._source_errors)
+            global_error = self._last_error
+        now = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+        eligible = {}
+        results = {}
+        for source_id, spec in specs.items():
+            sample = samples.get(source_id)
+            coverage = list(spec.get("coverage", ["forward", "rear"]))
+            result: dict[str, object] = {
+                "id": source_id,
+                "topic": spec.get("topic"),
+                "expected_frame_id": spec.get("frame_id"),
+                "coverage": coverage,
+                "model_mount": spec.get("model_mount") is True,
+                "status": "waiting_for_data",
+                "contributing": False,
+                "age_ms": None,
+                "receive_age_ms": None,
+                "stamp_age_ms": None,
+                "received_at": None if sample is None else sample["received_at"].isoformat(),
+                "timestamp": None if sample is None else sample["captured_at"].isoformat(),
+                "error": errors.get(source_id) or global_error,
+            }
+            if sample is None:
+                if result["error"]:
+                    result["status"] = "unavailable"
+                else:
+                    result["error"] = "No point-cloud sample received."
+            elif errors.get(source_id) or global_error:
+                result["status"] = "unavailable"
+            elif sample["frame_id"] != self.frame_id:
+                result["status"] = "frame_mismatch"
+                result["error"] = (
+                    f"Received point-cloud frame {sample['frame_id']!r}; "
+                    f"expected {self.frame_id!r}."
+                )
+            else:
+                receive_age = now - float(sample["received_monotonic"])
+                stamp_age = (now_utc - sample["captured_at"]).total_seconds()
+                result["receive_age_ms"] = round(receive_age * 1000)
+                result["stamp_age_ms"] = round(stamp_age * 1000)
+                result["age_ms"] = max(0, round(max(receive_age, stamp_age) * 1000))
+                if receive_age < 0:
+                    result["status"] = "invalid_clock"
+                    result["error"] = "Provider monotonic clock moved backwards."
+                elif stamp_age < -MAX_FUTURE_SKEW_SECONDS:
+                    result["status"] = "invalid_timestamp"
+                    result["error"] = "Point-cloud capture timestamp is in the future."
+                elif receive_age > MAX_SAMPLE_AGE_SECONDS or stamp_age > MAX_SAMPLE_AGE_SECONDS:
+                    result["status"] = "stale"
+                    result["error"] = "Point-cloud sample is stale."
+                elif sector is not None and sector not in coverage:
+                    result["status"] = "outside_sector_coverage"
+                    result["error"] = f"Configured source coverage does not include {sector}."
+                else:
+                    result["status"] = "ready"
+                    result["error"] = None
+                    eligible[source_id] = sample
+            result["sensor_frame_id"] = None if sample is None else sample["sensor_frame_id"]
+            result["transform"] = None if sample is None else sample["transform"]
+            if isinstance(result["transform"], dict):
+                result["calibration_source"] = result["transform"].get("calibration_source")
+            result["valid_points"] = None if sample is None else sample["valid_points"]
+            results[source_id] = result
+
+        newest_capture = max(
+            (sample["captured_at"] for sample in eligible.values()),
+            default=None,
+        )
+        for source_id, sample in eligible.items():
+            result = results[source_id]
+            skew = (newest_capture - sample["captured_at"]).total_seconds()
+            if skew > MAX_CLOUD_FUSION_SKEW_SECONDS:
+                result["status"] = "timestamp_skew"
+                result["error"] = (
+                    "Cloud capture time differs from the newest usable source by "
+                    "more than {:.0f} ms.".format(MAX_CLOUD_FUSION_SKEW_SECONDS * 1000)
+                )
+                continue
+            result["contributing"] = True
+        return [
+            {
+                key: value
+                for key, value in result.items()
+                if not key.startswith("_")
+            }
+            for result in results.values()
+        ]
 
     def current_sample(self, sector: str = "forward") -> dict[str, object] | None:
         if sector not in {"forward", "rear"}:
             raise ValueError("Distance sector must be forward or rear.")
+        statuses = self.source_status(sector)
+        source_ids = [item["id"] for item in statuses if item["contributing"]]
+        if not source_ids:
+            return None
         with self._lock:
-            distance = self._distances_m[sector]
-            received_at = self._received_at
-            received_monotonic = self._received_monotonic
-            frame_id = self._sample_frame_id
-            sensor_frame_id = self._sensor_frame_id
-            calibrated = self._calibrated
-            max_range_m = self.max_ranges_m[sector]
-            last_error = self._last_error
-        if last_error or received_at is None or received_monotonic is None or frame_id != self.frame_id:
-            return None
-        age = time.monotonic() - received_monotonic
-        if age < 0 or age > MAX_SAMPLE_AGE_SECONDS:
-            return None
+            source_samples = {key: dict(value) for key, value in self._source_samples.items()}
+            specs = {key: dict(value) for key, value in self._source_specs.items()}
+        contributing = [source_samples[source_id] for source_id in source_ids]
+        distances = [sample["distances_m"][sector] for sample in contributing]
+        observed_distances = [distance for distance in distances if distance is not None]
+        distance = min(observed_distances) if observed_distances else None
+        received_at = min(sample["received_at"] for sample in contributing)
+        captured_at = min(sample["captured_at"] for sample in contributing)
+        now_monotonic = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
+        receive_age_ms = max(
+            max(0, round((now_monotonic - sample["received_monotonic"]) * 1000))
+            for sample in contributing
+        )
+        stamp_age_ms = max(
+            round((now_utc - sample["captured_at"]).total_seconds() * 1000)
+            for sample in contributing
+        )
+        age_ms = max(receive_age_ms, stamp_age_ms, 0)
+        max_range_m = max(
+            sample["max_ranges_m"][sector]
+            for sample in contributing
+        )
+        primary = source_samples.get(self.sensor_id)
+        sensor_frame_id = (
+            primary["sensor_frame_id"]
+            if primary and self.sensor_id in source_ids
+            else contributing[0]["sensor_frame_id"]
+        )
+        calibrated = all(sample["calibrated"] for sample in contributing)
         return {
             "valid": True,
             "sector": sector,
             "distance_m": distance,
             "clear": distance is None,
             "max_range_m": max_range_m,
-            "timestamp": received_at.isoformat(),
-            "age_ms": max(0, round(age * 1000)),
+            "timestamp": captured_at.isoformat(),
+            "received_at": received_at.isoformat(),
+            "age_ms": age_ms,
+            "receive_age_ms": receive_age_ms,
+            "stamp_age_ms": stamp_age_ms,
             "sensor_id": self.sensor_id,
-            "frame_id": frame_id,
+            "frame_id": self.frame_id,
             "sensor_frame_id": sensor_frame_id,
             "measurement": "footprint_clearance" if calibrated else "sensor_frame_range",
             "calibrated": calibrated,
+            "source_ids": source_ids,
+            "sources": [
+                {
+                    **status,
+                    "coverage": specs[status["id"]].get("coverage", []),
+                }
+                for status in statuses
+            ],
         }
 
 
-def serve_http(cache: SampleCache, host: str, port: int, token: str) -> ThreadingHTTPServer:
+def serve_http(
+    cache: SampleCache,
+    host: str,
+    port: int,
+    token: str,
+    camera_cache: CameraFrameCache | None = None,
+) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path not in {
+            parsed_path = urlsplit(self.path)
+            if parsed_path.path not in {
                 "/distance/front",
                 "/distance/rear",
                 "/healthz",
                 "/calibration",
+                "/camera/frame",
             }:
                 self.send_error(404)
                 return
@@ -606,7 +1039,32 @@ def serve_http(cache: SampleCache, host: str, port: int, token: str) -> Threadin
             if not hmac.compare_digest(supplied, expected):
                 self.send_error(401)
                 return
-            if self.path == "/calibration":
+            if parsed_path.path == "/camera/frame":
+                if camera_cache is None:
+                    self.send_error(503, "Camera frame relay is unavailable")
+                    return
+                try:
+                    query = parse_qs(parsed_path.query, strict_parsing=True)
+                    topics = query.get("topic", [])
+                    if len(topics) != 1:
+                        raise ValueError("Exactly one configured camera topic is required.")
+                    payload = camera_cache.current_frame(topics[0])
+                except (KeyError, ValueError) as error:
+                    body = json.dumps({"error": str(error)}, separators=(",", ":")).encode("utf-8")
+                    self.send_response(400)
+                except LookupError as error:
+                    body = json.dumps({"error": str(error)}, separators=(",", ":")).encode("utf-8")
+                    self.send_response(503, "Camera frame unavailable")
+                else:
+                    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed_path.path == "/calibration":
                 payload = cache.current_calibration_status()
                 body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                 self.send_response(200)
@@ -615,14 +1073,14 @@ def serve_http(cache: SampleCache, host: str, port: int, token: str) -> Threadin
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            sector = "rear" if self.path == "/distance/rear" else "forward"
+            sector = "rear" if parsed_path.path == "/distance/rear" else "forward"
             sample = cache.current_sample(sector)
             if sample is None:
                 body = json.dumps(
                     {
                         "valid": False,
                         "sector": sector,
-                        "error": cache.unavailable_reason(),
+                        "error": cache.unavailable_reason(sector),
                     },
                     separators=(",", ":"),
                 ).encode("utf-8")
@@ -651,7 +1109,7 @@ def main() -> None:
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs_py import point_cloud2
-    from sensor_msgs.msg import PointCloud2
+    from sensor_msgs.msg import Image, PointCloud2
     from rclpy.duration import Duration
     from rclpy.time import Time
     from tf2_ros import Buffer, TransformException, TransformListener
@@ -665,6 +1123,21 @@ def main() -> None:
     topic = os.environ.get("G1_LIDAR_TOPIC", "/mid360/livox/lidar")
     sensor_id = os.environ["G1_DISTANCE_SENSOR_ID"]
     sensor_frame_id = os.environ["G1_DISTANCE_FRAME_ID"].strip()
+    source_specs = parse_pointcloud_source_specs(
+        topic,
+        sensor_id,
+        sensor_frame_id,
+        os.environ.get("G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON"),
+    )
+    primary_source = source_specs[0]
+    camera_configuration_error = None
+    try:
+        camera_source_specs = parse_camera_source_specs(
+            os.environ.get("G1_CAMERA_TOPICS_JSON")
+        )
+    except ValueError as error:
+        camera_source_specs = []
+        camera_configuration_error = str(error)
     base_frame_id = os.environ.get("G1_DISTANCE_BASE_FRAME", "").strip()
     token = os.environ["G1_DISTANCE_PROVIDER_TOKEN"]
     host = os.environ.get("G1_DISTANCE_PROVIDER_BIND_HOST", "127.0.0.1")
@@ -673,7 +1146,6 @@ def main() -> None:
     minimum_height = float(os.environ.get("G1_LIDAR_MINIMUM_HEIGHT_M", "-0.5"))
     maximum_height = float(os.environ.get("G1_LIDAR_MAXIMUM_HEIGHT_M", "1.5"))
     calibration_error = None
-    mount_confirmed = os.environ.get("G1_LIDAR_MOUNT_CONFIRMED") == "1"
     try:
         calibration_model = automatic_calibration_model(
             os.getenv("G1_SENSOR_URDF_PATH", DEFAULT_URDF_PATH),
@@ -681,6 +1153,9 @@ def main() -> None:
         )
         footprint = calibration_model["footprint"]
         sensor_mount = calibration_model["mount"]
+        primary_source["model_mount"] = (
+            sensor_frame_id == sensor_mount["sensor_frame"]
+        )
         if base_frame_id != calibration_model["root_frame"]:
             calibration_error = (
                 "G1_DISTANCE_BASE_FRAME {!r} must match the supported G1 model root {!r}."
@@ -702,7 +1177,9 @@ def main() -> None:
             self.cache = SampleCache(
                 sensor_id,
                 base_frame_id or "unconfigured_base_frame",
+                source_specs=source_specs,
             )
+            self.camera_cache = CameraFrameCache(camera_source_specs)
             self.cache.update_calibration_status(
                 {
                     "ready": False,
@@ -718,26 +1195,58 @@ def main() -> None:
             )
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
-            self.received_first_cloud = False
+            self.received_first_cloud: set[str] = set()
             self.processed_clouds = 0
             self.last_diagnostic_cloud_count = 0
             self.last_diagnostic_at = time.monotonic()
             self.last_tf_warning_at = None
-            self.clock_normalizer = PointCloudClockNormalizer()
-            self.reported_clock_offset = None
+            self.clock_normalizers = {
+                str(source["id"]): PointCloudClockNormalizer()
+                for source in source_specs
+            }
+            self.reported_clock_offsets: set[str] = set()
+            if camera_configuration_error:
+                self.get_logger().warning(
+                    f"Robot camera streaming is disabled by invalid configuration: {camera_configuration_error}"
+                )
             if calibration_error:
                 self.cache.mark_unavailable(calibration_error)
                 self.get_logger().error(calibration_error)
-            self.create_subscription(PointCloud2, topic, self.on_cloud, qos_profile_sensor_data)
+            for source in source_specs:
+                self.create_subscription(
+                    PointCloud2,
+                    str(source["topic"]),
+                    lambda message, selected_source=source: self.on_cloud(
+                        message, selected_source
+                    ),
+                    qos_profile_sensor_data,
+                )
+            for camera_source in camera_source_specs:
+                self.create_subscription(
+                    Image,
+                    camera_source["topic"],
+                    lambda message, selected_source=camera_source: self.on_image(
+                        message, selected_source
+                    ),
+                    qos_profile_sensor_data,
+                )
 
-        def on_cloud(self, message: PointCloud2) -> None:
+        def on_cloud(
+            self,
+            message: PointCloud2,
+            source_spec: dict[str, object] = primary_source,
+        ) -> None:
             callback_started = time.monotonic()
-            if not self.received_first_cloud:
+            source_id = str(source_spec["id"])
+            source_topic = str(source_spec["topic"])
+            expected_source_frame = str(source_spec["frame_id"])
+            uses_model_mount = source_spec.get("model_mount") is True
+            if source_id not in self.received_first_cloud:
                 self.get_logger().info(
-                    f"Received first point cloud: frame={message.header.frame_id}, "
+                    f"Received first point cloud from {source_topic}: frame={message.header.frame_id}, "
                     f"points={message.width * message.height}."
                 )
-                self.received_first_cloud = True
+                self.received_first_cloud.add(source_id)
             if calibration_error or footprint is None:
                 reason = calibration_error or "Automatic G1 footprint geometry is unavailable."
                 self.cache.mark_unavailable(reason)
@@ -755,101 +1264,85 @@ def main() -> None:
                 )
                 return
             source_frame = str(message.header.frame_id).strip()
-            if source_frame != sensor_frame_id:
-                reason = f"Received point-cloud frame {source_frame!r}; expected {sensor_frame_id!r}."
-                self.cache.mark_unavailable(reason)
-                self.cache.update_calibration_status(
-                    {
-                        "ready": False,
-                        "status": "frame_mismatch",
-                        "reason": reason,
-                        "model_fingerprint": calibration_model["model_fingerprint"],
-                        "footprint": footprint,
-                        "transform": None,
-                    }
+            if source_frame != expected_source_frame:
+                reason = (
+                    f"Received point-cloud frame {source_frame!r} from {source_topic}; "
+                    f"expected {expected_source_frame!r}."
                 )
+                self.cache.mark_unavailable(reason, source_id)
                 return
             try:
                 now_seconds = self.get_clock().now().nanoseconds / 1_000_000_000
-                captured_at = self.clock_normalizer.normalize(
+                clock_normalizer = self.clock_normalizers[source_id]
+                captured_at = clock_normalizer.normalize(
                     int(message.header.stamp.sec),
                     int(message.header.stamp.nanosec),
                     now_seconds,
                 )
                 if (
-                    self.clock_normalizer.offset_seconds is not None
-                    and self.reported_clock_offset is None
+                    clock_normalizer.offset_seconds is not None
+                    and source_id not in self.reported_clock_offsets
                 ):
-                    self.reported_clock_offset = self.clock_normalizer.offset_seconds
+                    self.reported_clock_offsets.add(source_id)
                     self.get_logger().warning(
-                        "LiDAR clock offset stabilized at {:.0f} ms; using corrected "
+                        "Point-cloud source {} clock offset stabilized at {:.0f} ms; using corrected "
                         "capture stamps for TF lookup and preserving receipt-age checks.".format(
-                            self.reported_clock_offset * 1000
+                            source_id,
+                            clock_normalizer.offset_seconds * 1000,
                         )
                     )
                 cloud_time = Time(
                     nanoseconds=round(captured_at.timestamp() * 1_000_000_000)
                 )
-                candidate_mount = {
-                    **sensor_mount,
-                    "sensor_frame": source_frame,
-                }
                 model_derived = False
-                try:
-                    mount_transform: TransformStamped = self.tf_buffer.lookup_transform(
-                        sensor_mount["parent_frame"],
-                        source_frame,
-                        cloud_time,
-                        timeout=Duration(seconds=0.05),
-                    )
-                except TransformException:
-                    model_derived = True
-                    observed_mount = candidate_mount
-                    mount_comparison = {
-                        "matches": True,
-                        "translation_error_m": 0.0,
-                        "rotation_error_rad": 0.0,
+                observed_mount = None
+                mount_comparison = None
+                if uses_model_mount:
+                    candidate_mount = {
+                        **sensor_mount,
+                        "sensor_frame": source_frame,
                     }
-                    sensor_to_parent_translation = tuple(sensor_mount["translation_m"])
-                    sensor_to_parent_rotation = tuple(sensor_mount["rotation_xyzw"])
-                else:
-                    mount_translation = mount_transform.transform.translation
-                    mount_rotation = mount_transform.transform.rotation
-                    observed_mount = {
-                        "parent_frame": mount_transform.header.frame_id,
-                        "sensor_frame": mount_transform.child_frame_id,
-                        "translation_m": [
-                            float(mount_translation.x),
-                            float(mount_translation.y),
-                            float(mount_translation.z),
-                        ],
-                        "rotation_xyzw": [
-                            float(mount_rotation.x),
-                            float(mount_rotation.y),
-                            float(mount_rotation.z),
-                            float(mount_rotation.w),
-                        ],
-                    }
-                    mount_comparison = compare_transforms(candidate_mount, observed_mount)
-                    if not mount_comparison["matches"]:
-                        reason = mount_comparison["reason"]
-                        self.cache.mark_unavailable(reason)
-                        self.cache.update_calibration_status(
-                            {
-                                "ready": False,
-                                "status": "transform_mismatch",
-                                "reason": reason,
-                                "model_fingerprint": calibration_model["model_fingerprint"],
-                                "footprint": footprint,
-                                "transform": {
-                                    "translation_error_m": mount_comparison.get("translation_error_m"),
-                                    "rotation_error_rad": mount_comparison.get("rotation_error_rad"),
-                                },
-                            }
+                    try:
+                        mount_transform: TransformStamped = self.tf_buffer.lookup_transform(
+                            sensor_mount["parent_frame"],
+                            source_frame,
+                            cloud_time,
+                            timeout=Duration(seconds=0.05),
                         )
-                        return
-                    sensor_to_parent_translation = tuple(observed_mount["translation_m"])
-                    sensor_to_parent_rotation = tuple(observed_mount["rotation_xyzw"])
+                    except TransformException:
+                        model_derived = True
+                        observed_mount = candidate_mount
+                        mount_comparison = {
+                            "matches": True,
+                            "translation_error_m": 0.0,
+                            "rotation_error_rad": 0.0,
+                        }
+                        sensor_to_parent_translation = tuple(sensor_mount["translation_m"])
+                        sensor_to_parent_rotation = tuple(sensor_mount["rotation_xyzw"])
+                    else:
+                        mount_translation = mount_transform.transform.translation
+                        mount_rotation = mount_transform.transform.rotation
+                        observed_mount = {
+                            "parent_frame": mount_transform.header.frame_id,
+                            "sensor_frame": mount_transform.child_frame_id,
+                            "translation_m": [
+                                float(mount_translation.x),
+                                float(mount_translation.y),
+                                float(mount_translation.z),
+                            ],
+                            "rotation_xyzw": [
+                                float(mount_rotation.x),
+                                float(mount_rotation.y),
+                                float(mount_rotation.z),
+                                float(mount_rotation.w),
+                            ],
+                        }
+                        mount_comparison = compare_transforms(candidate_mount, observed_mount)
+                        if not mount_comparison["matches"]:
+                            self.cache.mark_unavailable(mount_comparison["reason"], source_id)
+                            return
+                        sensor_to_parent_translation = tuple(observed_mount["translation_m"])
+                        sensor_to_parent_rotation = tuple(observed_mount["rotation_xyzw"])
                 if model_derived:
                     if sensor_mount["parent_frame"] == base_frame_id:
                         translation = sensor_to_parent_translation
@@ -915,41 +1408,28 @@ def main() -> None:
                     sensor_ranges,
                 )
             except TransformException as error:
-                reason = format_tf_calibration_error(
-                    error,
-                    sensor_mount["parent_frame"],
-                    source_frame,
-                    base_frame_id,
+                reason = (
+                    format_tf_calibration_error(
+                        error,
+                        sensor_mount["parent_frame"],
+                        source_frame,
+                        base_frame_id,
+                    )
+                    if uses_model_mount
+                    else (
+                        f"Point-cloud source {source_topic} could not be transformed "
+                        f"from {source_frame!r} to {base_frame_id!r} at its capture time: {error}"
+                    )
                 )
-                self.cache.mark_unavailable(reason)
-                self.cache.update_calibration_status(
-                    {
-                        "ready": False,
-                        "status": "unavailable",
-                        "reason": reason,
-                        "model_fingerprint": calibration_model["model_fingerprint"],
-                        "footprint": footprint,
-                        "transform": None,
-                    }
-                )
+                self.cache.mark_unavailable(reason, source_id)
                 warning_at = time.monotonic()
                 if should_log_tf_warning(self.last_tf_warning_at, warning_at):
                     self.get_logger().warning(reason)
                     self.last_tf_warning_at = warning_at
                 return
             except (TypeError, ValueError, IndexError) as error:
-                reason = f"LiDAR sample could not be transformed/calibrated: {error}"
-                self.cache.mark_unavailable(reason)
-                self.cache.update_calibration_status(
-                    {
-                        "ready": False,
-                        "status": "unavailable",
-                        "reason": reason,
-                        "model_fingerprint": calibration_model["model_fingerprint"],
-                        "footprint": footprint,
-                        "transform": None,
-                    }
-                )
+                reason = f"Point-cloud source {source_topic} could not be transformed/calibrated: {error}"
+                self.cache.mark_unavailable(reason, source_id)
                 warning_at = time.monotonic()
                 if should_log_tf_warning(self.last_tf_warning_at, warning_at):
                     self.get_logger().warning(reason)
@@ -958,18 +1438,19 @@ def main() -> None:
             self.cache.update_calibration_status(
                 {
                     "ready": True,
-                    "status": "model_derived" if model_derived or not mount_confirmed else "verified",
+                    "status": "model_derived",
                     "reason": (
                         "Using the nominal URDF mount and model-derived footprint; "
                         "physical sensor mounting has not been independently verified."
-                        if model_derived or not mount_confirmed
-                        else "Live sensor transform matches the supported G1 mount geometry; "
-                        "footprint was derived automatically from the G1 collision model."
+                        if model_derived
+                        else "Point cloud transformed to the G1 model root using timestamp-valid "
+                        "TF; the model-derived footprint remains provisional until hardware validation."
                     ),
                     "model_fingerprint": calibration_model["model_fingerprint"],
                     "footprint": footprint,
-                    "calibration_source": "model_derived" if model_derived or not mount_confirmed else "live_transform_match",
-                    "transform": {
+                    "calibration_source": "model_derived",
+                    "base_frame_id": base_frame_id,
+                    "transform": None if observed_mount is None else {
                         "parent_frame": observed_mount["parent_frame"],
                         "sensor_frame": observed_mount["sensor_frame"],
                         "translation_m": observed_mount["translation_m"],
@@ -979,11 +1460,12 @@ def main() -> None:
                     },
                 }
             )
-            self.cache.update_distances(
+            self.cache.update_source_distances(
+                source_id,
                 front_distance,
                 rear_distance,
                 base_frame_id,
-                sensor_frame_id,
+                source_frame,
                 captured_at,
                 calibrated=True,
                 max_ranges_m={
@@ -1004,6 +1486,14 @@ def main() -> None:
                         "rear",
                     ),
                 },
+                transform={
+                    "target_frame": base_frame_id,
+                    "source_frame": source_frame,
+                    "translation_m": list(translation),
+                    "rotation_xyzw": list(rotation),
+                    "calibration_source": "model_derived" if model_derived else "live_tf",
+                },
+                valid_points=valid_points,
             )
             self.processed_clouds += 1
             now = time.monotonic()
@@ -1019,9 +1509,36 @@ def main() -> None:
                 self.last_diagnostic_at = now
                 self.last_diagnostic_cloud_count = self.processed_clouds
 
+        def on_image(self, message: Image, source_spec: dict[str, str]) -> None:
+            topic_name = source_spec["topic"]
+            if not self.camera_cache.should_accept_image(topic_name):
+                return
+            try:
+                now_seconds = self.get_clock().now().nanoseconds / 1_000_000_000
+                captured_at = validate_pointcloud_timestamp(
+                    int(message.header.stamp.sec),
+                    int(message.header.stamp.nanosec),
+                    now_seconds,
+                )
+                self.camera_cache.update_image(
+                    topic_name,
+                    str(message.header.frame_id).strip(),
+                    captured_at,
+                    str(message.encoding).lower(),
+                    int(message.width),
+                    int(message.height),
+                    int(message.step),
+                    message.data,
+                )
+            except (TypeError, ValueError, IndexError) as error:
+                self.camera_cache.mark_unavailable(
+                    topic_name,
+                    f"Camera source {topic_name} is unavailable: {error}",
+                )
+
     rclpy.init()
     node = LidarNode()
-    server = serve_http(node.cache, host, port, token)
+    server = serve_http(node.cache, host, port, token, node.camera_cache)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     node.get_logger().info(f"Listening to {topic}; read-only sample endpoint bound to {host}:{port}.")

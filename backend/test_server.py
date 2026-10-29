@@ -1,4 +1,6 @@
 import os
+import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -1552,6 +1554,38 @@ class ProjectLibraryTests(unittest.TestCase):
 
 
 class NavigationHomeTests(unittest.TestCase):
+    @staticmethod
+    def map_snapshot(map_id='classroom', version='v4', frame_id='map'):
+        width = 100
+        height = 100
+        data = [0] * (width * height)
+        for column in range(width):
+            data[column] = 100
+            data[(height - 1) * width + column] = 100
+        for row in range(height):
+            data[row * width] = 100
+            data[row * width + width - 1] = 100
+        for row, column in (
+            (20, 15), (21, 15), (20, 16),
+            (34, 24), (35, 24), (36, 24), (36, 25),
+            (63, 70), (64, 70), (65, 70), (65, 71), (65, 72),
+        ):
+            data[row * width + column] = 100
+        return {
+            'ready': True,
+            'map': {
+                'map_id': map_id,
+                'version': version,
+                'frame_id': frame_id,
+                'resolution_m': 0.1,
+                'width': width,
+                'height': height,
+                'origin': {'x': -5.0, 'y': -5.0, 'yaw_rad': 0.0},
+                'updated_at': '2026-10-29T00:00:00+00:00',
+            },
+            'data': data,
+        }
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_patcher = patch.object(
@@ -1576,11 +1610,49 @@ class NavigationHomeTests(unittest.TestCase):
         self.db_patcher.stop()
         self.temp_dir.cleanup()
 
+    def test_existing_navigation_home_table_migrates_without_invented_reference(self):
+        legacy_path = os.path.join(self.temp_dir.name, 'legacy-classroom.db')
+        with patch.object(server, 'DB_PATH', legacy_path):
+            connection = sqlite3.connect(legacy_path)
+            connection.execute(
+                """
+                CREATE TABLE navigation_home (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    map_id TEXT NOT NULL,
+                    map_version TEXT NOT NULL,
+                    frame_id TEXT NOT NULL,
+                    x REAL NOT NULL,
+                    y REAL NOT NULL,
+                    yaw_rad REAL NOT NULL,
+                    set_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO navigation_home VALUES (1, 'classroom', 'v4', 'map', 1, 2, 0, 'teacher', '2026-10-28T00:00:00+00:00')"
+            )
+            connection.commit()
+            connection.close()
+
+            server.init_db()
+            home = server.get_navigation_home(include_reference=True)
+            migrated_connection = server.get_db_connection()
+            columns = {
+                row['name']
+                for row in migrated_connection.execute('PRAGMA table_info(navigation_home)').fetchall()
+            }
+            migrated_connection.close()
+
+        self.assertIn('reference_map', columns)
+        self.assertIsNone(home['reference_map'])
+
     def test_teacher_captures_fresh_shared_origin_and_students_can_read_it(self):
+        reference_snapshot = self.map_snapshot()
         status = {
             'ready': True,
             'motionReady': True,
-            'map': {'map_id': 'classroom', 'version': 'v4', 'frame_id': 'map'},
+            'map': reference_snapshot['map'],
             'localization': {
                 'ready': True,
                 'frame_id': 'map',
@@ -1591,10 +1663,13 @@ class NavigationHomeTests(unittest.TestCase):
             server, 'active_lidar_scan', return_value=None
         ), patch.object(server, 'robot_status', return_value={'running': False}), patch.object(
             server, 'navigation_bridge_status', return_value=status
+        ), patch.object(
+            server, 'navigation_map_snapshot', return_value=reference_snapshot
         ):
             captured = self.client.post('/api/navigation/home', headers=self.teacher_headers)
         student_read = self.client.get('/api/navigation/home', headers=self.student_headers)
         denied_set = self.client.post('/api/navigation/home', headers=self.student_headers)
+        denied_return = self.client.post('/api/navigation/home/return', headers=self.student_headers)
 
         self.assertEqual(captured.status_code, 200)
         self.assertEqual(captured.json()['home']['map_version'], 'v4')
@@ -1603,8 +1678,10 @@ class NavigationHomeTests(unittest.TestCase):
         self.assertEqual(captured.json()['home']['yaw_rad'], 1.1)
         self.assertEqual(student_read.json()['home'], captured.json()['home'])
         self.assertEqual(denied_set.status_code, 403)
+        self.assertEqual(denied_return.status_code, 403)
 
     def test_return_home_uses_live_nav_and_accepts_newer_version_same_identity(self):
+        reference_snapshot = self.map_snapshot()
         server.save_navigation_home(
             {
                 'map_id': 'classroom',
@@ -1613,13 +1690,25 @@ class NavigationHomeTests(unittest.TestCase):
                 'x': 2.5,
                 'y': -1.25,
                 'yaw_rad': 1.1,
+                'reference_map': server._pack_navigation_home_reference(reference_snapshot),
             },
             'teacher',
         )
-        with patch.object(server, 'navigation_map_snapshot', return_value={
-            'ready': True,
-            'map': {'map_id': 'classroom', 'version': 'v5', 'frame_id': 'map'},
-        }), patch.object(server, 'ensure_sdk_motion_available'), patch.object(
+        active_snapshot = self.map_snapshot(version='v5')
+        persisted_reference = server.get_navigation_home(include_reference=True)['reference_map']
+        self.assertIsNotNone(persisted_reference)
+        unpacked_reference = server._unpack_navigation_home_reference(persisted_reference)
+        active_reference = server._pack_navigation_home_reference(active_snapshot)
+        self.assertEqual(
+            [unpacked_reference['map'][key] == active_reference['map'][key]
+             for key in ('map_id', 'frame_id', 'resolution_m', 'width', 'height', 'origin')],
+            [True] * 6,
+        )
+        self.assertEqual(
+            persisted_reference['occupancy_zlib_b64'],
+            active_reference['occupancy_zlib_b64'],
+        )
+        with patch.object(server, 'navigation_map_snapshot', return_value=active_snapshot), patch.object(server, 'ensure_sdk_motion_available'), patch.object(
             server, 'active_lidar_scan', return_value=None
         ), patch.object(server, 'robot_status', return_value={'running': False}), patch.object(
             server,
@@ -1628,15 +1717,108 @@ class NavigationHomeTests(unittest.TestCase):
         ) as start_route:
             response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.json())
         self.assertEqual(response.json()['operation_id'], 'home-return-operation')
         self.assertEqual(start_route.call_args.args[0:4], (
             'classroom', 'v5', 'map', [{'x': 2.5, 'y': -1.25, 'yaw_rad': 1.1}],
         ))
         self.assertEqual(start_route.call_args.kwargs['planner_mode'], 'live')
         self.assertTrue(start_route.call_args.kwargs['allow_map_version_update'])
+        self.assertEqual(response.json()['origin_alignment']['status'], 'same_reference_grid')
 
-    def test_return_home_rejects_different_map_identity_or_frame(self):
+    def test_return_home_aligns_changed_map_and_keeps_live_nav(self):
+        reference_snapshot = self.map_snapshot()
+        server.save_navigation_home(
+            {
+                'map_id': 'classroom',
+                'map_version': 'v4',
+                'frame_id': 'map',
+                'x': 2.5,
+                'y': -1.25,
+                'yaw_rad': 1.1,
+                'reference_map': server._pack_navigation_home_reference(reference_snapshot),
+            },
+            'teacher',
+        )
+        active_snapshot = self.map_snapshot(
+            map_id='classroom-rebuilt', version='v1', frame_id='active_map'
+        )
+        with patch.object(server, 'navigation_map_snapshot', return_value=active_snapshot), patch.object(
+            server, 'ensure_sdk_motion_available'
+        ), patch.object(server, 'active_lidar_scan', return_value=None), patch.object(
+            server, 'robot_status', return_value={'running': False}
+        ), patch.object(
+            server,
+            'navigation_start_route',
+            return_value={'operation_id': 'aligned-home-return', 'status': 'accepted'},
+        ) as start_route:
+            response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
+
+        self.assertEqual(response.status_code, 200, response.json())
+        self.assertEqual(response.json()['origin_alignment']['algorithm'], 'bounded_occupancy_fft_se2_v1')
+        self.assertEqual(start_route.call_args.args[0:3], (
+            'classroom-rebuilt', 'v1', 'active_map',
+        ))
+        self.assertEqual(start_route.call_args.kwargs['planner_mode'], 'live')
+
+    def test_ambiguous_origin_alignment_blocks_route_dispatch(self):
+        reference_snapshot = self.map_snapshot()
+        server.save_navigation_home(
+            {
+                'map_id': 'classroom',
+                'map_version': 'v4',
+                'frame_id': 'map',
+                'x': 2.5,
+                'y': -1.25,
+                'yaw_rad': 1.1,
+                'reference_map': server._pack_navigation_home_reference(reference_snapshot),
+            },
+            'teacher',
+        )
+        active_snapshot = self.map_snapshot(
+            map_id='classroom-rebuilt', version='v1', frame_id='active_map'
+        )
+        with patch.object(server, 'navigation_map_snapshot', return_value=active_snapshot), patch.object(
+            server,
+            'align_occupancy_maps',
+            side_effect=server.MapAlignmentError('Map alignment is ambiguous.'),
+        ), patch.object(server, 'navigation_start_route') as start_route:
+            response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('Map alignment is ambiguous', response.json()['detail'])
+        start_route.assert_not_called()
+
+    def test_return_home_blocks_map_identity_or_frame_when_alignment_fails(self):
+        reference_snapshot = self.map_snapshot()
+        server.save_navigation_home(
+            {
+                'map_id': 'classroom',
+                'map_version': 'v4',
+                'frame_id': 'map',
+                'x': 2.5,
+                'y': -1.25,
+                'yaw_rad': 1.1,
+                'reference_map': server._pack_navigation_home_reference(reference_snapshot),
+            },
+            'teacher',
+        )
+        for map_id, frame_id in (
+            ('different-room', 'map'),
+            ('classroom', 'odom'),
+        ):
+            active_snapshot = self.map_snapshot(map_id=map_id, version='v5', frame_id=frame_id)
+            with patch.object(server, 'navigation_map_snapshot', return_value=active_snapshot), patch.object(
+                server,
+                'align_occupancy_maps',
+                side_effect=server.MapAlignmentError('No confident map match.'),
+            ), patch.object(server, 'navigation_start_route') as start_route:
+                response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn('No confident map match', response.json()['detail'])
+            start_route.assert_not_called()
+
+    def test_return_home_requires_reference_for_legacy_saved_origins(self):
         server.save_navigation_home(
             {
                 'map_id': 'classroom',
@@ -1648,17 +1830,115 @@ class NavigationHomeTests(unittest.TestCase):
             },
             'teacher',
         )
-        for current_map in (
-            {'map_id': 'different-room', 'version': 'v5', 'frame_id': 'map'},
-            {'map_id': 'classroom', 'version': 'v5', 'frame_id': 'odom'},
-        ):
-            with patch.object(server, 'navigation_map_snapshot', return_value={
-                'ready': True,
-                'map': current_map,
-            }), patch.object(server, 'navigation_start_route') as start_route:
-                response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
-            self.assertEqual(response.status_code, 409)
-            start_route.assert_not_called()
+        with patch.object(server, 'navigation_map_snapshot', return_value=self.map_snapshot()), patch.object(
+            server, 'navigation_start_route'
+        ) as start_route:
+            response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('Set the origin again', response.json()['detail'])
+        start_route.assert_not_called()
+
+    def test_return_home_rejects_origin_footprint_outside_map(self):
+        reference_snapshot = self.map_snapshot()
+        server.save_navigation_home(
+            {
+                'map_id': 'classroom',
+                'map_version': 'v4',
+                'frame_id': 'map',
+                'x': -4.9,
+                'y': 0.0,
+                'yaw_rad': 0.0,
+                'reference_map': server._pack_navigation_home_reference(reference_snapshot),
+            },
+            'teacher',
+        )
+        with patch.object(server, 'navigation_map_snapshot', return_value=reference_snapshot), patch.object(
+            server, 'navigation_start_route'
+        ) as start_route:
+            response = self.client.post('/api/navigation/home/return', headers=self.teacher_headers)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('outside the active map', response.json()['detail'])
+        start_route.assert_not_called()
+
+    def test_robot_camera_frame_proxy_is_teacher_only_and_topic_allowlisted(self):
+        topic = '/camera/color/image_raw'
+        payload = {
+            'topic': topic,
+            'frame_id': 'camera_color_optical_frame',
+            'timestamp': server.datetime.now(server.timezone.utc).isoformat(),
+            'receive_age_ms': 4,
+            'stamp_age_ms': 8,
+            'encoding': 'rgb8',
+            'width': 1,
+            'height': 1,
+            'step': 3,
+            'data_base64': 'YWJj',
+        }
+        provider_response = type('ProviderResponse', (), {
+            'status_code': 200,
+            'json': lambda self: payload,
+        })()
+        server._CAMERA_FRAME_LAST_REQUEST.clear()
+        with patch.dict(
+            os.environ,
+            {
+                'G1_CAMERA_TOPICS_JSON': json.dumps([
+                    {'topic': topic, 'frame_id': 'camera_color_optical_frame'},
+                ]),
+                'G1_DISTANCE_PROVIDER_URL': 'http://127.0.0.1:8181/distance/front',
+                'G1_DISTANCE_PROVIDER_TOKEN': 'provider-token',
+            },
+        ), patch.object(server.httpx, 'get', return_value=provider_response) as provider_request:
+            teacher_response = self.client.get(
+                '/api/sensors/camera/frame',
+                headers=self.teacher_headers,
+                params={'topic': topic},
+            )
+            limited_response = self.client.get(
+                '/api/sensors/camera/frame',
+                headers=self.teacher_headers,
+                params={'topic': topic},
+            )
+            student_response = self.client.get(
+                '/api/sensors/camera/frame',
+                headers=self.student_headers,
+                params={'topic': topic},
+            )
+            unknown_response = self.client.get(
+                '/api/sensors/camera/frame',
+                headers=self.teacher_headers,
+                params={'topic': '/camera/not-configured'},
+            )
+            server._CAMERA_FRAME_LAST_REQUEST.clear()
+            payload['timestamp'] = '2020-01-01T00:00:00+00:00'
+            stale_response = self.client.get(
+                '/api/sensors/camera/frame',
+                headers=self.teacher_headers,
+                params={'topic': topic},
+            )
+            server._CAMERA_FRAME_LAST_REQUEST.clear()
+            payload.update(
+                timestamp=server.datetime.now(server.timezone.utc).isoformat(),
+                step=2,
+                data_base64='YWI=',
+            )
+            invalid_stride_response = self.client.get(
+                '/api/sensors/camera/frame',
+                headers=self.teacher_headers,
+                params={'topic': topic},
+            )
+
+        self.assertEqual(teacher_response.status_code, 200)
+        self.assertEqual(teacher_response.content, b'abc')
+        self.assertEqual(teacher_response.headers['X-Camera-Frame-Id'], 'camera_color_optical_frame')
+        self.assertEqual(teacher_response.headers['Cache-Control'], 'no-store, no-cache, max-age=0')
+        self.assertEqual(student_response.status_code, 403)
+        self.assertEqual(unknown_response.status_code, 404)
+        self.assertEqual(limited_response.status_code, 429)
+        self.assertEqual(stale_response.status_code, 503)
+        self.assertEqual(invalid_stride_response.status_code, 502)
+        self.assertEqual(provider_request.call_count, 3)
+        self.assertEqual(provider_request.call_args.kwargs['headers']['Authorization'], 'Bearer provider-token')
 
 
 if __name__ == '__main__':

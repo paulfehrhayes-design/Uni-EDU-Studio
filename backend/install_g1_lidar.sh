@@ -56,6 +56,8 @@ SAVED_LIDAR_TOPIC=""
 SAVED_SENSOR_FRAME=""
 SAVED_MOUNT_CONFIRMED=""
 SAVED_SENSOR_ID=""
+SAVED_EXTRA_POINTCLOUD_SOURCES_JSON=""
+SAVED_CAMERA_TOPICS_JSON=""
 SAVED_PUBLISH_FREQ=""
 SAVED_AXIS_CONFIRMED=""
 SAVED_CALIBRATION_CONFIRMED=""
@@ -70,6 +72,8 @@ if [[ -f "$ENV_FILE" ]]; then
   SAVED_SENSOR_FRAME="$(awk -F= '$1 == "G1_DISTANCE_FRAME_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_MOUNT_CONFIRMED="$(awk -F= '$1 == "G1_LIDAR_MOUNT_CONFIRMED" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_SENSOR_ID="$(awk -F= '$1 == "G1_DISTANCE_SENSOR_ID" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_EXTRA_POINTCLOUD_SOURCES_JSON="$(awk -F= '$1 == "G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  SAVED_CAMERA_TOPICS_JSON="$(awk -F= '$1 == "G1_CAMERA_TOPICS_JSON" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_PUBLISH_FREQ="$(awk -F= '$1 == "G1_LIDAR_PUBLISH_FREQ" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_AXIS_CONFIRMED="$(awk -F= '$1 == "G1_LIDAR_AXIS_CONFIRMED" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
   SAVED_CALIBRATION_CONFIRMED="$(awk -F= '$1 == "G1_DISTANCE_CALIBRATION_CONFIRMED" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
@@ -110,6 +114,21 @@ G1_LIDAR_TOPIC="${G1_LIDAR_TOPIC:-${SAVED_LIDAR_TOPIC:-$DISCOVERED_TOPIC}}"
 G1_DISTANCE_SENSOR_ID="${G1_DISTANCE_SENSOR_ID:-${DISCOVERED_SENSOR_ID:-${SAVED_SENSOR_ID:-mid360-front}}}"
 G1_LIDAR_LOWSTATE_TOPIC="${G1_LIDAR_LOWSTATE_TOPIC:-/lowstate}"
 G1_LIDAR_MOUNT_CONFIRMED="${G1_LIDAR_MOUNT_CONFIRMED:-${SAVED_MOUNT_CONFIRMED:-0}}"
+G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON="${G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON:-${SAVED_EXTRA_POINTCLOUD_SOURCES_JSON:-[]}}"
+CAMERA_DISCOVERY_JSON="$(PYTHONPATH="$PROJECT_DIR/backend" python3 -c 'import json; from camera_discovery import discover_camera_sources; print(json.dumps(discover_camera_sources()))' 2>/dev/null || printf '{}')"
+DISCOVERED_CAMERA_TOPICS_JSON="$(printf '%s' "$CAMERA_DISCOVERY_JSON" | python3 -c '
+import json
+import sys
+
+report = json.load(sys.stdin)
+topics = []
+for source in report.get("sources", {}).values():
+  for topic in source.get("image_topics", []):
+    if topic.get("fresh") and topic.get("frame_id") and topic.get("type") == "sensor_msgs/msg/Image":
+      topics.append({"topic": topic["name"], "frame_id": topic["frame_id"]})
+print(json.dumps(topics[:8], separators=(",", ":")))
+')"
+G1_CAMERA_TOPICS_JSON="${G1_CAMERA_TOPICS_JSON:-${SAVED_CAMERA_TOPICS_JSON:-$DISCOVERED_CAMERA_TOPICS_JSON}}"
 G1_LIDAR_PUBLISH_FREQ="${G1_LIDAR_PUBLISH_FREQ:-${SAVED_PUBLISH_FREQ:-20.0}}"
 CALIBRATION_MODEL_JSON="$(
   PYTHONPATH="$PROJECT_DIR/backend" python3 -c \
@@ -246,6 +265,29 @@ if [[ ! "$G1_DISTANCE_SENSOR_ID" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
   echo "Configured sensor ID contains invalid characters." >&2
   exit 1
 fi
+G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON="$(
+  PYTHONPATH="$PROJECT_DIR/backend" python3 - \
+    "$G1_LIDAR_TOPIC" "$G1_DISTANCE_SENSOR_ID" "$G1_DISTANCE_FRAME_ID" \
+    "$G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON" <<'PY'
+import json
+import sys
+
+from ros_lidar_provider import parse_pointcloud_source_specs
+
+sources = parse_pointcloud_source_specs(*sys.argv[1:])
+print(json.dumps(sources[1:], separators=(",", ":")))
+PY
+)"
+G1_CAMERA_TOPICS_JSON="$(
+  PYTHONPATH="$PROJECT_DIR/backend" python3 - "$G1_CAMERA_TOPICS_JSON" <<'PY'
+import json
+import sys
+
+from ros_lidar_provider import parse_camera_source_specs
+
+print(json.dumps(parse_camera_source_specs(sys.argv[1]), separators=(",", ":")))
+PY
+)"
 if [[ "$AXIS_CONFIRMED" != "0" && "$AXIS_CONFIRMED" != "1" ]] ||
    [[ "$CALIBRATION_CONFIRMED" != "0" && "$CALIBRATION_CONFIRMED" != "1" ]] ||
    [[ "$G1_LIDAR_MOUNT_CONFIRMED" != "0" && "$G1_LIDAR_MOUNT_CONFIRMED" != "1" ]]; then
@@ -409,6 +451,8 @@ G1_DISTANCE_CALIBRATION_CONFIRMED=$CALIBRATION_CONFIRMED
 G1_DISTANCE_PROVIDER_TOKEN=$TOKEN
 G1_DISTANCE_SENSOR_ID=$G1_DISTANCE_SENSOR_ID
 G1_DISTANCE_FRAME_ID=$G1_DISTANCE_FRAME_ID
+G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON=$G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON
+G1_CAMERA_TOPICS_JSON=$G1_CAMERA_TOPICS_JSON
 G1_DISTANCE_BASE_FRAME=$G1_DISTANCE_BASE_FRAME
 G1_LIDAR_MOUNT_CONFIRMED=$G1_LIDAR_MOUNT_CONFIRMED
 G1_LIDAR_LOWSTATE_TOPIC=$G1_LIDAR_LOWSTATE_TOPIC
