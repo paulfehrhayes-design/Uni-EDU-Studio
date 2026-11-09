@@ -128,6 +128,51 @@ The repositories in `ai-agent/research/` may be studied, adapted, or directly mo
 
 Keep these components replaceable and choose the best-fit components across repositories rather than requiring one repository to provide everything. Maintain one documented interface and common safety/data-handling layer across local and online providers. Do not make a framework's default behavior auto-speak; manual approval is a product-level constraint.
 
+## Git LFS review — 2026-11-09
+
+The inventory at review time contained **12 LFS objects totaling 5,966,053 bytes (5.69 MiB)**, all under the copied `ai-agent/research/agents/` tree in the main Uni-EDU Studio history. The research directories are not independent Git repositories in this checkout.
+
+### Approved disposition
+
+- Keep `livekit-plugins/livekit-plugins-silero/livekit/plugins/silero/resources/silero_vad.onnx` at **2,327,524 bytes** as a normal Git file, not Git LFS. SHA-256: `1a153a22f450e202d3ec03968cff71846284c3b70d4353b3096ce9121d34224c3`. This is the actual model loaded by the upstream Silero plugin. The plugin's `pyproject.toml` also includes the model in built wheels; retaining this copy in the research snapshot keeps the source/reference tree complete. Before using it in a product runtime, verify its model-specific terms and provenance, pin the chosen plugin/model version, and avoid needlessly duplicating model storage.
+- Remove the other **11 audio files (3,638,529 bytes)** from the project tree and rewritten branch history. Keep the specific textual references below so their original purpose, source locations, and known provenance remain discoverable. None is needed by Uni-EDU voice-chat runtime.
+- The LFS audio pointers occur only in unpublished commits ahead of `origin/Ai-integration`. Rewrite only the local `Ai-integration` branch, preserving the shared remote base. Do not force-push; after validation, an ordinary fast-forward push should be possible. If the branch is later found to have been shared, coordinate before pushing the rewritten commits.
+
+### Specific references for omitted audio
+
+The paths below are relative to `ai-agent/research/agents/`, the copied LiveKit Agents source tree (`https://github.com/livekit/agents`). The listed LFS object IDs are the content SHA-256 values from the original LFS pointers; they are references, not files that the voice service should download.
+
+| Omitted file | Size; original LFS SHA-256 | Original purpose and source reference | Product decision |
+|---|---:|---|---|
+| `examples/drive_thru/bg_noise.mp3` | 352,802 B; `09c8c8f934d872b076f86ac0fe9cb429d02eb9a6cb222f7600e0c60b474bf5bc` | Ambient drive-through background track. Described in `examples/drive_thru/README.md` and passed to `BackgroundAudioPlayer` in `examples/drive_thru/agent.py`. | Demo-only; no conversational or speech-pipeline function. Omit. |
+| `livekit-agents/livekit/agents/resources/city-ambience.ogg` | 393,503 B; `520910965ef316130ac7240d86fd985613769c85a22d629f3d9d316accb4623f` | Optional city ambience selected by `CITY_AMBIENCE` in `livekit-agents/livekit/agents/voice/background_audio.py`. | Optional background sound only. Omit. |
+| `livekit-agents/livekit/agents/resources/crowded-room.ogg` | 318,878 B; `4a3c8c476f176b59cbcfedc212e65b4c8b0cb9b1b7555fcf09c4e7fadf8e867f` | Optional crowded-room ambience selected by `CROWDED_ROOM` in `livekit-agents/livekit/agents/voice/background_audio.py`. | Optional sound effect; it is not the diarization model or a required real-room test fixture. Omit. |
+| `livekit-agents/livekit/agents/resources/forest-ambience.ogg` | 399,708 B; `6692987291acdec983db399e08d5a4dd55627bbdf1ac59b86e8988999facee5d` | Optional forest ambience selected by `FOREST_AMBIENCE` in `livekit-agents/livekit/agents/voice/background_audio.py`. | Optional background sound only. Omit. |
+| `livekit-agents/livekit/agents/resources/hold_music.ogg` | 702,469 B; `cfb2a77542ac01011f41593a5fe9b919ee898343bcc66d72499b77b2640def28` | Hold music resource in the upstream LiveKit Agents voice background-audio resources. | Not part of conversation, transcription, or approved-response playback. Omit. |
+| `livekit-agents/livekit/agents/resources/keyboard-typing.ogg` | 73,576 B; `56258677554c75019be52f8a16e8494ee5bccfb74c01f490b5a1befd48cbbeae` | Optional keyboard-typing sound in the upstream voice background-audio resources. The adjacent `NOTICE` attributes the sample to Anton at `https://freesound.org/s/137/` under CC BY 4.0. | Omit; preserve this textual attribution here. If ever redistributed, comply with CC BY 4.0 attribution terms. |
+| `livekit-agents/livekit/agents/resources/keyboard-typing2.ogg` | 28,046 B; `1b8244f26ae315561aefdbb09387bf16388c3380d74c2e1f0008be0998169954` | Second optional keyboard-typing sound. The adjacent upstream `NOTICE` says `keyboard-typing2.opg` (upstream typo) and attributes it to Anton at `https://freesound.org/s/137/` under CC BY 4.0. | Omit; retain corrected filename and the source notice's attribution/typo in this reference. |
+| `livekit-agents/livekit/agents/resources/office-ambience.ogg` | 190,410 B; `967a445f505e202d3ec03968cff71846284c3b70d4353b3096ce9121d34224c3` | Optional office ambience in the upstream voice background-audio resources. | Optional background sound only. Omit. |
+| `tests/change-sophie.opus` | 48,905 B; `7a2eb5667dc35714b4cb70324d3722f89580885ee5e51be5f2c793e7893d9a24` | Audio fixture referenced by `tests/test_audio_decoder.py`; that integration test sends audio to LiveKit cloud/Deepgram and skips without valid cloud configuration. | Upstream test-only audio, not an offline product test. The speaker's identity/consent is not established by this review; do not reuse as classroom data. Omit. |
+| `tests/change-sophie.wav` | 570,264 B; `16a978d4be2506cca5e25c5b7aa5b0e53451049d979684d9168c1a81beb4babd` | No code/test reference found in the copied tree; only an LFS entry in `tests/.gitattributes`. | No demonstrated purpose. Omit. |
+| `tests/long.mp3` | 559,968 B; `a420326dbf4f37675bf14ae260fff776aee428ced887fc97e0936c36b96589f6` | Upstream speech fixture referenced by `tests/utils/__init__.py` as `TEST_AUDIO_FILEPATH`, paired with `long_transcript.txt`, and used by upstream STT tests (including a noted ~44.4-second speech end). | Upstream provider-test fixture, not required by our runtime. For future evaluation, make a dedicated synthetic or consented fixture and transcript with explicit data rights. Omit. |
+
+These are references to the original copied tree and its observed source usages, not a promise that the upstream files remain available at those paths or that their audio licenses were comprehensively audited. The keyboard samples' CC BY 4.0 attribution is the only explicit sample-audio attribution found in the inspected tree. The LiveKit Agents repository has Apache-2.0 project licensing; that does not by itself establish the license/consent status of every bundled recording.
+
+### Migration and verification record — 2026-11-09
+
+- **Completed locally:** Converted the retained ONNX to an ordinary Git blob. Its worktree and committed blob are both 2,327,524 bytes with SHA-256 `1a153a22f450e202d3ec03968cff71846284c3b70d4353b3096ce9121d34224c3`.
+- **Completed locally:** Removed the 11 audio paths from both unpublished commits. The rewrite was explicitly limited to commits reachable from `Ai-integration` but not `origin/Ai-integration`; the shared remote base remains an ancestor, and the branch is still two commits ahead. The branch does not require a force push.
+- **Completed locally:** Removed the audio LFS rules from the copied LiveKit Agents attributes. The root `.gitattributes` has an explicit non-LFS exception for the retained ONNX.
+- **Verified:** `git lfs ls-files Ai-integration` is empty; `git lfs status` reports no LFS objects to push for the current branch; the omitted audio paths are absent from its tree/history. No remote push was performed.
+- **Backup refs:** Local pre-cleanup and filter-attempt backup refs remain for recovery and can still expose old LFS pointers to commands that inspect *all* local refs. Push only `Ai-integration` (not `--all`) unless those backups have been deliberately cleaned up. The current branch's ordinary push does not include them.
+- **Not yet committed:** The attribute cleanup and this plan update are working-tree changes. Include them in the next normal commit on `Ai-integration`; then push that branch normally.
+
+After migration, verify all of the following before pushing:
+
+- The ONNX path remains a normal Git blob, with the SHA-256 above.
+- Before a normal push, confirm `git lfs status` still lists no objects for the current branch and push `Ai-integration`, not all local refs.
+- Keep any future selected offline model/version, checksum, license/provenance, and installation method documented here.
+
 ## Implementation phases
 
 ### Phase 0 — Discovery and compatibility
@@ -135,6 +180,7 @@ Keep these components replaceable and choose the best-fit components across repo
 - Inspect the target G1's microphone/speaker APIs, audio device availability, current audio users, operating-system environment, and network arrangement.
 - Record the exact hardware/firmware and available compute; measure resource headroom with existing Uni-EDU and robot services active.
 - Inventory the `ai-agent/` scaffold and research references; map candidate components to concrete requirements and identify what should be reused, adapted, forked, or left as reference. Choose a first pipeline candidate only after checking license, maintenance, model requirements, child-safety limitations, and offline support.
+- Record and preserve the verified LFS cleanup described above while retaining the copied research source and the regular-Git Silero model.
 - Define the intended child age range, local/online data-flow policy, consent/retention defaults, and baseline safety tests with educators.
 - Verify that the chosen local component set can work without Wi-Fi; specify what optional online components add and what data they receive.
 - Define initial latency, transcription-quality, diarization-quality, and resource targets from a baseline recording and hardware benchmark.
