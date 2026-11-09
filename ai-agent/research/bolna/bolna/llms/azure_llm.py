@@ -1,0 +1,519 @@
+import os
+import json
+import re
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+import httpx
+from bolna.llms.http_client_pool import get_shared_http_client
+from dotenv import load_dotenv
+from openai import (
+    AsyncAzureOpenAI,
+    AsyncOpenAI,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    APIStatusError,
+    RateLimitError,
+    APIError,
+    APIConnectionError,
+    BadRequestError,
+)
+
+from bolna.constants import (
+    DEFAULT_LANGUAGE_CODE,
+    canonical_model,
+    default_reasoning_effort,
+    is_reasoning_model,
+)
+from bolna.enums import Verbosity
+from bolna.helpers.utils import convert_to_request_log, compute_function_pre_call_message, now_ms
+from .openai_base import OpenAICompatibleLLM
+from .tool_call_accumulator import ToolCallAccumulator
+from .types import LLMStreamChunk, LatencyData
+from .message_models import strip_internal_keys
+from bolna.helpers.function_calling_helpers import tool_names
+from bolna.helpers.logger_config import configure_logger
+
+logger = configure_logger(__name__)
+load_dotenv()
+
+
+def should_overflow(error) -> bool:
+    """Whether another backend is worth trying: saturation, a server fault, or no connection."""
+    if isinstance(error, (APIConnectionError, httpx.TransportError)):
+        return True
+    if isinstance(error, APIStatusError):
+        return error.status_code == 429 or error.status_code >= 500
+    # A fault reported inside an already-open stream has no status code, only its error type.
+    return isinstance(error, APIError) and error.type == "server_error"
+
+
+@dataclass
+class ReissuedStream:
+    """The turn's stream dropped before any output and was re-issued on the overflow target."""
+
+    stream: object
+    error: Exception
+
+
+class AzureLLM(OpenAICompatibleLLM):
+    def __init__(
+        self,
+        max_tokens=100,
+        buffer_size=40,
+        model="gpt-4.1-mini",
+        temperature=0.1,
+        language=DEFAULT_LANGUAGE_CODE,
+        **kwargs,
+    ):
+        super().__init__(max_tokens, buffer_size)
+
+        if model.startswith("azure/"):
+            self.model = model.replace("azure/", "", 1)
+        else:
+            self.model = model
+        # self.model is the Azure deployment name, which need not resemble the model it serves.
+        self._request_log_model = model
+        self._model_family = canonical_model(self.model)
+
+        self.custom_tools = kwargs.get("api_tools", None)
+        self.language = language
+        logger.info(f"Initializing Azure LLM with model: {self.model} and max tokens {max_tokens}")
+        logger.info("API Tools %s", tool_names(self.custom_tools))
+        if self.custom_tools is not None:
+            self.trigger_function_call = True
+            self.api_params = self.custom_tools["tools_params"]
+            self.tools = self.custom_tools["tools"]
+        else:
+            self.trigger_function_call = False
+
+        self.started_streaming = False
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        max_tokens_key = "max_tokens"
+        self.model_args = {}
+        if is_reasoning_model(self.model_family):
+            max_tokens_key = "max_completion_tokens"
+            self.model_args["reasoning_effort"] = kwargs.get("reasoning_effort", None) or default_reasoning_effort(
+                self.model_family
+            )
+            self.model_args["verbosity"] = kwargs.get("verbosity", None) or Verbosity.LOW.value
+            self.reasoning_summary = kwargs.get("reasoning_summary")
+
+        self.model_args.update({max_tokens_key: self.max_tokens, "temperature": self.temperature, "model": self.model})
+        self.model_args["service_tier"] = kwargs.get("service_tier", "default")
+
+        azure_endpoint = kwargs.get("base_url", os.getenv("AZURE_OPENAI_ENDPOINT"))
+        api_key = kwargs.get("llm_key", os.getenv("AZURE_OPENAI_API_KEY"))
+        api_version = kwargs.get("api_version", os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"))
+
+        http_client = get_shared_http_client(base_url=azure_endpoint, http2=False)
+
+        overflow = kwargs.get("overflow_llm") or {}
+        has_overflow = bool(overflow.get("api_key") and overflow.get("base_url") and overflow.get("model"))
+
+        # Retries stay on unless there is an overflow to fall to, which serves the same purpose faster.
+        self.async_client = AsyncAzureOpenAI(
+            azure_endpoint=azure_endpoint,
+            api_key=api_key,
+            api_version=api_version,
+            http_client=http_client,
+            **({"max_retries": 0} if has_overflow else {}),
+        )
+
+        self.run_id = kwargs.get("run_id", None)
+        self.llm_host = urlparse(azure_endpoint).netloc if azure_endpoint else None
+
+        # Fallback backend for turns the provisioned deployment cannot serve.
+        self._overflow_client = None
+        # Required, not derived: a deployment name need not resemble the model it serves.
+        if has_overflow:
+            self._overflow_model = overflow["model"]
+            self._overflow_service_tier = overflow.get("service_tier") or "priority"
+            self._overflow_client = AsyncOpenAI(
+                api_key=overflow["api_key"],
+                base_url=overflow["base_url"],
+                http_client=get_shared_http_client(base_url=overflow["base_url"], http2=False),
+            )
+            logger.info(f"Azure LLM overflow target ready: {self._overflow_model} @ {overflow['base_url']}")
+
+        # Responses API: uses v1 endpoint with regular AsyncOpenAI client
+        self._init_responses_api(
+            kwargs.get("use_responses_api", False), compact_threshold=kwargs.get("compact_threshold")
+        )
+        if self.use_responses_api:
+            v1_base_url = f"{azure_endpoint.rstrip('/')}/openai/v1/"
+            self._responses_api_client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=v1_base_url,
+                http_client=http_client,
+            )
+
+    @property
+    def _responses_client(self):
+        return getattr(self, "_responses_api_client", self.async_client)
+
+    async def generate_stream(
+        self, messages, synthesize=True, request_json=False, meta_info=None, tool_choice=None, tools=None
+    ):
+        if self.use_responses_api:
+            async for chunk in self._generate_stream_responses(
+                messages, synthesize, request_json, meta_info, tool_choice, tools
+            ):
+                yield chunk
+        else:
+            async for chunk in self._generate_stream_chat(
+                messages, synthesize, request_json, meta_info, tool_choice, tools
+            ):
+                yield chunk
+
+    async def _route_completion(self, model_args):
+        return await self._create_completion(model_args)
+
+    async def _create_completion(self, model_args):
+        """Start a completion, overflowing when the pool cannot serve it. Returns (completion, overflowed)."""
+        try:
+            return await self.async_client.chat.completions.create(**model_args), False
+        except (APIStatusError, APIConnectionError) as e:
+            if self._overflow_client is None or not should_overflow(e):
+                raise
+            logger.warning(f"Azure OpenAI saturated, overflowing turn to {self._overflow_model} run_id={self.run_id}")
+            return await self._overflow_completion(model_args), True
+
+    async def _overflow_completion(self, model_args):
+        overflow_args = {
+            **model_args,
+            "model": self._overflow_model,
+            "service_tier": self._overflow_service_tier,
+        }
+        return await self._overflow_client.chat.completions.create(**overflow_args)
+
+    async def _overflow_on_early_drop(self, completion_stream, model_args, delivered):
+        """Yield the stream's chunks; if it drops before delivered() (nothing spoken yet), re-issue on the overflow."""
+        try:
+            async for chunk in completion_stream:
+                yield chunk
+            return
+        except Exception as e:
+            if delivered() or not should_overflow(e):
+                raise
+            dropped = e
+        logger.warning(
+            f"Azure OpenAI stream dropped before any output, overflowing turn to {self._overflow_model} "
+            f"run_id={self.run_id}: {dropped!r}"
+        )
+        try:
+            completion_stream = await self._overflow_completion(model_args)
+        except Exception as e:
+            logger.error(f"Azure OpenAI overflow after a dropped stream failed: {e}")
+            raise
+        yield ReissuedStream(completion_stream, dropped)
+        async for chunk in completion_stream:
+            yield chunk
+
+    async def _generate_stream_chat(
+        self, messages, synthesize=True, request_json=False, meta_info=None, tool_choice=None, tools=None
+    ):
+        if not messages or len(messages) == 0:
+            raise Exception("No messages provided")
+
+        response_format = self.get_response_format(request_json)
+        model_args = {
+            **self.model_args,
+            "response_format": response_format,
+            "messages": strip_internal_keys(messages),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        if not is_reasoning_model(self.model_family):
+            model_args["stop"] = ["User:"]
+
+        if self.trigger_function_call:
+            _tools = self._parse_tools(tools)
+            if _tools:  # omit tools when none are visible this turn (an empty array is a 400)
+                model_args["tools"] = _tools
+                model_args["tool_choice"] = tool_choice or "auto"
+                model_args["parallel_tool_calls"] = False
+
+        answer, buffer = "", ""
+        tools = model_args.get("tools", [])
+        accumulator = None
+        if self.trigger_function_call:
+            accumulator = ToolCallAccumulator(
+                self.api_params, tools, self.language, self.request_log_model, self.run_id
+            )
+
+        text_tool_buffer = None
+        captured_tool_text = None
+
+        start_time = now_ms()
+        first_token_time = None
+        latency_data = None
+        stream_usage = None
+        finish_reason = None
+
+        try:
+            completion_stream, turn_overflowed = await self._create_completion(model_args)
+        except BadRequestError as e:
+            logger.error(f"Azure OpenAI bad request: {e}")
+            raise
+        except AuthenticationError as e:
+            logger.error(f"Azure OpenAI authentication failed: {e}")
+            raise
+        except PermissionDeniedError as e:
+            logger.error(f"Azure OpenAI permission denied: {e}")
+            raise
+        except NotFoundError as e:
+            logger.error(f"Azure OpenAI resource not found: {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"Azure OpenAI rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"Azure OpenAI connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"Azure OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Azure OpenAI unexpected error: {e}")
+            raise
+
+        # Text received but still buffered was never spoken; only a yielded chunk makes a re-issue repeat speech.
+        delivered = False
+        chunks = completion_stream
+        if self._overflow_client is not None and not turn_overflowed:
+            chunks = self._overflow_on_early_drop(completion_stream, model_args, lambda: delivered)
+        async for chunk in chunks:
+            if isinstance(chunk, ReissuedStream):
+                completion_stream, turn_overflowed = chunk.stream, True
+                first_token_time = latency_data = None
+                # The dropped stream's unspoken text and half tool call must not leak into the new answer.
+                answer, buffer = "", ""
+                text_tool_buffer = captured_tool_text = finish_reason = stream_usage = None
+                if accumulator:
+                    accumulator = ToolCallAccumulator(
+                        self.api_params, tools, self.language, self.request_log_model, self.run_id
+                    )
+                if isinstance(meta_info, dict):
+                    meta_info.setdefault("_non_fatal_errors", []).append(
+                        {"error_type": "stream_dropped_before_output", "error": str(chunk.error), "model": self.model}
+                    )
+                continue
+
+            # Final usage-only chunk (choices=[]) from stream_options
+            if not chunk.choices or len(chunk.choices) == 0:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    stream_usage = chunk.usage
+                continue
+
+            choice = chunk.choices[0]
+            now = now_ms()
+            if not first_token_time:
+                first_token_time = now
+                self.started_streaming = True
+                latency_data = LatencyData(
+                    sequence_id=meta_info.get("sequence_id"),
+                    first_token_latency_ms=first_token_time - start_time,
+                )
+                self._log_llm_request_id(completion_stream, getattr(chunk, "id", None))
+
+            delta = choice.delta
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+
+            if hasattr(delta, "tool_calls") and delta.tool_calls and accumulator:
+                if buffer:
+                    delivered = delivered or bool(buffer.strip())
+                    yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data)
+                    buffer = ""
+
+                accumulator.process_delta(delta.tool_calls)
+
+                pre_call = accumulator.get_pre_call_message(meta_info)
+                if pre_call:
+                    # A silent filler (switch_language's "") speaks nothing, so the turn can still be re-issued.
+                    delivered = delivered or bool((pre_call[0] or "").strip())
+                    yield LLMStreamChunk(
+                        data=pre_call[0],
+                        end_of_stream=True,
+                        latency=latency_data,
+                        function_name=pre_call[1],
+                        function_message=pre_call[2],
+                    )
+
+            elif hasattr(delta, "content") and delta.content is not None:
+                if accumulator:
+                    accumulator.note_content(delta.content)
+                content = delta.content
+
+                if text_tool_buffer is not None:
+                    text_tool_buffer += content
+                    end_pos = self._find_tool_call_end(text_tool_buffer)
+                    if end_pos != -1:
+                        if captured_tool_text is not None:
+                            logger.warning(
+                                f"Multiple text tool calls in one stream — dropping earlier: {captured_tool_text[:60]!r}"
+                            )
+                        captured_tool_text = text_tool_buffer[:end_pos]
+                        remainder = text_tool_buffer[end_pos:].lstrip("\n")
+                        text_tool_buffer = None
+                        answer += remainder
+                        buffer = remainder
+                elif (idx := self._find_text_tool_call_start(buffer + content, tools)) != -1:
+                    combined = buffer + content
+                    before = combined[:idx]
+                    after = combined[idx:]
+                    if before:
+                        answer += before
+                        if synthesize:
+                            delivered = delivered or bool(before.strip())
+                            yield LLMStreamChunk(data=before, end_of_stream=False, latency=latency_data)
+                    end_pos = self._find_tool_call_end(after)
+                    if end_pos != -1:
+                        if captured_tool_text is not None:
+                            logger.warning(
+                                f"Multiple text tool calls in one stream — dropping earlier: {captured_tool_text[:60]!r}"
+                            )
+                        captured_tool_text = after[:end_pos]
+                        remainder = after[end_pos:].lstrip("\n")
+                        answer += remainder
+                        buffer = remainder
+                    else:
+                        text_tool_buffer = after
+                        buffer = ""
+                else:
+                    answer += content
+                    buffer += content
+                    if synthesize and len(buffer) >= self.buffer_size:
+                        split = buffer.rsplit(" ", 1)
+                        delivered = delivered or bool(split[0].strip())
+                        yield LLMStreamChunk(data=split[0], end_of_stream=False, latency=latency_data)
+                        buffer = split[1] if len(split) > 1 else ""
+
+        if latency_data:
+            latency_data.total_stream_duration_ms = now_ms() - start_time
+        if isinstance(meta_info, dict):
+            meta_info["llm_finish_reason"] = finish_reason
+
+        if text_tool_buffer is not None:
+            captured_tool_text = text_tool_buffer
+
+        if captured_tool_text and not (accumulator and accumulator.final_tool_calls):
+            logger.warning(f"Text tool call detected in content stream, attempting rescue: {captured_tool_text[:80]}")
+            rescue_chunk = self._try_rescue_text_tool_call(
+                captured_tool_text, model_args, meta_info, answer, latency_data
+            )
+            if rescue_chunk:
+                yield rescue_chunk
+            else:
+                # A functions.<name>(...) fragment is never speech; drop it rather than speak ids aloud.
+                logger.warning(f"Text tool call rescue failed, dropping fragment: {captured_tool_text[:80]!r}")
+
+        if accumulator and accumulator.final_tool_calls:
+            api_call_payload = accumulator.build_api_payload(model_args, meta_info, answer)
+            if api_call_payload:
+                fc_chunk = LLMStreamChunk(
+                    data=api_call_payload, end_of_stream=False, latency=latency_data, is_function_call=True
+                )
+                if stream_usage:
+                    fc_chunk.input_tokens = getattr(stream_usage, "prompt_tokens", None)
+                    fc_chunk.output_tokens = getattr(stream_usage, "completion_tokens", None)
+                    _d = getattr(stream_usage, "completion_tokens_details", None)
+                    if _d:
+                        fc_chunk.reasoning_tokens = getattr(_d, "reasoning_tokens", None)
+                    _pd = getattr(stream_usage, "prompt_tokens_details", None)
+                    if _pd:
+                        fc_chunk.cached_tokens = getattr(_pd, "cached_tokens", None)
+                fc_chunk.overflowed = turn_overflowed
+                yield fc_chunk
+
+        # Extract actual token counts from stream usage
+        usage_kwargs = {}
+        usage_kwargs["overflowed"] = turn_overflowed
+        if stream_usage:
+            usage_kwargs["input_tokens"] = getattr(stream_usage, "prompt_tokens", None)
+            usage_kwargs["output_tokens"] = getattr(stream_usage, "completion_tokens", None)
+            details = getattr(stream_usage, "completion_tokens_details", None)
+            if details:
+                usage_kwargs["reasoning_tokens"] = getattr(details, "reasoning_tokens", None)
+            prompt_details = getattr(stream_usage, "prompt_tokens_details", None)
+            if prompt_details:
+                usage_kwargs["cached_tokens"] = getattr(prompt_details, "cached_tokens", None)
+
+        if synthesize:
+            yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+        else:
+            yield LLMStreamChunk(data=answer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+
+        self.started_streaming = False
+
+    async def generate(self, messages, request_json=False, ret_metadata=False):
+        if self.use_responses_api:
+            return await self._generate_responses(messages, request_json, ret_metadata)
+        return await self._generate_chat(messages, request_json, ret_metadata)
+
+    async def _generate_chat(self, messages, request_json=False, ret_metadata=False):
+        response_format = self.get_response_format(request_json)
+
+        try:
+            completion, _ = await self._create_completion(
+                {
+                    "model": self.model,
+                    "temperature": 0.0,
+                    # Same guarantee as the streaming path: bookkeeping keys never reach the wire.
+                    "messages": strip_internal_keys(messages),
+                    "stream": False,
+                    "response_format": response_format,
+                }
+            )
+
+            res = completion.choices[0].message.content
+            if ret_metadata:
+                metadata = {}
+                if completion.usage:
+                    metadata["input_tokens"] = completion.usage.prompt_tokens
+                    metadata["output_tokens"] = completion.usage.completion_tokens
+                    details = getattr(completion.usage, "completion_tokens_details", None)
+                    if details:
+                        metadata["reasoning_tokens"] = getattr(details, "reasoning_tokens", None)
+                    prompt_details = getattr(completion.usage, "prompt_tokens_details", None)
+                    if prompt_details:
+                        metadata["cached_tokens"] = getattr(prompt_details, "cached_tokens", None)
+                return res, metadata
+            else:
+                return res
+        except BadRequestError as e:
+            logger.error(f"Azure OpenAI bad request: {e}")
+            raise
+        except AuthenticationError as e:
+            logger.error(f"Azure OpenAI authentication failed: {e}")
+            raise
+        except PermissionDeniedError as e:
+            logger.error(f"Azure OpenAI permission denied: {e}")
+            raise
+        except NotFoundError as e:
+            logger.error(f"Azure OpenAI resource not found: {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"Azure OpenAI rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"Azure OpenAI connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"Azure OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Azure OpenAI unexpected error: {e}")
+            raise
+
+    async def close(self):
+        pass  # httpx client is shared via pool, don't close it here
+
+    def get_response_format(self, is_json_format: bool):
+        if is_json_format and self.model in ("gpt-4-1106-preview", "gpt-3.5-turbo-1106", "gpt-4o-mini", "gpt-4.1-mini"):
+            return {"type": "json_object"}
+        else:
+            return {"type": "text"}

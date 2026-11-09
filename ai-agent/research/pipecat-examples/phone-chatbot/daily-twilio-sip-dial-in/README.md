@@ -1,0 +1,224 @@
+# Twilio Phone Number → Daily SIP → Pipecat Bot (Dial-in)
+
+This example shows how to receive inbound phone calls on a **Twilio phone number** and route them through **Daily's SIP infrastructure** to a **Pipecat voice bot**. The `provider="daily"` setting tells Daily to use its own SIP servers for the media path, so no external SIP trunk is required.
+
+> **Using a Daily phone number instead of Twilio?** See the [`daily-pstn-dial-in`](../daily-pstn-dial-in) example.
+
+## How It Works
+
+```
+Caller → Twilio Phone Number → Webhook (server.py) → Daily SIP Room → Pipecat Bot
+```
+
+1. A caller dials your **Twilio phone number**
+2. Twilio sends a webhook to your server (`/call` endpoint in `server.py`)
+3. The caller hears hold music while the server handles the webhook
+4. The server creates a **Daily room** with SIP enabled (`provider="daily"`)
+5. The server starts the Pipecat bot (locally or via Pipecat Cloud)
+6. The bot joins the Daily room and signals readiness (`dialin-ready` fires)
+7. TwiML is invoked that asks Twilio to forward the call to Daily's SIP endpoint
+8. The caller and the bot are connected for a voice conversation
+
+## Project Structure
+
+This example is organized to be production-ready and easy to customize:
+
+- **`server.py`** - FastAPI webhook server that handles incoming calls
+
+  - Receives Twilio call webhooks
+  - Creates Daily rooms with SIP capabilities
+  - Routes to local or production bot deployment
+  - Uses shared HTTP session for optimal performance
+
+- **`server_utils.py`** - Utility functions for Twilio and Daily API interactions
+
+  - Data models for call data and agent requests
+  - Room creation logic
+  - Bot starting logic (production and local modes)
+  - Easy to extend with custom business logic
+
+- **`bot.py`** - The voice bot implementation
+  - Handles the conversation with the caller
+  - Deployed to Pipecat Cloud in production or run locally for development
+
+## Prerequisites
+
+### Twilio
+
+- A Twilio account with a phone number that supports voice
+- Twilio Account SID and Auth Token
+
+### Daily
+
+- A Daily account with an API key (or Daily API key from Pipecat Cloud account)
+
+### AI Services
+
+- OpenAI API key for the LLM inference
+- Deepgram API key for speech-to-text
+- Cartesia API key for text-to-speech
+
+### System
+
+- Python 3.11+
+- `uv` package manager
+- ngrok (for local development)
+- Docker (for production deployment)
+
+## Setup
+
+1. Create a virtual environment and install dependencies
+
+   ```bash
+   uv sync
+   ```
+
+2. Set up environment variables
+
+Copy the example file and fill in your API keys:
+
+    ```bash
+    cp .env.example .env
+    # Edit .env with your API keys
+    ```
+
+3. Configure your Twilio webhook
+
+In the Twilio console:
+
+- Go to your phone number's configuration
+- Set the webhook for "A call comes in" to your server's URL + "/call"
+- For local testing, you can use ngrok to expose your local server
+
+```bash
+ngrok http 8080
+# Then use the provided URL (e.g., https://abc123.ngrok.io/call) in Twilio
+```
+
+## Environment Configuration
+
+The bot supports two deployment modes controlled by the `ENV` variable:
+
+### Local Development (`ENV=local`)
+
+- Uses your local server or ngrok URL for handling the webhook and starting the bot
+- Default configuration for development and testing
+
+### Production (`ENV=production`)
+
+- Bot is deployed to Pipecat Cloud; requires `PIPECAT_API_KEY` and `PIPECAT_AGENT_NAME`
+- Set these when deploying to production environments
+- Your FastAPI server runs either locally or deployed to your infrastructure
+
+## Run the Bot Locally
+
+You'll need three terminal windows open:
+
+1. Terminal 1: Start the webhook server:
+
+   ```bash
+   uv run server.py
+   ```
+
+2. Terminal 2: Start an ngrok tunnel to expose the FastAPI server running on server.py
+
+   ```bash
+   ngrok http 8080
+   ```
+
+   Important: Make sure that this URL matches the webhook URL configured in your Twilio phone number settings.
+
+   > Tip: Use the `--subdomain` flag for a reusable ngrok link.
+
+3. Terminal 3: Run your bot:
+
+   ```bash
+   uv run bot.py -t daily
+   ```
+
+   > The bot.py file includes a FastAPI server. This emulates the Pipecat Cloud service, and is as if you're running with `min_agents=1`.
+
+4. Call your bot!
+
+   Call the Twilio number you configured to talk to your bot.
+
+## Production Deployment
+
+You can deploy your bot to Pipecat Cloud and server to your infrastructure to run this bot in a production environment.
+
+### Deploy your Bot to Pipecat Cloud
+
+Follow the [quickstart instructions](https://docs.pipecat.ai/getting-started/quickstart#step-2%3A-deploy-to-production) for tips on how to create secrets, build and push a docker image, and deploy your agent to Pipecat Cloud.
+
+You'll only deploy your `bot.py` file.
+
+### Deploy the Server
+
+The `server.py` handles inbound call webhooks and should be deployed separately from your bot:
+
+- **Bot**: Runs on Pipecat Cloud (handles the conversation)
+- **Server**: Runs on your infrastructure (receives webhooks and starts the bot)
+
+### Environment Variables for Production
+
+Add these to your production environment:
+
+```bash
+ENV=production
+PIPECAT_API_KEY=your_pipecat_cloud_api_key
+PIPECAT_AGENT_NAME=your-agent-name
+```
+
+The server automatically detects the environment and routes bot starting requests accordingly.
+
+## Adding Custom Data to Agent Requests
+
+You can extend the `AgentRequest` model in `server_utils.py` to pass custom data to your bot:
+
+```python
+class AgentRequest(BaseModel):
+    room_url: str
+    token: str
+    call_sid: str
+    sip_uri: str
+    to_phone: str
+    # Add your custom fields here
+    customer_name: str | None = None
+    account_id: str | None = None
+```
+
+Then populate this data in `server.py` before starting the bot:
+
+```python
+# Example: Look up customer information
+customer_info = await get_customer_by_phone(call_data.from_phone)
+
+agent_request = AgentRequest(
+    room_url=sip_config.room_url,
+    token=sip_config.token,
+    call_sid=call_data.call_sid,
+    sip_uri=sip_config.sip_endpoint,
+    to_phone=call_data.to_phone,
+    customer_name=customer_info.name,
+    account_id=customer_info.id,
+)
+```
+
+## Troubleshooting
+
+### Call is not being answered
+
+- Check that your Twilio webhook is correctly configured to point to your ngrok server and `/call` endpoint
+- Make sure the server.py file is running
+- Make sure ngrok is correctly setup and pointing to the correct port
+
+### Call connects but no bot is heard
+
+- Ensure your Daily API key is correct and has SIP capabilities
+- Verify that the Cartesia API key and voice ID are correct
+- Check that your Twilio credentials (Account SID and Auth Token) are correct
+
+### Bot starts but disconnects immediately
+
+- Check the Daily logs for any error messages
+- Ensure your server has stable internet connectivity

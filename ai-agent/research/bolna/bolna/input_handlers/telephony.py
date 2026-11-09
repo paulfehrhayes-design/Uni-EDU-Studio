@@ -1,0 +1,195 @@
+import traceback
+from .default import DefaultInputHandler
+import asyncio
+import base64
+import json
+from starlette.websockets import WebSocketDisconnect
+from dotenv import load_dotenv
+from bolna.helpers.utils import create_ws_data_packet
+from bolna.helpers.logger_config import configure_logger
+
+logger = configure_logger(__name__)
+load_dotenv()
+
+
+class TelephonyInputHandler(DefaultInputHandler):
+    def __init__(
+        self,
+        queues,
+        websocket=None,
+        input_types=None,
+        mark_event_meta_data=None,
+        turn_based_conversation=False,
+        is_welcome_message_played=False,
+        observable_variables=None,
+    ):
+        super().__init__(
+            queues,
+            websocket,
+            input_types,
+            mark_event_meta_data,
+            turn_based_conversation,
+            is_welcome_message_played=is_welcome_message_played,
+            observable_variables=observable_variables,
+        )
+        self._stream_sid = None
+        self.stream_sid_ready.clear()
+        self.call_sid = None
+        self._fallback_call_sid = None
+        self.buffer = []
+        self.message_count = 0
+        # self.mark_event_meta_data = mark_event_meta_data
+        self.last_media_received = 0
+        self.io_provider = None
+        self.websocket_listen_task = None
+
+    @property
+    def stream_sid(self):
+        return self._stream_sid
+
+    @stream_sid.setter
+    def stream_sid(self, value):
+        self._stream_sid = value
+        if value is not None:
+            self.stream_sid_ready.set()
+
+    def get_stream_sid(self):
+        return self._stream_sid
+
+    def get_call_sid(self):
+        return self.call_sid or self._fallback_call_sid
+
+    def set_fallback_call_sid(self, call_sid):
+        """Carrier sid from the call record, for a stream that reconnects with no start event."""
+        self._fallback_call_sid = call_sid
+
+    async def call_start(self, packet):
+        pass
+
+    async def disconnect_stream(self):
+        pass
+
+    async def _safe_disconnect_stream(self):
+        """Wrapper for disconnect_stream with error handling for background execution."""
+        try:
+            await self.disconnect_stream()
+        except Exception as e:
+            logger.error(f"Error in disconnect_stream: {e}")
+
+    # def get_mark_event_meta_data_obj(self, packet):
+    #     pass
+
+    async def stop_handler(self):
+        logger.info("stopping handler")
+        self.running = False
+        # Fire and forget disconnect_stream - don't block the disconnection flow
+        asyncio.create_task(self._safe_disconnect_stream())
+        logger.info("sleeping for 2 seconds so that whatever needs to pass is passed")
+        await asyncio.sleep(2)
+        try:
+            await self.websocket.close()
+            logger.info("WebSocket connection closed")
+        except Exception as e:
+            logger.info(f"Error closing WebSocket: {e}")
+
+    async def ingest_audio(self, audio_data, meta_info):
+        ws_data_packet = create_ws_data_packet(data=audio_data, meta_info=meta_info)
+        self.queues["transcriber"].put_nowait(ws_data_packet)
+
+    async def _handle_dtmf_digit(self, digit: str) -> bool:
+        """Handle digit. Returns True if complete (termination '#')."""
+        if not self.is_dtmf_active:
+            return False
+
+        termination_key = "#"
+
+        if digit == termination_key:
+            logger.info("DTMF termination key pressed")
+            return True
+
+        self.dtmf_digits += digit
+        return False
+
+    async def _listen(self):
+        buffer = []
+        while True:
+            try:
+                message = await self.websocket.receive_text()
+
+                packet = json.loads(message)
+                if packet["event"] == "start":
+                    await self.call_start(packet)
+                elif packet["event"] == "media":
+                    media_data = packet["media"]
+                    media_audio = base64.b64decode(media_data["payload"])
+                    media_ts = int(media_data["timestamp"])
+
+                    if "chunk" in packet["media"] or (
+                        "track" in packet["media"] and packet["media"]["track"] == "inbound"
+                    ):
+                        meta_info = {
+                            "io": self.io_provider,
+                            "call_sid": self.call_sid,
+                            "stream_sid": self.stream_sid,
+                            "sequence": self.input_types["audio"],
+                        }
+                        """
+                        if self.last_media_received + 20 < media_ts:
+                            bytes_to_fill = 8 * (media_ts - (self.last_media_received + 20))
+                            logger.info(f"Filling {bytes_to_fill} bytes of silence")
+                            #await self.ingest_audio(b"\xff" * bytes_to_fill, meta_info)
+                        """
+                        self.last_media_received = media_ts
+                        buffer.append(media_audio)
+                        self.message_count += 1
+
+                        # Send 100 ms of audio to deepgram
+                        if self.message_count == 10:
+                            merged_audio = b"".join(buffer)
+                            buffer = []
+                            await self.ingest_audio(merged_audio, meta_info)
+                            self.message_count = 0
+                    else:
+                        logger.info("Getting media elements but not inbound media")
+
+                elif packet["event"] == "mark" or packet["event"] == "playedStream":
+                    self.process_mark_message(packet)
+
+                elif packet["event"] == "dtmf":
+                    digit = packet.get("dtmf", {}).get("digit", "")
+                    logger.info(f"DTMF key pressed: '{digit}' | Accumulated: '{self.dtmf_digits}'")
+                    if not digit:
+                        continue
+
+                    is_complete = await self._handle_dtmf_digit(digit)
+                    if is_complete and self.dtmf_digits:
+                        if self.is_dtmf_active:
+                            logger.info(f"DTMF complete - Sending: '{self.dtmf_digits}'")
+                            self.queues["dtmf"].put_nowait(self.dtmf_digits)
+                        self.dtmf_digits = ""
+
+                elif packet["event"] == "stop":
+                    logger.info("call stopping")
+                    self._end_input_stream("default")
+                    break
+
+            except WebSocketDisconnect as e:
+                if e.code in (1000, 1001):
+                    logger.info(f"{self.io_provider} websocket closed normally: code={e.code}")
+                else:
+                    # 1006 (abnormal closure, no close frame) and any other code mean the media
+                    # stream dropped mid-call rather than ending gracefully.
+                    logger.warning(
+                        f"{self.io_provider} websocket disconnected abnormally: code={e.code}, "
+                        f"reason={getattr(e, 'reason', None)}, stream_sid={self.stream_sid}, call_sid={self.call_sid}"
+                    )
+
+            except Exception as e:
+                traceback.print_exc()
+                self._end_input_stream("default")
+                logger.info(f"Exception in {self.io_provider} receiver reading events: {str(e)}")
+                break
+
+    async def handle(self):
+        if not self.websocket_listen_task:
+            self.websocket_listen_task = asyncio.create_task(self._listen())

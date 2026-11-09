@@ -1,0 +1,72 @@
+{
+  "backends": {
+    "filterLabel": "Filtrar backends",
+    "reinstallBackend": "Reinstalar backend",
+    "deleteBackend": "Excluir backend",
+    "loadFailedTitle": "Não foi possível carregar o catálogo de backends.",
+    "filtersButton": "Filtros",
+    "filtersDone": "Concluir",
+    "filterGroups": {
+      "state": "Estado",
+      "type": "Tipo",
+      "show": "Mostrar",
+      "library": "Biblioteca"
+    },
+    "showVariants": "Variantes",
+    "showDevelopment": "Builds de desenvolvimento",
+    "allLibraries": "Todas as bibliotecas",
+    "moreActions": "Mais ações de backends",
+    "installFromUrl": "Instalar a partir de URL…",
+    "manageLibraries": "Gerenciar bibliotecas…",
+    "count_one": "{{count}} backend",
+    "count_other": "{{count}} backends",
+    "countOf": "{{shown}} de {{total}} backends",
+    "activeFilters": "Filtros ativos",
+    "removeFilter": "Remover filtro: {{name}}",
+    "updatesAvailable_one": "{{count}} atualização disponível",
+    "updatesAvailable_other": "{{count}} atualizações disponíveis",
+    "reviewUpdates": "Revisar",
+    "close": "Fechar",
+    "installedLoadFailedTitle": "Não foi possível carregar os backends instalados."
+  },
+  "capacity": {
+    "diskChip": "Disco quase cheio"
+  },
+  "activity": {
+    "kind": {
+      "addon": "complemento"
+    },
+    "verb": {
+      "upgrading": "Atualizando {{kind}}",
+      "failedUpgrade": "Não foi possível atualizar {{kind}}"
+    },
+    "filter": {
+      "addons": "Complementos"
+    },
+    "upgradeVersions": "{{from}} para {{to}}",
+    "rowUpgraded": "Atualizado em {{duration}}",
+    "rowUpgradedPlain": "Atualizado",
+    "viewInAddons": "Ver em Complementos",
+    "upgradeWaiting": "Aguardando o serviço de complementos iniciar. Próxima verificação em {{seconds}} s.",
+    "addonStage": {
+      "submitting": "Submitting update",
+      "accepted": "Accepted by owner",
+      "running": "Running update",
+      "preparing-package": "Preparing package",
+      "committing-package": "Committing package",
+      "backing-up": "Creating and verifying backup",
+      "backed-up": "Backup verified",
+      "staged": "Package committed",
+      "migrating": "Starting candidate and checking migration",
+      "healthy": "Candidate healthy",
+      "publishing": "Publishing generation",
+      "completed": "Update completed",
+      "failed": "Update failed"
+    },
+    "addonFailure": {
+      "upgrade_failed": "Update failed. Check the owner logs for details.",
+      "interrupted": "Update interrupted by owner shutdown or restart. It was not replayed.",
+      "recovery_required": "Update interrupted. Data recovery is required before this add-on can run."
+    }
+  }
+}

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <!-- Required meta tags -->
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+        <link rel="icon" href="img/favicon.ico">
+        <title>How to Contribute</title>
+        <!-- Bootstrap CSS -->
+        <link rel="stylesheet" href="css/bootstrap.css">
+        <link rel="stylesheet" href="vendors/linericon/style.css">
+        <link rel="stylesheet" href="css/font-awesome.min.css">
+        <link rel="stylesheet" href="vendors/owl-carousel/owl.carousel.min.css">
+        <link rel="stylesheet" href="vendors/lightbox/simpleLightbox.css">
+        <link rel="stylesheet" href="vendors/nice-select/css/nice-select.css">
+        <link rel="stylesheet" href="vendors/animate-css/animate.css">
+        <!-- main css -->
+        <link rel="stylesheet" href="css/style.css">
+        <link rel="stylesheet" href="css/responsive.css">
+    </head>
+    <body>
+
+        <!--================Header Menu Area =================-->
+      <header class="header_area">
+          <div class="main_menu">
+              <nav class="navbar navbar-expand-lg navbar-light">
+                  <div class="container box_1620">
+                      <!-- Brand and toggle get grouped for better mobile display -->
+                      <a class="navbar-brand logo_h" href="index.html"><img src="img/speechbrain-horiz-logo.svg" width="175px" alt=""></a>
+                      <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
+                          <span class="icon-bar"></span>
+                          <span class="icon-bar"></span>
+                          <span class="icon-bar"></span>
+                      </button>
+                      <!-- Collect the nav links, forms, and other content for toggling -->
+                      <div class="collapse navbar-collapse offset" id="navbarSupportedContent">
+                          <ul class="nav navbar-nav menu_nav justify-content-center">
+                              <li class="nav-item active"><a class="nav-link" href="index.html">Home</a></li>
+                              <li class="nav-item"><a class="nav-link" href="about.html">About SpeechBrain</a></li>
+                              <li class="nav-item"><a class="nav-link" href="contributing.html">Contributing</a></li>
+                              <li class="nav-item"><a class="nav-link" href="https://speechbrain.readthedocs.io/">Documentation</a></li>
+                              <li class="nav-item"><a class="nav-link" href="https://speechbrain.readthedocs.io/">Tutorials</a></li>
+                              <li class="nav-item"><a class="nav-link" href="https://github.com/speechbrain/benchmarks">Benchmarks</a></li>
+                          </ul>
+                      </div>
+                  </div>
+              </nav>
+          </div>
+      </header>
+        <!--================Header Menu Area =================-->
+
+        <!--================Home Banner Area =================-->
+        <section class="home_banner_area blog_banner">
+            <div class="banner_inner d-flex align-items-center">
+            	<div class="overlay bg-parallax" data-stellar-ratio="0.9" data-stellar-vertical-offset="0" data-background=""></div>
+				<div class="container">
+					<div class="blog_b_text text-center">
+						<h2>Contributing</h2>
+						<h3>Everyone is welcome!</h3>
+
+					</div>
+				</div>
+            </div>
+        </section>
+        <!--================End Home Banner Area =================-->
+	<div class="alert alert-primary" role="alert" style="text-align: center; font-size: 24px;">
+	    🎉 SpeechBrain 1.0 is out.  <a href="https://colab.research.google.com/drive/1IEPfKRuvJRSjoxu22GZhb3czfVHsAy0s?usp=sharing"><strong> Check out what's new!</strong></a>
+	</div>
+        <!--================Work Area =================-->
+        <section class="work_area p_120">
+            <div class="main_title">
+              <h2> 🚀 Contributing to SpeechBrain</h2>
+              <p class="justified large"> The goal is to collectively write a set of open-source libraries for Conversational AI.
+                It is crucial to write a set of homogeneous libraries that are all compliant with a set of guidelines described
+                in our <a href="https://speechbrain.readthedocs.io/en/latest/contributing.html"> documentation </a>.
+              </p>
+	      <br>
+              <h3> 🌟 Zen of SpeechBrain </h3>
+              <p class="justified large"> SpeechBrain could be used for research, academic, commercial, non-commercial purposes.If you want to contribute, keep in mind the following features:
+	      <br/><br/>
+             <b>Simplicity:</b> the code must be easy to understand even by students or users that are not professional programmers or speech researchers.
+ Design your code such that it can be easily read. Given alternatives with the same level of performance, code the simplest one. <br/><br/>
+                <b>Modularity:</b> Write your code to be modular and well-fitting with the other functionalities of the toolkit. The idea is to develop a bunch of models that can be naturally interconnected with each other. <br/><br/>
+                 <b>Efficiency:</b> The code should be as efficient as possible. Contributors should maximize the use of pytorch native operations
+<br/><br/>
+		      <b>Documentation:</b> Given the goals of SpeechBrain, writing rich and good documentation is a crucial step. Write docstrings with runnable examples (as done in PyTorch code).
+	<br/><br/>      
+              <h3> 🔧 How to get my code into SpeechBrain? </h3>
+              <p class="justified large"> SpeechBrain is hosted via <a href="https://github.com/speechbrain/speechbrain"> GitHub </a>. Contributing requires three steps: <br/><br/>
+                <b>1.</b> Fork, clone the <a href="https://github.com/speechbrain/speechbrain">repository</a> and install our test suite as detailed in <a href="https://speechbrain.readthedocs.io/en/latest/contributing.html"> the documentation </a>. <br/>
+                <b>2.</b> Write your code and test it properly. Commit your changes to your fork with our pre-commit tests to ensure tests are passing.
+                Then open a pull request on the official repository.<br/>
+                <b>3.</b> Participate in the review process. Each pull request is reviewed by one or two reviewers.
+                Please integrate their feedback into your code. Once reviewers are happy with your pull request, they will merge it into the official code. <br/><br/>
+                <b>Details about this process (i.e including steps for installing the tests) are given in <a href="https://speechbrain.readthedocs.io/en/latest/contributing.html"> the documentation </a>.</b>
+              </p>
+	 <br/><br/>
+              <h3> 🙌 How can I help? </h3>
+              <p class="justified large">  Examples of contributions include new recipes, new models, new external functionalities, solving issues/bugs.
+              </p>
+            </div>
+
+<div class="main_title">
+  <h2>🌟 Contributors</h2>
+  <p class="justified large">We would like to thank the following contributors:</p>
+</div>
+<ul class="contributors-list">
+              <li>Mirco Ravanelli, Concordia University, Mila (CA)</li>
+              <li>Titouan Parcollet, Samsung Research, University of Cambridge (UK)</li>
+              <li>Peter Plantinga, Ohio State University (USA)</li>
+	      <li>Aku Rouhe, Aalto University (FI)</li>
+	      <li>Adel Moumen, University of Cambridge (UK) </li>
+	      <li>Sylvain de Langen, Avignon Université (LIA, FR) </li>
+	      <li>Cem Subakan, Mila, Laval University (CA)</li>
+	      <li>Luca Della Libera, Concordia  University, Mila (CA)</li>
+	      <li>Pooneh Mousavi, Concordia  University, Mila (CA)</li>	
+	      <li>Artem Ploujnikov, Université de Montréal, Mila (CA)</li>	
+	      <li>Davide Borra, University of Bologna (IT)</li>
+              <li>Francesco Paissan, Fondazione Bruno Kessler (IT)</li>
+	      <li>Mahed Mousavi, University of Trento (IT)</li>
+	      <li>Salah Zaiem, Telecom Paris (FR)</li>
+	      <li>Zeyu Zhao, University of Edinburgh (UK)</li> 
+	      <li> Pierre Champion,  INRIA (FR)</li> 
+        <li> Georgios Karakasidis, University of Edinburgh (UK)</li> 
+	      <li> Sung-Lin Yeh, University of Edinburgh (UK)</li> 
+	      <li> Yingzhi Wang, Zaion (FR)</li> 
+        <li> Dongwon Kim, Krafton AI (KR)</li> 
+	      <li> Xuechen Liu, Aalto University (FI)</li> 
+	      <li> Andreas Nautsch, Avignon Université (LIA, FR)</li> 
+	      <li> Pradnya Kandarkar, Concordia University</li>
+	      <li> Jarod Duret, Avignon Université (LIA, FR)</li>
+	      <li> Sangeet Sagar, Saarland University (GE) </li>
+	      <li> Gaëlle Laperrière, Avignon Université (LIA, FR) </li> 
+          <li> Ha Nguyen, Oracle (FR) </li>
+        <li>  Pablo Zuluaga, École Polytechnique Fédérale de Lausanne (EPFL, CH)</li>
+        <li>  Florian Mai, École Polytechnique Fédérale de Lausanne (EPFL, CH)</li>
+	      <li> Loren Lugosch, Mila, McGill University (CA)</li>
+          <li> Nauman Dawalatabad, Indian Institute of Technology Madras (IN)</li>
+          <li> Ju-Chieh Chou, National Taiwan University (TW)</li>
+          <li> Abdel Heba, Linagora / University of Toulouse (IRIT, FR)</li>
+          <li> Francois Grondin, University of Sherbrooke (CA)</li>
+          <li> William Aris, University of Sherbrooke (CA)</li>
+          <li> Chien-Feng Liao, National Taiwan University (TW)</li>
+          <li> Samuele Cornell, Università Politecnica delle Marche (IT)</li>
+          <li> Sung-Lin Yeh, National Tsing Hua University (TW)</li>
+          <li> Hwidong Na, Visiting Researcher Samsung SAIL (CA)</li>
+          <li> Yan Gao, University of Cambridge (UK)</li>
+          <li> Szu-Wei Fu, Academia Sinica (TW)</li>
+	      <li> Elena Rastorgueva, University of Cambridge (UK)</li>
+              <li> Jianyuan Zhong, University of Rochester (USA)<li>
+              <li> Brecht Desplanques, Ghent University (BE)<li>
+              <li> Jenthe Thienpondt, Ghent University (BE)<li>
+	      <li> Salima Mdhaffar, Avignon Université (LIA, FR)<li>
+        <li> Mickael Rouvier, Avignon University (LIA, FR)</li>
+	      <li> Yannick Estève, Avignon University (LIA, FR)</li>
+              <li> Renato De Mori, McGill University (CA), Avignon University (LIA, FR)</li>
+              <li> Yoshua Bengio, Mila, University of Montréal (CA)</li>
+ </ul>
+ </div>
+        </section>
+        <!--================End Work Area =================-->
+
+
+
+        <!-- Optional JavaScript -->
+        <!-- jQuery first, then Popper.js, then Bootstrap JS -->
+        <script src="js/jquery-3.2.1.min.js"></script>
+        <script src="js/popper.js"></script>
+        <script src="js/bootstrap.min.js"></script>
+        <script src="js/stellar.js"></script>
+        <script src="vendors/lightbox/simpleLightbox.min.js"></script>
+        <script src="vendors/nice-select/js/jquery.nice-select.min.js"></script>
+        <script src="vendors/isotope/imagesloaded.pkgd.min.js"></script>
+        <script src="vendors/isotope/isotope-min.js"></script>
+        <script src="vendors/owl-carousel/owl.carousel.min.js"></script>
+        <script src="js/jquery.ajaxchimp.min.js"></script>
+        <script src="js/mail-script.js"></script>
+        <script src="vendors/counter-up/jquery.waypoints.min.js"></script>
+        <script src="vendors/counter-up/jquery.counterup.min.js"></script>
+        <script src="js/theme.js"></script>
+
+        <link rel="stylesheet" href="js/styles/monokai-sublime.css">
+        <script src="js/highlight.pack.js"></script>
+        <script>hljs.initHighlightingOnLoad();</script>
+    </body>
+</html>

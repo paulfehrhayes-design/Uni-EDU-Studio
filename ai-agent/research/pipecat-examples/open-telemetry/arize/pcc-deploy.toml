@@ -1,0 +1,5 @@
+agent_name = "openinference-tracing"
+secret_set = "openinference-tracing-secrets"
+
+[scaling]
+	min_agents = 1

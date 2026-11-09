@@ -1,0 +1,45 @@
+repository	url	commit	license_file	folder
+DrewThomasson/VoxNovel	https://github.com/DrewThomasson/VoxNovel	2d2fc9fd52ce2312ea75dd33bcd2da27b5762aba	LICENSE	VoxNovel
+Aratako/T5Gemma-TTS	https://github.com/Aratako/T5Gemma-TTS	65244b6191513043700793b5133a30d1d9acac3e	LICENSE	T5Gemma-TTS
+nazdridoy/kokoro-tts	https://github.com/nazdridoy/kokoro-tts	88569fb56d4694b3278e1714452515f0093e20b0	LICENSE	kokoro-tts
+microsoft/VibeVoice	https://github.com/microsoft/VibeVoice	16fb2cb1217c9934a886e1948ffb06120caa2df5	LICENSE	VibeVoice
+Enemyx-net/VibeVoice-ComfyUI	https://github.com/Enemyx-net/VibeVoice-ComfyUI	b0a8efc23c9d902d7ebd8fe3f79515a23d343bc2	vvembed/LICENSE	VibeVoice-ComfyUI
+FranckyB/Voice-Clone-Studio	https://github.com/FranckyB/Voice-Clone-Studio	fe0b40458c5adcd03bff9df5ae668d9138e369a2	LICENSE	Voice-Clone-Studio
+theaifutureguy/Vocal-Agent	https://github.com/theaifutureguy/Vocal-Agent	1d5d425016c2d5f8cf5d181c3bb2c739ed73cc4f	LICENSE	Vocal-Agent
+w-okada/voice-changer	https://github.com/w-okada/voice-changer	d8ef15799470193f7c8176ef471245753a656626	LICENSE	voice-changer
+aquibali01/Voice-to-text-and-voice-chatbot	https://github.com/aquibali01/Voice-to-text-and-voice-chatbot	f0fabf8e969107d73bbe48c3dc9f030629f9eb44	NOT FOUND	Voice-to-text-and-voice-chatbot
+geoffsmith82/Symposium2023	https://github.com/geoffsmith82/Symposium2023	5745b330edd3237347a19e4a1d0d5ed35b842f29	LICENSE	Symposium2023
+jbpassot/flutter_voice_friend	https://github.com/jbpassot/flutter_voice_friend	3dadfb0fa4d105ef8d350e7555d321ee76882e09	LICENSE	flutter_voice_friend
+speechbrain/speechbrain.github.io	https://github.com/speechbrain/speechbrain.github.io	f9559c641fd92756898945c13b60b200263ee132	NOT FOUND	speechbrain.github.io
+arjunprabhulal/gemma4-agent	https://github.com/arjunprabhulal/gemma4-agent	c0f7749091ee9fc2e8cd2beb9da3ccd86a0fbbb6	LICENSE	gemma4-agent
+speechbrain/speechbrain	https://github.com/speechbrain/speechbrain	c0241278f93ef02cd5191f03caf4e5f8e1292bf6	LICENSE	speechbrain
+daily-co/pcc-groq-llama	https://github.com/daily-co/pcc-groq-llama	ed8025a2ead379a96ab743360210330ed63e37df	NOT FOUND	pcc-groq-llama
+tarun7r/Vocal-Agent	https://github.com/tarun7r/Vocal-Agent	2b1c594dcc990dceb21471840c0aab93003f6bb3	LICENSE	Vocal-Agent__tarun7r
+livekit/agents	https://github.com/livekit/agents	1e352e413a2441b2c9cedcfe8f72392b2365b802	LICENSE	agents
+kyutai-labs/moshi-finetune	https://github.com/kyutai-labs/moshi-finetune	2acc879fe7c48f885a18f6cc9548bccb2674d87b	LICENSE	moshi-finetune
+rhasspy/piper	https://github.com/rhasspy/piper	73c04d81d5590ecc46e522de3601ce7fb29fc2be	LICENSE.md	piper
+QwenLM/Qwen3-VL	https://github.com/QwenLM/Qwen3-VL	96588727e44c78b25ba03ea03b8e12f7e64fd0da	LICENSE	Qwen3-VL
+QwenLM/Qwen3-TTS	https://github.com/QwenLM/Qwen3-TTS	022e286b98fbec7e1e916cb940cdf532cd9f488e	LICENSE	Qwen3-TTS
+Saganaki22/ComfyUI-OmniVoice-TTS	https://github.com/Saganaki22/ComfyUI-OmniVoice-TTS	3fe8e42a6d4a03628471aa1ba8506657e2e96dea	LICENSE	ComfyUI-OmniVoice-TTS
+FireRedTeam/FireRedVAD	https://github.com/FireRedTeam/FireRedVAD	c30ec49e8cc69642b0ee65362eba11b9d11c6e54	LICENSE	FireRedVAD
+nilboy/vc-lm	https://github.com/nilboy/vc-lm	f60856525a1effc622deb06537b91e5295996440	NOT FOUND	vc-lm
+facebookresearch/svoice	https://github.com/facebookresearch/svoice	1e381907afeb85fe89e9f0b44af6c3bc96b3693f	LICENSE	svoice
+huggingface/speech-to-speech	https://github.com/huggingface/speech-to-speech	327a8c190d4126f8f7e06287b1086078835a5a4a	LICENSE	speech-to-speech
+NVIDIA-NeMo/Speech	https://github.com/NVIDIA-NeMo/Speech	cd61689d41b1962d3e1957ae8faf28bf8bee0e3b	LICENSE	Speech
+snakers4/silero-vad	https://github.com/snakers4/silero-vad	066409f3d9db45a30d21dfcbf9147826ffdd7052	LICENSE	silero-vad
+pyannote/pyannote-audio	https://github.com/pyannote/pyannote-audio	eec9b7d665497858c4aaae3dac1ddee5fe654e9f	LICENSE	pyannote-audio
+pipecat-ai/pipecat	https://github.com/pipecat-ai/pipecat	2c57b197823925dbe711c44ad0a60a4483465e09	LICENSE	pipecat
+myshell-ai/OpenVoice	https://github.com/myshell-ai/OpenVoice	74a1d147b17a8c3092dd5430504bd83ef6c7eb23	LICENSE	OpenVoice
+k2-fsa/OmniVoice	https://github.com/k2-fsa/OmniVoice	08be0b4ccbac3e13e374e86fbfead4b4cac343e2	LICENSE	OmniVoice
+kyutai-labs/moshi	https://github.com/kyutai-labs/moshi	e6a55d2722a65870ef52a6c9f6ecfc0e90f38362	rust/LICENSE	moshi
+mudler/LocalAI	https://github.com/mudler/LocalAI	77ec194ca0ba1b781d3069abc614a55c01ebc8b8	LICENSE	LocalAI
+pirevi/local-voice-assistant	https://github.com/pirevi/local-voice-assistant	161a76cf439845015ae638deb38725b2fd7ec72d	NOT FOUND	local-voice-assistant
+hexgrad/kokoro	https://github.com/hexgrad/kokoro	dfb907a02bba8152ca444717ca5d78747ccb4bec	LICENSE	kokoro
+ykdojo/gemma-voice-agent	https://github.com/ykdojo/gemma-voice-agent	0b62a27fcbe847542c1257fefa3f5ecb956f26c0	NOT FOUND	gemma-voice-agent
+MattMoony/figaro	https://github.com/MattMoony/figaro	2c7d84d1035296e7daf0a1265e5273b71e7842a5	LICENSE	figaro
+SYSTRAN/faster-whisper	https://github.com/SYSTRAN/faster-whisper	846467d436117e44d54ad74f555d85c75834edb0	LICENSE	faster-whisper
+QwenAudio/CosyVoice	https://github.com/QwenAudio/CosyVoice	074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc	LICENSE	CosyVoice
+coqui-ai/coqui-voice-pack	https://github.com/coqui-ai/coqui-voice-pack	d36757315ebb9745eb8049b2db1712a6363a9678	LICENSE.md	coqui-voice-pack
+bolna-ai/bolna	https://github.com/bolna-ai/bolna	26cf0f1b9d6ec37d544f9a4ae7b89312c9219781	LICENSE	bolna
+pipecat-ai/pipecat-examples	https://github.com/pipecat-ai/pipecat-examples	7875d02bc0714d59528b0c8797664308af960a3a	LICENSE	pipecat-examples
+pipecat-ai/pipecat-flows	https://github.com/pipecat-ai/pipecat-flows	96223f4e9ea6f84651e379978be6560cf3ae50c8	LICENSE	pipecat-flows

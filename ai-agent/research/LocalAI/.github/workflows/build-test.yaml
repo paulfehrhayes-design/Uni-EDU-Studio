@@ -1,0 +1,127 @@
+# Concurrency policy: a newer push to master cancels the in-flight run of this
+# workflow on master, because the newer commit contains the older one and the
+# result that matters is the newest. PR runs group by PR number (as before),
+# tag pushes group by their own tag ref, and schedule/dispatch runs group by
+# commit SHA, so none of those is ever cancelled by a master push.
+# See .agents/ci-caching.md, section "Concurrency".
+name: Build test
+
+on:
+  pull_request:
+    paths:
+      - 'core/**'
+      - 'pkg/**'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'backend/*.proto'
+      - 'backend/*/*.proto'
+      - 'addons/**'
+      - 'configuration/**'
+      - 'swagger/**'
+      - 'prompt-templates/**'
+      - '.goreleaser*'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'scripts/**'
+      - '.github/actions/**'
+      - '.github/workflows/build-test.yaml'
+      - 'Entitlements.plist'
+  push:
+    branches: [master]
+    paths:
+      - 'core/**'
+      - 'pkg/**'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'backend/*.proto'
+      - 'backend/*/*.proto'
+      - 'addons/**'
+      - 'configuration/**'
+      - 'swagger/**'
+      - 'prompt-templates/**'
+      - '.goreleaser*'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'scripts/**'
+      - '.github/actions/**'
+      - '.github/workflows/build-test.yaml'
+      - 'Entitlements.plist'
+
+concurrency:
+  group: ci-build-test-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.sha }}-${{ github.repository }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Free disk space
+        # The three-platform build and the UI build fill the hosted runner and
+        # fail with "no space left on device". Remove the unused preinstalled
+        # toolchains before Go is installed.
+        run: sh scripts/ci/free-runner-disk.sh
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25
+      # A PR builds only the host target. The three-platform cross-compile
+      # (linux/amd64, linux/arm64, darwin/arm64) is the bulk of this job's
+      # ~6.6min median and no PR consumes the resulting binaries. The
+      # before-hooks (protogen-go, react-ui, go mod tidy) run either way, so the
+      # "is the release build broken" signal is unchanged. master and tags still
+      # build everything.
+      - name: Run GoReleaser
+        run: |
+          make ${{ github.event_name == 'pull_request' && 'dev-dist-single' || 'dev-dist' }}
+  launcher-build-darwin:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25
+      - name: Build launcher for macOS ARM64
+        run: |
+          make build-launcher-darwin
+          ls -liah dist
+      - name: Upload macOS launcher artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: launcher-macos
+          path: dist/
+          retention-days: 30
+
+  launcher-build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Configure apt mirror on runner
+        uses: ./.github/actions/configure-apt-mirror
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25
+      - name: Build launcher for Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install golang gcc libgl1-mesa-dev xorg-dev libxkbcommon-dev
+          make build-launcher-linux
+      - name: Upload Linux launcher artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: launcher-linux
+          path: local-ai-launcher-linux.tar.xz
+          retention-days: 30

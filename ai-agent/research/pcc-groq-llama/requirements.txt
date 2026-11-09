@@ -1,0 +1,8 @@
+pipecatcloud
+-e ./pipecat[groq,daily,webrtc,silero]
+pipecat-ai-small-webrtc-prebuilt
+python-dotenv
+fastapi
+uvicorn
+aiohttp
+websockets

@@ -1,0 +1,5 @@
+agent_name = "langfuse-tracing"
+secret_set = "langfuse-tracing-secrets"
+
+[scaling]
+	min_agents = 1

@@ -1,0 +1,537 @@
+import asyncio
+
+import pytest
+
+from livekit.agents import tokenize
+from livekit.agents.tokenize import basic, blingfire
+from livekit.agents.tokenize._basic_paragraph import split_paragraphs
+from livekit.plugins import nltk
+
+pytestmark = [pytest.mark.unit, pytest.mark.concurrent]
+
+# Download the punkt tokenizer, will only download if not already present
+nltk.NltkPlugin().download_files()
+
+TEXT = (
+    "Hi! "
+    "LiveKit is a platform for live audio and video applications and services. \n\n"
+    "R.T.C stands for Real-Time Communication... again R.T.C. "
+    "Mr. Theo is testing the sentence tokenizer. "
+    "\nThis is a test. Another test. "
+    "A short sentence.\n"
+    "A longer sentence that is longer than the previous sentence. "
+    "f(x) = x * 2.54 + 42. "
+    "Hey!\n Hi! Hello! "
+    "\n\n"
+    "This is a sentence. 这是一个中文句子。これは日本語の文章です。"
+    "你好！LiveKit是一个直播音频和视频应用程序和服务的平台。"
+    "\nThis is a sentence contains   consecutive spaces."
+)
+
+EXPECTED_MIN_20 = [
+    "Hi! LiveKit is a platform for live audio and video applications and services.",
+    "R.T.C stands for Real-Time Communication... again R.T.C.",
+    "Mr. Theo is testing the sentence tokenizer.",
+    "This is a test. Another test.",
+    "A short sentence. A longer sentence that is longer than the previous sentence.",
+    "f(x) = x * 2.54 + 42.",
+    "Hey! Hi! Hello! This is a sentence.",
+    "这是一个中文句子。 これは日本語の文章です。",
+    "你好！ LiveKit是一个直播音频和视频应用程序和服务的平台。",
+    "This is a sentence contains   consecutive spaces.",
+]
+
+EXPECTED_MIN_20_RETAIN_FORMAT = [
+    "Hi! LiveKit is a platform for live audio and video applications and services.",
+    " \n\nR.T.C stands for Real-Time Communication... again R.T.C.",
+    " Mr. Theo is testing the sentence tokenizer.",
+    " \nThis is a test. Another test.",
+    " A short sentence.\nA longer sentence that is longer than the previous sentence.",
+    " f(x) = x * 2.54 + 42.",
+    " Hey!\n Hi! Hello! \n\nThis is a sentence.",
+    " 这是一个中文句子。これは日本語の文章です。",
+    "你好！LiveKit是一个直播音频和视频应用程序和服务的平台。",
+    "\nThis is a sentence contains   consecutive spaces.",
+]
+
+EXPECTED_MIN_20_NLTK = [
+    "Hi! LiveKit is a platform for live audio and video applications and services.",
+    "R.T.C stands for Real-Time Communication... again R.T.C.",
+    "Mr. Theo is testing the sentence tokenizer.",
+    "This is a test. Another test.",
+    "A short sentence. A longer sentence that is longer than the previous sentence.",
+    "f(x) = x * 2.54 + 42.",
+    "Hey! Hi! Hello! This is a sentence.",
+    # nltk does not support character-based languages like CJK
+    "这是一个中文句子。これは日本語の文章です。你好！LiveKit是一个直播音频和视频应用程序和服务的平台。\nThis is a sentence contains   consecutive spaces.",  # noqa: E501
+]
+
+EXPECTED_MIN_20_BLINGFIRE = [
+    "Hi! LiveKit is a platform for live audio and video applications and services.",
+    "R.T.C stands for Real-Time Communication... again R.T.C. Mr. Theo is testing the sentence tokenizer.",
+    "This is a test. Another test.",
+    "A short sentence. A longer sentence that is longer than the previous sentence. f(x) = x * 2.54 + 42.",
+    "Hey! Hi! Hello! This is a sentence.",
+    "这是一个中文句子。これは日本語の文章です。",
+    "你好！LiveKit是一个直播音频和视频应用程序和服务的平台。",
+    "This is a sentence contains   consecutive spaces.",
+]
+
+
+SENT_TOKENIZERS = [
+    (nltk.SentenceTokenizer(min_sentence_len=20), EXPECTED_MIN_20_NLTK),
+    (basic.SentenceTokenizer(min_sentence_len=20), EXPECTED_MIN_20),
+    (
+        basic.SentenceTokenizer(min_sentence_len=20, retain_format=True),
+        EXPECTED_MIN_20_RETAIN_FORMAT,
+    ),
+    (blingfire.SentenceTokenizer(min_sentence_len=20), EXPECTED_MIN_20_BLINGFIRE),
+]
+
+
+@pytest.mark.parametrize("tokenizer, expected", SENT_TOKENIZERS)
+def test_sent_tokenizer(tokenizer: tokenize.SentenceTokenizer, expected: list[str]):
+    segmented = tokenizer.tokenize(text=TEXT)
+    print(segmented)
+    for i, segment in enumerate(expected):
+        assert segment == segmented[i]
+
+
+@pytest.mark.parametrize("tokenizer, expected", SENT_TOKENIZERS)
+async def test_streamed_sent_tokenizer(tokenizer: tokenize.SentenceTokenizer, expected: list[str]):
+    # divide text by chunks of arbitrary length (1-4)
+    pattern = [1, 2, 4]
+    text = TEXT
+    chunks = []
+    pattern_iter = iter(pattern * (len(text) // sum(pattern) + 1))
+
+    for chunk_size in pattern_iter:
+        if not text:
+            break
+        chunks.append(text[:chunk_size])
+        text = text[chunk_size:]
+
+    stream = tokenizer.stream()
+    for chunk in chunks:
+        stream.push_text(chunk)
+
+    stream.end_input()
+
+    for i in range(len(expected)):
+        ev = await stream.__anext__()
+        assert ev.token == expected[i]
+
+
+MULTILINGUAL_SENT_CASES = [
+    # Arabic question mark
+    (
+        "هل تريد حجز موعد غداً؟ لدينا مواعيد متاحة في الصباح.",
+        ["هل تريد حجز موعد غداً؟", "لدينا مواعيد متاحة في الصباح."],
+    ),
+    # Urdu full stop
+    ("آپ کیسے ہیں۔ میں ٹھیک ہوں۔", ["آپ کیسے ہیں۔", "میں ٹھیک ہوں۔"]),
+    # Devanagari danda (Hindi)
+    ("आप कैसे हैं। मैं ठीक हूँ। धन्यवाद", ["आप कैसे हैं।", "मैं ठीक हूँ।", "धन्यवाद"]),
+    # Devanagari double danda
+    ("श्लोक एक॥ श्लोक दो॥", ["श्लोक एक॥", "श्लोक दो॥"]),
+    # Bengali also uses the danda
+    ("আপনি কেমন আছেন। আমি ভালো আছি।", ["আপনি কেমন আছেন।", "আমি ভালো আছি।"]),
+    # the closing quote stays with the sentence it ends
+    ("वह बोली “मैं ठीक हूँ।” अगला वाक्य।", ["वह बोली “मैं ठीक हूँ।”", "अगला वाक्य।"]),
+]
+
+
+@pytest.mark.parametrize(
+    "tokenizer",
+    [basic.SentenceTokenizer(min_sentence_len=1), blingfire.SentenceTokenizer(min_sentence_len=1)],
+)
+@pytest.mark.parametrize("text, expected", MULTILINGUAL_SENT_CASES)
+def test_sent_tokenizer_non_latin_terminators(
+    tokenizer: tokenize.SentenceTokenizer, text: str, expected: list[str]
+):
+    assert tokenizer.tokenize(text=text) == expected
+
+
+TERMINATOR_RUN_CASES = [
+    ("Really?! Yes it is.", ["Really?!", "Yes it is."]),
+    ("Wow!!! That was great.", ["Wow!!!", "That was great."]),
+    ("What?? No way.", ["What??", "No way."]),
+    ('She asked "really?!" and left.', ['She asked "really?!"', "and left."]),
+]
+
+
+@pytest.mark.parametrize(
+    "tokenizer",
+    [basic.SentenceTokenizer(min_sentence_len=1), blingfire.SentenceTokenizer(min_sentence_len=1)],
+)
+@pytest.mark.parametrize("text, expected", TERMINATOR_RUN_CASES)
+def test_sent_tokenizer_terminator_runs(
+    tokenizer: tokenize.SentenceTokenizer, text: str, expected: list[str]
+):
+    assert tokenizer.tokenize(text=text) == expected
+
+
+def test_basic_sent_tokenizer_keeps_terminator_runs_unspaced():
+    # with the default min_sentence_len the pieces were merged back with spaces
+    text = "That is amazing!!! I cannot believe it happened today."
+    assert basic.SentenceTokenizer().tokenize(text=text) == [
+        "That is amazing!!! I cannot believe it happened today."
+    ]
+
+
+async def test_streamed_sent_tokenizer_emits_hindi_before_end_of_input():
+    # the first sentence must reach TTS while the LLM is still generating
+    stream = blingfire.SentenceTokenizer().stream()
+    for word in "आप कैसे हैं, आज का दिन कैसा रहा। मैं ठीक हूँ, धन्यवाद आपका".split(" "):
+        stream.push_text(word + " ")
+
+    ev = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+    assert ev.token == "आप कैसे हैं, आज का दिन कैसा रहा।"
+    await stream.aclose()
+
+
+WORDS_TEXT = "This is a test. Blabla another test! multiple consecutive spaces:     done"
+WORDS_EXPECTED = [
+    "This",
+    "is",
+    "a",
+    "test",
+    "Blabla",
+    "another",
+    "test",
+    "multiple",
+    "consecutive",
+    "spaces",
+    "done",
+]
+
+WORD_TOKENIZERS = [basic.WordTokenizer()]
+
+
+@pytest.mark.parametrize("tokenizer", WORD_TOKENIZERS)
+def test_word_tokenizer(tokenizer: tokenize.WordTokenizer):
+    tokens = tokenizer.tokenize(text=WORDS_TEXT)
+    for i, token in enumerate(WORDS_EXPECTED):
+        assert token == tokens[i]
+
+
+@pytest.mark.parametrize("tokenizer", WORD_TOKENIZERS)
+async def test_streamed_word_tokenizer(tokenizer: tokenize.WordTokenizer):
+    # divide text by chunks of arbitrary length (1-4)
+    pattern = [1, 2, 4]
+    text = WORDS_TEXT
+    chunks = []
+    pattern_iter = iter(pattern * (len(text) // sum(pattern) + 1))
+
+    for chunk_size in pattern_iter:
+        if not text:
+            break
+        chunks.append(text[:chunk_size])
+        text = text[chunk_size:]
+
+    stream = tokenizer.stream()
+    for chunk in chunks:
+        stream.push_text(chunk)
+
+    stream.end_input()
+
+    for i in range(len(WORDS_EXPECTED)):
+        ev = await stream.__anext__()
+        assert ev.token == WORDS_EXPECTED[i]
+
+
+WORDS_PUNCT_TEXT = (
+    'This is <phoneme alphabet="cmu-arpabet" ph="AE K CH UW AH L IY">actually</phoneme> tricky to handle.'  # noqa: E501
+    "这是一个中文句子。 これは日本語の文章です。"
+)
+
+WORDS_PUNCT_EXPECTED = [
+    "This",
+    "is",
+    "<phoneme",
+    'alphabet="cmu-arpabet"',
+    'ph="AE',
+    "K",
+    "CH",
+    "UW",
+    "AH",
+    "L",
+    'IY">actually</phoneme>',
+    "tricky",
+    "to",
+    "handle.",
+    "这",
+    "是",
+    "一",
+    "个",
+    "中",
+    "文",
+    "句",
+    "子",
+    "。",
+    "こ",
+    "れ",
+    "は",
+    "日",
+    "本",
+    "語",
+    "の",
+    "文",
+    "章",
+    "で",
+    "す",
+    "。",
+]
+
+WORD_PUNCT_TOKENIZERS = [basic.WordTokenizer(ignore_punctuation=False, split_character=True)]
+
+
+@pytest.mark.parametrize("tokenizer", WORD_PUNCT_TOKENIZERS)
+def test_punct_word_tokenizer(tokenizer: tokenize.WordTokenizer):
+    tokens = tokenizer.tokenize(text=WORDS_PUNCT_TEXT)
+    for i, token in enumerate(WORDS_PUNCT_EXPECTED):
+        assert token == tokens[i]
+
+
+@pytest.mark.parametrize("tokenizer", WORD_PUNCT_TOKENIZERS)
+async def test_streamed_punct_word_tokenizer(tokenizer: tokenize.WordTokenizer):
+    # divide text by chunks of arbitrary length (1-4)
+    pattern = [1, 2, 4]
+    text = WORDS_PUNCT_TEXT
+    chunks = []
+    pattern_iter = iter(pattern * (len(text) // sum(pattern) + 1))
+
+    for chunk_size in pattern_iter:
+        if not text:
+            break
+        chunks.append(text[:chunk_size])
+        text = text[chunk_size:]
+
+    stream = tokenizer.stream()
+    for chunk in chunks:
+        stream.push_text(chunk)
+
+    stream.end_input()
+
+    for i in range(len(WORDS_PUNCT_EXPECTED)):
+        ev = await stream.__anext__()
+        assert ev.token == WORDS_PUNCT_EXPECTED[i]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("مرحبا، كيف حالك؟", ["مرحبا", "كيف", "حالك"]),  # Arabic comma and question mark
+        ("تم الحجز؛ شكراً", ["تم", "الحجز", "شكراً"]),  # Arabic semicolon
+        ("آپ کیسے ہیں۔", ["آپ", "کیسے", "ہیں"]),  # Urdu full stop
+        ("आप कैसे हैं।", ["आप", "कैसे", "हैं"]),  # Devanagari danda
+        ("你好，我很好。", ["你", "好", "我", "很", "好"]),  # fullwidth CJK punctuation
+    ],
+)
+def test_word_tokenizer_ignores_non_ascii_punctuation(text: str, expected: list[str]):
+    tokenizer = basic.WordTokenizer(ignore_punctuation=True, split_character=True)
+    assert tokenizer.tokenize(text=text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("好的，我可以帮您。需要提醒吗？", ["好的，", "我可以帮您。", "需要提醒吗？"]),
+        ("はい、できます。", ["はい、", "できます。"]),
+        ("「はい」。わかりました。", ["「はい」。", "わかりました。"]),
+        # spaces still split, and a mark followed by a space adds no empty word
+        (
+            "LiveKit是一个平台， 用于 voice agents",
+            ["LiveKit是一个平台，", "用于", "voice", "agents"],
+        ),
+        # a full-width number keeps its separators, and a sentence ending in one still ends
+        (
+            "お会計は１，０００。会議は１０：３０から。",
+            ["お会計は１，０００。", "会議は１０：３０から。"],
+        ),
+        # a mark that doesn't follow CJK text, e.g. in an SSML attribute, doesn't end a
+        # word, since ElevenLabs rejoins the words of a tag with spaces
+        (
+            'Say <phoneme alphabet="ipa" ph="ni，hao">hello</phoneme>',
+            ["Say", "<phoneme", 'alphabet="ipa"', 'ph="ni，hao">hello</phoneme>'],
+        ),
+    ],
+)
+def test_word_tokenizer_splits_cjk_at_clause_punctuation(text: str, expected: list[str]):
+    tokenizer = basic.WordTokenizer(ignore_punctuation=False)
+    assert tokenizer.tokenize(text=text) == expected
+
+
+async def test_streamed_word_tokenizer_releases_cjk_before_end_of_input():
+    # TTS plugins such as Deepgram send the LLM text through this stream. A CJK reply has
+    # no spaces, so it used to come out only once the whole reply had arrived
+    stream = basic.WordTokenizer(ignore_punctuation=False).stream()
+    stream.push_text("好的，我可以")
+    first = await asyncio.wait_for(anext(stream), timeout=1)
+    assert first.token == "好的，"
+    stream.end_input()
+    assert [ev.token async for ev in stream] == ["我可以"]
+
+
+HYPHENATOR_TEXT = [
+    "Segment",
+    "expected",
+    "communication",
+    "window",
+    "welcome",
+    "bedroom",
+]
+
+HYPHENATOR_EXPECTED = [
+    ["Seg", "ment"],
+    ["ex", "pect", "ed"],
+    ["com", "mu", "ni", "ca", "tion"],
+    ["win", "dow"],
+    ["wel", "come"],
+    ["bed", "room"],
+]
+
+
+def test_hyphenate_word():
+    for i, word in enumerate(HYPHENATOR_TEXT):
+        hyphenated = basic.hyphenate_word(word)
+        assert hyphenated == HYPHENATOR_EXPECTED[i]
+
+
+REPLACE_TEXT = (
+    "This is a test. Hello world, I'm creating this agents..     framework. Once again "
+    "framework.  A.B.C"
+)
+REPLACE_EXPECTED = (
+    "This is a test. Hello universe, I'm creating this assistants..     library. twice again "
+    "library.  A.B.C.D"
+)
+
+REPLACE_REPLACEMENTS = {
+    "world": "universe",
+    "framework": "library",
+    "a.b.c": "A.B.C.D",
+    "once": "twice",
+    "agents": "assistants",
+}
+
+
+def test_replace_words():
+    replaced = tokenize.utils.replace_words(text=REPLACE_TEXT, replacements=REPLACE_REPLACEMENTS)
+    assert replaced == REPLACE_EXPECTED
+
+
+@pytest.mark.parametrize(
+    "text, replacements, expected",
+    [
+        ("مرحبا، كيف حالك؟", {"مرحبا": "أهلاً", "حالك": "أحوالك"}, "أهلاً، كيف أحوالك؟"),
+        ("नमस्ते। आप कैसे हैं", {"नमस्ते": "नमस्कार"}, "नमस्कार। आप कैसे हैं"),
+        # a key that ends in punctuation still matches as a whole word
+        ("ג׳ שלום", {"ג׳": "ד׳"}, "ד׳ שלום"),
+        # ...and keeps any punctuation that follows it
+        ("ג׳, שלום", {"ג׳": "ד׳"}, "ד׳, שלום"),
+    ],
+)
+def test_replace_words_non_ascii_punctuation(
+    text: str, replacements: dict[str, str], expected: str
+):
+    assert tokenize.utils.replace_words(text=text, replacements=replacements) == expected
+
+
+async def test_replace_words_async():
+    pattern = [1, 2, 4]
+    text = REPLACE_TEXT
+    chunks = []
+    pattern_iter = iter(pattern * (len(text) // sum(pattern) + 1))
+
+    for chunk_size in pattern_iter:
+        if not text:
+            break
+        chunks.append(text[:chunk_size])
+        text = text[chunk_size:]
+
+    async def _replace_words_async():
+        for chunk in chunks:
+            yield chunk
+
+    replaced_chunks = []
+
+    async for chunk in tokenize.utils.replace_words(
+        text=_replace_words_async(), replacements=REPLACE_REPLACEMENTS
+    ):
+        replaced_chunks.append(chunk)
+
+    replaced = "".join(replaced_chunks)
+    assert replaced == REPLACE_EXPECTED
+
+
+async def test_replace_words_matches_keys_across_full_width_punctuation():
+    # replace_words keeps whitespace-only words, so a key spanning a full-width mark
+    # still matches the CJK text it covers
+    replacements = {"你好，世界": "hello"}
+    assert tokenize.utils.replace_words(text="你好，世界", replacements=replacements) == "hello"
+
+    async def _chunks():
+        for chunk in ("你好", "，世", "界"):
+            yield chunk
+
+    replaced = [
+        chunk
+        async for chunk in tokenize.utils.replace_words(text=_chunks(), replacements=replacements)
+    ]
+    assert "".join(replaced) == "hello"
+
+
+PARAGRAPH_TEST_CASES = [
+    ("Single paragraph.", [("Single paragraph.", 0, 17)]),
+    (
+        "Paragraph 1.\n\nParagraph 2.",
+        [("Paragraph 1.", 0, 12), ("Paragraph 2.", 14, 26)],
+    ),
+    (
+        "Para 1.\n\nPara 2.\n\nPara 3.",
+        [("Para 1.", 0, 7), ("Para 2.", 9, 16), ("Para 3.", 18, 25)],
+    ),
+    (
+        "\n\nParagraph with leading newlines.",
+        [("Paragraph with leading newlines.", 2, 34)],
+    ),
+    (
+        "Paragraph with trailing newlines.\n\n",
+        [("Paragraph with trailing newlines.", 0, 33)],
+    ),
+    (
+        "\n\n  Paragraph with leading and trailing spaces.  \n\n",
+        [("Paragraph with leading and trailing spaces.", 4, 47)],
+    ),
+    (
+        "Para 1.\n\n\n\nPara 2.",  # Multiple newlines between paragraphs
+        [("Para 1.", 0, 7), ("Para 2.", 11, 18)],
+    ),
+    (
+        "Para 1.\n \n \nPara 2.",  # Newlines with spaces between paragraphs
+        [("Para 1.", 0, 7), ("Para 2.", 12, 19)],
+    ),
+    (
+        "",  # Empty string
+        [],
+    ),
+    (
+        "\n\n\n",  # Only newlines
+        [],
+    ),
+    (
+        "Line 1\nLine 2\nLine 3",  # Single paragraph with newlines
+        [("Line 1\nLine 2\nLine 3", 0, 20)],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    PARAGRAPH_TEST_CASES,
+)
+def test_split_paragraphs(test_case):
+    input_text, expected_output = test_case
+    result = split_paragraphs(input_text)
+    assert result == expected_output, f"Failed for input: {input_text}"

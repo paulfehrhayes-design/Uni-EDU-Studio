@@ -1,0 +1,187 @@
+#
+# Copyright (c) 2024–2025, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+"""Twilio + Daily voice bot implementation."""
+
+import os
+
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMRunFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.base_transport import BaseTransport
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
+from pipecat.workers.runner import WorkerRunner
+from twilio.rest import Client
+
+from server_utils import AgentRequest
+
+load_dotenv(override=True)
+
+
+async def run_bot(transport: BaseTransport, request: AgentRequest, handle_sigint: bool) -> None:
+    """Run the voice bot with the given parameters.
+
+    Args:
+        transport: The Daily transport instance
+        request: The agent request containing the call details
+        handle_sigint: Whether to handle SIGINT
+    """
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAILLMService.Settings(
+            system_instruction=(
+                "You are a friendly phone assistant. Your responses will be read aloud, "
+                "so keep them concise and conversational. Avoid special characters or "
+                "formatting. Begin by greeting the caller and asking how you can help them today."
+            ),
+        ),
+    )
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        settings=CartesiaTTSService.Settings(
+            voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+        ),
+    )
+
+    # Setup the conversational context
+    context = LLMContext()
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
+    # Build the pipeline
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            user_aggregator,
+            llm,
+            tts,
+            transport.output(),
+            assistant_aggregator,
+        ]
+    )
+
+    # Create the pipeline task
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+            audio_in_sample_rate=8000,
+            audio_out_sample_rate=8000,
+        ),
+    )
+
+    runner = WorkerRunner(handle_sigint=handle_sigint)
+    await runner.add_workers(worker)
+
+    # Handle call ready to forward
+    @transport.event_handler("on_dialin_ready")
+    async def on_dialin_ready(transport, sip_endpoint):
+        logger.info(f"Forwarding call {request.call_sid} to {request.sip_uri}")
+
+        try:
+            # Use to_phone to select Twilio credentials if you have multiple
+            # accounts (e.g., US vs EU). For now, we use a single set of credentials.
+            to_phone = request.to_phone
+            logger.info(f"Dialing in to {to_phone}")
+
+            account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+            auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+            logger.info(f"Using Twilio credentials for {to_phone}")
+
+            twilio_client = Client(account_sid, auth_token)
+
+            # Update the Twilio call with TwiML to forward to the Daily SIP endpoint
+            twilio_client.calls(request.call_sid).update(
+                twiml=f"<Response><Dial><Sip>{request.sip_uri}</Sip></Dial></Response>"
+            )
+            logger.info("Call forwarded successfully")
+        except Exception as e:
+            logger.error(f"Failed to forward call: {str(e)}")
+            await runner.cancel()
+
+    @transport.event_handler("on_dialin_connected")
+    async def on_dialin_connected(transport, data):
+        logger.info(f"Dial-in connected: {data}")
+
+    @transport.event_handler("on_dialin_stopped")
+    async def on_dialin_stopped(transport, data):
+        logger.info(f"Dial-in stopped: {data}")
+        await runner.cancel()
+
+    @transport.event_handler("on_dialin_warning")
+    async def on_dialin_warning(transport, data):
+        logger.warning(f"Dial-in warning: {data}")
+
+    @transport.event_handler("on_dialin_error")
+    async def on_dialin_error(transport, data):
+        logger.error(f"Dial-in error: {data}")
+        await runner.cancel()
+
+    @transport.event_handler("on_dtmf_event")
+    async def on_dtmf_event(transport, data):
+        logger.info(f"DTMF event: {data}")
+        # Echo back the DTMF tone to the caller
+        # await transport._client.send_dtmf(
+        #     {"sessionId": data["sessionId"], "tones": data["tone"], "digitDurationMs": 100}
+        # )
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected")
+        await worker.queue_frame(LLMRunFrame())
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected")
+        await runner.cancel()
+
+    await runner.run()
+
+
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point."""
+    try:
+        request = AgentRequest.model_validate(runner_args.body)
+
+        transport = DailyTransport(
+            request.room_url,
+            request.token,
+            "SIP Dial-in Bot",
+            params=DailyParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+            ),
+        )
+
+        await run_bot(transport, request, runner_args.handle_sigint)
+    except Exception as e:
+        logger.error(f"Invalid request: {e}")
+        return
+
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+
+    main()

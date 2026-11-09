@@ -1,0 +1,254 @@
+import os
+import json
+import time
+import logging
+from litellm import acompletion, ContentPolicyViolationError
+from litellm.exceptions import AuthenticationError, RateLimitError, APIError, APIConnectionError
+from dotenv import load_dotenv
+
+from bolna.constants import DEFAULT_LANGUAGE_CODE
+from bolna.enums import LogComponent, LogDirection
+from bolna.helpers.utils import convert_to_request_log, compute_function_pre_call_message, now_ms
+from .llm import BaseLLM
+from .tool_call_accumulator import ToolCallAccumulator
+from .types import LLMStreamChunk, LatencyData
+from .message_models import strip_internal_keys
+from .routing_stream import read_routing_stream
+from bolna.helpers.function_calling_helpers import tool_names
+from bolna.helpers.logger_config import configure_logger
+
+logger = configure_logger(__name__)
+load_dotenv()
+
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM Router").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM Proxy").setLevel(logging.WARNING)
+
+
+class LiteLLM(BaseLLM):
+    def __init__(self, model, max_tokens=30, buffer_size=40, temperature=0.0, language=DEFAULT_LANGUAGE_CODE, **kwargs):
+        super().__init__(max_tokens, buffer_size)
+        self.model = model
+        self.started_streaming = False
+
+        self.language = language
+        self.model_args = {"max_tokens": max_tokens, "temperature": temperature, "model": self.model}
+        self.api_key = kwargs.get("llm_key", os.getenv("LITELLM_MODEL_API_KEY"))
+        self.api_base = kwargs.get("base_url", os.getenv("LITELLM_MODEL_API_BASE"))
+        self.api_version = kwargs.get("api_version", os.getenv("LITELLM_MODEL_API_VERSION"))
+        if self.api_key:
+            self.model_args["api_key"] = self.api_key
+        if self.api_base:
+            self.model_args["api_base"] = self.api_base
+        if self.api_version:
+            self.model_args["api_version"] = self.api_version
+
+        if len(kwargs) != 0:
+            if kwargs.get("base_url", None):
+                self.model_args["api_base"] = kwargs["base_url"]
+            if kwargs.get("llm_key", None):
+                self.model_args["api_key"] = kwargs["llm_key"]
+            if kwargs.get("api_version", None):
+                self.model_args["api_version"] = kwargs["api_version"]
+            if kwargs.get("aws_region_name", None):
+                # Bedrock models: region for boto3 under litellm (no per-box aws config needed).
+                self.model_args["aws_region_name"] = kwargs["aws_region_name"]
+
+        self.custom_tools = kwargs.get("api_tools", None)
+        logger.info("API Tools %s", tool_names(self.custom_tools))
+        if self.custom_tools is not None:
+            self.trigger_function_call = True
+            self.api_params = self.custom_tools["tools_params"]
+            self.tools = self.custom_tools["tools"]
+        else:
+            self.trigger_function_call = False
+        self.run_id = kwargs.get("run_id", None)
+
+    async def generate_stream(self, messages, synthesize=True, meta_info=None, tool_choice=None, tools=None):
+        if not messages or len(messages) == 0:
+            raise Exception("No messages provided")
+
+        answer, buffer = "", ""
+        first_token_time = None
+        finish_reason = None
+
+        model_args = self.model_args.copy()
+        model_args["messages"] = strip_internal_keys(messages)
+        model_args["stream"] = True
+        model_args["stop"] = ["User:"]
+
+        if self.trigger_function_call:
+            _tools = tools if tools is not None else self.tools
+            _tools = json.loads(_tools) if isinstance(_tools, str) else _tools
+            if _tools:  # omit tools when none are visible this turn (an empty array is a 400)
+                model_args["tools"] = _tools
+                model_args["tool_choice"] = tool_choice or "auto"
+                model_args["parallel_tool_calls"] = False
+
+        tools = model_args.get("tools", [])
+        accumulator = None
+        if self.trigger_function_call:
+            accumulator = ToolCallAccumulator(self.api_params, tools, self.language, self.model, self.run_id)
+
+        start_time = now_ms()
+        latency_data = LatencyData(
+            sequence_id=meta_info.get("sequence_id") if meta_info else None,
+        )
+
+        try:
+            completion_stream = await acompletion(**model_args)
+        except ContentPolicyViolationError as e:
+            logger.error(f"LiteLLM content policy violation: {e}")
+            raise
+        except AuthenticationError as e:
+            logger.error(f"LiteLLM authentication failed: Invalid or expired API key - {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"LiteLLM rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"LiteLLM connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"LiteLLM API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"LiteLLM unexpected error: {e}")
+            raise
+
+        async for chunk in completion_stream:
+            now = now_ms()
+            if not first_token_time:
+                first_token_time = now
+                self.started_streaming = True
+                latency_data = LatencyData(
+                    sequence_id=meta_info.get("sequence_id"),
+                    first_token_latency_ms=first_token_time - start_time,
+                )
+                self._log_llm_request_id(completion_stream, getattr(chunk, "id", None))
+
+            choice = chunk["choices"][0]
+            delta = choice.get("delta", {})
+            finish_reason = choice.get("finish_reason") or finish_reason
+
+            if hasattr(delta, "tool_calls") and delta.tool_calls and accumulator:
+                if buffer:
+                    yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data)
+                    buffer = ""
+
+                accumulator.process_delta(delta.tool_calls)
+
+                pre_call = accumulator.get_pre_call_message(meta_info)
+                if pre_call:
+                    yield LLMStreamChunk(
+                        data=pre_call[0],
+                        end_of_stream=True,
+                        latency=latency_data,
+                        function_name=pre_call[1],
+                        function_message=pre_call[2],
+                    )
+
+            elif hasattr(delta, "content") and delta.content:
+                if accumulator:
+                    accumulator.note_content(delta.content)
+                answer += delta.content
+                buffer += delta.content
+                if synthesize and len(buffer) >= self.buffer_size:
+                    split = buffer.rsplit(" ", 1)
+                    yield LLMStreamChunk(data=split[0], end_of_stream=False, latency=latency_data)
+                    buffer = split[1] if len(split) > 1 else ""
+
+        if latency_data:
+            latency_data.total_stream_duration_ms = now_ms() - start_time
+        if isinstance(meta_info, dict):
+            meta_info["llm_finish_reason"] = finish_reason
+
+        if accumulator and accumulator.final_tool_calls:
+            api_call_payload = accumulator.build_api_payload(model_args, meta_info, answer)
+            if api_call_payload:
+                yield LLMStreamChunk(
+                    data=api_call_payload, end_of_stream=False, latency=latency_data, is_function_call=True
+                )
+
+        if synthesize and buffer.strip():
+            yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data)
+        elif not synthesize:
+            yield LLMStreamChunk(data=answer, end_of_stream=True, latency=latency_data)
+
+        self.started_streaming = False
+
+    async def route(self, messages, tools, tool_choice="required", meta_info=None):
+        parsed_tools = json.loads(tools) if isinstance(tools, str) else tools
+        model_args = self.model_args.copy()
+        model_args.update(
+            {
+                "model": self.model,
+                "messages": strip_internal_keys(messages),
+                "tools": parsed_tools,
+                "tool_choice": tool_choice,
+                "parallel_tool_calls": False,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "temperature": 0.0,
+            }
+        )
+        stream = await acompletion(**model_args)
+        return await read_routing_stream(stream, parsed_tools)
+
+    async def generate(self, messages, stream=False, request_json=False, meta_info=None, ret_metadata=False):
+        text = ""
+        completion = None
+        model_args = self.model_args.copy()
+        model_args["model"] = self.model
+        model_args["messages"] = strip_internal_keys(messages)
+        model_args["stream"] = stream
+
+        if request_json:
+            model_args["response_format"] = {"type": "json_object"}
+        # model_args holds the BYOK api_key. The conversation path's prompt is persisted by
+        # convert_to_request_log; extraction and summarization keep only this shape.
+        sent_messages = model_args["messages"] or []
+        logger.info(
+            "Request to litellm model=%s messages=%s chars=%s stream=%s",
+            model_args.get("model"),
+            len(sent_messages),
+            sum(len(str(m.get("content") or "")) for m in sent_messages if isinstance(m, dict)),
+            stream,
+        )
+        try:
+            completion = await acompletion(**model_args)
+            text = completion.choices[0].message.content
+        except ContentPolicyViolationError as e:
+            logger.error(f"LiteLLM content policy violation: {e}")
+            raise
+        except AuthenticationError as e:
+            logger.error(f"LiteLLM authentication failed: Invalid or expired API key - {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"LiteLLM rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"LiteLLM connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"LiteLLM API error: {e}")
+            raise
+        except Exception as e:
+            error_message = str(e)
+            logger.error(f"LiteLLM unexpected error generating response: {error_message}")
+            raise
+        if ret_metadata:
+            metadata = {}
+            usage = getattr(completion, "usage", None)
+            if usage is not None:
+                metadata = {
+                    "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                }
+                details = getattr(usage, "prompt_tokens_details", None)
+                cached = getattr(details, "cached_tokens", 0) if details is not None else 0
+                if cached:
+                    metadata["cached_tokens"] = cached
+            return text, metadata
+        else:
+            return text

@@ -1,0 +1,40 @@
+{
+  "name": "gradio_filelister",
+  "version": "0.3.34",
+  "description": "Gradio UI packages",
+  "type": "module",
+  "author": "",
+  "license": "ISC",
+  "private": false,
+  "main_changeset": true,
+  "exports": {
+    ".": {
+      "gradio": "./Index.svelte",
+      "svelte": "./dist/Index.svelte",
+      "types": "./dist/Index.svelte.d.ts"
+    },
+    "./example": {
+      "gradio": "./Example.svelte",
+      "svelte": "./dist/Example.svelte",
+      "types": "./dist/Example.svelte.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@gradio/atoms": "0.20.1",
+    "@gradio/icons": "0.15.1",
+    "@gradio/statustracker": "0.12.2",
+    "@gradio/utils": "0.11.2"
+  },
+  "devDependencies": {
+    "@gradio/preview": "0.15.2"
+  },
+  "peerDependencies": {
+    "svelte": "^5.48.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gradio-app/gradio.git",
+    "directory": "js/simpletextbox"
+  }
+}

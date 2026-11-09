@@ -1,0 +1,6 @@
+agent_name = "simple-chatbot"
+secret_set = "simple-chatbot-secrets"
+agent_profile = "agent-1x"
+
+[scaling]
+	min_agents = 1

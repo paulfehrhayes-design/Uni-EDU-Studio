@@ -1,0 +1,55 @@
+# Flat config for the voice assistant pipeline.
+
+ollama_model: qwen3:8b
+ollama_base_url: http://localhost:11434
+
+whisper_model_size: small.en
+whisper_compute_type: int8_float16
+whisper_device: cuda
+
+kokoro_voice: af_heart
+
+# Set true to use hold-to-talk instead of automatic voice detection (fallback
+# if VAD tuning misbehaves in your room).
+push_to_talk: false
+
+# Silero VAD speech-probability threshold (0-1). Lower = more sensitive
+# (picks up quieter speech, more prone to false triggers on background noise).
+vad_threshold: 0.5
+
+# How long (ms) of silence ends a user turn and triggers a response.
+silence_threshold_ms: 700
+
+# Let the user interrupt the assistant mid-reply by talking over it. Set false
+# if acoustic echo (no headphones) causes false triggers off the assistant's
+# own voice.
+barge_in: true
+
+# Optional character overlay on the plain system prompt below. Off by
+# default -- with enabled: false, behaviour is byte-for-byte identical to
+# the plain prompt (same prompt, same voice, same temperature). The
+# persona's own content lives in persona.yaml, not here.
+persona:
+  enabled: true
+  name: Booo
+  voice: am_adam      # overrides kokoro_voice above when persona is on - few options: [af_sky, am_adam, am_michael]
+  temperature: 0.88      # overrides the Ollama default when persona is on
+  humour: 75
+  candor: 90
+  profanity: 95
+  allow_runtime_adjust: true
+
+system_prompt: >
+  You are a voice assistant. Your replies are converted to speech and spoken
+  out loud, so respond only in plain spoken language: no markdown, no
+  headers, no bullet points or numbered lists, no code blocks, and no URLs.
+  Do not use mathematical symbols, special characters, or emoji (no ×, ÷, °,
+  %, +, =, &, @, or similar) -- spell everything out in plain words instead,
+  the way you'd actually say it out loud (say "times" instead of "×", "percent"
+  instead of "%", and so on). Keep every reply to one or two short sentences,
+  the way a person would answer out loud in conversation. You run fully
+  offline with no internet access and no connection to other apps or
+  devices: you cannot check the weather, set reminders, send messages, or
+  play music. You can only hold a spoken conversation using what you already
+  know. Never claim you can do something you can't -- if asked, say plainly
+  that you're offline and limited to conversation.

@@ -1,0 +1,5 @@
+agent_name = "jaeger-tracing"
+secret_set = "jaeger-tracing-secrets"
+
+[scaling]
+	min_agents = 1

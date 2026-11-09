@@ -1,0 +1,155 @@
+{
+  "cluster": {
+    "vram": "클러스터 VRAM",
+    "ram": "클러스터 RAM",
+    "nodesOnline": "노드 {{total}}개 중 {{healthy}}개 온라인"
+  },
+  "resourceGpu": "GPU",
+  "resourceRam": "RAM",
+  "greeting": {
+    "morning": "Good morning",
+    "afternoon": "Good afternoon",
+    "evening": "Good evening",
+    "night": "Working late"
+  },
+  "statusLine": {
+    "modelsLoaded_one": "{{count}} model loaded",
+    "modelsLoaded_other": "{{count}} models loaded",
+    "noModelsLoaded": "No models loaded",
+    "nodes_one": "{{count}} node",
+    "nodes_other": "{{count}} nodes",
+    "loadedLabel": "Loaded",
+    "nodesLabel": "Nodes"
+  },
+  "assistant": {
+    "title": "채팅으로 LocalAI 관리",
+    "description": "LocalAI와 대화하여 모델을 설치하고, 백엔드를 전환하고, 구성을 편집하고, 상태를 확인하세요.",
+    "open": "어시스턴트 열기",
+    "tooltip": "채팅으로 LocalAI 관리",
+    "noModel": "먼저 채팅 모델을 선택하세요.",
+    "startFailed": "어시스턴트 채팅을 시작할 수 없습니다: {{message}}",
+    "chatTitle": "LocalAI 어시스턴트"
+  },
+  "input": {
+    "placeholder": "메시지...",
+    "attachFile": "파일 첨부",
+    "dropFiles": "파일을 놓아 첨부하세요",
+    "dropFilesNote": "파일을 놓으면 메시지에 첨부됩니다.",
+    "enterToSend": "Enter로 전송",
+    "selectModelFirst": "먼저 모델을 선택하세요",
+    "sendMessage": "메시지 보내기",
+    "selectModelToast": "먼저 모델을 선택해 주세요",
+    "dictate": "받아쓰기 (음성을 텍스트로)",
+    "dictateStop": "녹음 중지",
+    "dictateBusy": "변환 중…",
+    "dictateEmpty": "인식된 음성이 없습니다.",
+    "dictateFailed": "변환 실패: {{error}}",
+    "dictateNoMic": "마이크를 사용할 수 없습니다: {{error}}",
+    "pdfScannedAsImages": "{{name}}에 텍스트 레이어가 없습니다(스캔). 비전 모델용으로 {{total}}페이지 중 {{count}}페이지를 이미지로 첨부했습니다."
+  },
+  "quickLinks": {
+    "manageByChat": "채팅으로 관리",
+    "installedModels": "설치된 모델",
+    "browseGallery": "갤러리 둘러보기",
+    "importModel": "모델 가져오기",
+    "documentation": "문서"
+  },
+  "loadedModels": {
+    "heading": "활성 모델",
+    "count_one": "모델 {{count}}개 로드됨",
+    "count_other": "모델 {{count}}개 로드됨",
+    "stop": "모델 중지",
+    "stopAll": "모두 중지",
+    "serving": "Serving"
+  },
+  "stopDialog": {
+    "title": "모델 중지",
+    "message": "모델 {{model}}을(를) 중지하시겠습니까?",
+    "confirm": "{{model}} 중지",
+    "stopAllTitle": "모든 모델 중지",
+    "stopAllMessage": "로드된 모델 {{count}}개를 모두 중지하시겠습니까?",
+    "stopAllConfirm": "모두 중지",
+    "stoppedToast": "{{model}} 중지됨",
+    "allStoppedToast": "모든 모델이 중지되었습니다",
+    "stopFailed": "중지 실패: {{message}}"
+  },
+  "wizard": {
+    "getStarted": "{{name}} 시작하기",
+    "intro": "첫 모델을 설치하여 시작하세요. 갤러리를 둘러보거나 직접 가져올 수 있습니다.",
+    "steps": {
+      "step1Title": "모델 갤러리 둘러보기",
+      "step1Body": "엄선된 컬렉션에서 필요에 맞는 모델을 찾으세요.",
+      "step2Title": "모델 설치",
+      "step2Body": "설치를 클릭하면 자동으로 다운로드되고 구성됩니다.",
+      "step3Title": "채팅 시작",
+      "step3Body": "브라우저에서 바로 모델과 채팅하거나 API를 사용하세요."
+    },
+    "browseGallery": "모델 갤러리 둘러보기",
+    "importModel": "모델 가져오기",
+    "docs": "문서",
+    "noModelsTitle": "사용 가능한 모델 없음",
+    "noModelsBody": "아직 설치된 모델이 없습니다. 채팅을 시작할 수 있도록 관리자에게 모델 설정을 요청하세요."
+  },
+  "connect": {
+    "title": "하나의 엔드포인트, 모든 API",
+    "subtitle": "LocalAI는 이미지 및 비디오 생성, 깊이, 객체 탐지, 리랭킹, 오디오, 얼굴 및 음성 인식, 그리고 WebRTC와 WebSocket을 통한 실시간 음성 등 자체 전체 API를 제공합니다. 여기에 드롭인 호환 계층을 통해 OpenAI, Anthropic, Ollama 또는 OpenAI Responses용으로 만들어진 모든 앱이 수정 없이 작동합니다.",
+    "nativeTitle": "네이티브 API",
+    "compatTitle": "드롭인 호환성",
+    "apiReference": "전체 API 레퍼런스",
+    "copy": "복사",
+    "copied": "복사됨",
+    "browse": "Browse the API",
+    "hide": "Hide endpoints",
+    "dismiss": "Dismiss"
+  },
+  "jump": {
+    "heading": "Jump back in",
+    "models": "Models",
+    "modelsSummary": "Explore, install, and manage models",
+    "create": "Create",
+    "createSummary": "Open a chat, image or voice session",
+    "operate": "관리",
+    "operateSummary": "{{models}} models configured · nodes, activity and traces",
+    "allChats": "모든 채팅"
+  },
+  "slash": {
+    "commandDiagnostics": "앱 명령 진단",
+    "apps": {
+      "label": "앱",
+      "desc": "설치된 앱 찾아보기"
+    },
+    "group": {
+      "addons": "앱"
+    },
+    "agents": {
+      "label": "에이전트",
+      "desc": "저장된 에이전트, 트리거, 스킬"
+    },
+    "mcp": {
+      "label": "MCP 커넥터",
+      "desc": "채팅이 쓸 수 있는 MCP 서버"
+    },
+    "memory": {
+      "label": "지식",
+      "desc": "채팅이 검색할 수 있는 지식"
+    },
+    "complete": "완성"
+  },
+  "notice": {
+    "appUnavailable": "앱을 더 이상 사용할 수 없습니다.",
+    "addonsDownTitle": "지금 애드온이 응답하지 않습니다",
+    "addonsDownBody": "{{name}}은(는) 애드온입니다. 잠시 후 다시 시도하세요.",
+    "addonsRetry": "다시 시도"
+  },
+  "picker": {
+    "aliasOf": "{{target}}의 별칭",
+    "aliasBroken": "깨진 별칭",
+    "disabled": "비활성",
+    "pinned": "고정됨",
+    "useTyped": "\"{{name}}\" 사용",
+    "empty": "사용 가능한 모델 없음",
+    "add": "모델 추가",
+    "remove": "{{name}} 제거",
+    "clear": "지우기"
+  }
+}

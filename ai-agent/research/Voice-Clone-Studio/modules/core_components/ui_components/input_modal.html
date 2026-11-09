@@ -1,0 +1,19 @@
+<div id="input-modal-overlay">
+  <div class="modal-box">
+    <h3 id="input-modal-title">Enter Value</h3>
+    <p id="input-modal-message" class="modal-message">Please enter a value:</p>
+    <input type="text" id="input-modal-field" placeholder="Enter text..." />
+    <div class="modal-error" id="input-modal-error"></div>
+    <div class="modal-actions" id="input-modal-main-actions">
+      <button class="modal-btn primary" id="input-modal-submit-btn" onclick="submitInputModalValue('submit', this)">Save</button>
+      <button class="modal-btn" id="input-modal-cancel-btn" onclick="submitInputModalValue('cancel', this)">Cancel</button>
+    </div>
+    <div id="input-modal-confirm-bar" class="modal-confirm-bar">
+      <p class="confirm-warning">A file with this name already exists. Overwrite it?</p>
+      <div class="confirm-actions">
+        <button class="modal-btn primary" id="input-modal-confirm-yes" onclick="_forceSubmit()">Overwrite</button>
+        <button class="modal-btn" id="input-modal-confirm-no" onclick="_hideConfirmBar()">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>

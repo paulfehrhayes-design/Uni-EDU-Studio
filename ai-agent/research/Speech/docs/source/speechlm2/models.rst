@@ -1,0 +1,492 @@
+Models
+======
+
+The Duplex Speech-to-Speech (S2S) collection consists of several model architectures designed to enable conversational AI systems with speech understanding and generation capabilities. These models combine audio perception components with language models and speech synthesis to create end-to-end speech-to-speech systems.
+
+Core Model Architectures
+------------------------
+
+The collection includes the following core model architectures:
+
+
+DuplexEARTTS
+^^^^^^^^^^^^
+
+DuplexEARTTS is a streaming text-to-speech model designed for duplex speech-to-speech systems. It focuses on low-latency, fully streamable speech generation by converting text tokens into audio representations in real time.
+
+The architecture is based on the Streaming TTS model proposed in `Audio Flamingo 3 <https://arxiv.org/abs/2507.08128>`_, with several extensions for duplex interaction:
+
+* **Gated fusion of text and audio representations**: (`GatedProjectedSumRMSNorm`), enabling better multimodal integration.
+* **Subword-aware embeddings**: (`SubwordFlagEmbedding`) to improve pronunciation for words composed of multiple text tokens.
+* **Custom BOS/EOS embeddings**: (`BOSEOSEmbedding`) for interruption-aware, multi-turn duplex generation.
+
+
+Key components:
+
+* **RVQVAEModel**: An RVQ-based neural audio codec that compresses speech into discrete acoustic tokens using a convolutional encoder and reconstructs high-quality audio via a convolutional decoder.
+* **RVQEARTTSModel**: A streaming speech generation model that predicts multiple RVQ codebooks in parallel using a Mixture-of-Gaussians (MoG) prediction head. It produces audio tokens autoregressively from text representations with minimal latency.
+
+DuplexEARTTS is particularly useful for:
+* Duplex speech-to-speech systems requiring interruption-aware synthesis.
+* Low-latency text-to-speech generation.
+* Real-time conversational agents with streamed audio output.
+
+
+SALM (Speech-Augmented Language Model)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SALM is a speech-augmented language model that integrates an audio perception module with a pre-trained LLM. The model is designed to understand speech input and generate text responses.
+This is an implementation of the `SALM paper <https://arxiv.org/abs/2310.09424>`_.
+
+Key components:
+
+* **Audio Perception Module**: Processes audio inputs and converts them into embeddings that can be understood by the LLM. This module leverages a pre-trained ASR model's encoder.
+* **LLM**: A pre-trained large language model that receives the audio embeddings and generates appropriate text responses.
+* **Audio Locator Tag**: A special token that serves as a placeholder in the input text, which gets replaced with the audio embeddings during processing.
+
+SALM is particularly useful for:
+* Speech-to-text applications where high-quality text generation is required
+* Speech understanding tasks that benefit from the contextual understanding of an LLM
+* Applications that need to handle mixed text and speech inputs
+
+SALMAutomodel (NeMo Automodel variant)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SALMAutomodel is a variant of SALM that replaces HuggingFace Transformers with
+`NeMo Automodel <https://github.com/NVIDIA-NeMo/Automodel>`_ for the LLM backbone.
+It provides the same speech-augmented language model capabilities with additional
+benefits for distributed training and inference — especially with Mixture-of-Experts
+(MoE) models like `NVIDIA Nemotron Nano V3 <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16>`_.
+
+Key differences from SALM:
+
+* **Deferred initialization**: The LLM and perception module are not loaded until
+  ``configure_model()`` is called, enabling memory-efficient distributed loading
+  where each GPU only loads its own shard.
+* **Native LoRA**: Uses NeMo Automodel's built-in LoRA instead of HuggingFace PEFT.
+  LoRA is applied before FSDP2 sharding for correct meta-device handling.
+* **AutomodelParallelStrategy**: Integrates with a custom Lightning strategy that
+  delegates topology resolution to NeMo Automodel, supporting FSDP2, TP, PP, CP,
+  EP (MoE), and HSDP. ``SALMAutomodel`` currently uses all except PP.
+* **MoE optimizations**: NeMo Automodel provides first-class support for
+  Mixture-of-Experts architectures with **Grouped GEMM** (fused expert computation
+  for higher throughput) and **DeepEP** (Deep Expert Parallelism for efficient
+  all-to-all expert routing across GPUs). This makes it possible to efficiently
+  train Speech LLMs using MoE backbones like NVIDIA Nemotron Nano V3 (30B total,
+  3B active parameters).
+* **Embedding stays in LLM**: Unlike SALM (which moves ``embed_tokens`` out of the
+  LLM to avoid FSDP/TP hook issues), SALMAutomodel keeps embeddings inside the LLM
+  and uses ``F.embedding`` with explicit DTensor handling.
+* **Encoder chunking**: Long audio inputs can be split into fixed-duration chunks
+  for the speech encoder, batched through the perception forward, and concatenated
+  back into one embedding sequence before the LLM forward. This is controlled by
+  ``model.encoder_chunk_size_seconds`` in ``salm_automodel.yaml``; set it to
+  ``null`` to encode each audio row directly. The same knob is also available in
+  ``SALM`` via ``model.encoder_chunk_size_seconds`` in ``salm.yaml`` (defaults to
+  ``null`` there to preserve existing behavior).
+
+CTC word timestamps
+~~~~~~~~~~~~~~~~~~~
+
+``SALMAutomodel.generate()`` can return speaker-attributed word timestamps when
+its perception encoder is a ``ParallelExpertEncoder`` with a compatible CTC
+timestamp artifact. The runtime artifact contains only the CTC decoder config,
+decoder weights, and matching SentencePiece model; it does not restore or retain
+an ``EncDecCTCModelBPE`` encoder. Set ``ctc_timestamp_model_path`` on
+``model.perception.encoder`` after loading the model and pass
+``generate_timestamps=True``. The return value is then a dictionary containing
+``answer_ids`` and one timestamp result per input in ``timestamps``.
+
+Each timestamp result contains two independent timing products:
+
+* ``speaker_word_timestamps`` contains CTC-aligned word boundaries. These are
+  intended for transcription display and word-level scoring, not DER. Each
+  word contains only ``word``, ``speaker``, ``start``, and ``end``.
+* ``diarization_timestamps`` contains contiguous speaker-activity segments from
+  the native 10 ms Sortformer output and is the appropriate output for DER
+  evaluation. Each segment contains ``speaker``, ``start``, and ``end``.
+  ``diarization_frame_seconds``, ``diarization_max_speaker_count``, and
+  ``diarization_activity_threshold`` record the conversion contract.
+
+The PEE stores the high-resolution activity as a boolean tensor shaped
+``(batch, max_speaker_count, frames)``; ``max_speaker_count`` defaults to 8.
+Word alignment does not derive diarization segments from CTC word boundaries.
+
+Only when timestamps are requested, the PEE retains detached ASR encoder states
+in BF16 or FP16 while the LLM generates text. After generation, the CTC head
+converts those states to log probabilities in context-extended windows. Completed
+transcripts are tokenized first; after full-vocabulary normalization, only their
+token and blank columns are copied into compact CPU buffers. Each vocabulary-wide
+window is released before the next decoder call. Decoder batches are capped at
+16,777,216 output elements (64 MiB at FP32), with a minimum of one recording per
+call so a single larger context window remains intact. This bounds output storage,
+not the head's internal activations. The explicit ``ctc_log_probs_from_inputs()``
+API still returns a full-vocabulary tensor when requested directly.
+Exact max-sum dynamic programming and backtracing flatten every
+recording and speaker stream into shared padded batches. Alignment keeps rolling
+score rows, bounded emission blocks, and packed two-bit backpointers instead of
+dense frames-by-states emissions and int64 backpointers. The CTC artifact is not
+loaded or run when timestamps are disabled, which is the default.
+
+Convert the training-time CTC model once. This is deliberately separate from
+serving so a training encoder and a machine-local adapter path are not serialized
+with the PEE or loaded by each inference worker.
+
+.. code-block:: python
+
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import export_ctc_timestamp_artifact
+
+    export_ctc_timestamp_artifact(
+        "/path/to/Nemotron3-CTC-Timestamp-Adapter.nemo",
+        "/path/to/nemotron3_ctc_timestamp_artifact.pt",
+    )
+
+.. code-block:: python
+
+    model.perception.encoder.ctc_timestamp_model_path = "/path/to/nemotron3_ctc_timestamp_artifact.pt"
+    result = model.generate(
+        prompts=prompts,
+        audios=audios,
+        audio_lens=audio_lens,
+        generate_timestamps=True,
+        max_new_tokens=1024,
+    )
+    answer_ids = result["answer_ids"]
+    timestamps = result["timestamps"]
+
+The focused runtime components are public from ``nemo.collections.speechlm2.parts.ctc_timestamp_utils``:
+``TransformerCTCDecoder``, ``MultiSpeakerSOTWordTimestampAligner``, and
+``load_ctc_timestamp_artifact``.
+
+CTC timestamps in vLLM chat responses
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A vLLM server whose checkpoint bundles a compatible CTC timestamp head, or
+configures ``ctc_timestamps.adapter_path``, can attach timestamps to chat
+completions, on vLLM's V1 GPU model runner and on Model Runner V2. Start the
+server with the middleware and per-request multimodal kwargs allowed:
+
+.. code-block:: bash
+
+    vllm serve /path/to/checkpoint \
+        --middleware nemo.collections.speechlm2.vllm.salm.ctc_serving.ctc_timestamp_middleware \
+        --trust-request-mm-kwargs
+
+Requests opt in through ``mm_processor_kwargs``, which vLLM 0.31 and later
+reject unless the server sets ``--trust-request-mm-kwargs``; set it only when
+clients are trusted. vLLM 0.28 has no such flag, so leave it out there.
+
+When the engine cannot produce timestamps, for example with a chunked encoder,
+a bundled head is skipped with a warning and opted-in requests report
+``error="not_enabled"``; a configured ``adapter_path`` or
+``ctc_timestamps.enabled=true`` fails at startup instead. Set
+``ctc_timestamps.enabled=false``, in ``config.json`` or with
+``--hf-overrides``, to serve a bundled checkpoint without timestamps.
+
+Opt in per request with ``mm_processor_kwargs.capture_ctc_timestamps=true``.
+Timestamp requests support one audio item and one completion (``n=1``).
+Set ``skip_special_tokens=false`` to preserve the generated ``<spk:N>`` tags
+for speaker attribution. Non-streaming responses include a top-level
+``ctc_timestamps`` object with ``words``, ``diarization``,
+``speaker_tag_to_diarization_speaker`` and ``error``.
+
+Streaming responses use the same opt-in, together with ``stream=true``:
+
+.. code-block:: json
+
+    {
+      "model": "served-model-name",
+      "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Transcribe the audio with speaker tags."},
+        {"type": "input_audio", "input_audio": {"data": "<base64 WAV>", "format": "wav"}}
+      ]}],
+      "stream": true,
+      "stream_options": {"include_usage": true},
+      "skip_special_tokens": false,
+      "mm_processor_kwargs": {"capture_ctc_timestamps": true}
+    }
+
+Text deltas arrive as they are generated. After generation, the server aligns
+the full transcript using the captured encoder states; it does not run the
+audio encoder again. The final choice chunk carries both ``finish_reason``
+and the top-level ``ctc_timestamps`` object. Alignment adds latency only to
+stream completion. If requested, vLLM's final usage chunk follows, then the
+``data: [DONE]`` event. Clients should read ``ctc_timestamps`` from the final
+choice chunk and consume the stream through ``[DONE]`` to receive usage too.
+
+If alignment fails after text has streamed, the final timestamp object reports
+``error="alignment_failed"`` with empty ``words``; the transcript remains
+available. The HTTP status has already been sent. Other timestamp errors have
+the same meaning as in non-streaming responses. A disconnected client releases
+its capture. Requests without timestamp opt-in retain vLLM's usual streaming
+behavior.
+
+SALMAutomodel is particularly useful for:
+
+* Efficient training of Speech LLMs with MoE backbones (e.g., Nemotron Nano V3)
+* Large-scale distributed training with advanced parallelism strategies (FSDP2 with EP for MoE, TP)
+* Models that benefit from native Automodel LoRA integration
+* Inference with model parallelism (TP/EP)
+
+DuplexS2SModel
+^^^^^^^^^^^^^^
+
+The DuplexS2SModel extends the SALM architecture to enable full speech-to-speech capabilities, adding the ability to generate speech output.
+
+Key components:
+
+* **Audio Perception Module**: Processes audio inputs into embeddings for the LLM.
+* **LLM**: Processes audio embeddings and generates text or audio token responses.
+* **Audio Codec**: Converts discrete audio tokens into speech waveforms.
+* **Audio Head**: Predicts audio tokens for speech generation.
+* **Embed Audio Tokens**: Embedding layers for audio token representation.
+
+This model is particularly useful for:
+* Complete conversational agents that can listen and respond with speech
+* Voice assistants and interactive dialogue systems
+* Applications requiring natural-sounding spoken responses
+
+DuplexS2SSpeechDecoderModel
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This model focuses on the speech generation aspect of the duplex system, optimizing the decoder for high-quality speech output.
+
+Key components:
+
+* **Audio Perception Module**: Similar to other models, processes audio into embeddings.
+* **Speech Decoder**: A specialized component for generating high-quality speech from text or audio representations.
+* **TransformerARSpeechDecoder**: An autoregressive transformer-based decoder for speech generation.
+
+This model is particularly useful for:
+* Applications focusing on high-quality speech synthesis
+* Systems where speech generation quality is the primary concern
+* Specialized voice output applications
+
+DuplexSTTModel
+^^^^^^^^^^^^^^
+
+This model focuses on speech-to-text conversion in duplex conversations, processing both user speech and generating agent text responses.
+
+Key components:
+
+* **Audio Perception Module**: Processes audio inputs into embeddings for the LLM.
+* **LLM**: Processes audio embeddings and generates text responses.
+* **Tokenizer**: Converts LLM outputs into readable text.
+
+This model is particularly useful for:
+* Speech-to-text applications in conversational settings
+* Duplex systems where text responses are needed instead of speech
+* Applications requiring transcript generation from spoken dialogue
+
+
+NemotronVoiceChat
+^^^^^^^^^^^^^^^^^
+
+NemotronVoiceChat is an **inference-only**, end-to-end Duplex Speech-to-Speech pipeline. It achieves full-duplex conversational capabilities by seamlessly merging the `DuplexSTTModel` with the `DuplexEARTTS` model. 
+
+Because it is designed exclusively for evaluation, offline inference, and validation workflows (no training step is implemented), it is highly optimized for executing the full perception-generation-synthesis loop.
+
+Key components:
+
+* **DuplexSTTModel**: Handles the streaming audio perception and text response generation.
+* **DuplexEARTTS**: Serves as the autoregressive speech decoder, generating high-fidelity audio from the STT model's text tokens in a streamable fashion.
+
+This model is particularly useful for:
+* End-to-end evaluation of the complete speech-to-speech pipeline.
+* Offline speech-to-speech inference workflows.
+
+
+Model Components
+----------------
+
+Audio Perception Module
+^^^^^^^^^^^^^^^^^^^^^^^
+
+The audio perception module is responsible for converting speech signals into embeddings that can be processed by language models. It typically consists of:
+
+1. **Preprocessor**: Converts raw audio waveforms into spectral features
+2. **Encoder**: Processes these features to create meaningful representations
+3. **Modality Adapter**: Adapts the encoder outputs to be compatible with the LLM's input space
+
+Speech Generation
+^^^^^^^^^^^^^^^^^
+
+Speech generation components convert text or token representations back into speech. The collection offers:
+
+1. **TransformerARSpeechDecoder**: An autoregressive transformer-based speech decoder
+2. **Audio Codec Integration**: Works with audio codecs to generate natural speech from discrete tokens
+3. **DuplexEARTTS**: A ready-to-use duplex text-to-speech model that supports user interruption via a special text interruption token. The model integrates an RVQ-based audio codec with a streaming speech generation module to enable low-latency, real-time synthesis.
+
+Implementation Details
+----------------------
+
+The DuplexS2SModel implementation contains several key methods that handle different aspects of the model's functionality:
+
+Model Initialization
+^^^^^^^^^^^^^^^^^^^^
+
+The constructor (`__init__`) initializes the following components:
+
+1. **Pretrained ASR encoder/perception**: Loads a pretrained NeMo ASR model and adapts it for audio perception
+2. **LLM**: Loads a pretrained language model using HuggingFace's AutoModel
+3. **Audio codec**: Loads a pretrained NeMo audio codec for speech generation
+4. **Token prediction heads**: Adds separate heads for text token and audio token prediction
+
+Forward Method
+^^^^^^^^^^^^^^
+
+The `forward` method:
+
+1. Accepts input representations (sum of audio perception and text embedding outputs)
+2. Runs an offline forward pass through the language model
+3. Generates logits from both text and audio token prediction heads
+4. Returns these logits for loss computation
+
+Training Step
+^^^^^^^^^^^^^
+
+The `training_step` method:
+
+1. Builds input representations using the `prepare_inputs` method
+2. Runs the `forward` method to get text and audio logits
+3. Computes losses for both text and audio tokens
+4. Logs training metrics (loss, learning rate, etc.)
+5. Returns the loss for backpropagation
+
+Prepare Inputs
+^^^^^^^^^^^^^^
+
+The `prepare_inputs` method:
+
+1. Processes source audio through the perception module (with gradients enabled)
+2. Processes target audio through the audio codec (with gradients disabled)
+3. Truncates source/target audio and target text sequences to have the same sequence length, if needed
+4. Performs additional truncation for sequence lengths to be divisible by tensor parallelism world size (if enabled)
+5. Returns a dictionary with input and label tensors for training
+
+.. code-block:: python
+
+    def prepare_inputs(self, batch):
+        # Process source audio through perception
+        audio_embs, audio_emb_lens = self.perception(
+            input_signal=batch["source_audio"], 
+            input_signal_length=batch["source_audio_lens"]
+        )
+        
+        # Process target audio through codec (no gradients)
+        with torch.no_grad():
+            target_audio_tokens, target_audio_token_lens = self.audio_codec.encode(batch["target_audio"], batch["target_audio_lens"])
+        
+        # Truncate sequences if needed
+        # ... (truncation logic)
+
+        # Embed text tokens and combine them with audio representations
+        # ... (text embedding logic)
+
+        # Return processed inputs and labels
+        return {
+            "audio_embeds": audio_embs,
+            "input_embeds": input_embeds,
+            "attention_mask": attention_mask,
+            "target_text_ids": target_text_ids,
+            "target_audio_ids": target_audio_ids,
+        }
+
+Validation
+^^^^^^^^^^
+
+The validation process:
+
+1. Clears GPU memory to avoid OOM issues
+2. Loads a scoring ASR model into GPU for evaluation
+3. Initializes metric aggregation for each dataset
+4. Processes each validation dataset separately
+5. Computes BLEU scores for text and ASR-decoded audio
+6. Logs and clears metrics after validation is complete
+
+Scaling Support
+---------------
+
+The DuplexS2SModel includes a `configure_model` method that sets up model parallelism for large-scale training. This method:
+
+1. Detects the parallelism strategy from the trainer's device mesh
+2. Applies Fully Sharded Data Parallel (FSDP) sharding to appropriate modules
+3. Applies Tensor Parallelism (TP) and Sequence Parallelism (SP) when configured
+4. Handles model-specific adaptations for different LLM architectures
+
+The scaling approach supports:
+
+* Pure FSDP2 for distributing parameters across GPUs
+* Pure TP/SP for splitting computation across GPUs
+* 2D parallelism combining both approaches
+
+Pretrained Model Usage
+----------------------
+
+All models in the speechlm2 collection can be instantiated from pretrained checkpoints:
+
+.. code-block:: python
+
+    import nemo.collections.speechlm2 as slm
+    
+    # Load SALM model
+    salm_model = slm.models.SALM.from_pretrained("path/to/checkpoint")
+    
+    # Load SALMAutomodel
+    salm_automodel = slm.models.SALMAutomodel.from_pretrained("path/to/checkpoint")
+
+    # Load DuplexS2SModel
+    duplex_model = slm.models.DuplexS2SModel.from_pretrained("path/to/checkpoint")
+
+    # Load DuplexS2SSpeechDecoderModel
+    speech_decoder_model = slm.models.DuplexS2SSpeechDecoderModel.from_pretrained("path/to/checkpoint")
+
+    # Load DuplexSTTModel
+    stt_model = slm.models.DuplexSTTModel.from_pretrained("path/to/checkpoint")
+
+    # Load DuplexEARTTS
+    ear_tts_model = slm.models.DuplexEARTTS.from_pretrained("path/to/checkpoint")
+
+    # Load NemotronVoiceChat (Inference Only)
+    voicechat_model = slm.models.NemotronVoiceChat.from_pretrained("path/to/checkpoint")
+
+Remote HuggingFace code is disabled by default. If a trusted checkpoint requires
+custom code, opt in at runtime and pin the repository to a reviewed revision:
+
+.. code-block:: python
+
+    model = slm.models.SALM.from_pretrained(
+        "trusted/model",
+        revision="reviewed-commit-sha",
+        trust_remote_code=True,
+    )
+
+The ``trust_remote_code`` setting stored in a checkpoint configuration is ignored.
+This prevents a model repository from opting itself into executing downloaded
+Python code.
+
+Fine-Tuning from a Checkpoint
+------------------------------
+
+To fine-tune a model starting from a previous training checkpoint (with a fresh
+optimizer and step counter), set ``model.init_from_checkpoint`` in the config:
+
+.. code-block:: python
+
+    # Via Hydra override:
+    # ++model.init_from_checkpoint=/path/to/step=6375.ckpt
+
+This loads only model weights from the checkpoint — optimizer state, LR scheduler,
+and training step are discarded. Supports DCP directories (from FSDP2/TP training),
+HuggingFace directories, and single-file ``.ckpt`` files. Works with both ``SALM``
+and ``SALMAutomodel``.
+
+See :ref:`fine-tuning-from-checkpoint` in the configuration documentation for full
+details.
+
+Model Configuration
+-------------------
+
+All models in this collection use a configuration-based approach, where a YAML configuration file specifies the model architecture, components, and training parameters. See the :doc:`configurations documentation <configs>` for details on these configuration files.
+
+For information about scaling and training these models at scale, see the :doc:`training and scaling documentation <training_and_scaling>`.

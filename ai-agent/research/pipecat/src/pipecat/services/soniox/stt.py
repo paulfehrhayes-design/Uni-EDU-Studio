@@ -1,0 +1,1044 @@
+#
+# Copyright (c) 2024-2026, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+"""Soniox speech-to-text service implementation."""
+
+import asyncio
+import json
+import re
+import time
+from collections import Counter
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from loguru import logger
+from pydantic import BaseModel
+from websockets.protocol import State
+
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    Frame,
+    InterimTranscriptionFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
+    STTMetadataFrame,
+    TranscriptionFrame,
+    TTSTextFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
+from pipecat.observers.bot_speech_observer import BotSpeechObserver
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.services.settings import STTSettings
+from pipecat.services.soniox.errors import classify_error_code
+from pipecat.services.stt_latency import SONIOX_TTFS_P99
+from pipecat.services.stt_service import WebsocketSTTService
+from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+from pipecat.utils.deprecation import deprecated
+from pipecat.utils.time import nanoseconds_to_seconds, time_now_iso8601
+from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
+
+KEEPALIVE_MESSAGE = '{"type": "keepalive"}'
+
+FINALIZE_MESSAGE = '{"type": "finalize"}'
+
+DEFAULT_AGENT_TEXT_LEAD_MS = 700
+
+END_TOKEN = "<end>"
+
+FINALIZED_TOKEN = "<fin>"
+
+# The versioned real-time model names, e.g. "stt-rt-v6".
+_VERSIONED_MODEL = re.compile(r"stt-rt-v(\d+)")
+
+# The first real-time model version that accepts agent text input.
+_AGENT_TEXT_INPUT_MIN_VERSION = 6
+
+
+class SonioxContextGeneralItem(BaseModel):
+    """Represents a key-value pair for structured general context information."""
+
+    key: str
+    value: str
+
+
+class SonioxContextTranslationTerm(BaseModel):
+    """Represents a custom translation mapping for ambiguous or domain-specific terms."""
+
+    source: str
+    target: str
+
+
+class SonioxContextObject(BaseModel):
+    """Structured context that steers transcription and translation.
+
+    Every section is optional; supply only the ones that are relevant. Soniox
+    caps the whole object at 8k tokens.
+
+    Learn more about context in the documentation:
+    https://soniox.com/docs/stt/concepts/context
+    """
+
+    general: list[SonioxContextGeneralItem] | None = None
+    text: str | None = None
+    terms: list[str] | None = None
+    translation_terms: list[SonioxContextTranslationTerm] | None = None
+
+
+@deprecated(
+    "`SonioxInputParams` is deprecated since 0.0.105 and will be removed in 2.0.0. Use "
+    "`SonioxSTTService.Settings` instead."
+)
+class SonioxInputParams(BaseModel):
+    """Real-time transcription settings.
+
+    .. deprecated:: 0.0.105
+        Use ``settings=SonioxSTTService.Settings(...)`` instead.
+        Will be removed in 2.0.0.
+
+    See Soniox WebSocket API documentation for more details:
+    https://soniox.com/docs/speech-to-text/api-reference/websocket-api#configuration-parameters
+
+    Parameters:
+        model: Model to use for transcription.
+        audio_format: Audio format to use for transcription.
+        num_channels: Number of channels to use for transcription.
+        language_hints: List of language hints to use for transcription.
+        language_hints_strict: If true, strictly enforce language hints (only transcribe in provided languages).
+        context: Customization for transcription. String for models with context_version 1 and ContextObject for models with context_version 2.
+        enable_speaker_diarization: Whether to enable speaker diarization. Tokens are annotated with speaker IDs.
+        enable_language_identification: Whether to enable language identification. Tokens are annotated with language IDs.
+        client_reference_id: Client reference ID to use for transcription.
+    """
+
+    model: str = "stt-rt-v6"
+
+    audio_format: str | None = "pcm_s16le"
+    num_channels: int | None = 1
+
+    language_hints: list[Language] | None = None
+    language_hints_strict: bool | None = None
+    context: SonioxContextObject | str | None = None
+
+    enable_speaker_diarization: bool | None = False
+    enable_language_identification: bool | None = False
+
+    client_reference_id: str | None = None
+
+
+def is_end_token(token: dict) -> bool:
+    """Determine if a token is an end token."""
+    return token["text"] == END_TOKEN or token["text"] == FINALIZED_TOKEN
+
+
+def language_to_soniox_language(language: Language) -> str:
+    """Convert a Pipecat Language to a Soniox language code.
+
+    For a list of all supported languages, see:
+    https://soniox.com/docs/speech-to-text/core-concepts/supported-languages
+    """
+    LANGUAGE_MAP = {
+        Language.AF: "af",
+        Language.AR: "ar",
+        Language.AZ: "az",
+        Language.BE: "be",
+        Language.BG: "bg",
+        Language.BN: "bn",
+        Language.BS: "bs",
+        Language.CA: "ca",
+        Language.CS: "cs",
+        Language.CY: "cy",
+        Language.DA: "da",
+        Language.DE: "de",
+        Language.EL: "el",
+        Language.EN: "en",
+        Language.ES: "es",
+        Language.ET: "et",
+        Language.EU: "eu",
+        Language.FA: "fa",
+        Language.FI: "fi",
+        Language.FR: "fr",
+        Language.GL: "gl",
+        Language.GU: "gu",
+        Language.HE: "he",
+        Language.HI: "hi",
+        Language.HR: "hr",
+        Language.HU: "hu",
+        Language.ID: "id",
+        Language.IT: "it",
+        Language.JA: "ja",
+        Language.KK: "kk",
+        Language.KN: "kn",
+        Language.KO: "ko",
+        Language.LT: "lt",
+        Language.LV: "lv",
+        Language.MK: "mk",
+        Language.ML: "ml",
+        Language.MR: "mr",
+        Language.MS: "ms",
+        Language.NB: "no",
+        Language.NL: "nl",
+        Language.NO: "no",
+        Language.PA: "pa",
+        Language.PL: "pl",
+        Language.PT: "pt",
+        Language.RO: "ro",
+        Language.RU: "ru",
+        Language.SK: "sk",
+        Language.SL: "sl",
+        Language.SQ: "sq",
+        Language.SR: "sr",
+        Language.SV: "sv",
+        Language.SW: "sw",
+        Language.TA: "ta",
+        Language.TE: "te",
+        Language.TH: "th",
+        Language.TL: "tl",
+        Language.TR: "tr",
+        Language.UK: "uk",
+        Language.UR: "ur",
+        Language.VI: "vi",
+        Language.ZH: "zh",
+    }
+    return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
+
+
+def _prepare_language_hints(
+    language_hints: list[Language] | None,
+) -> list[str] | None:
+    if language_hints is None:
+        return None
+
+    prepared_languages = [language_to_soniox_language(lang) for lang in language_hints]
+    # Remove duplicates (in case of language_hints with multiple regions).
+    return list(set(prepared_languages))
+
+
+def _language_from_tokens(tokens: list[dict]) -> Language | None:
+    language_counts: Counter[Language] = Counter()
+
+    for token in tokens:
+        language = token.get("language")
+        if not language:
+            continue
+        try:
+            language_counts[Language(language)] += 1
+        except ValueError:
+            pass
+
+    if not language_counts:
+        return None
+
+    return language_counts.most_common(1)[0][0]
+
+
+@dataclass
+class SonioxSTTSettings(STTSettings):
+    """Settings for SonioxSTTService.
+
+    Parameters:
+        language_hints: List of language hints to use for transcription.
+        language_hints_strict: If true, strictly enforce language hints.
+        context: Customization for transcription. Either a
+            :class:`SonioxContextObject` or a plain string of background text.
+        enable_speaker_diarization: Whether to enable speaker diarization.
+        enable_language_identification: Whether to enable language identification.
+        max_endpoint_delay_ms: Max ms after speech ends before endpoint detection returns
+            an endpoint (500-3000).
+        endpoint_sensitivity: Endpoint detection sensitivity (-1.0 to 1.0); higher finalizes sooner.
+        endpoint_latency_adjustment_level: Reduces endpoint latency vs. the default (0-3); higher
+            finalizes sooner but may reduce accuracy.
+        client_reference_id: Client reference ID to use for transcription.
+        enable_agent_text_input: Whether to send each completed bot reply to
+            Soniox as agent text, so words the bot said (e.g. a product name)
+            are recognized when the user says them. Defaults to True. Only
+            takes effect on models that support agent text input
+            (``stt-rt-v6`` and later); it stays off for older models. Agent
+            text is billed as input text tokens.
+        enable_echo_cancellation: Whether to send the bot's speech to Soniox as
+            agent text while it plays, which also lets Soniox cancel the bot's
+            echo in the user's audio. Implies ``enable_agent_text_input``, and
+            likewise only takes effect on models that support it. Needs a TTS
+            service that reports word timestamps.
+        agent_text_lead_ms: How far ahead of playback each of the bot's words is
+            sent, in milliseconds. Soniox places agent text where it sits among
+            the audio frames and wants it a little before the caller hears it;
+            500 to 1000 is the documented range. 0 sends each word as it starts
+            playing. Only used with ``enable_echo_cancellation``, and only for a
+            TTS service that reports word timestamps.
+
+    Endpoint detection runs in both turn detection modes. With
+    ``vad_force_turn_endpoint=True`` it only ends transcripts, so
+    ``max_endpoint_delay_ms`` bounds how long the transcript of speech the
+    local VAD missed waits.
+    """
+
+    language_hints: list[Language] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    language_hints_strict: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    context: SonioxContextObject | str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_speaker_diarization: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_language_identification: bool | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    max_endpoint_delay_ms: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    endpoint_sensitivity: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    endpoint_latency_adjustment_level: int | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    client_reference_id: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_agent_text_input: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_echo_cancellation: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    agent_text_lead_ms: int | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
+def _move_language_to_hints(delta: SonioxSTTSettings) -> None:
+    """Replace ``language_hints`` with ``delta.language``, the field Soniox reads on connect.
+
+    Hints given in the same delta win. A string outside :class:`Language` stays in
+    ``language`` for the base class to handle.
+    """
+    if not is_given(delta.language) or delta.language is None:
+        return
+    if is_given(getattr(delta, "language_hints", NOT_GIVEN)):
+        return
+    try:
+        language = Language(delta.language)
+    except ValueError:
+        return
+    delta.language_hints = [language]
+    delta.language = NOT_GIVEN
+
+
+class SonioxSTTService(WebsocketSTTService):
+    """Speech-to-Text service using Soniox's WebSocket API.
+
+    This service connects to Soniox's WebSocket API for real-time transcription
+    with support for multiple languages, custom context, speaker diarization,
+    and more.
+
+    For complete API documentation, see: https://soniox.com/docs/speech-to-text/api-reference/websocket-api
+    """
+
+    Settings = SonioxSTTSettings
+    _settings: Settings
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        url: str = "wss://stt-rt.soniox.com/transcribe-websocket",
+        sample_rate: int | None = None,
+        model: str | None = None,
+        audio_format: str = "pcm_s16le",
+        num_channels: int = 1,
+        params: SonioxInputParams | None = None,
+        vad_force_turn_endpoint: bool = True,
+        should_interrupt: bool = True,
+        settings: Settings | None = None,
+        ttfs_p99_latency: float | None = SONIOX_TTFS_P99,
+        **kwargs,
+    ):
+        """Initialize the Soniox STT service.
+
+        Args:
+            api_key: Soniox API key.
+            url: Soniox WebSocket API URL.
+            sample_rate: Audio sample rate.
+            model: Soniox model to use for transcription.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=SonioxSTTService.Settings(model=...)`` instead.
+                    Will be removed in 2.0.0.
+
+            audio_format: Audio format for transcription. Defaults to ``"pcm_s16le"``.
+            num_channels: Number of audio channels. Defaults to 1.
+            params: Additional configuration parameters, such as language hints, context and
+                speaker diarization.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=SonioxSTTService.Settings(...)`` instead.
+                    Will be removed in 2.0.0.
+
+            vad_force_turn_endpoint: Controls turn detection mode.
+                When True (Pipecat mode, default): Pipecat's user turn strategies
+                decide turn endings, and a `VADUserStoppedSpeakingFrame` sends a
+                finalize message to Soniox so the transcript arrives sooner. Soniox
+                endpoint detection still ends the transcript when the VAD misses
+                speech, but never the turn. When False (Soniox turn detection mode):
+                Soniox endpoint detection controls turn endings. Proposes a
+                turn start on the local VAD signal when a VAD analyzer is
+                configured (most responsive) or on the first transcript token
+                otherwise, and a turn stop when the endpoint is detected.
+            should_interrupt: Whether to interrupt the bot when the user starts speaking
+                in Soniox turn detection mode (vad_force_turn_endpoint=False). Only applies
+                when using Soniox's built-in endpoint detection. Passed along to the
+                user turn strategies this service recommends, which own the
+                interruption; a user-supplied ``user_turn_strategies`` overrides the
+                recommendation and this setting with it. Defaults to True.
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
+            ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
+                Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
+            **kwargs: Additional arguments passed to the STTService.
+        """
+        # --- 1. Hardcoded defaults ---
+        default_settings = self.Settings(
+            model="stt-rt-v6",
+            language=None,
+            language_hints=None,
+            language_hints_strict=None,
+            context=None,
+            enable_speaker_diarization=False,
+            enable_language_identification=False,
+            max_endpoint_delay_ms=None,
+            endpoint_sensitivity=None,
+            endpoint_latency_adjustment_level=None,
+            client_reference_id=None,
+            enable_agent_text_input=True,
+            enable_echo_cancellation=False,
+            agent_text_lead_ms=DEFAULT_AGENT_TEXT_LEAD_MS,
+        )
+
+        # --- 2. Deprecated direct-arg overrides ---
+        if model is not None:
+            self._warn_init_param_moved_to_settings("model", "model")
+            default_settings.model = model
+
+        # --- 3. Deprecated params overrides ---
+        if params is not None:
+            self._warn_init_param_moved_to_settings("params")
+            if not settings:
+                default_settings.model = params.model
+                if params.audio_format is not None:
+                    audio_format = params.audio_format
+                if params.num_channels is not None:
+                    num_channels = params.num_channels
+                default_settings.language_hints = params.language_hints
+                default_settings.language_hints_strict = params.language_hints_strict
+                default_settings.context = params.context
+                default_settings.enable_speaker_diarization = params.enable_speaker_diarization
+                default_settings.enable_language_identification = (
+                    params.enable_language_identification
+                )
+                default_settings.client_reference_id = params.client_reference_id
+
+        # --- 4. Settings delta (canonical API, always wins) ---
+        if settings is not None:
+            settings = replace(settings)
+            _move_language_to_hints(settings)
+            default_settings.apply_update(settings)
+
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            keepalive_timeout=1,
+            keepalive_interval=5,
+            settings=default_settings,
+            **kwargs,
+        )
+
+        self._api_key = api_key
+        self._url = url
+        self._vad_force_turn_endpoint = vad_force_turn_endpoint
+        self._should_interrupt = should_interrupt
+
+        # Init-only audio config
+        self._audio_format = audio_format
+        self._num_channels = num_channels
+
+        self._final_transcription_buffer = []
+        self._last_tokens_received: float | None = None
+
+        # Turn tracking for Soniox turn-detection mode.
+        self._user_turn_open = False
+
+        self._receive_task = None
+        if is_given(lead := default_settings.agent_text_lead_ms) and lead < 0:
+            raise ValueError(f"agent_text_lead_ms cannot be negative, but got {lead}")
+
+        # Present while echo cancellation is on, reporting the bot's words.
+        self._agent_text_observer: BotSpeechObserver | None = None
+        # Whether agent text was sent since the last segment was closed.
+        self._agent_text_segment_open = False
+        self._warned_untimed_text = False
+        # Timed words waiting for their moment, each with the turn it belongs to.
+        self._agent_text_words: asyncio.Queue[tuple[TTSTextFrame, asyncio.Event]] = asyncio.Queue()
+        self._agent_text_sender: asyncio.Task | None = None
+        self._agent_text_last_pts = 0
+        # Set when the turn is interrupted. A word decides whether it is still
+        # wanted when its turn to be sent comes round.
+        self._agent_text_turn = asyncio.Event()
+
+    def can_generate_metrics(self) -> bool:
+        """Check if this service can generate processing metrics.
+
+        Returns:
+            True, as Soniox STT supports metrics generation.
+        """
+        return True
+
+    def service_metadata_frame(self) -> STTMetadataFrame:
+        """Request external turn strategies in Soniox's turn-detection mode.
+
+        With ``vad_force_turn_endpoint=False`` Soniox's endpoint detection decides
+        turn endings and this service proposes turn boundaries, so the user
+        aggregator resolves those rather than running local VAD/smart-turn. In the
+        default Pipecat mode (``vad_force_turn_endpoint=True``) the STT proposes
+        no turns, so the defaults are left in place. Applied unless the user
+        passed their own ``user_turn_strategies``.
+        """
+        frame = super().service_metadata_frame()
+        if not self._vad_force_turn_endpoint:
+            frame.user_turn_strategies = ExternalUserTurnStrategies(
+                enable_interruptions=self._should_interrupt,
+            )
+        return frame
+
+    async def _user_turn_started(self):
+        """Propose a turn start — Soniox turn-detection mode only.
+
+        Soniox has no speech-started event, so the turn opens on the local VAD
+        signal when available (fast path) or on the first transcript token
+        otherwise; whichever arrives first wins, the other is a no-op. The
+        proposal goes out before any transcription frames for the turn are
+        pushed.
+        """
+        if self._vad_force_turn_endpoint or self._user_turn_open:
+            return
+        self._user_turn_open = True
+        await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
+
+    async def _user_turn_stopped(self):
+        """Propose a turn stop — Soniox turn-detection mode only.
+
+        Broadcast right after the endpoint's finalized TranscriptionFrame (same
+        downstream queue, so ordering is preserved).
+        """
+        if self._vad_force_turn_endpoint or not self._user_turn_open:
+            return
+        self._user_turn_open = False
+        await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
+
+    async def _update_settings(self, delta: Settings) -> dict[str, Any]:
+        """Apply settings delta and reconnect if anything changed.
+
+        A ``language`` replaces ``language_hints``, the field Soniox reads on connect.
+
+        Args:
+            delta: A settings delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        delta = replace(delta)
+        _move_language_to_hints(delta)
+        changed = await super()._update_settings(delta)
+
+        if changed:
+            await self._update_agent_text_observer()
+            await self._request_reconnect()
+
+        return changed
+
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service and connect.
+
+        Args:
+            setup: Configuration object containing setup parameters.
+        """
+        await super().setup(setup)
+        await self._update_agent_text_observer()
+        await self._connect()
+
+    async def cleanup(self):
+        """Stop observing the bot's speech and release the service's resources."""
+        await self._stop_agent_text_observer()
+        await super().cleanup()
+
+    async def stop(self, frame: EndFrame):
+        """Stop the Soniox STT websocket connection.
+
+        Args:
+            frame: The end frame.
+        """
+        # The end-of-audio frame has to reach the socket before teardown closes
+        # it. Trailing final tokens are not waited for: that would hold shutdown
+        # open for a transcript that generates no further turn.
+        await self._send_stop_recording()
+        await super().stop(frame)
+
+    async def cancel(self, frame: CancelFrame):
+        """Cancel the Soniox STT websocket connection.
+
+        Compared to stop, this closes the connection without sending the
+        end-of-audio frame.
+
+        Args:
+            frame: The cancel frame.
+        """
+        await super().cancel(frame)
+        await self._disconnect()
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        """Send audio data to Soniox STT Service.
+
+        Args:
+            audio: Raw audio bytes to transcribe.
+
+        Yields:
+            Frame: None (transcription results come via WebSocket callbacks).
+        """
+        if self._websocket and self._websocket.state is State.OPEN:
+            try:
+                await self._websocket.send(audio)
+            except Exception as e:
+                logger.warning(f"{self}: send failed: {e}")
+
+        yield None
+
+    @traced_stt
+    async def _handle_transcription(
+        self, transcript: str, is_final: bool, language: Language | None = None
+    ):
+        """Handle a transcription result with tracing."""
+        pass
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Processes a frame of audio data, either buffering or transcribing it.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction of frame processing.
+        """
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            # In Soniox turn-detection mode the local VAD signal is the fast
+            # path for opening the turn — the first transcript token arrives a
+            # full network round-trip plus model TTFB later and remains the
+            # fallback when no VAD analyzer is configured. No-op in Pipecat
+            # mode or mid-turn.
+            await self._user_turn_started()
+        elif isinstance(frame, VADUserStoppedSpeakingFrame) and self._vad_force_turn_endpoint:
+            # Send finalize message to Soniox so we get the final tokens asap.
+            if self._websocket and self._websocket.state is State.OPEN:
+                await self._websocket.send(FINALIZE_MESSAGE)
+                logger.debug(f"Triggered finalize event on: {frame.name=}, {direction=}")
+
+    async def _process_assistant_turn(self, text: str):
+        """Send the bot's completed reply to Soniox as agent text.
+
+        The text arrives without turn completion markers or expression tags, and
+        goes out as one segment. With echo cancellation enabled the reply was
+        already sent while it played.
+
+        Args:
+            text: The assistant's aggregated spoken text for this turn.
+        """
+        if self._agent_text_observer is None and text.strip():
+            await self._send_agent_text(text)
+
+    def _agent_text_input_enabled(self) -> bool:
+        """Whether this session takes agent text: enabled, on a model that supports it.
+
+        Echo cancellation enables it too. Soniox ends the stream on an
+        ``agent_text`` message to a session that did not enable it, and on
+        enabling it for a model without support.
+        """
+        s = self._settings
+        enabled = bool(s.enable_agent_text_input or s.enable_echo_cancellation)
+        return enabled and _supports_agent_text_input(s.model)
+
+    async def _send_agent_text(self, text: str, end_of_segment: bool = True):
+        """Send text the bot is speaking, which Soniox places by its position in the audio."""
+        if not self._agent_text_input_enabled():
+            return
+        if self._websocket and self._websocket.state is State.OPEN:
+            message = {"type": "agent_text", "text": text, "end_of_segment": end_of_segment}
+            try:
+                await self._websocket.send(json.dumps(message))
+            except Exception as e:
+                logger.warning(f"{self}: agent text send failed: {e}")
+
+    async def _update_agent_text_observer(self):
+        """Observe the bot's speech while echo cancellation is on."""
+        if not self._setup:
+            return
+        if self._settings.enable_echo_cancellation and self._agent_text_input_enabled():
+            if not self._agent_text_observer:
+                observer = BotSpeechObserver()
+                observer.add_event_handler("on_bot_text", self._on_bot_text)
+                observer.add_event_handler("on_bot_speech_ended", self._on_bot_speech_ended)
+                self.pipeline_worker.add_observer(observer)
+                self._agent_text_observer = observer
+        else:
+            await self._stop_agent_text_observer()
+
+    async def _stop_agent_text_observer(self):
+        observer, self._agent_text_observer = self._agent_text_observer, None
+        if observer:
+            await self.pipeline_worker.remove_observer(observer)
+        if self._agent_text_sender:
+            await self.cancel_task(self._agent_text_sender)
+            self._agent_text_sender = None
+        self._drop_agent_text_words()
+
+    async def _on_bot_text(self, observer: BotSpeechObserver, frame: TTSTextFrame):
+        """Time a word the bot will say against its playback, or send untimed text now."""
+        if frame.pts:
+            self._queue_agent_text(frame)
+            return
+        if not self._warned_untimed_text:
+            self._warned_untimed_text = True
+            logger.warning(
+                f"{self}: the TTS service does not report word timestamps; "
+                "agent text is sent untimed, so echo cancellation will not work"
+            )
+        await self._send_bot_text(frame)
+
+    async def _on_bot_speech_ended(self, observer: BotSpeechObserver, interrupted: bool):
+        """Close the turn's segment, and on an interruption drop the words not yet sent.
+
+        Each word still queued is dropped as the sender reaches it, because the
+        transport drops its audio too.
+        """
+        if interrupted:
+            self._agent_text_turn.set()
+            self._agent_text_turn = asyncio.Event()
+        await self._close_agent_text_segment()
+
+    def _queue_agent_text(self, frame: TTSTextFrame):
+        """Queue a timed word behind the words reported before it."""
+        assert frame.pts
+        if frame.pts < self._agent_text_last_pts:
+            logger.warning(
+                f"{self}: the TTS service reported a word timestamp earlier than "
+                f"the previous one; agent text keeps the order the words arrived in"
+            )
+        self._agent_text_last_pts = frame.pts
+        self._agent_text_words.put_nowait((frame, self._agent_text_turn))
+        # `done()` as well as None: a sender that raised is finished, and
+        # without this the words after it would wait on a task that is over.
+        if self._agent_text_sender is None or self._agent_text_sender.done():
+            self._agent_text_sender = self.create_task(
+                self._send_agent_text_words(), name="soniox-agent-text"
+            )
+
+    async def _send_agent_text_words(self):
+        """Send the queued words one after another, each when its moment comes."""
+        while True:
+            frame, interrupted = await self._agent_text_words.get()
+            await self._send_bot_word_at(frame, interrupted)
+            self._agent_text_words.task_done()
+
+    async def _send_bot_word_at(self, frame: TTSTextFrame, interrupted: asyncio.Event):
+        """Send a word ``agent_text_lead_ms`` before it is played.
+
+        Soniox places agent text where it sits among the audio frames, and
+        recognizes the caller's reply better when the words arrive a little
+        before the caller hears them. The pts is when the audio reaches the
+        transport, so the caller hears it that much later again.
+        """
+        assert frame.pts
+        # Read the clock here, not at push time: whatever the frame waited in
+        # the queue is time the lead would otherwise have lost.
+        delay = nanoseconds_to_seconds(frame.pts - self.get_clock().get_time())
+        delay -= assert_given(self._settings.agent_text_lead_ms) / 1000
+        if not frame.interruptible:
+            # Uninterruptible speech plays on through an interruption.
+            if delay > 0:
+                await asyncio.sleep(delay)
+        else:
+            # An interruption ends the wait: the transport drops this word's
+            # audio, so the caller never hears it.
+            try:
+                await asyncio.wait_for(interrupted.wait(), max(delay, 0))
+            except TimeoutError:
+                pass
+            if interrupted.is_set():
+                return
+        await self._send_bot_text(frame)
+
+    async def _send_bot_text(self, frame: TTSTextFrame):
+        """Send one piece of the bot's text, restoring the space the aggregator stripped."""
+        text = frame.text
+        if self._agent_text_segment_open and not frame.includes_inter_frame_spaces:
+            text = f" {text}"
+        self._agent_text_segment_open = True
+        await self._send_agent_text(text, end_of_segment=False)
+
+    async def _close_agent_text_segment(self):
+        """Close the open segment, if there is one. Closing it twice would open another."""
+        if not self._agent_text_segment_open:
+            return
+        self._agent_text_segment_open = False
+        await self._send_agent_text("", end_of_segment=True)
+
+    def _drop_agent_text_words(self):
+        """Drop the words waiting on the clock, uninterruptible ones too."""
+        self._agent_text_turn.set()
+        self._agent_text_turn = asyncio.Event()
+        # The event alone leaves uninterruptible speech, which ignores it, so
+        # the queue itself goes too.
+        while not self._agent_text_words.empty():
+            self._agent_text_words.get_nowait()
+            self._agent_text_words.task_done()
+
+    async def _send_stop_recording(self):
+        """Send the end-of-audio frame, an empty message that ends the session."""
+        if self._websocket and self._websocket.state is State.OPEN:
+            try:
+                await self._websocket.send("")
+            except Exception as e:
+                logger.warning(f"{self}: end-of-audio send failed: {e}")
+
+    async def _connect(self):
+        """Connect to the Soniox service.
+
+        Establishes websocket connection and starts receive and keepalive tasks.
+        """
+        await self._connect_websocket()
+
+        await super()._connect()
+
+        # Started even when the connection failed: with no socket the receive
+        # loop goes straight to its reconnect path, which retries the connect.
+        if not self._receive_task:
+            self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+
+    async def _disconnect(self):
+        """Disconnect from the Soniox service.
+
+        Cleans up tasks and closes websocket connection.
+        """
+        await super()._disconnect()
+
+        if self._receive_task:
+            await self.cancel_task(self._receive_task)
+            self._receive_task = None
+
+        await self._disconnect_websocket()
+
+    async def _connect_websocket(self):
+        """Establish the websocket connection to Soniox."""
+        try:
+            if self._websocket and self._websocket.state is State.OPEN:
+                return
+
+            logger.debug("Connecting to Soniox STT")
+
+            self._websocket = await self._websocket_connect(
+                self._url,
+                additional_headers={"Authorization": f"Bearer {self._api_key}"},
+            )
+
+            if not self._websocket:
+                await self.push_error(error_msg=f"Unable to connect to Soniox API at {self._url}")
+                raise Exception(f"Unable to connect to Soniox API at {self._url}")
+
+            s = self._settings
+
+            context = s.context
+            if isinstance(context, SonioxContextObject):
+                context = context.model_dump()
+
+            # Send the initial configuration message.
+            config = {
+                "model": s.model,
+                "audio_format": self._audio_format,
+                "num_channels": self._num_channels,
+                # On in both modes. In Pipecat mode a VAD stop finalizes sooner,
+                # and the endpoint still ends the transcript of speech the VAD
+                # missed; it never ends the turn.
+                "enable_endpoint_detection": True,
+                "max_endpoint_delay_ms": s.max_endpoint_delay_ms,
+                "endpoint_sensitivity": s.endpoint_sensitivity,
+                "endpoint_latency_adjustment_level": s.endpoint_latency_adjustment_level,
+                "sample_rate": self.sample_rate,
+                "language_hints": _prepare_language_hints(assert_given(s.language_hints)),
+                "language_hints_strict": s.language_hints_strict,
+                "context": context,
+                "enable_speaker_diarization": s.enable_speaker_diarization,
+                "enable_language_identification": s.enable_language_identification,
+                "client_reference_id": s.client_reference_id,
+            }
+            # Left out unless enabled: older models reject the field.
+            if self._agent_text_input_enabled():
+                config["enable_agent_text_input"] = True
+
+            # Send the configuration message.
+            await self._websocket.send(json.dumps(config))
+            # The new session has no open segment, and words timed against the
+            # old one's audio would be placed where the bot's voice is not,
+            # where they can cancel the caller's own speech.
+            self._agent_text_segment_open = False
+            self._drop_agent_text_words()
+
+            await self._call_event_handler("on_connected")
+            logger.debug("Connected to Soniox STT")
+        except Exception as e:
+            self._websocket = None
+            await self.push_error(error_msg=f"Unable to connect to Soniox: {e}", exception=e)
+
+    async def _disconnect_websocket(self):
+        """Close the websocket connection to Soniox."""
+        try:
+            if self._websocket:
+                logger.debug("Disconnecting from Soniox STT")
+                await self._websocket.close()
+        except Exception as e:
+            await self.push_error(error_msg=f"Error closing websocket: {e}", exception=e)
+        finally:
+            self._websocket = None
+            self._drop_agent_text_words()
+            await self._call_event_handler("on_disconnected")
+
+    def _get_websocket(self):
+        """Get the current WebSocket connection.
+
+        Returns:
+            The WebSocket connection.
+
+        Raises:
+            Exception: If WebSocket is not connected.
+        """
+        if self._websocket:
+            return self._websocket
+        raise Exception("Websocket not connected")
+
+    async def _receive_messages(self):
+        """Receive and process websocket messages.
+
+        Continuously processes messages from the websocket connection.
+        """
+        # Transcription frame will be only sent after we get the "endpoint" event.
+        self._final_transcription_buffer = []
+
+        async def send_endpoint_transcript():
+            if self._final_transcription_buffer:
+                text = "".join(map(lambda token: token["text"], self._final_transcription_buffer))
+                language = _language_from_tokens(self._final_transcription_buffer)
+                # Report usage before the transcription frame so tracing can
+                # attach it to the STT span the frame closes.
+                await self.emit_stt_usage_metrics()
+                # Soniox only pushes TranscriptionFrame when an end token is received,
+                # so every TranscriptionFrame is inherently finalized
+                await self.push_frame(
+                    TranscriptionFrame(
+                        text=text,
+                        user_id=self._user_id,
+                        timestamp=time_now_iso8601(),
+                        language=language,
+                        result=self._final_transcription_buffer,
+                        finalized=True,
+                    )
+                )
+                await self._handle_transcription(text, is_final=True, language=language)
+                self._final_transcription_buffer = []
+
+        async def finalize_turn():
+            await send_endpoint_transcript()
+            await self._user_turn_stopped()
+
+        async for message in self._get_websocket():
+            try:
+                content = json.loads(message)
+
+                tokens = content["tokens"]
+
+                if tokens:
+                    if len(tokens) == 1 and tokens[0]["text"] == FINALIZED_TOKEN:
+                        # Ignore finalized token, prevent auto-finalize cycling.
+                        pass
+                    else:
+                        # Got at least one token, so we can reset the auto finalize delay.
+                        self._last_tokens_received = time.time()
+
+                # We will only send the final tokens after we get the "endpoint" event.
+                non_final_transcription = []
+
+                for token in tokens:
+                    if not is_end_token(token):
+                        # In Soniox turn-detection mode, the first token of a new
+                        # turn opens it (no-op in Pipecat mode or when a VAD
+                        # signal already opened the turn).
+                        await self._user_turn_started()
+                    if token["is_final"]:
+                        if is_end_token(token):
+                            # Found an endpoint, tokens until here will be sent as transcript,
+                            # the rest will be sent as interim tokens (even final tokens).
+                            await finalize_turn()
+                        else:
+                            self._final_transcription_buffer.append(token)
+                    else:
+                        non_final_transcription.append(token)
+
+                if self._final_transcription_buffer or non_final_transcription:
+                    final_text = "".join(
+                        map(lambda token: token["text"], self._final_transcription_buffer)
+                    )
+                    non_final_text = "".join(
+                        map(lambda token: token["text"], non_final_transcription)
+                    )
+
+                    await self.push_frame(
+                        InterimTranscriptionFrame(
+                            # Even final tokens are sent as interim tokens as we want to send
+                            # nicely formatted messages - therefore waiting for the endpoint.
+                            text=final_text + non_final_text,
+                            user_id=self._user_id,
+                            timestamp=time_now_iso8601(),
+                            result=self._final_transcription_buffer + non_final_transcription,
+                        )
+                    )
+
+                error_code = content.get("error_code")
+                error_message = content.get("error_message")
+                if error_code or error_message:
+                    # In case of error, still send the final transcript (if any remaining
+                    # in the buffer) and close any open user turn.
+                    await finalize_turn()
+                    await self.push_error(
+                        error_msg=f"Error: {error_code} (_receive_messages) - {error_message}",
+                        category=classify_error_code(error_code),
+                    )
+
+                finished = content.get("finished")
+                if finished:
+                    # When finished, still send the final transcript (if any remaining
+                    # in the buffer) and close any open user turn.
+                    await finalize_turn()
+                    logger.debug("Transcription finished.")
+                    return
+
+            except json.JSONDecodeError:
+                logger.warning(f"Received non-JSON message: {message}")
+            except Exception as e:
+                logger.warning(f"Error processing message: {e}")
+
+    async def _send_keepalive(self, silence: bytes):
+        """Send a Soniox protocol-level keepalive message.
+
+        Args:
+            silence: Silent PCM audio bytes (unused, Soniox uses a protocol message).
+        """
+        if self._websocket is None:
+            logger.warning(f"{self}: websocket unavailable, skipping keepalive")
+            return
+        await self._websocket.send(KEEPALIVE_MESSAGE)
+
+
+def _supports_agent_text_input(model: str | None | NotGiven) -> bool:
+    """Whether a Soniox model accepts agent text input.
+
+    Versioned models before ``stt-rt-v6`` do not. Any other name is assumed to.
+    """
+    match = _VERSIONED_MODEL.fullmatch(model) if isinstance(model, str) else None
+    return not match or int(match.group(1)) >= _AGENT_TEXT_INPUT_MIN_VERSION

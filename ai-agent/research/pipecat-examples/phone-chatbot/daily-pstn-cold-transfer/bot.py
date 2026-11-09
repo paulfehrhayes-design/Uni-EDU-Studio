@@ -1,0 +1,281 @@
+#
+# Copyright (c) 2024–2025, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+import os
+import sys
+
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import (
+    EndFrame,
+    EndWorkerFrame,
+    FunctionCallResultProperties,
+    LLMMessagesAppendFrame,
+    LLMRunFrame,
+    TTSSpeakFrame,
+)
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.runner.types import RunnerArguments
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transports.base_transport import BaseTransport
+from pipecat.transports.daily.transport import (
+    DailyDialinSettings,
+    DailyParams,
+    DailySIPTransferFrame,
+    DailyTransport,
+)
+from pipecat.workers.runner import WorkerRunner
+
+load_dotenv(override=True)
+
+logger.remove(0)
+logger.add(sys.stderr, level="DEBUG")
+
+
+async def terminate_call(params: FunctionCallParams):
+    """Function the bot can call to terminate the call."""
+    await params.llm.queue_frame(EndWorkerFrame())
+
+
+async def run_bot(transport: BaseTransport, handle_sigint: bool) -> None:
+    """Run the voice bot with the given parameters."""
+    # Operator dialout number
+
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY", ""),
+        settings=CartesiaTTSService.Settings(
+            voice="b7d50908-b17c-442d-ad8d-810c63997ed9",  # Use Helpful Woman voice by default
+        ),
+    )
+
+    system_instruction = """You are Hailey, a friendly customer support representative. Your responses will be converted to speech, so use natural, conversational language without special characters or formatting.
+
+Guidelines:
+1. Start by greeting callers: "Hello, this is Hailey from customer support. What can I help you with today?"
+
+2. When handling requests:
+   - If a caller asks to speak with a supervisor, manager, or human agent, use the `dial_operator` function to transfer them
+   - If a caller wants to end the conversation or says goodbye, use the `terminate_call` function
+
+3. Be helpful and professional while assisting with their questions or concerns.
+
+Note: When you transfer a call to a supervisor, you will leave the call and the customer will speak directly with the supervisor.
+
+Available functions:
+- `dial_operator`: Call this when the user requests to speak with a supervisor or manager (this will transfer the call)
+- `terminate_call`: Call this when the user wants to end the conversation"""
+
+    llm = OpenAILLMService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        settings=OpenAILLMService.Settings(
+            system_instruction=system_instruction,
+        ),
+    )
+
+    # ------------ FUNCTION DEFINITIONS ------------
+
+    async def dial_operator(params: FunctionCallParams):
+        """Call this function when the user asks to speak with a human."""
+        operator_number = os.getenv("OPERATOR_NUMBER", None)
+
+        if operator_number:
+            logger.info(f"Transferring call to operator: {operator_number}")
+
+            # Tell the caller, then transfer. The transport holds the transfer
+            # frame until the announcement before it has played; calling
+            # transport.sip_call_transfer() here would transfer at once.
+            announcement = TTSSpeakFrame(
+                "I'm transferring you to a supervisor now. Please hold while I connect you."
+            )
+            transfer = DailySIPTransferFrame(settings={"toEndPoint": operator_number})
+            # The caller talking over the announcement must not cancel the transfer
+            announcement.interruptible = False
+            transfer.interruptible = False
+
+            await params.llm.push_frame(announcement)
+            await params.llm.push_frame(transfer)
+
+            # The bot has nothing more to say
+            await params.result_callback(
+                {"status": "transferring"},
+                properties=FunctionCallResultProperties(run_llm=False),
+            )
+
+        else:
+            # No operator number configured: let the LLM tell the caller
+            logger.warning("No operator dialout settings available")
+            await params.result_callback(
+                {
+                    "status": "unavailable",
+                    "reason": "Supervisor transfer is not available right now.",
+                }
+            )
+
+    # Initialize LLM context and aggregator
+    context = LLMContext(tools=[terminate_call, dial_operator])
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
+    # ------------ PIPELINE SETUP ------------
+
+    # Build simple pipeline for cold transfer
+    pipeline = Pipeline(
+        [
+            transport.input(),  # Transport user input
+            stt,
+            user_aggregator,  # User responses
+            llm,
+            tts,
+            transport.output(),  # Transport bot output
+            assistant_aggregator,  # Assistant spoken responses
+        ]
+    )
+
+    # Create pipeline task
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+            audio_in_sample_rate=8000,
+            audio_out_sample_rate=8000,
+        ),
+    )
+
+    runner = WorkerRunner(handle_sigint=handle_sigint)
+    await runner.add_workers(worker)
+
+    # ------------ EVENT HANDLERS ------------
+
+    @transport.event_handler("on_first_participant_joined")
+    async def on_first_participant_joined(transport, participant):
+        # Bot answers the phone and greets the user
+        await worker.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_dialin_ready")
+    async def on_dialin_ready(transport, sip_endpoint):
+        logger.info(f"Dial-in ready: {sip_endpoint}")
+
+    @transport.event_handler("on_dialin_connected")
+    async def on_dialin_connected(transport, data):
+        logger.info(f"Dial-in connected: {data}")
+
+    @transport.event_handler("on_dialin_stopped")
+    async def on_dialin_stopped(transport, data):
+        logger.info(f"Dial-in stopped: {data}")
+
+    @transport.event_handler("on_dialin_warning")
+    async def on_dialin_warning(transport, data):
+        logger.warning(f"Dial-in warning: {data}")
+
+    @transport.event_handler("on_dialin_error")
+    async def on_dialin_error(transport, data):
+        logger.error(f"Dial-in error: {data}")
+        await runner.cancel()
+
+    @transport.event_handler("on_dialout_answered")
+    async def on_dialout_answered(transport, data):
+        logger.info(f"Operator answered, transferring call: {data}")
+        # Cold transfer: bot leaves the call, customer and operator continue
+        # await task.cancel()
+        await worker.queue_frames([EndFrame()])
+
+    @transport.event_handler("on_dialout_connected")
+    async def on_dialout_connected(transport, data):
+        logger.info(f"Operator dial-out connected: {data}")
+
+    @transport.event_handler("on_dialout_stopped")
+    async def on_dialout_stopped(transport, data):
+        logger.info(f"Operator dial-out stopped: {data}")
+        # Inform the customer that transfer stopped
+        content = "I'm sorry, but I'm unable to connect you with a supervisor at this time. Is there anything else I can help you with?"
+        message = {"role": "developer", "content": content}
+        await worker.queue_frames([LLMMessagesAppendFrame([message], run_llm=True)])
+
+    @transport.event_handler("on_dialout_warning")
+    async def on_dialout_warning(transport, data):
+        logger.warning(f"Operator dial-out warning: {data}")
+
+    @transport.event_handler("on_dialout_error")
+    async def on_dialout_error(transport, data):
+        logger.error(f"Operator dial-out error: {data}")
+        # Inform the customer that transfer failed
+        content = "I'm sorry, but I'm unable to connect you with a supervisor at this time. Is there anything else I can help you with?"
+        message = {"role": "developer", "content": content}
+        await worker.queue_frames([LLMMessagesAppendFrame([message], run_llm=True)])
+
+    @transport.event_handler("on_dtmf_event")
+    async def on_dtmf_event(transport, data):
+        logger.info(f"DTMF event: {data}")
+
+    @transport.event_handler("on_participant_left")
+    async def on_participant_left(transport, participant, reason):
+        logger.debug(f"Participant left: {participant}, reason: {reason}")
+        # If customer leaves, end the call
+        await runner.cancel()
+
+    # ------------ RUN PIPELINE ------------
+
+    await runner.run()
+
+
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point compatible with Pipecat Cloud."""
+    # Body is always a dict (compatible with both local and Pipecat Cloud)
+    body_data = runner_args.body
+    room_url = body_data.get("room_url")
+    token = body_data.get("token")
+    call_id = body_data.get("callId")
+    call_domain = body_data.get("callDomain")
+    from_phone = body_data.get("From")
+    to_phone = body_data.get("To")
+
+    if not all([call_id, call_domain]):
+        logger.error("Call ID and Call Domain are required in the body.")
+        return None
+
+    daily_dialin_settings = DailyDialinSettings(call_id=call_id, call_domain=call_domain)
+    logger.info(f"Starting dial-in bot, settings: call_id={call_id}, call_domain={call_domain}")
+
+    transport = DailyTransport(
+        room_url,
+        token,
+        "Call Transfer Bot",
+        params=DailyParams(
+            dialin_settings=daily_dialin_settings,
+            api_key=os.getenv("DAILY_API_KEY"),
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+    )
+
+    # Log caller information if available (which number is calling)
+    # You can use this to look up customer information to personalize the conversation
+    if from_phone:
+        logger.info(f"Handling call from: {from_phone}")
+    # Log callee information if available (which number was called)
+    # You can use this to load different prompts based on which number was called
+    if to_phone:
+        logger.info(f"Handling call to: {to_phone}")
+
+    await run_bot(transport, runner_args.handle_sigint)

@@ -1,0 +1,547 @@
+# Copyright 2023 LiveKit, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import os
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
+from typing import Any, cast
+
+import httpx2 as httpx
+
+from livekit.agents import (
+    APIConnectionError,
+    APIConnectOptions,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    tokenize,
+    tts,
+    utils,
+)
+from livekit.agents.types import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    NotGivenOr,
+)
+from livekit.agents.utils import is_given
+from livekit.agents.voice.io import TimedString
+from speechify.client import AsyncSpeechify
+from speechify.core.api_error import ApiError
+from speechify.core.pagination import AsyncPager
+from speechify.core.request_options import RequestOptions
+from speechify.environment import SpeechifyEnvironment
+from speechify.types.get_voice import GetVoice
+from speechify.types.list_voices_response import ListVoicesResponse
+from speechify.types.speech_stream_event import (
+    SpeechStreamEvent_SpeechChunk,
+    SpeechStreamEvent_SpeechError,
+)
+
+from .log import logger
+from .models import Gender, TTSModels, VoiceType
+from .version import __version__
+
+DEFAULT_VOICE_ID = "dominic_32"
+DEFAULT_MODEL: TTSModels = "simba-3.2"
+SAMPLE_RATE = 24000
+NUM_CHANNELS = 1
+AUDIO_FORMAT = "pcm"
+MIME_TYPE = "audio/pcm"
+CALLER_HEADER = "Speechify-Caller"
+CALLER_VERSION_HEADER = "Speechify-Caller-Version"
+# Unauthenticated, so warming the connection never presents the API key.
+PREWARM_PATH = "/health"
+
+
+@dataclass
+class _TTSOptions:
+    voice_id: str
+    model: NotGivenOr[TTSModels | str]
+    language: NotGivenOr[str]
+    loudness_normalization: NotGivenOr[bool]
+    text_normalization: NotGivenOr[bool]
+
+
+@dataclass
+class Voice:
+    id: str
+    type: VoiceType
+    display_name: str
+    gender: Gender
+    avatar_image: str | None
+    models: list[TTSModels | str]
+    locale: str
+
+
+def _voice_from_sdk(v: GetVoice) -> Voice:
+    # The SDK exposes "not_specified"; the plugin's Gender literal is "neutral".
+    gender = "neutral" if v.gender == "not_specified" else v.gender
+    return Voice(
+        id=v.id,
+        type=cast(VoiceType, v.type),
+        display_name=v.display_name,
+        gender=cast(Gender, gender),
+        avatar_image=v.avatar_image,
+        models=[m.name for m in v.models],
+        locale=v.locale,
+    )
+
+
+class TTS(tts.TTS):
+    def __init__(
+        self,
+        *,
+        voice_id: str = DEFAULT_VOICE_ID,
+        model: TTSModels | str = DEFAULT_MODEL,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        loudness_normalization: NotGivenOr[bool] = NOT_GIVEN,
+        text_normalization: NotGivenOr[bool] = NOT_GIVEN,
+        api_key: NotGivenOr[str] = NOT_GIVEN,
+        base_url: NotGivenOr[str] = NOT_GIVEN,
+        tokenizer: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
+        client: AsyncSpeechify | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Create a new instance of Speechify TTS.
+
+        Both ``synthesize()`` and ``stream()`` use the
+        ``/v1/audio/stream/with-timestamps`` endpoint, which streams raw PCM
+        (24 kHz mono) together with word-level speech marks, so audio and aligned
+        timestamps are emitted as they arrive. ``stream()`` splits its input into
+        sentences and issues one streaming request per sentence. Every model
+        streams except the legacy ``simba-english`` and ``simba-multilingual``,
+        which do not serve the streaming route and use one non-streamed
+        ``/v1/audio/speech`` request per input (``synthesize()``) or per sentence
+        (``stream()``).
+
+        Requests share one keep-alive connection, which ``prewarm()`` opens
+        before the first request.
+
+        Args:
+            voice_id: Id of the voice to synthesize with. The voice must support
+                the chosen ``model`` (see the ``/v1/voices`` endpoint). Defaults
+                to ``dominic_32``. Voices whose id carries a ``_32`` suffix are
+                part of the curated simba-3.2 roster; a warning is logged when
+                they are paired with a model older than simba-3.2.
+            model: Synthesis model, e.g. ``simba-3.5``, ``simba-3.2`` or
+                ``simba-3.0``; any model the API serves works without a plugin
+                update. Defaults to ``simba-3.2``.
+            language: BCP-47 language code of the input (e.g. ``en-US``).
+            loudness_normalization: Normalize output loudness to a standard
+                level. Increases latency slightly when enabled.
+            text_normalization: Expand numbers, dates, etc. into words before
+                synthesis. Increases latency slightly when enabled.
+            api_key: Speechify API key. Falls back to the ``SPEECHIFY_API_KEY``
+                environment variable.
+            base_url: Override the Speechify API base URL.
+            tokenizer: Sentence tokenizer used to chunk input in ``stream()``.
+            client: A preconfigured ``AsyncSpeechify`` client. When provided,
+                ``api_key`` and ``base_url`` are ignored.
+            **kwargs: Catches deprecated parameters. A warning is logged for
+                any recognised deprecated name.
+        """
+        super().__init__(
+            capabilities=tts.TTSCapabilities(streaming=True, aligned_transcript=True),
+            sample_rate=SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+        )
+
+        self._owns_client = client is None
+        self._prewarm_task: asyncio.Task[None] | None = None
+        self._base_url = base_url if is_given(base_url) else SpeechifyEnvironment.DEFAULT.value
+        if client is not None:
+            self._client = client
+        else:
+            resolved_key = api_key if is_given(api_key) else os.environ.get("SPEECHIFY_API_KEY")
+            if not resolved_key:
+                raise ValueError(
+                    "Speechify API key is required, either as the api_key argument "
+                    "or via the SPEECHIFY_API_KEY environment variable"
+                )
+            # Fixed httpx2.AsyncClient default header so every request the SDK
+            # issues is attributed to this integration, regardless of call site.
+            # Timeout/limits mirror the openai plugin's owned-client defaults —
+            # the client's own 5s default is too short for longer synthesis requests.
+            # speechify-api types this argument as httpx.AsyncClient and only
+            # retries httpx.ConnectError. request/stream still work against
+            # httpx2; _raise_from maps the httpx2 errors onto APIError so the
+            # TTS retry loop runs.
+            self._httpx_client = httpx.AsyncClient(
+                headers={CALLER_HEADER: "livekit", CALLER_VERSION_HEADER: __version__},
+                timeout=httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=5.0),
+                limits=httpx.Limits(
+                    max_connections=50, max_keepalive_connections=50, keepalive_expiry=120
+                ),
+            )
+            self._client = AsyncSpeechify(
+                token=resolved_key,
+                base_url=self._base_url,
+                httpx_client=self._httpx_client,  # type: ignore[arg-type]
+            )
+
+        self._tokenizer = tokenizer if is_given(tokenizer) else tokenize.basic.SentenceTokenizer()
+        self._opts = _TTSOptions(
+            voice_id=voice_id,
+            model=model,
+            language=language,
+            loudness_normalization=loudness_normalization,
+            text_normalization=text_normalization,
+        )
+
+        _check_deprecated_args(kwargs)
+        _warn_voice_model_compat(self._opts.voice_id, self._opts.model)
+
+    @property
+    def model(self) -> str:
+        return self._opts.model if is_given(self._opts.model) else "unknown"
+
+    @property
+    def provider(self) -> str:
+        return "Speechify"
+
+    def prewarm(self) -> None:
+        """Open the HTTPS connection to the Speechify API ahead of the first request.
+
+        Sends an unauthenticated ``GET /health`` through the connection pool the
+        synthesis requests use, so the first reply of a session does not pay for
+        DNS, TCP and TLS setup. Does nothing when a preconfigured ``client`` was
+        passed in, because the plugin does not own that client's connections.
+        """
+        if not self._owns_client:
+            return
+
+        async def _prewarm() -> None:
+            try:
+                await self._httpx_client.get(self._base_url.rstrip("/") + PREWARM_PATH)
+            except Exception:
+                pass
+
+        # A prewarm still in flight keeps its task, so aclose() can cancel it.
+        if self._prewarm_task is None or self._prewarm_task.done():
+            self._prewarm_task = asyncio.create_task(_prewarm())
+
+    async def aclose(self) -> None:
+        if self._prewarm_task is not None:
+            await utils.aio.cancel_and_wait(self._prewarm_task)
+        if self._owns_client:
+            await self._httpx_client.aclose()
+
+    async def list_voices(self) -> list[Voice]:
+        """List the voices available for the configured Speechify account."""
+        # Iterate the pager, not .items: it follows next_cursor across pages.
+        pager: AsyncPager[GetVoice, ListVoicesResponse] = await self._client.voices.list()
+        return [_voice_from_sdk(v) async for v in pager]
+
+    def update_options(
+        self,
+        *,
+        voice_id: NotGivenOr[str] = NOT_GIVEN,
+        model: NotGivenOr[TTSModels | str] = NOT_GIVEN,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        loudness_normalization: NotGivenOr[bool] = NOT_GIVEN,
+        text_normalization: NotGivenOr[bool] = NOT_GIVEN,
+    ) -> None:
+        if is_given(voice_id):
+            self._opts.voice_id = voice_id
+        if is_given(model):
+            self._opts.model = model
+        if is_given(language):
+            self._opts.language = language
+        if is_given(loudness_normalization):
+            self._opts.loudness_normalization = loudness_normalization
+        if is_given(text_normalization):
+            self._opts.text_normalization = text_normalization
+        _warn_voice_model_compat(self._opts.voice_id, self._opts.model)
+
+    def synthesize(
+        self,
+        text: str,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> ChunkedStream:
+        return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+
+    def stream(
+        self,
+        *,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> SynthesizeStream:
+        return SynthesizeStream(tts=self, conn_options=conn_options)
+
+
+def _request_kwargs(text: str, opts: _TTSOptions) -> dict[str, object]:
+    options: dict[str, bool] = {}
+    if is_given(opts.loudness_normalization):
+        options["loudness_normalization"] = opts.loudness_normalization
+    if is_given(opts.text_normalization):
+        options["text_normalization"] = opts.text_normalization
+
+    kwargs: dict[str, object] = {
+        "audio_format": AUDIO_FORMAT,
+        "input": text,
+        "voice_id": opts.voice_id,
+    }
+    if is_given(opts.model):
+        kwargs["model"] = opts.model
+    if is_given(opts.language):
+        kwargs["language"] = opts.language
+    if options:
+        kwargs["options"] = options
+    return kwargs
+
+
+def _stream_request_kwargs(text: str, opts: _TTSOptions) -> dict[str, object]:
+    options: dict[str, bool] = {}
+    if is_given(opts.loudness_normalization):
+        options["loudness_normalization"] = opts.loudness_normalization
+    if is_given(opts.text_normalization):
+        options["text_normalization"] = opts.text_normalization
+
+    kwargs: dict[str, object] = {
+        "input": text,
+        "voice_id": opts.voice_id,
+        "output_format": f"pcm_{SAMPLE_RATE}",
+    }
+    if is_given(opts.model):
+        kwargs["model"] = opts.model
+    if is_given(opts.language):
+        kwargs["language"] = opts.language
+    if options:
+        kwargs["options"] = options
+    return kwargs
+
+
+_LEGACY_MODELS = ("simba-english", "simba-multilingual")
+_PRE_32_MODELS = (*_LEGACY_MODELS, "simba-3.0")
+
+
+def _supports_streaming_marks(model: NotGivenOr[TTSModels | str]) -> bool:
+    # Only the legacy models lack the streaming route, so a model released after
+    # this plugin streams by default; with no model the server uses simba-3.0.
+    return not is_given(model) or model not in _LEGACY_MODELS
+
+
+def _warn_voice_model_compat(voice_id: str, model: NotGivenOr[TTSModels | str]) -> None:
+    # simba-3.2 introduced a curated stock roster whose ids carry a "_32" suffix
+    # (e.g. "dominic_32"). simba-3.2 and later models serve it; pairing it with
+    # an older model is likely to be rejected or sub-optimal.
+    if is_given(model) and model not in _PRE_32_MODELS:
+        return
+    if not voice_id.endswith("_32"):
+        return
+    effective = model if is_given(model) else "simba-3.0 (server default)"
+    logger.warning(
+        f"voice {voice_id!r} is part of the curated simba-3.2 roster but the "
+        f"configured model is {effective!r}; this pairing may be unsupported. "
+        "Use simba-3.2 or a later model with a '*_32' voice."
+    )
+
+
+def _marks_to_timed(chunks: Iterable[object], offset: float) -> list[TimedString]:
+    out: list[TimedString] = []
+    for chunk in chunks:
+        value = getattr(chunk, "value", None)
+        start = getattr(chunk, "start_time", None)
+        if value is None or start is None:
+            continue
+        end = getattr(chunk, "end_time", None)
+        out.append(
+            TimedString(
+                text=value,
+                start_time=start / 1000 + offset,
+                end_time=(end / 1000 + offset) if end is not None else NOT_GIVEN,
+            )
+        )
+    return out
+
+
+def _timed_transcript(speech_marks: object, offset: float) -> list[TimedString]:
+    chunks = getattr(speech_marks, "chunks", None)
+    if not chunks:
+        return []
+    return _marks_to_timed(chunks, offset)
+
+
+async def _synthesize_text(
+    client: AsyncSpeechify,
+    text: str,
+    opts: _TTSOptions,
+    conn_options: APIConnectOptions,
+    output_emitter: tts.AudioEmitter,
+    *,
+    offset: float,
+) -> int:
+    """Synthesize ``text`` into ``output_emitter`` and return the PCM bytes pushed.
+
+    ``offset`` (seconds) shifts the word timestamps onto the emitter's timeline.
+    """
+    request_options: RequestOptions = {"timeout_in_seconds": int(conn_options.timeout)}
+
+    if not _supports_streaming_marks(opts.model):
+        response = await client.audio.speech(
+            **_request_kwargs(text, opts), request_options=request_options
+        )
+        audio = base64.b64decode(response.audio_data)
+        timed = _timed_transcript(response.speech_marks, offset)
+        if timed:
+            output_emitter.push_timed_transcript(timed)
+        output_emitter.push(audio)
+        return len(audio)
+
+    pushed = 0
+    stream = client.audio.stream_with_timestamps(
+        **_stream_request_kwargs(text, opts), request_options=request_options
+    )
+    # Drain past speech.done: an unread body can't return its connection to the pool.
+    async for event in stream:
+        if isinstance(event, SpeechStreamEvent_SpeechChunk):
+            if event.audio:
+                audio = base64.b64decode(event.audio)
+                output_emitter.push(audio)
+                pushed += len(audio)
+            if event.speech_marks:
+                timed = _marks_to_timed(event.speech_marks, offset)
+                if timed:
+                    output_emitter.push_timed_transcript(timed)
+        elif isinstance(event, SpeechStreamEvent_SpeechError):
+            raise APIStatusError(
+                message=event.error.message,
+                status_code=-1,
+                request_id=event.request_id,
+                body=None,
+            )
+    return pushed
+
+
+def _raise_from(e: Exception) -> None:
+    if isinstance(e, APIError):
+        raise e
+    if isinstance(e, ApiError):
+        raise APIStatusError(
+            message=str(e.body) if e.body is not None else "Speechify API error",
+            status_code=e.status_code or -1,
+            request_id=None,
+            body=None,
+        ) from None
+    if isinstance(e, asyncio.TimeoutError):
+        raise APITimeoutError() from None
+    # The SDK only recognizes httpx v1 errors from its own client. The client
+    # we own is httpx2, so connect and timeout failures arrive here unwrapped.
+    if isinstance(e, httpx.TimeoutException):
+        raise APITimeoutError() from e
+    if isinstance(e, (ConnectionError, httpx.TransportError)):
+        raise APIConnectionError() from e
+    raise e
+
+
+def _check_deprecated_args(kwargs: dict[str, Any]) -> None:
+    """Warn about kwargs from earlier plugin versions that no longer apply."""
+    removed = {
+        "encoding": "output is fixed to 24 kHz PCM",
+        "http_session": "the official Speechify SDK owns the HTTP client",
+        "follow_redirects": "the official Speechify SDK handles redirects",
+    }
+    for name, reason in removed.items():
+        if name in kwargs:
+            logger.warning(f"`{name}` is deprecated and no longer used ({reason})")
+
+
+class ChunkedStream(tts.ChunkedStream):
+    def __init__(self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions) -> None:
+        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
+        self._tts: TTS = tts
+        self._opts = replace(tts._opts)
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        output_emitter.initialize(
+            request_id=utils.shortuuid(),
+            sample_rate=SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+            mime_type=MIME_TYPE,
+        )
+        try:
+            await _synthesize_text(
+                self._tts._client,
+                self._input_text,
+                self._opts,
+                self._conn_options,
+                output_emitter,
+                offset=0.0,
+            )
+            output_emitter.flush()
+        except Exception as e:
+            _raise_from(e)
+
+
+class SynthesizeStream(tts.SynthesizeStream):
+    def __init__(self, *, tts: TTS, conn_options: APIConnectOptions) -> None:
+        super().__init__(tts=tts, conn_options=conn_options)
+        self._tts: TTS = tts
+        self._opts = replace(tts._opts)
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        request_id = utils.shortuuid()
+        output_emitter.initialize(
+            request_id=request_id,
+            sample_rate=SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+            mime_type=MIME_TYPE,
+            stream=True,
+        )
+        output_emitter.start_segment(segment_id=request_id)
+
+        sent_stream = self._tts._tokenizer.stream()
+
+        async def _forward_input() -> None:
+            async for data in self._input_ch:
+                if isinstance(data, self._FlushSentinel):
+                    sent_stream.flush()
+                    continue
+                sent_stream.push_text(data)
+            sent_stream.end_input()
+
+        async def _synthesize() -> None:
+            offset = 0.0
+            async for ev in sent_stream:
+                if not (text := ev.token.strip()):
+                    continue
+                self._mark_started()
+                sentence_bytes = await _synthesize_text(
+                    self._tts._client,
+                    text,
+                    self._opts,
+                    self._conn_options,
+                    output_emitter,
+                    offset=offset,
+                )
+                output_emitter.flush()
+                offset += sentence_bytes / (2 * SAMPLE_RATE * NUM_CHANNELS)
+
+            output_emitter.end_segment()
+
+        tasks = [
+            asyncio.create_task(_forward_input()),
+            asyncio.create_task(_synthesize()),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            _raise_from(e)
+        finally:
+            await sent_stream.aclose()
+            await utils.aio.cancel_and_wait(*tasks)

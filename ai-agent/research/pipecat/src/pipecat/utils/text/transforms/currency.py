@@ -1,0 +1,83 @@
+#
+# Copyright (c) 2024-2026, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+"""Expand currency amounts into spoken form for TTS."""
+
+import re
+
+from num2words import num2words
+
+from pipecat.frames.frames import TextType
+
+# Maps currency symbol to (singular, plural, cents_singular, cents_plural)
+_CURRENCY_MAP: dict[str, tuple[str, str, str | None, str | None]] = {
+    "$": ("dollar", "dollars", "cent", "cents"),
+    "€": ("euro", "euros", "cent", "cents"),
+    "£": ("pound", "pounds", "penny", "pence"),
+    "¥": ("yen", "yen", None, None),
+    "₹": ("rupee", "rupees", "paisa", "paise"),
+}
+
+# An amount may be followed by a scale word ("$2.5 billion"), which multiplies the
+# whole amount, so the fraction is part of the number rather than a subunit.
+_CURRENCY_RE = re.compile(
+    r"([€£¥₹\$])\s*(\d{1,3}(?:,\d{3})*|\d+)\b(?:\.(\d+))?"
+    r"(?:\s+(thousand|million|billion|trillion)\b)?",
+    re.IGNORECASE,
+)
+
+
+def _amount_to_words(n: float, singular: str, plural: str) -> str:
+    words = num2words(n, lang="en")
+    unit = singular if n == 1 else plural
+    return f"{words} {unit}"
+
+
+def _currency_match(match: re.Match) -> str:
+    symbol = match.group(1)
+    whole_str = match.group(2).replace(",", "")
+    frac_str = match.group(3)
+
+    currency = _CURRENCY_MAP.get(symbol, ("unit", "units", "cent", "cents"))
+    singular, plural, c_singular, c_plural = currency
+
+    whole = int(whole_str)
+
+    scale = match.group(4)
+    if scale:
+        # "$2.5 billion" reads "two point five billion dollars": the fraction
+        # belongs to the scaled number, and the unit is always plural.
+        number = num2words(whole, lang="en")
+        if frac_str:
+            number += " point " + " ".join(num2words(int(d), lang="en") for d in frac_str)
+        return f"{number} {scale.lower()} {plural}"
+
+    result = _amount_to_words(whole, singular, plural)
+
+    if frac_str and c_singular and c_plural:
+        frac = int(frac_str[:2].ljust(2, "0"))
+        if frac > 0:
+            result += " and " + _amount_to_words(frac, c_singular, c_plural)
+
+    return result
+
+
+async def expand_currency(text: str, text_type: str | TextType) -> str:
+    """Expand currency amounts to their spoken form.
+
+    Args:
+        text: Input text possibly containing currency expressions.
+        text_type: Text type of the text frame (unused).
+
+    Returns:
+        Text with currency amounts replaced by spoken equivalents.
+
+    Example::
+
+        result = await expand_currency("Your balance is $42.50", "*")
+        # "Your balance is forty-two dollars and fifty cents"
+    """
+    return _CURRENCY_RE.sub(_currency_match, text)

@@ -1,0 +1,215 @@
+# Pipecat PhoneLLM Example
+
+[Pipecat PhoneLLM](https://huggingface.co/pipecat-ai/phonellm-alpha-1) is an open-weights 30B language model from the Pipecat team, fine-tuned for voice agents that handle phone calls. It's accurate at tool calling, fast, and low cost — making it ideal for phone use cases such as customer service agents.
+
+> [!TIP]
+> **Quickstart:** using [Claude Code](https://claude.com/claude-code)? Run `/setup` in this repo — a committed skill (`.claude/skills/setup/`) that steps through everything below, health-checking along the way and asking for input only where needed. The rest of this README is the manual path.
+
+This repo is a [Pipecat](https://github.com/pipecat-ai/pipecat) voice agent that runs Pipecat PhoneLLM on [Modal](https://modal.com), with Deepgram Flux for both speech-to-text and text-to-speech.
+
+```
+Deepgram Flux (STT) → Pipecat PhoneLLM Alpha 1 on Modal (LLM) → Deepgram Flux (TTS)
+```
+
+## Install the CLIs
+
+```bash
+uv tool install "pipecat-ai[cli]"
+uv tool install modal
+```
+
+## Provision PhoneLLM on Modal
+
+### 1. Log in
+
+```bash
+modal setup
+```
+
+This opens your browser to authenticate and writes your API credentials to a local Modal profile.
+
+### 2. Create a proxy token
+
+The bot authenticates with a workspace proxy token rather than your local credentials. Create it before the endpoint — an authenticated endpoint requires a proxy token to already exist in the workspace, and `modal endpoint create` fails without one:
+
+```bash
+modal workspace proxy-tokens create
+```
+
+This prints a token ID (`wk-...`) and secret (`ws-...`). Save the secret now — it can't be retrieved later. Combined as `<token-id>.<token-secret>`, they form the API key the bot sends as a Bearer token.
+
+On workspaces with RBAC enabled, new tokens start with no environment access, and the endpoint rejects them with `401 "Webhook token not found"`. Allow the token into the environment the endpoint will live in (`main` unless you create it elsewhere):
+
+```bash
+modal workspace proxy-tokens allow <token-id> main
+```
+
+### 3. Create the endpoint
+
+```bash
+modal endpoint create --model pipecat-ai/phonellm-alpha-1
+```
+
+Modal provisions an [Auto Endpoint](https://modal.com/docs/guide/endpoints) — a production-ready, OpenAI-compatible inference server for PhoneLLM. **Note the endpoint URL it prints; you'll need it below.** This process can take ~20 minutes.
+
+> **Note:** The CLI can't retrieve the endpoint URL after the fact — `modal endpoint list` shows status but not the URL. If you lose it, find it on the endpoint's page in the [Modal dashboard](https://modal.com/) (`modal dashboard` opens it).
+
+> **Note:** `modal endpoint create --unauthenticated` skips the token requirement, but leaves the endpoint open to anyone on the internet. The rest of this guide assumes the authenticated endpoint above.
+
+### 4. Check that it's running
+
+List your endpoints and their status (`provisioning` → `live`):
+
+```bash
+modal endpoint list
+```
+
+Once it's running, you can send a quick authenticated request using your local Modal credentials (no token required):
+
+```bash
+modal curl <endpoint-url>/v1/models
+```
+
+A JSON response listing `pipecat-ai/phonellm-alpha-1` means the endpoint is healthy.
+
+> **Note:** Endpoints scale to zero when idle. The first request after creation (or after a quiet period) returns 503 while the model spins up — this can take several minutes for a 30B model, and the container logs (`modal app logs`) may go quiet during kernel compilation. Keep retrying.
+
+### 5. Verify end to end (optional)
+
+Test the exact request path the bot will use — proxy-token auth against the chat completions API:
+
+```bash
+curl "<endpoint-url>/v1/chat/completions" \
+  -H "Authorization: Bearer <token-id>.<token-secret>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "pipecat-ai/phonellm-alpha-1", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+## Configure the bot
+
+```bash
+cd server
+cp .env.example .env
+```
+
+In `.env`, set:
+
+- `MODAL_ENDPOINT_URL` — the endpoint URL from `modal endpoint create` (or the Modal dashboard)
+- `MODAL_API_KEY` — the proxy token, combined as `<token-id>.<token-secret>` (`wk-....ws-...`)
+- `DEEPGRAM_API_KEY` — your [Deepgram](https://console.deepgram.com) API key
+
+## Run the bot
+
+Install dependencies and start the bot:
+
+```bash
+uv sync
+uv run bot.py
+```
+
+Open http://localhost:7860 in your browser and talk to it.
+
+## Test it headless
+
+The example ships behavioral evals: scripted conversations run against the live bot, no microphone needed. The `pipecat` CLI arrives with the `evals` extra already in `pyproject.toml`, so `uv sync` is the only setup.
+
+The `naturalness` scenario is scored by a judge LLM, configured for [Ollama](https://ollama.com) running `gemma4:12b` locally — no API key, no cost:
+
+```bash
+ollama pull gemma4:12b
+```
+
+Run the whole suite. It starts a fresh bot per scenario, so nothing needs to be running first:
+
+```bash
+uv run pipecat eval suite evals/manifest.yaml
+```
+
+Or run a single scenario against a bot you keep up, which is quicker while iterating. Two terminals, both from `server/`:
+
+```bash
+uv run bot.py -t eval                                 # 1: the bot, headless
+uv run pipecat eval run evals/naturalness.yaml -v     # 2: the scenario
+```
+
+See the [evals docs](https://docs.pipecat.ai/pipecat/evals/overview) for the scenario format, judges, and suites.
+
+## Run the web client
+
+`client/` is a Vite + React voice console built from [Pipecat Voice UI Kit](https://voiceuikit.pipecat.ai) components — an alternative to the prebuilt UI on port 7860.
+
+Start the bot with the WebRTC transport (from `server/`):
+
+```bash
+uv run bot.py -t webrtc
+```
+
+Then, from `client/` in a second terminal:
+
+```bash
+npm install
+npm run dev
+```
+
+Open http://localhost:5173 and hit Connect. The dev server proxies `/api` to the bot on port 7860.
+
+### Build it
+
+```bash
+npm run build    # typecheck + production build to dist/
+```
+
+A production build switches to the Daily transport and connects to a Pipecat Cloud agent, since the local SmallWebRTC bot isn't there to talk to. Starting a session needs your Pipecat Cloud API key, so the client posts to `client/api/connect.ts` — a serverless function that holds the key and returns only the Daily room to join. On Vercel that function deploys with the app; set `BOT_START_URL` (the agent's full start endpoint) and `BOT_START_PUBLIC_KEY` in the project.
+
+See [client/README.md](client/README.md) for the transport table and the other build options.
+
+## Deploying to Pipecat Cloud
+
+The quickest path is a [cloud build](https://docs.pipecat.ai/pipecat-cloud/guides/cloud-builds): `pipecat cloud deploy` uploads your source and builds the image on Pipecat Cloud from the committed `server/Dockerfile` — no local Docker, no container registry. The deploy config is already in `server/pcc-deploy.toml`. You'll need a [Pipecat Cloud account](https://pipecat.daily.co) and the cloud plugin:
+
+```bash
+uv tool install "pipecat-ai[cli]" --with pipecatcloud
+```
+
+### 1. Log in (one time)
+
+```bash
+pipecat cloud auth login
+```
+
+### 2. Upload your secrets
+
+A deployed bot doesn't have your local `.env`, so push it as a secret set (the name matches `secret_set` in `pcc-deploy.toml`). From `server/`:
+
+```bash
+pipecat cloud secrets set phonellm-example-secrets --file .env --skip
+```
+
+Re-run this whenever a key changes.
+
+### 3. Deploy
+
+From `server/`:
+
+```bash
+pipecat cloud deploy
+```
+
+The CLI tars up the project (excluding `.env`, `.venv`, etc.), builds the image in the cloud, and deploys it. Builds are content-hashed, so redeploying unchanged code reuses the cached build and is nearly instant.
+
+### 4. Check on it
+
+```bash
+pipecat cloud agent status phonellm-example
+pipecat cloud agent logs phonellm-example
+```
+
+> **Note:** The `[krisp_viva]` block in `pcc-deploy.toml` enables Krisp noise cancellation on Cloud; the bot skips it automatically when running locally.
+
+## Cleaning up
+
+To permanently stop the endpoint and its containers (the `ep-...` ID comes from `modal endpoint list`):
+
+```bash
+modal endpoint stop <endpoint-id>
+```

@@ -1,0 +1,622 @@
+unit uLLM.Anthropic;
+
+interface
+
+uses
+  System.Classes,
+  REST.Response.Adapter,
+  System.JSON,
+  System.SysUtils,
+  System.Rtti,
+  System.TypInfo,
+  System.Generics.Collections,
+  REST.Client,
+  REST.Types,
+  uLLM,
+  uLLM.Functions
+  ;
+
+type
+  EAnthropicError = class(ELLMException);
+
+  TClaudeJSONFunctionMessage = class(TChatMessage)
+  private
+    FJson: TJSONObject;
+  public
+    constructor Create(json:TJSONObject);
+    destructor Destroy; override;
+    function AsJSON: TJSONObject; override;
+  end;
+
+{$M+}
+  TClaudeFunctionMessage = class(TChatMessage)
+  private
+    FId : string;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function AsJSON: TJSONObject; override;
+  published
+    property Id : string read FId write FId;
+  end;
+{$M-}
+
+  TClaudeVisionMessage = class(TChatVisionMessage)
+    function AsJSON: TJSONObject; override;
+  end;
+
+  TClaudeFunctionRegistry = class(TFunctionRegistry)
+  private
+    FLLM: TBaseLLM;
+  public
+    constructor Create(ALLM: TBaseLLM);
+    destructor Destroy; override;
+    procedure InvokeFunctionFromJSON(const Method: System.TMethod; const JSONObject: TJSONObject; out ReturnValue: string); override;
+    procedure InvokeFunction(const JSONObject: TJSONObject; out ReturnValue: string); override;
+    function GetAvailableFunctionsJSON(UseStrict: Boolean = True): TJSONArray; override;
+  end;
+
+  TAnthropic = class(TBaseLLM)
+  protected
+    function GetModelInfo: TObjectList<TBaseModelInfo>; override;
+  private
+    FOnLog: TOnLog;
+    procedure CreateRESTClientAndRequest(out AClient: TRESTClient; out ARequest: TRESTRequest; out AResponse: TRESTResponse);
+    procedure BuildJSONRequestBody(ARequest: TRESTRequest; ChatConfig: TChatSettings; AMessages: TObjectList<TChatMessage>);
+    procedure ProcessResponse(LJSONResponse: TJSONObject; var AResponse: TChatResponse; out FunctionReturnValue: string; AMessages : TObjectList<TChatMessage>);
+    procedure HandleErrorResponse(AResponse: TRESTResponse);
+  public
+    constructor Create(const APIKey: string);
+    destructor Destroy; override;
+    function ChatCompletion(ChatConfig: TChatSettings; AMessages: TObjectList<TChatMessage>): TChatResponse; override;
+    function Completion(const AQuestion: string; const AModel: string): string; override;
+
+    class function CreateChatVisionMessage: TChatVisionMessage; override;
+
+    property OnLog: TOnLog read FOnLog write FOnLog;
+  end;
+
+implementation
+
+{ TAnthropic }
+
+function TAnthropic.ChatCompletion(ChatConfig: TChatSettings; AMessages: TObjectList<TChatMessage>): TChatResponse;
+var
+  LRESTClient: TRESTClient;
+  LRESTRequest: TRESTRequest;
+  LRESTResponse: TRESTResponse;
+  LJSONResponse: TJSONObject;
+  FunctionReturnValue: string;
+begin
+  Result := Default(TChatResponse);
+  Result.Content := '';
+  Result.Completion_Tokens := 0;
+  Result.Prompt_Tokens := 0;
+  Result.Total_Tokens := 0;
+
+  CreateRESTClientAndRequest(LRESTClient, LRESTRequest, LRESTResponse);
+
+  try
+    BuildJSONRequestBody(LRESTRequest, ChatConfig, AMessages);
+    LRESTRequest.Execute;
+
+    if LRESTResponse.StatusCode = 200 then
+    begin
+      LJSONResponse := LRESTResponse.JSONValue as TJSONObject;
+      ProcessResponse(LJSONResponse, Result, FunctionReturnValue, AMessages);
+      if Result.Finish_Reason = 'tool_use' then
+        Result := ChatCompletion(ChatConfig, AMessages);
+    end
+    else
+    begin
+      HandleErrorResponse(LRESTResponse);
+    end;
+  finally
+    FreeAndNil(LRESTClient);
+    FreeAndNil(LRESTRequest);
+    FreeAndNil(LRESTResponse);
+  end;
+end;
+
+procedure TAnthropic.CreateRESTClientAndRequest(out AClient: TRESTClient; out ARequest: TRESTRequest; out AResponse: TRESTResponse);
+begin
+  AClient := TRESTClient.Create(nil);
+  ARequest := TRESTRequest.Create(nil);
+  AResponse := TRESTResponse.Create(nil);
+
+  AClient.BaseURL := 'https://api.anthropic.com/';
+  AClient.Accept := 'application/json';
+  AClient.AcceptCharset := 'UTF-8';
+
+  ARequest.Client := AClient;
+  ARequest.Response := AResponse;
+  ARequest.Method := TRESTRequestMethod.rmPOST;
+  ARequest.Timeout := 80000; // Set the timeout as needed
+  ARequest.Resource := '/v1/messages';
+
+  ARequest.Params.AddItem('anthropic-version', '2023-06-01', TRESTRequestParameterKind.pkHTTPHEADER, [poDoNotEncode]);
+  ARequest.Params.AddItem('content-type', 'application/json', TRESTRequestParameterKind.pkHTTPHEADER, [poDoNotEncode]);
+  ARequest.Params.AddItem('x-api-key', FAPIKey, TRESTRequestParameterKind.pkHTTPHEADER, [poDoNotEncode]);
+  NotifyRESTClientCreated(AClient, ARequest);
+end;
+
+procedure TAnthropic.BuildJSONRequestBody(ARequest: TRESTRequest; ChatConfig: TChatSettings; AMessages: TObjectList<TChatMessage>);
+var
+  LJSONBody: TJSONObject;
+  LJSONMessages: TJSONArray;
+  LJSONMessage: TJSONObject;
+  LMessage: TChatMessage;
+  LJSONFunctions: TJSONArray;
+  LMsgNo: Integer;
+begin
+  LJSONBody := nil;
+  LJSONMessages := nil;
+  LJSONMessage := nil;
+  LMessage := nil;
+  LJSONFunctions := nil;
+
+  try
+    LJSONBody := TJSONObject.Create;
+    LJSONMessages := TJSONArray.Create;
+    LMsgNo := 0;
+    for LMessage in AMessages do
+    begin
+      if (LMsgNo = 0) and (LMessage.Role.ToLower = 'system') then
+      begin
+        LJSONBody.AddPair('system', LMessage.Content);
+      end
+      else
+        LJSONMessages.AddElement(LMessage.AsJSON);
+      Inc(LMsgNo);
+    end;
+
+    LJSONBody.AddPair('model', ChatConfig.model);
+    LJSONBody.AddPair('messages', LJSONMessages);
+    if ChatConfig.max_tokens > 0 then
+      LJSONBody.AddPair('max_tokens', ChatConfig.max_tokens)
+    else
+      LJSONBody.AddPair('max_tokens', 20000);
+    if ChatConfig.user.Length > 0 then
+      LJSONBody.AddPair('user', ChatConfig.user);
+
+    if ChatConfig.seed > 0 then
+      LJSONBody.AddPair('seed', ChatConfig.seed);
+    if ChatConfig.json_mode then
+    begin
+      LJSONMessage := TJSONObject.Create;
+      LJSONMessage.AddPair('type', 'json_object');
+      LJSONBody.AddPair('response_format', LJSONMessage);
+    end;
+
+    // Include available functions in the request
+    if Functions.Count > 0 then
+    begin
+      LJSONFunctions := Functions.GetAvailableFunctionsJSON(False);
+      LJSONBody.AddPair('tools', LJSONFunctions as TJSONArray);
+    end;
+    Log(LJSONBody.ToJSON);
+    ARequest.AddBody(LJSONBody.ToJSON, TRESTContentType.ctAPPLICATION_JSON);
+  finally
+    FreeAndNil(LJSONBody);
+  end;
+end;
+
+procedure TAnthropic.ProcessResponse(LJSONResponse: TJSONObject; var AResponse: TChatResponse; out FunctionReturnValue: string; AMessages : TObjectList<TChatMessage>);
+var
+  LChoices: TJSONArray;
+  LChoice: TJSONValue;
+  LUsage: TJSONObject;
+  FunctionId: string;
+  FunctionName: string;
+  txt : string;
+begin
+  if not LJSONResponse.TryGetValue<TJSONArray>('content', LChoices) then
+    raise EAnthropicError.Create('Invalid response: missing content array');
+  if LJSONResponse.TryGetValue<string>('model', txt) then
+    AResponse.Model := txt;
+  Log('Choices  ' + LChoices.ToJSON);
+
+  Log('');
+  Log('');
+  Log(LJSONResponse.ToJSON);
+
+  if LJSONResponse.TryGetValue<string>('id', txt) then
+    AResponse.Log_Id := txt;
+
+  LUsage := LJSONResponse.GetValue<TJSONObject>('usage');
+  LUsage.TryGetValue('input_tokens', AResponse.Prompt_Tokens);
+  LUsage.TryGetValue('output_tokens', AResponse.Completion_Tokens);
+  AResponse.Total_Tokens := AResponse.Prompt_Tokens + AResponse.Completion_Tokens;
+  if LChoices.Count > 0 then      
+  begin
+    if (LChoices.Items[0] as TJSONObject).TryGetValue<string>('text', txt) then
+      AResponse.Content := txt;
+    LChoice := LChoices.Items[0] as TJSONObject;
+  end;
+
+  LJSONResponse.TryGetValue<string>('stop_reason', AResponse.Finish_Reason);
+  for LChoice in LChoices do
+  begin
+      var msgType : string;
+      if LChoice.TryGetValue<string>('type', msgType) then
+      begin
+        if msgType = 'tool_use' then
+        begin
+          var msg := TClaudeJSONFunctionMessage.Create(LChoice as TJSONObject);
+          AMessages.Add(msg);
+          FunctionId := LChoice.GetValue<string>('id');
+          FunctionName := LChoice.GetValue<string>('name');
+          // Invoke the function with the arguments
+          Functions.InvokeFunction(LChoice as TJSONObject, FunctionReturnValue);
+          var funcMsg := TClaudeFunctionMessage.Create;
+          funcMsg.Content := FunctionReturnValue;
+          funcMsg.Id := FunctionId;
+          AMessages.Add(funcMsg);
+        end;
+      end;
+  end;
+end;
+
+procedure TAnthropic.HandleErrorResponse(AResponse: TRESTResponse);
+var
+  LJSONResponse: TJSONObject;
+  LJSONMsg: TJSONObject;
+  param : string;
+begin
+  LJSONResponse := TJSONObject.ParseJSONValue(AResponse.Content) as TJSONObject;
+  if Assigned(LJSONResponse) then
+  try
+    if LJSONResponse.TryGetValue<TJSONObject>('error', LJSONMsg) then
+    begin
+      LJSONMsg.TryGetValue<string>('param', param);
+      raise EAnthropicError.CreateFmt(LJSONMsg.GetValue<string>('type'), AResponse.StatusCode, LJSONMsg.GetValue<string>('message'))
+    end
+    else
+      raise EAnthropicError.CreateFmt('', AResponse.StatusCode, AResponse.StatusText);
+  finally
+    LJSONResponse.Free;
+  end
+  else
+    raise EAnthropicError.CreateFmt('', AResponse.StatusCode, AResponse.StatusText);
+end;
+
+constructor TAnthropic.Create(const APIKey: string);
+begin
+  inherited Create(APIKey);
+  FFunctions := TClaudeFunctionRegistry.Create(Self);
+end;
+
+class function TAnthropic.CreateChatVisionMessage: TChatVisionMessage;
+begin
+  Result := TClaudeVisionMessage.Create;
+end;
+
+destructor TAnthropic.Destroy;
+begin
+  FreeAndNil(FFunctions);
+  inherited;
+end;
+
+function TAnthropic.Completion(const AQuestion, AModel: string): string;
+var
+  LChatConfig: TChatSettings;
+  LMessages: TObjectList<TChatMessage>;
+  LMsg: TChatMessage;
+begin
+  LChatConfig.model := AModel;
+  LMessages := nil;
+  LMsg := nil;
+  try
+    LMessages := TObjectList<TChatMessage>.Create;
+    LMsg := TChatMessage.Create;
+    LMsg.Role := 'Human';
+    LMsg.Content := AQuestion;
+    LMessages.Add(LMsg);
+    Result := ChatCompletion(LChatConfig, LMessages).Content;
+  finally
+    FreeAndNil(LMessages);
+  end;
+end;
+
+function TAnthropic.GetModelInfo: TObjectList<TBaseModelInfo>;
+var
+  LRESTClient: TRESTClient;
+  LRESTRequest: TRESTRequest;
+  LRESTResponse: TRESTResponse;
+  LJSONArray: TJSONArray;
+  LJSONModel: TJSONObject;
+  LBaseJSONObject: TJSONObject;
+  i: Integer;
+  LModelObj : TBaseModelInfo;
+begin
+  Result := nil;
+  if FModelInfo.Count > 0 then
+  begin
+    Result := FModelInfo;
+    Exit;
+  end;
+  
+  LRESTClient := nil;
+  LRESTRequest := nil;
+  LRESTResponse := nil;
+  LBaseJSONObject := nil;
+
+  try
+    CreateRESTClientAndRequest(LRESTClient, LRESTRequest, LRESTResponse);
+    LRESTRequest.Resource := '/v1/models';
+    LRESTRequest.Method := rmGET;
+    LRESTRequest.Response := LRESTResponse;
+
+    // Add your API key to the request header
+    LRESTRequest.Params.AddItem('Authorization', 'Bearer ' + FAPIKey, pkHTTPHEADER, [poDoNotEncode]);
+
+    LRESTRequest.Execute;
+
+    if LRESTResponse.StatusCode = 200 then
+    begin
+      LBaseJSONObject := TJSONObject.ParseJSONValue(LRESTResponse.JSONText) as TJSONObject;
+      try
+        if LBaseJSONObject.TryGetValue<TJSONArray>('data', LJSONArray) then
+        begin
+          for i := 0 to LJSONArray.Count - 1 do
+          begin
+            LJSONModel := LJSONArray.Items[i] as TJSONObject;
+            LModelObj := TBaseModelInfo.Create;
+            LModelObj.modelName := LJSONModel.GetValue<string>('id');
+            LModelObj.version := LJSONModel.GetValue<string>('created_at');
+            FModelInfo.Add(LModelObj);
+          end;
+          Result := FModelInfo;
+        end;
+      finally
+        FreeAndNil(LBaseJSONObject);
+      end;
+    end;
+  finally
+    FreeAndNil(LRESTResponse);
+    FreeAndNil(LRESTRequest);
+    FreeAndNil(LRESTClient);
+  end;
+end;
+
+{ TClaudeVisionMessage }
+
+function TClaudeVisionMessage.AsJSON: TJSONObject;
+var
+  msg : TJSONObject;
+  source: TJSONObject;
+  contentObj: TJSONObject;
+  contentArr: TJSONArray;
+  I: Integer;
+begin
+  msg := TJSONObject.Create;
+  if FImageURLs.Count = 0 then
+  begin
+    msg.AddPair('role', Role);
+    msg.AddPair('content', content);
+  end
+  else
+  begin
+    contentArr := TJSONArray.Create;
+    for I := 0 to FImageURLs.Count -1 do
+    begin
+      contentObj:= TJSONObject.Create;
+      contentObj.AddPair('type', 'image');
+      source := TJSONObject.Create;
+      source.AddPair('type', 'base64');
+      source.AddPair('media_type', FImageURLs[i].mimeType);
+      source.AddPair('data', FImageURLs[i].data);
+      contentObj.AddPair('source', source);
+      contentArr.AddElement(contentObj);
+    end;
+    contentObj:= TJSONObject.Create;
+    contentObj.AddPair('type', 'text');
+    contentObj.AddPair('text', content);
+    contentArr.AddElement(contentObj);
+    msg.AddPair('role', 'user');
+    msg.AddPair('content', contentArr);
+  end;
+
+  Result := msg;
+end;
+
+{ TClaudeFunctionMessage }
+
+function TClaudeFunctionMessage.AsJSON: TJSONObject;
+var
+  LJSONMsg : TJSONObject;
+  LSubMsg : TJSONObject;
+  Arr: TJSONArray;
+begin
+  LJSONMsg := TJSONObject.Create;
+  LJSONMsg.AddPair('role', 'user');
+  LSubMsg := TJSONObject.Create;
+  LSubMsg.AddPair('type', 'tool_result');
+  LSubMsg.AddPair('tool_use_id', FId);
+  LSubMsg.AddPair('content', Content);
+  Arr := TJSONArray.Create;
+  Arr.AddElement(LSubMsg);
+  LJSONMsg.AddPair('content', Arr);
+
+  Result := LJSONMsg;
+end;
+
+constructor TClaudeFunctionMessage.Create;
+begin
+  inherited;
+end;
+
+destructor TClaudeFunctionMessage.Destroy;
+begin
+
+  inherited;
+end;
+
+{ TClaudeJSONFunctionMessage }
+
+function TClaudeJSONFunctionMessage.AsJSON: TJSONObject;
+begin
+  Result := FJSON.Clone as TJSONObject;
+end;
+
+constructor TClaudeJSONFunctionMessage.Create(json: TJSONObject);
+var
+  content : TJSONObject;
+  arr : TJSONArray;
+  c : TJSONOBject;
+begin
+  inherited Create;
+  content := TJSONObject.Create;
+  arr := TJSONArray.Create;
+  content.AddPair('content', arr);
+  content.AddPair('role', 'assistant');
+  c := TJSONOBject.Create;
+  c.AddPair('type', 'text');
+  c.AddPair('text', 'Thinking');
+  arr.AddElement(c);
+  FJSON := content;
+  arr.AddElement(json.Clone as TJSONObject);
+end;
+
+destructor TClaudeJSONFunctionMessage.Destroy;
+begin
+  FreeAndNil(FJSON);
+  inherited;
+end;
+
+procedure TClaudeFunctionRegistry.InvokeFunctionFromJSON(const Method: System.TMethod; const JSONObject: TJSONObject; out ReturnValue: string);
+var
+  ArgsObject: TJSONObject;
+  Context: TRttiContext;
+  MethodType: TRttiMethod;
+  Params: TArray<TRttiParameter>;
+  Args: TArray<TValue>;
+  ParamValue: TJSONValue;
+  I: Integer;
+  ResultValue: TValue;
+begin
+  FLLM.Log(JSONObject.ToJSON);
+
+  // Extract the 'input' JSON object properly
+  ArgsObject := JSONObject.GetValue<TJSONObject>('input');
+
+  if ArgsObject = nil then
+    raise ELLMFunctionError.Create('Invalid JSON: "arguments" field is missing or not a valid JSON object');
+
+  Context := TRttiContext.Create;
+  try
+    MethodType := Context.GetType(TObject(Method.Data).ClassType).GetMethod(JSONObject.GetValue<string>('name'));
+
+    if Assigned(MethodType) then
+    begin
+      Params := MethodType.GetParameters;
+      SetLength(Args, Length(Params));
+
+      for I := 0 to High(Params) do
+      begin
+        ParamValue := ArgsObject.GetValue(Params[I].Name);
+
+        if ParamValue = nil then
+          raise ELLMFunctionError.CreateFmt('Missing required parameter: %s', [Params[I].Name]);
+
+        case Params[I].ParamType.TypeKind of
+          tkInteger: Args[I] := StrToIntDef(ParamValue.Value, 0);
+          tkFloat: Args[I] := StrToFloatDef(ParamValue.Value, 0.0);
+          tkString, tkLString, tkUString, tkWString: Args[I] := ParamValue.Value;
+          tkEnumeration:
+            if Params[I].ParamType.Handle = TypeInfo(Boolean) then
+              Args[I] := SameText(ParamValue.Value, 'true')
+            else
+              raise ELLMFunctionError.CreateFmt('Unsupported enumeration type for parameter %s', [Params[I].Name]);
+          tkClass: Args[I] := TObject(StrToIntDef(ParamValue.Value, 0));
+          tkChar: Args[I] := ParamValue.Value[1];
+        else
+          raise ELLMFunctionError.CreateFmt('Unsupported parameter type for %s', [Params[I].Name]);
+        end;
+      end;
+
+      ResultValue := MethodType.Invoke(TObject(Method.Data), Args);
+      if ResultValue.Kind = tkUString then
+        ReturnValue := ResultValue.AsString
+      else
+        ReturnValue := '';
+    end
+    else
+      raise ELLMFunctionError.Create('Method not found');
+  finally
+    Context.Free;
+  end;
+end;
+
+
+procedure TClaudeFunctionRegistry.InvokeFunction(const JSONObject: TJSONObject; out ReturnValue: string);
+var
+  FunctionName: string;
+  Method: TFunctionDescription;
+begin
+  FunctionName := JSONObject.GetValue<string>('name');
+  if FMethods.TryGetValue(FunctionName, Method) then
+  begin
+    InvokeFunctionFromJSON(Method.Method, JSONObject, ReturnValue);
+  end
+  else
+    raise ELLMFunctionError.Create('Function not registered');
+end;
+
+constructor TClaudeFunctionRegistry.Create(ALLM: TBaseLLM);
+begin
+  FLLM := ALLM;
+  inherited Create;
+end;
+
+destructor TClaudeFunctionRegistry.Destroy;
+begin
+
+  inherited;
+end;
+
+function TClaudeFunctionRegistry.GetAvailableFunctionsJSON(UseStrict: Boolean): TJSONArray;
+var
+  ToolsArray: TJSONArray;
+  FuncDesc: TFunctionDescription;
+  FunctionJSON, ToolObject: TJSONObject;
+  functionArray: TArray<string>;
+  functionName: string;
+begin
+  ToolsArray := TJSONArray.Create;
+  functionArray := FMethods.Keys.ToArray;
+
+  for functionName in functionArray do
+  begin
+    if FMethods.TryGetValue(functionName, FuncDesc) then
+    begin
+      ToolObject := TJSONObject.Create;
+      try
+        ToolObject.AddPair('name', FuncDesc.Name);
+        ToolObject.AddPair('description', FuncDesc.Description);
+        if UseStrict then
+          ToolObject.AddPair('strict', TJSONBool.Create(True));
+        ToolObject.AddPair('input_schema', FuncDesc.Parameters.Clone as TJSONObject);
+
+        FunctionJSON := TJSONObject.Create;
+        try
+         // FunctionJSON.AddPair('type', 'function'); // Ensure 'type' is included
+          FunctionJSON.AddPair('function', ToolObject);
+
+          ToolsArray.AddElement(ToolObject);
+        except
+          FreeAndNil(FunctionJSON);
+          raise;
+        end;
+      except
+        FreeAndNil(ToolObject);
+        raise;
+      end;
+    end;
+  end;
+
+  Result := ToolsArray;
+end;
+
+
+end.

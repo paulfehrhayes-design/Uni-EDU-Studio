@@ -1,0 +1,898 @@
+import copy
+import json
+import re
+from typing import Optional
+
+from openai import BadRequestError, APIError
+
+from bolna.constants import IS_USER_ONLINE_MESSAGE, is_reasoning_model
+from bolna.enums import ChatRole, ResponseStreamEvent, ResponseItemType, LogComponent, LogDirection
+from bolna.helpers.utils import (
+    convert_to_request_log,
+    compute_function_pre_call_message,
+    now_ms,
+    SERVER_OWNED_CALL_IDENTIFIERS,
+)
+from .llm import BaseLLM
+from .message_models import MessageFormatAdapter, strip_internal_keys
+from .routing_stream import read_routing_stream
+from .schema_forced_tool_call import force_tools_by_schema
+from .types import APIParams, LLMStreamChunk, LatencyData, FunctionCallPayload
+from bolna.helpers.function_calling_helpers import record_unresolved_tool_call, redacted_url, resolve_tool_name
+from bolna.helpers.logger_config import configure_logger
+
+logger = configure_logger(__name__)
+
+
+def _clean_rescue_answer(answer: str) -> str | None:
+    """Strip leftover 'functions' / 'functions.xxx' tokens from a rescue textual_response."""
+    cleaned = re.sub(r"\bfunctions(\.\w+)?\b", "", answer).strip()
+    return cleaned if cleaned else None
+
+
+def _strip_server_injected_params(tools):
+    """Drop server-owned ids (call_sid/stream_sid) from each tool schema so the model can't echo them."""
+    cleaned = []
+    for tool in tools:
+        params = tool.get("function", {}).get("parameters")
+        props = params.get("properties") if isinstance(params, dict) else None
+        if not props or not any(k in props for k in SERVER_OWNED_CALL_IDENTIFIERS):
+            cleaned.append(tool)
+            continue
+        tool = copy.deepcopy(tool)
+        params = tool["function"]["parameters"]
+        for key in SERVER_OWNED_CALL_IDENTIFIERS:
+            params["properties"].pop(key, None)
+            if isinstance(params.get("required"), list) and key in params["required"]:
+                params["required"].remove(key)
+        cleaned.append(tool)
+    return cleaned
+
+
+def _new_items_start(messages):
+    """Index of the first message after the last assistant message, where a chained request begins."""
+    for i in range(len(messages) - 1, -1, -1):
+        # The "are you still there" nudge never went through the model, so it is not on the chain.
+        if (
+            messages[i].get("role") == ChatRole.ASSISTANT
+            and messages[i].get("message_category") != IS_USER_ONLINE_MESSAGE
+        ):
+            return i + 1
+    return 0
+
+
+def _system_prompt(messages):
+    return messages[0].get("content") if messages and messages[0].get("role") == ChatRole.SYSTEM else None
+
+
+def _last_assistant_turn_end(messages):
+    """Index past the last assistant message and the tool outputs answering it."""
+    i = _new_items_start(messages)
+    while i < len(messages) and messages[i].get("role") == ChatRole.TOOL:
+        i += 1
+    return i
+
+
+class OpenAICompatibleLLM(BaseLLM):
+    """Base class for OpenAI-API-compatible LLM providers.
+
+    Subclasses must:
+    - Call _init_responses_api() during __init__
+    - Override _responses_client property if they need a different client
+    """
+
+    # Both are set by subclasses whose self.model is a deployment name rather than the model itself.
+    _request_log_model = None
+    _model_family = None
+
+    # Set by subclasses whose backend cannot force tool_choice (SCHEMA_FORCED_TOOL_PROVIDERS).
+    _forces_tools_by_schema = False
+
+    # The system prompt the Responses chain was built on; None until a request records one.
+    _chain_system_prompt = None
+
+    # A reasoning summary streams ahead of the answer text, so it is opt-in: requesting one costs
+    # time to first spoken token on a live call. Set from config by subclasses; None omits it.
+    reasoning_summary = None
+
+    @property
+    def request_log_model(self):
+        """Provider-qualified model name, so request logs key the same way the task manager records."""
+        return self._request_log_model or self.model
+
+    @property
+    def model_family(self):
+        """Model self.model actually serves; family checks must use this, not the deployment name."""
+        return self._model_family or self.model
+
+    @staticmethod
+    def _find_tool_call_end(text):
+        """Return the index after the closing brace/paren of a text tool call
+        (functions.x(...) or a bare {...} object), or -1 if incomplete."""
+        m = re.search(r"functions\.\w+\s*[({]", text)
+        if m:
+            start = m.end() - 1
+        elif text.lstrip().startswith("{"):
+            start = text.index("{")
+        else:
+            return -1
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] in "({":
+                depth += 1
+            elif text[i] in ")}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    if end < len(text) and text[end] == ";":
+                        end += 1
+                    return end
+        return -1
+
+    @staticmethod
+    def _find_offered_tool_name(text, offered):
+        """Earliest offered tool name in text (longest wins on a tie, to prefer the most specific),
+        or None. Used to recover which tool a captured narration fragment refers to."""
+        best, best_i = None, len(text) + 1
+        for t in offered or []:
+            name = (t.get("function") or {}).get("name")
+            if not name or (i := text.find(name)) == -1:
+                continue
+            if i < best_i or (i == best_i and len(name) > len(best or "")):
+                best, best_i = name, i
+        return best
+
+    @staticmethod
+    def _find_text_tool_call_start(text, offered):
+        """Earliest index where a narrated tool call begins: a `functions.` prefix, or an offered
+        tool name that sits inside an unclosed { } wrapper (e.g. {type:transfer_call_..}). A bare
+        tool name in plain text is left as speech, so a tool named like a common word ('book') never
+        triggers on an ordinary sentence. Returns -1 if none."""
+        idx = -1
+        m = re.search(r"functions\.\w", text)
+        if m:
+            idx = m.start()
+        for t in offered or []:
+            name = (t.get("function") or {}).get("name")
+            if not name or (i := text.find(name)) == -1:
+                continue
+            brace = text.rfind("{", 0, i)
+            if brace == -1 or "}" in text[brace:i]:
+                continue  # not inside a { } wrapper -> ordinary speech, not a tool call
+            if idx == -1 or brace < idx:
+                idx = brace
+        return idx
+
+    @staticmethod
+    def _parse_text_tool_call(text):
+        """Parse functions.name({...}) or functions.name { ... } from text.
+
+        Returns (func_name, args_json_str) or None if unparseable.
+        Handles both strict JSON and JS-style unquoted keys.
+        """
+        m = re.search(r"functions\.(\w+)\s*([({])", text)
+        if not m:
+            return None
+
+        func_name = m.group(1)
+        start = m.start(2)
+        depth = 0
+        end = -1
+        for i in range(start, len(text)):
+            if text[i] in "({":
+                depth += 1
+            elif text[i] in ")}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        if end == -1:
+            return None
+
+        raw = text[start:end]
+        if raw.startswith("("):
+            raw = raw[1:-1].strip()
+        if not raw:
+            return func_name, "{}"
+
+        try:
+            json.loads(raw)
+            return func_name, raw
+        except json.JSONDecodeError:
+            pass
+
+        # Fix JS-style unquoted keys: notes: "..." → "notes": "..."
+        fixed = re.sub(r'(?<!["\w])([a-zA-Z_]\w*)\s*:', r'"\1":', raw)
+        try:
+            json.loads(fixed)
+            return func_name, fixed
+        except json.JSONDecodeError:
+            logger.warning(f"Could not parse text tool call args for {func_name}: {raw[:100]}")
+            return None
+
+    def _try_rescue_text_tool_call(self, text, model_args, meta_info, answer, latency_data):
+        """Attempt to execute a tool call that was output as plain text instead of delta.tool_calls.
+
+        Parses the text, builds FunctionCallPayload directly from api_params, and returns an
+        LLMStreamChunk with is_function_call=True. Returns None if rescue is not possible
+        (no tools registered, unknown function, or unparseable args) so the caller can fall
+        back to sending the raw text to TTS.
+        """
+        if not self.trigger_function_call:
+            return None
+
+        # Respect per-call tool visibility (node scoping): only rescue a tool offered this turn.
+        offered = model_args.get("tools") or []
+        if isinstance(offered, str):
+            offered = json.loads(offered)
+
+        parsed = self._parse_text_tool_call(text)
+        if parsed:
+            func_name, args_str = parsed
+            args_recovered = False
+        else:
+            # No functions.NAME(...) form — e.g. a {type:transfer_call_..} shape, a truncated call,
+            # or a mangled wrapper. Recover by matching any offered tool name; fire only if it needs
+            # no model args (the required-args gate below).
+            func_name = self._find_offered_tool_name(text, offered)
+            if not func_name:
+                return None
+            args_str, args_recovered = "{}", True
+
+        func_name = resolve_tool_name(func_name, self.api_params)
+        if func_name not in self.api_params:
+            logger.warning(f"Text tool call rescue: '{func_name}' not in api_params, falling back to TTS")
+            return None
+
+        tool_spec = next((t for t in offered if t.get("function", {}).get("name") == func_name), None)
+        if tool_spec is None:
+            logger.warning(f"Text tool call rescue: '{func_name}' not offered this turn, falling back to TTS")
+            return None
+
+        if args_recovered and (tool_spec["function"].get("parameters") or {}).get("required"):
+            logger.warning(f"Text tool call rescue: '{func_name}' recovered by name but needs model args, dropping")
+            return None
+
+        func_conf = self.api_params[func_name]
+        method = func_conf.get("method")
+
+        api_call_payload = FunctionCallPayload(
+            url=func_conf.get("url"),
+            method=method.lower() if method else None,
+            param=func_conf.get("param"),
+            api_token=func_conf.get("api_token"),
+            headers=func_conf.get("headers"),
+            model_args=model_args,
+            meta_info=meta_info,
+            called_fun=func_name,
+            model_response=[
+                {
+                    "index": 0,
+                    "id": f"rescued_{func_name}",
+                    "function": {"name": func_name, "arguments": args_str},
+                    "type": "function",
+                }
+            ],
+            tool_call_id=f"rescued_{func_name}",
+            textual_response=_clean_rescue_answer(answer),
+        )
+
+        # Mirror ToolCallAccumulator.build_api_payload: validate required keys against the tool spec
+        try:
+            parsed_args = json.loads(args_str)
+            if tool_spec and tool_spec["function"].get("parameters") is not None:
+                required_keys = tool_spec["function"]["parameters"].get("required", [])
+                missing = [k for k in required_keys if k not in parsed_args]
+                if missing:
+                    logger.warning(
+                        f"Text tool call rescue: '{func_name}' missing required args {missing}, zeroing resp"
+                    )
+                    api_call_payload.resp = None
+                    return LLMStreamChunk(
+                        data=api_call_payload, end_of_stream=False, latency=latency_data, is_function_call=True
+                    )
+            for k, v in parsed_args.items():
+                setattr(api_call_payload, k, v)
+            logger.info(f"Text tool call rescue succeeded: {func_name}")
+        except Exception as e:
+            logger.error(f"Text tool call rescue: failed to apply args for {func_name}: {e}")
+            api_call_payload.resp = None
+
+        return LLMStreamChunk(data=api_call_payload, end_of_stream=False, latency=latency_data, is_function_call=True)
+
+    def _init_responses_api(self, use_responses_api: bool = False, compact_threshold: Optional[int] = None):
+        self.use_responses_api = use_responses_api
+        self.previous_response_id = None
+        self._in_flight_response_id: Optional[str] = None
+        self._pending_call_ids: set[str] = set()
+        self.compact_threshold = compact_threshold
+        self._interruption_hint: Optional[str] = None
+
+    @property
+    def _responses_client(self):
+        """Return the async client for Responses API calls.
+
+        Default: ``self.async_client``. Override in subclasses that need a
+        different client (e.g. Azure v1 endpoint).
+        """
+        return self.async_client
+
+    def _build_responses_input(self, messages):
+        """Build (instructions, input_items): chained when the head completed and tool outputs are in, else full history."""
+        hint = self._interruption_hint
+        self._interruption_hint = None
+
+        chained = bool(self.previous_response_id)
+        if chained and self.previous_response_id == self._in_flight_response_id:
+            logger.info("Chain head never completed, sending full context")
+            self.previous_response_id = None
+            self._pending_call_ids = set()
+            chained = False
+        if chained and self._pending_call_ids:
+            completed = {m.get("tool_call_id") for m in messages if m.get("role") == ChatRole.TOOL}
+            if not self._pending_call_ids.issubset(completed):
+                logger.info("Pending tool call outputs missing, sending full context")
+                self.previous_response_id = None
+                chained = False
+        system_prompt = _system_prompt(messages)
+        if chained and self._chain_system_prompt is not None and system_prompt != self._chain_system_prompt:
+            # A chained request does not resend the system prompt, so a changed one needs the full context.
+            logger.info("System prompt changed since the chain began, sending full context")
+            self.previous_response_id = None
+            self._pending_call_ids = set()
+            chained = False
+        self._chain_system_prompt = system_prompt
+        if chained:
+            instructions, new_items = self._extract_new_input(messages)
+            history_items = []
+        else:
+            split = _last_assistant_turn_end(messages)
+            instructions, history_items = MessageFormatAdapter.chat_to_responses_input(messages[:split])
+            _, new_items = MessageFormatAdapter.chat_to_responses_input(messages[split:])
+            # Full history holds only what was heard, so a reply nobody heard leaves nothing to qualify.
+            if hint is not None and not hint.strip():
+                hint = None
+        hint_items = [] if hint is None else [self._build_interruption_hint_item(hint)]
+        return instructions, [*history_items, *hint_items, *new_items]
+
+    @staticmethod
+    def _build_interruption_hint_item(heard_text: str) -> dict:
+        heard = (heard_text or "").strip()
+        return {
+            "type": ResponseItemType.MESSAGE,
+            "role": "developer",
+            "content": (
+                f'[Your previous response was interrupted. The user only heard: "{heard}". Adapt accordingly.]'
+            ),
+        }
+
+    def set_interruption_hint(self, heard_text: Optional[str]) -> None:
+        """Record what the user heard before barge-in. Consumed on next build."""
+        self._interruption_hint = "" if heard_text is None else heard_text
+
+    def _extract_new_input(self, messages):
+        """Send only items after the last assistant; prior context (including system) lives on the chain."""
+        _, input_items = MessageFormatAdapter.chat_to_responses_input(messages[_new_items_start(messages) :])
+        return "", input_items
+
+    @staticmethod
+    def _is_stale_response_error(error):
+        """Check if an API error is likely due to a stale previous_response_id.
+
+        All known stale-response errors from OpenAI are BadRequestError
+        (HTTP 400). Since this is only called when previous_response_id is
+        set, a BadRequestError is most likely caused by it. The retry is
+        self-limiting: it clears the ID, so a second failure will raise the
+        real error.
+        """
+        return isinstance(error, BadRequestError)
+
+    def _parse_tools(self, tools=None):
+        """Parse tools from string or list format. ``tools`` overrides ``self.tools`` when given."""
+        if not self.trigger_function_call:
+            return []
+        src = tools if tools is not None else self.tools
+        parsed = json.loads(src) if isinstance(src, str) else src
+        return _strip_server_injected_params(parsed)
+
+    async def _route_completion(self, model_args):
+        """Issue the routing completion. Returns (completion, overflowed). Azure overrides for PTU overflow."""
+        return await self.async_client.chat.completions.create(**model_args), False
+
+    async def route(self, messages, tools, tool_choice="required", meta_info=None):
+        # Same SSRF guard the streaming path runs before reaching a customer base_url.
+        guard = getattr(self, "_ensure_base_url_allowed", None)
+        if guard:
+            await guard()
+        parsed_tools = json.loads(tools) if isinstance(tools, str) else tools
+        model_args = {
+            **self.model_args,
+            "messages": strip_internal_keys(messages),
+            "tools": parsed_tools,
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": False,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if "reasoning_effort" in model_args:  # gpt-5 family fixes temperature, so leave it unset
+            model_args.pop("temperature", None)
+        else:
+            model_args["temperature"] = 0.0
+        forced = force_tools_by_schema(model_args) if self._forces_tools_by_schema else None
+        stream, overflowed = await self._route_completion(model_args)
+        if forced:
+            stream = forced.stream(stream)
+        return await read_routing_stream(stream, parsed_tools, overflowed)
+
+    def invalidate_response_chain(self):
+        self.previous_response_id = None
+        self._in_flight_response_id = None
+        self._pending_call_ids = set()
+        self._interruption_hint = None
+
+    def _on_response_created(self, response_id):
+        self.previous_response_id = response_id
+        self._in_flight_response_id = response_id
+
+    def _on_response_completed(self, response_id, call_ids):
+        if response_id:
+            self.previous_response_id = response_id
+        self._in_flight_response_id = None
+        self._pending_call_ids = set(call_ids)
+
+    def _build_function_call_chunk(
+        self,
+        func_call_args,
+        func_call_names,
+        func_call_ids,
+        responses_tools,
+        create_kwargs,
+        meta_info,
+        answer,
+        received_textual,
+        latency_data,
+    ):
+        """Build LLMStreamChunk with FunctionCallPayload from accumulated function call data, or None."""
+        if not (func_call_args and self.trigger_function_call):
+            return None
+
+        first_item_id = next(iter(func_call_args))
+        func_name = func_call_names[first_item_id]
+        call_id = func_call_ids[first_item_id]
+        arguments_str = func_call_args[first_item_id]
+
+        if func_name not in self.api_params:
+            record_unresolved_tool_call(func_name, meta_info, self.model)
+            return None
+
+        func_conf = APIParams.model_validate(self.api_params[func_name])
+        logger.info(
+            "Payload to send %s func=%s url=%s method=%s",
+            arguments_str,
+            func_name,
+            redacted_url(func_conf.url),
+            func_conf.method,
+        )
+
+        api_call_payload = FunctionCallPayload(
+            url=func_conf.url,
+            method=func_conf.method.lower() if func_conf.method else None,
+            param=func_conf.param,
+            api_token=func_conf.api_token,
+            headers=func_conf.headers,
+            model_args=create_kwargs,
+            meta_info=meta_info,
+            called_fun=func_name,
+            model_response=[
+                {
+                    "index": 0,
+                    "id": call_id,
+                    "function": {"name": func_name, "arguments": arguments_str},
+                    "type": "function",
+                }
+            ],
+            tool_call_id=call_id,
+            textual_response=answer.strip() if received_textual else None,
+        )
+
+        tool_spec = next((t for t in responses_tools if t["name"] == func_name), None)
+        if tool_spec:
+            try:
+                parsed_args = json.loads(arguments_str)
+                required_keys = tool_spec.get("parameters", {}).get("required", [])
+                if tool_spec.get("parameters") is not None and all(k in parsed_args for k in required_keys):
+                    convert_to_request_log(
+                        arguments_str,
+                        meta_info,
+                        self.request_log_model,
+                        LogComponent.LLM,
+                        direction=LogDirection.RESPONSE,
+                        is_cached=False,
+                        run_id=self.run_id,
+                    )
+                    for k, v in parsed_args.items():
+                        setattr(api_call_payload, k, v)
+                else:
+                    api_call_payload.resp = None
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.error(f"Error parsing function arguments: {e}")
+                api_call_payload.resp = None
+        else:
+            api_call_payload.resp = None
+
+        return LLMStreamChunk(data=api_call_payload, end_of_stream=False, latency=latency_data, is_function_call=True)
+
+    def _build_responses_create_kwargs(
+        self, messages, meta_info, request_json, tool_choice, *, store=True, stream=None, tools=None
+    ):
+        """Build create kwargs common to both HTTP SSE and WebSocket streaming paths."""
+        _, input_items = self._build_responses_input(messages)
+        responses_tools = MessageFormatAdapter.chat_tools_to_responses_tools(self._parse_tools(tools))
+
+        create_kwargs = {
+            "model": self.model,
+            "input": input_items,
+            "store": store,
+            "truncation": "auto",
+            "max_output_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
+
+        if stream is not None:
+            create_kwargs["stream"] = stream
+
+        if self.compact_threshold:
+            create_kwargs["context_management"] = [{"type": "compaction", "compact_threshold": self.compact_threshold}]
+
+        service_tier = self.model_args.get("service_tier")
+        if service_tier:
+            create_kwargs["service_tier"] = service_tier
+
+        if is_reasoning_model(self.model_family):
+            create_kwargs["temperature"] = 1
+            reasoning_effort = self.model_args.get("reasoning_effort")
+            reasoning_config = {}
+            if reasoning_effort:
+                reasoning_config["effort"] = reasoning_effort
+            if self.reasoning_summary:
+                reasoning_config["summary"] = self.reasoning_summary
+            create_kwargs["reasoning"] = reasoning_config
+            verbosity = self.model_args.get("verbosity")
+            if verbosity:
+                create_kwargs.setdefault("text", {})["verbosity"] = verbosity
+            # Preserves reasoning across full-history fallbacks; no-op when chain is alive.
+            create_kwargs["include"] = ["reasoning.encrypted_content"]
+
+        if self.previous_response_id:
+            create_kwargs["previous_response_id"] = self.previous_response_id
+
+        if responses_tools:
+            create_kwargs["tools"] = responses_tools
+            create_kwargs["tool_choice"] = MessageFormatAdapter.chat_tool_choice_to_responses(tool_choice or "auto")
+            create_kwargs["parallel_tool_calls"] = False
+
+        if request_json:
+            create_kwargs.setdefault("text", {})["format"] = {"type": "json_object"}
+
+        return create_kwargs, responses_tools
+
+    async def _generate_stream_responses(
+        self,
+        messages,
+        synthesize=True,
+        request_json=False,
+        meta_info=None,
+        tool_choice=None,
+        tools=None,
+        retry_on_empty=True,
+        started_at=None,
+    ):
+        """``started_at`` carries a retried turn's original start so its latency includes the failed attempt."""
+        if not messages:
+            raise ValueError("No messages provided")
+
+        create_kwargs, responses_tools = self._build_responses_create_kwargs(
+            messages, meta_info, request_json, tool_choice, store=True, stream=True, tools=tools
+        )
+
+        answer, buffer = "", ""
+        func_call_args = {}
+        func_call_names = {}
+        func_call_ids = {}
+        gave_pre_call_msg = False
+        received_textual = False
+        reasoning_summary_parts = []
+
+        start_time = started_at if started_at is not None else now_ms()
+        first_token_time = None
+        latency_data = None
+        service_tier = None
+        llm_host = getattr(self, "llm_host", None)
+        response_usage = None
+        incomplete = False
+        incomplete_reason = None
+
+        try:
+            stream = await self._responses_client.responses.create(**create_kwargs)
+        except Exception as e:
+            if self.previous_response_id and self._is_stale_response_error(e):
+                logger.warning(f"Stale previous_response_id, retrying with full history: {e}")
+                if isinstance(meta_info, dict):
+                    meta_info.setdefault("_non_fatal_errors", []).append(
+                        {"error_type": "stale_response_id", "error": str(e), "model": self.model}
+                    )
+                self.previous_response_id = None
+                async for chunk in self._generate_stream_responses(
+                    messages,
+                    synthesize,
+                    request_json,
+                    meta_info,
+                    tool_choice,
+                    tools,
+                    retry_on_empty=retry_on_empty,
+                    started_at=start_time,
+                ):
+                    yield chunk
+                return
+            logger.error(f"Responses API error: {e}")
+            raise
+
+        async for event in stream:
+            now = now_ms()
+
+            if event.type == ResponseStreamEvent.CREATED:
+                self._on_response_created(event.response.id)
+                self._log_llm_request_id(stream, event.response.id)
+                service_tier = getattr(event.response, "service_tier", None)
+                if latency_data is None:
+                    latency_data = LatencyData(
+                        sequence_id=meta_info.get("sequence_id") if meta_info else None,
+                        connection_latency_ms=round(now - start_time, 2),
+                    )
+                else:
+                    latency_data.connection_latency_ms = round(now - start_time, 2)
+                continue
+
+            if event.type == ResponseStreamEvent.FAILED:
+                error_info = getattr(event.response, "error", None) or getattr(event.response, "last_error", None)
+                logger.error(f"Responses API stream failed: {error_info}")
+                self.invalidate_response_chain()
+                raise APIError(message=f"Response failed: {error_info}", request=None, body=None)
+
+            if event.type == ResponseStreamEvent.INCOMPLETE:
+                incomplete = True
+                incomplete_reason = getattr(getattr(event.response, "incomplete_details", None), "reason", None)
+                logger.warning(f"Responses API stream incomplete, reason={incomplete_reason}")
+                self.invalidate_response_chain()
+                break
+
+            if not first_token_time and event.type in (
+                ResponseStreamEvent.OUTPUT_TEXT_DELTA,
+                ResponseStreamEvent.FUNCTION_CALL_ARGS_DELTA,
+            ):
+                first_token_time = now
+                self.started_streaming = True
+                latency_data = LatencyData(
+                    sequence_id=meta_info.get("sequence_id") if meta_info else None,
+                    first_token_latency_ms=first_token_time - start_time,
+                    total_stream_duration_ms=None,
+                    service_tier=service_tier,
+                    llm_host=llm_host,
+                    reasoning_effort=self.model_args.get("reasoning_effort"),
+                    verbosity=self.model_args.get("verbosity"),
+                )
+
+            if event.type == ResponseStreamEvent.OUTPUT_TEXT_DELTA:
+                received_textual = True
+                answer += event.delta
+                buffer += event.delta
+                if synthesize and len(buffer) >= self.buffer_size:
+                    split = buffer.rsplit(" ", 1)
+                    yield LLMStreamChunk(data=split[0], end_of_stream=False, latency=latency_data)
+                    buffer = split[1] if len(split) > 1 else ""
+
+            elif event.type == ResponseStreamEvent.OUTPUT_ITEM_ADDED:
+                item = event.item
+                if item.type == ResponseItemType.FUNCTION_CALL:
+                    if buffer:
+                        yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data)
+                        buffer = ""
+                    func_call_args[item.id] = ""
+                    func_name = resolve_tool_name(item.name, self.api_params)
+                    func_call_names[item.id] = func_name
+                    func_call_ids[item.id] = item.call_id
+
+                    # An unconfigured tool is dropped later, so a filler would promise a reply that never comes.
+                    if (
+                        not gave_pre_call_msg
+                        and not received_textual
+                        and self.trigger_function_call
+                        and func_name in self.api_params
+                    ):
+                        gave_pre_call_msg = True
+                        func_params = self.api_params.get(func_name)
+                        api_tool_pre_call_message = (
+                            APIParams.model_validate(func_params).pre_call_message if func_params else None
+                        )
+                        detected_lang = meta_info.get("detected_language") if meta_info else None
+                        active_language = detected_lang or self.language
+                        pre_msg = compute_function_pre_call_message(
+                            active_language, func_name, api_tool_pre_call_message
+                        )
+                        if pre_msg:
+                            yield LLMStreamChunk(
+                                data=pre_msg,
+                                end_of_stream=True,
+                                latency=latency_data,
+                                function_name=func_name,
+                                function_message=api_tool_pre_call_message,
+                            )
+
+            elif event.type == ResponseStreamEvent.FUNCTION_CALL_ARGS_DELTA:
+                func_call_args[event.item_id] = func_call_args.get(event.item_id, "") + event.delta
+
+            elif event.type == ResponseStreamEvent.REASONING_SUMMARY_TEXT_DELTA:
+                reasoning_summary_parts.append(event.delta)
+
+            elif event.type == ResponseStreamEvent.COMPLETED:
+                self._on_response_completed(getattr(event.response, "id", None), func_call_ids.values())
+                service_tier = service_tier or getattr(event.response, "service_tier", None)
+                if hasattr(event.response, "usage") and event.response.usage:
+                    response_usage = event.response.usage
+                break
+
+        # Nothing was yielded yet, so a retry cannot duplicate speech.
+        if incomplete and not answer and not func_call_args and retry_on_empty:
+            logger.warning(f"Responses API returned no output (reason={incomplete_reason}), retrying once")
+            if isinstance(meta_info, dict):
+                meta_info.setdefault("_non_fatal_errors", []).append(
+                    {"error_type": "incomplete_empty_response", "error": incomplete_reason, "model": self.model}
+                )
+            async for chunk in self._generate_stream_responses(
+                messages,
+                synthesize,
+                request_json,
+                meta_info,
+                tool_choice,
+                tools,
+                retry_on_empty=False,
+                started_at=start_time,
+            ):
+                yield chunk
+            return
+
+        if latency_data:
+            latency_data.total_stream_duration_ms = now_ms() - start_time
+            if service_tier:
+                latency_data.service_tier = service_tier
+
+        fc_chunk = self._build_function_call_chunk(
+            func_call_args,
+            func_call_names,
+            func_call_ids,
+            responses_tools,
+            create_kwargs,
+            meta_info,
+            answer,
+            received_textual,
+            latency_data,
+        )
+        if fc_chunk:
+            if response_usage:
+                fc_chunk.input_tokens = getattr(response_usage, "input_tokens", None)
+                fc_chunk.output_tokens = getattr(response_usage, "output_tokens", None)
+                _od = getattr(response_usage, "output_tokens_details", None)
+                if _od:
+                    fc_chunk.reasoning_tokens = getattr(_od, "reasoning_tokens", None)
+                _id = getattr(response_usage, "input_tokens_details", None)
+                if _id:
+                    fc_chunk.cached_tokens = getattr(_id, "cached_tokens", None)
+            yield fc_chunk
+
+        usage_kwargs = {}
+        if response_usage:
+            usage_kwargs["input_tokens"] = getattr(response_usage, "input_tokens", None)
+            usage_kwargs["output_tokens"] = getattr(response_usage, "output_tokens", None)
+            output_details = getattr(response_usage, "output_tokens_details", None)
+            if output_details:
+                usage_kwargs["reasoning_tokens"] = getattr(output_details, "reasoning_tokens", None)
+            input_details = getattr(response_usage, "input_tokens_details", None)
+            if input_details:
+                usage_kwargs["cached_tokens"] = getattr(input_details, "cached_tokens", None)
+
+        reasoning_content = "".join(reasoning_summary_parts) if reasoning_summary_parts else None
+        if reasoning_content:
+            usage_kwargs["reasoning_content"] = reasoning_content
+
+        if synthesize:
+            yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+        else:
+            yield LLMStreamChunk(data=answer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+
+        self.started_streaming = False
+
+    async def _generate_responses(self, messages, request_json=False, ret_metadata=False, meta_info=None):
+        _, input_items = self._build_responses_input(messages)
+
+        create_kwargs = {
+            "model": self.model,
+            "input": input_items,
+            "store": True,
+            "truncation": "auto",
+            "max_output_tokens": self.max_tokens,
+            "temperature": 0.0,  # Intentional: non-streaming uses deterministic output
+        }
+
+        if self.compact_threshold:
+            create_kwargs["context_management"] = [{"type": "compaction", "compact_threshold": self.compact_threshold}]
+
+        service_tier = self.model_args.get("service_tier")
+        if service_tier:
+            create_kwargs["service_tier"] = service_tier
+
+        if is_reasoning_model(self.model_family):
+            create_kwargs["temperature"] = 1
+            reasoning_config = {}
+            reasoning_effort = self.model_args.get("reasoning_effort")
+            if reasoning_effort:
+                reasoning_config["effort"] = reasoning_effort
+            if self.reasoning_summary:
+                reasoning_config["summary"] = self.reasoning_summary
+            create_kwargs["reasoning"] = reasoning_config
+            verbosity = self.model_args.get("verbosity")
+            if verbosity:
+                create_kwargs.setdefault("text", {})["verbosity"] = verbosity
+            create_kwargs["include"] = ["reasoning.encrypted_content"]
+
+        if self.previous_response_id:
+            create_kwargs["previous_response_id"] = self.previous_response_id
+
+        if request_json:
+            create_kwargs.setdefault("text", {})["format"] = {"type": "json_object"}
+
+        llm_host = getattr(self, "llm_host", None)
+
+        try:
+            response = await self._responses_client.responses.create(**create_kwargs)
+            self.previous_response_id = response.id
+            res = response.output_text
+
+            if ret_metadata:
+                metadata = {
+                    "llm_host": llm_host,
+                    "service_tier": getattr(response, "service_tier", None),
+                }
+                if hasattr(response, "usage") and response.usage:
+                    metadata["input_tokens"] = getattr(response.usage, "input_tokens", None)
+                    metadata["output_tokens"] = getattr(response.usage, "output_tokens", None)
+                    output_details = getattr(response.usage, "output_tokens_details", None)
+                    if output_details:
+                        metadata["reasoning_tokens"] = getattr(output_details, "reasoning_tokens", None)
+                    input_details = getattr(response.usage, "input_tokens_details", None)
+                    if input_details:
+                        metadata["cached_tokens"] = getattr(input_details, "cached_tokens", None)
+
+                reasoning_texts = []
+                if hasattr(response, "output") and response.output:
+                    for item in response.output:
+                        if getattr(item, "type", None) == "reasoning" and hasattr(item, "summary"):
+                            for part in item.summary or []:
+                                if getattr(part, "text", None):
+                                    reasoning_texts.append(part.text)
+                if reasoning_texts:
+                    metadata["reasoning_content"] = "\n".join(reasoning_texts)
+
+                return res, metadata
+            return res
+        except Exception as e:
+            if self.previous_response_id and self._is_stale_response_error(e):
+                logger.warning(f"Stale previous_response_id, retrying with full history: {e}")
+                if isinstance(meta_info, dict):
+                    meta_info.setdefault("_non_fatal_errors", []).append(
+                        {"error_type": "stale_response_id", "error": str(e), "model": self.model}
+                    )
+                self.previous_response_id = None
+                return await self._generate_responses(messages, request_json, ret_metadata, meta_info)
+            logger.error(f"Responses API error: {e}")
+            raise

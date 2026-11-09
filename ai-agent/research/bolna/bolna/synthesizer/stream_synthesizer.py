@@ -1,0 +1,463 @@
+"""
+Base class for WebSocket-streaming TTS synthesizers.
+
+Subclasses only need to implement a handful of provider-specific methods:
+  - establish_connection()  -> connect & return websocket (or None)
+  - sender()               -> send text to the WS
+  - receiver()             -> async-generator yielding audio bytes (b'\\x00' = end)
+  - form_payload()         -> build the JSON payload for a text chunk (optional)
+  - _get_audio_format()    -> return the meta_info 'format' string
+  - _process_audio_chunk() -> transform raw audio before yielding (optional)
+
+Everything else — push routing, latency tracking, first-chunk bookkeeping,
+monitor_connection, cleanup — lives here.
+"""
+
+import asyncio
+import copy
+import json
+import time
+import traceback
+from collections import deque
+
+import websockets
+
+from .base_synthesizer import BaseSynthesizer
+from bolna.helpers.logger_config import configure_logger
+from bolna.helpers.utils import create_ws_data_packet
+
+logger = configure_logger(__name__)
+
+# Maximum consecutive connection failures before giving up
+MAX_CONNECTION_FAILURES = 3
+
+
+class StreamSynthesizer(BaseSynthesizer):
+    """Base class for all WebSocket-streaming synthesizers."""
+
+    def __init__(self, stream=True, provider_name="stream", task_manager_instance=None, buffer_size=400, **kwargs):
+        super().__init__(
+            task_manager_instance=task_manager_instance,
+            stream=stream,
+            buffer_size=buffer_size,
+        )
+        self.provider_name = provider_name
+
+        # WebSocket state
+        self.websocket = None
+        # Set whenever a fresh socket is assigned, so a sender waiting in _wait_for_ws wakes on the connect.
+        self.websocket_ready = asyncio.Event()
+        self.sender_task = None
+        self.conversation_ended = False
+        self.connection_error = None
+
+        # Text / meta_info queue (sender pushes, generate pops)
+        self.text_queue = deque()
+        self.meta_info = None
+        self.current_text = ""
+        self.last_text_sent = False
+
+        # Turn-level latency tracking
+        self.current_turn_start_time = None
+        self.current_turn_id = None
+        self.current_sequence_id = None
+        # Canned speech (handoff, goodbye, ...) has no turn_id; the category is the only
+        # way downstream can attribute its latency entry to the message that was spoken.
+        self.current_message_category = None
+        self.current_tts_start_ms = None
+        self.current_turn_ttfb = None
+        self.ws_send_time = None
+        self.current_sequence_chars = 0
+        # Socket this turn's text was attempted on; only that socket's loss settles the turn.
+        self.current_turn_socket = None
+
+    # ------------------------------------------------------------------
+    # Subclass hooks (override these)
+    # ------------------------------------------------------------------
+
+    async def establish_connection(self):
+        """Connect to the provider WebSocket. Return the websocket object or None."""
+        raise NotImplementedError
+
+    async def sender(self, text, sequence_id, end_of_llm_stream=False):
+        """Send *text* to the WebSocket. Called as an asyncio task."""
+        raise NotImplementedError
+
+    async def receiver(self):
+        """Async generator yielding raw audio bytes. Yield b'\\x00' for end-of-stream."""
+        raise NotImplementedError
+        yield  # pragma: no cover — make this a generator
+
+    def _get_audio_format(self):
+        """Return the format string for meta_info (e.g. 'mulaw', 'wav', 'pcm')."""
+        return "wav"
+
+    def _process_audio_chunk(self, chunk):
+        """Optional per-chunk transform for WS streaming (resample, decode, etc). Return bytes."""
+        return chunk
+
+    def _process_http_audio(self, audio):
+        """Audio conversion for HTTP mode. Defaults to _process_audio_chunk.
+
+        Override separately when the HTTP response format differs from the WS
+        wire format (e.g. Rime WS sends mulaw, but HTTP sends mp3/wav).
+        """
+        return self._process_audio_chunk(audio)
+
+    def _get_http_audio_format(self):
+        """Output format string for HTTP mode. Defaults to _get_audio_format.
+
+        Override when HTTP output format differs from WS output format.
+        """
+        return self._get_audio_format()
+
+    def _unpack_receiver_message(self, item):
+        """Unpack what receiver() yields into (audio_bytes, extra_meta_dict).
+
+        Default assumes receiver() yields raw bytes.
+        Override if your receiver yields richer objects (e.g. ElevenLabs yields
+        (audio, text_synthesized) tuples).
+        """
+        return item, {}
+
+    # ------------------------------------------------------------------
+    # Shared sender helpers
+    # ------------------------------------------------------------------
+
+    def _is_ws_connected(self):
+        ws = self.websocket
+        return ws is not None and ws.state is not websockets.protocol.State.CLOSED
+
+    async def _wait_for_ws(self, poll_interval=1):
+        """Block until the WebSocket is connected."""
+        while not self._is_ws_connected():
+            if self.conversation_ended or self.connection_error:
+                logger.info(
+                    f"Aborting {self.provider_name} sender wait: conversation_ended={self.conversation_ended} connection_error={self.connection_error}"
+                )
+                return
+            logger.info(f"Waiting for {self.provider_name} WebSocket connection...")
+            # Woken by the connect itself; the interval only bounds how stale the checks above can get.
+            self.websocket_ready.clear()
+            try:
+                await asyncio.wait_for(self.websocket_ready.wait(), timeout=poll_interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _send_json(self, payload):
+        """Send a JSON payload over the WebSocket. Sets connection_error on failure."""
+        try:
+            await self.websocket.send(json.dumps(payload))
+        except Exception as e:
+            logger.error(f"Error sending to {self.provider_name}: {e}")
+            self.connection_error = str(e)
+            raise
+
+    # ------------------------------------------------------------------
+    # push()  — routes to WS queue or internal_queue
+    # ------------------------------------------------------------------
+
+    async def push(self, message):
+        if self.stream:
+            await self._push_stream(message)
+        else:
+            self.internal_queue.put_nowait(copy.deepcopy(message))
+
+    async def _push_stream(self, message):
+        meta_info = message.get("meta_info")
+        text = message.get("data")
+        self.current_text = text
+        self.synthesized_characters += len(text) if text else 0
+        self.meta_info = copy.deepcopy(meta_info)
+        meta_info["text"] = text
+
+        # Stamp turn start on first push of a new turn
+        self._stamp_turn_start(meta_info)
+        # After the stamp, which may close an abandoned turn and zero the count.
+        self.current_sequence_chars += len(text) if text else 0
+
+        # Pre-push hook (e.g. context_id); Cartesia may defer end_of_llm_stream, so read it after.
+        self._on_push(meta_info, text)
+
+        end_of_llm_stream = meta_info.get("end_of_llm_stream", False)
+        self.sender_task = asyncio.create_task(self.sender(text, meta_info.get("sequence_id"), end_of_llm_stream))
+        self.text_queue.append(meta_info)
+
+    def _stamp_turn_start(self, meta_info):
+        """Only stamp on the first push of a new turn (don't re-stamp on subsequent chunks)."""
+        if self.open_turn_is_retired(meta_info.get("sequence_id")):
+            self.abandon_open_turn()
+        if self.current_turn_start_time is None:
+            # Drop leftover entries from a previous turn so this turn's first audio
+            # chunk doesn't pop a stale entry and inherit a dead sequence_id (which
+            # __listen_synthesizer would then filter out). Keep same-seq entries —
+            # they belong to this turn (sequence_ids are monotonic; only -1 repeats).
+            new_seq = meta_info.get("sequence_id")
+            if self.text_queue and any(m.get("sequence_id") != new_seq for m in self.text_queue):
+                kept = deque(m for m in self.text_queue if m.get("sequence_id") == new_seq)
+                dropped = len(self.text_queue) - len(kept)
+                self.text_queue = kept
+                logger.info(f"Dropped {dropped} stale text_queue entries on new turn start (seq={new_seq})")
+            self.current_turn_start_time = time.perf_counter()
+            self.ws_send_time = None
+            self.current_turn_ttfb = None
+            self.current_turn_socket = None
+            # Anchor tts_start_ms to the first push — re-pushes of speculative responses
+            # (e.g. after a tool call confirms the eager response) would overwrite this
+            # to a later timestamp, making tts_start appear after agent_speech_start.
+            self.current_tts_start_ms = meta_info.get("tts_start_ms")
+            self.last_text_sent = False
+            logger.info(f"Push new_turn text_len={len(meta_info.get('text', '') or '')}")
+        self.current_turn_id = meta_info.get("turn_id")
+        self.current_sequence_id = meta_info.get("sequence_id")
+        self.current_message_category = meta_info.get("message_category")
+        # Eager stub — captured even if turn never produces audio (e.g. TTS WS drop).
+        # _record_turn_latency() upserts by sequence_id on completion, replacing this entry.
+        self._upsert_turn_latency(
+            {
+                "turn_id": self.current_turn_id,
+                "sequence_id": self.current_sequence_id,
+                "tts_start_ms": self.current_tts_start_ms,
+                "message_category": self.current_message_category,
+            }
+        )
+
+    def _on_push(self, meta_info, text):
+        """Provider-specific hook called during push before sender is created."""
+        pass
+
+    # ------------------------------------------------------------------
+    # generate()  — the main audio-producing async generator
+    # ------------------------------------------------------------------
+
+    async def generate(self):
+        try:
+            if self.stream:
+                async for packet in self._generate_ws_loop():
+                    yield packet
+            else:
+                async for packet in self._generate_http_loop():
+                    yield packet
+        except Exception as e:
+            logger.error(f"Error in {self.provider_name} generate: {e}", exc_info=True)
+            raise
+
+    async def _generate_ws_loop(self):
+        """Core WebSocket streaming loop. Rarely needs overriding."""
+        async for raw_item in self.receiver():
+            if self.connection_error:
+                raise Exception(self.connection_error)
+
+            audio, extra_meta = self._unpack_receiver_message(raw_item)
+
+            # An abandoned turn's eos goes out under its own retired sequence, so the downstream guard
+            # settles it, without taking the next turn's meta.
+            if audio == b"\x00" and extra_meta.get("retired_sequence_id") is not None:
+                logger.info(f"{self.provider_name}: eos for abandoned seq={extra_meta['retired_sequence_id']}")
+                retired_meta = {
+                    "sequence_id": extra_meta["retired_sequence_id"],
+                    "end_of_synthesizer_stream": True,
+                    "format": self._get_audio_format(),
+                }
+                yield create_ws_data_packet(audio, retired_meta)
+                continue
+
+            # Pop meta_info from the text_queue when available
+            if self.text_queue:
+                self.meta_info = self.text_queue.popleft()
+                self._compute_first_result_latency()
+
+            if self.meta_info is None:
+                self.meta_info = {}
+
+            self.meta_info["format"] = self._get_audio_format()
+            # Merge any extra metadata from the receiver
+            self.meta_info.update(extra_meta)
+
+            # First-chunk bookkeeping
+            self._stamp_first_chunk(self.meta_info)
+
+            if self.last_text_sent:
+                self.first_chunk_generated = False
+                self.last_text_sent = True
+
+            # End-of-stream sentinel
+            if audio == b"\x00":
+                logger.info(f"{self.provider_name}: end of stream")
+                self.meta_info["end_of_synthesizer_stream"] = True
+                # eos may pop a non-final chunk's meta; carry end_of_llm_stream so is_final_chunk fires
+                if self.last_text_sent:
+                    self.meta_info["end_of_llm_stream"] = True
+                self.first_chunk_generated = False
+                self._record_turn_latency()
+            else:
+                audio = self._process_audio_chunk(audio)
+                if audio is None:
+                    continue
+
+            self._stamp_mark_id(self.meta_info)
+            yield create_ws_data_packet(audio, self.meta_info)
+
+        if self.connection_error:
+            raise Exception(self.connection_error)
+
+    # ------------------------------------------------------------------
+    # Latency helpers
+    # ------------------------------------------------------------------
+
+    def _compute_first_result_latency(self):
+        """Compute and stamp synthesizer_latency on first audio chunk of a turn."""
+        try:
+            if self.current_turn_ttfb is None and self.ws_send_time is not None:
+                self.current_turn_ttfb = time.perf_counter() - self.ws_send_time
+                self.meta_info["synthesizer_latency"] = self.current_turn_ttfb
+        except Exception:
+            pass
+
+    def has_unsettled_turn_on(self, socket):
+        """True when the open turn's text was attempted on `socket` and never reached its eos.
+
+        Pushing a turn only stamps the start; its sender may still be waiting for a connection,
+        so ownership of the socket is what says the audio is actually lost with it."""
+        return socket is not None and self.current_turn_socket is socket and self.current_turn_start_time is not None
+
+    def _record_turn_latency(self):
+        """Append a latency record for the completed turn."""
+        try:
+            if self.current_turn_start_time is not None:
+                total_stream_duration = time.perf_counter() - self.current_turn_start_time
+                self._upsert_turn_latency(
+                    {
+                        "turn_id": self.current_turn_id,
+                        "sequence_id": self.current_sequence_id,
+                        "tts_start_ms": self.current_tts_start_ms,
+                        "first_result_latency_ms": round((self.current_turn_ttfb or 0) * 1000),
+                        "total_stream_duration_ms": round(total_stream_duration * 1000),
+                        "characters": self.current_sequence_chars,
+                        "message_category": self.current_message_category,
+                    }
+                )
+                self.reset_turn_state()
+        except Exception:
+            pass
+
+    def reset_turn_state(self):
+        self.current_turn_start_time = None
+        self.current_turn_id = None
+        self.current_sequence_id = None
+        self.current_message_category = None
+        self.current_tts_start_ms = None
+        self.ws_send_time = None
+        self.current_turn_ttfb = None
+        self.current_sequence_chars = 0
+        self.current_turn_socket = None
+
+    def open_turn_is_retired(self, next_sequence_id):
+        """True when a push for another sequence finds the open turn's sequence already retired."""
+        open_sequence_id = self.current_sequence_id
+        if self.current_turn_start_time is None or open_sequence_id in (None, -1, next_sequence_id):
+            return False
+        try:
+            return not self.should_synthesize_response(open_sequence_id)
+        except Exception:
+            return False
+
+    def call_relative_now_ms(self):
+        call_start_ms = getattr(self.task_manager_instance, "conversation_start_init_ts", None)
+        return round(time.time() * 1000 - call_start_ms, 2) if isinstance(call_start_ms, (int, float)) else None
+
+    def abandon_open_turn(self):
+        """Close a turn cut off before its eos, so the next sequence does not inherit its start.
+
+        Without this, the next push found the timer still running and reused this turn's tts_start and
+        first-result latency."""
+        if self.current_turn_start_time is None:
+            return
+        entry = {
+            "turn_id": self.current_turn_id,
+            "sequence_id": self.current_sequence_id,
+            "tts_start_ms": self.current_tts_start_ms,
+            "characters": self.current_sequence_chars,
+            "message_category": self.current_message_category,
+            "cancelled_at_ms": self.call_relative_now_ms(),
+        }
+        if self.current_turn_ttfb is not None:
+            entry["first_result_latency_ms"] = round(self.current_turn_ttfb * 1000)
+        self._upsert_turn_latency(entry)
+        logger.info(f"{self.provider_name}: abandoned open turn seq={self.current_sequence_id}")
+        self.reset_turn_state()
+
+    # ------------------------------------------------------------------
+    # monitor_connection() — shared reconnect loop
+    # ------------------------------------------------------------------
+
+    async def monitor_connection(self):
+        consecutive_failures = 0
+
+        while consecutive_failures < MAX_CONNECTION_FAILURES:
+            if not self._is_ws_connected():
+                logger.info(f"Re-establishing {self.provider_name} connection...")
+                result = await self.establish_connection()
+                if result is None:
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"{self.provider_name} connection failed "
+                        f"(attempt {consecutive_failures}/{MAX_CONNECTION_FAILURES})"
+                    )
+                    if consecutive_failures >= MAX_CONNECTION_FAILURES:
+                        logger.error(f"Max connection failures reached for {self.provider_name}")
+                        self.connection_error = self.connection_error or "Max connection failures reached"
+                        break
+                else:
+                    self.websocket = result
+                    self.websocket_ready.set()
+                    consecutive_failures = 0
+            await asyncio.sleep(1)
+
+    async def close_connection(self):
+        """Close the socket without ending the synthesizer: a multilingual leg reopens it on a later switch."""
+        ws, self.websocket = self.websocket, None
+        if ws is None:
+            return
+        try:
+            await ws.close()
+        except Exception as e:
+            logger.info(f"Error closing idle {self.provider_name} WebSocket: {e}")
+
+    # ------------------------------------------------------------------
+    # cleanup() — cancel tasks and close WS
+    # ------------------------------------------------------------------
+
+    async def cleanup(self):
+        self.conversation_ended = True
+        logger.info(f"Cleaning up {self.provider_name} synthesizer tasks")
+
+        if self.sender_task:
+            try:
+                self.sender_task.cancel()
+                await self.sender_task
+            except asyncio.CancelledError:
+                logger.info(f"{self.provider_name} sender task cancelled during cleanup.")
+                # Always stamp cancellation — even if sequence_id is None the event is useful
+                _t = self.task_manager_instance
+                _cancelled_at = round(time.time() * 1000 - _t.conversation_start_init_ts, 2) if _t is not None else None
+                self._upsert_turn_latency(
+                    {
+                        "turn_id": self.current_turn_id,
+                        "sequence_id": self.current_sequence_id,
+                        "tts_start_ms": self.current_tts_start_ms,
+                        "cancelled_at_ms": _cancelled_at,
+                        "message_category": self.current_message_category,
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"Error cancelling {self.provider_name} sender task: {e}")
+
+        ws = self.websocket
+        if ws:
+            try:
+                await ws.close()
+            except Exception as e:
+                logger.error(f"Error closing {self.provider_name} WebSocket: {e}")
+        self.websocket = None
+        logger.info(f"{self.provider_name} WebSocket connection closed.")

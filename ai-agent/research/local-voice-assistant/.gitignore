@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor/OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Local overrides (keep config.yaml itself tracked, ignore any personal copies)
+config.local.yaml
+*.local.yaml

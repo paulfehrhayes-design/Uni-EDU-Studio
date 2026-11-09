@@ -1,0 +1,628 @@
+import os
+from datetime import datetime, timezone
+from bolna.enums import LLMProvider, ReasoningEffort as RE, SynthesizerProvider, TelephonyProvider
+
+PREPROCESS_DIR = "agent_data"
+PCM16_SCALE = 32768.0
+
+# Provider label for browser web calls (raw-WS transport). Not a TelephonyProvider — it's the
+# codebase-wide literal the transcribers already branch on; single home for new comparisons.
+WEB_BASED_CALL_PROVIDER = "web_based_call"
+# Web + FreeSWITCH webcall paths play raw PCM at this fixed rate (telephony stays 8k mulaw).
+WEBCALL_TTS_SAMPLE_RATE = 24000
+# Input handlers on these providers batch a different amount of audio than the transcriber's
+# frame constant assumes, so the stream cursor measures the payload instead of trusting it.
+# sip-trunk batches 80ms against a 200ms constant; the webcall paths batch 200ms against 256ms/500ms.
+MEASURED_FRAME_PROVIDERS = frozenset(
+    {
+        TelephonyProvider.SIP_TRUNK.value,
+        TelephonyProvider.FREESWITCH.value,
+        WEB_BASED_CALL_PROVIDER,
+    }
+)
+
+OPENAI_TRANSCRIBER_HEARTBEAT_INTERVAL_S = 5
+OPENAI_TRANSCRIBER_UTTERANCE_TIMEOUT_S = 0.5
+
+# ElevenLabs realtime (scribe_v2_realtime) accepts up to 50 keyterms for biasing.
+ELEVENLABS_REALTIME_MAX_KEYTERMS = 50
+
+# Past these the engine rejects the session rather than truncating.
+ASSEMBLYAI_MAX_KEYTERMS = 100
+ASSEMBLYAI_MAX_PROMPT_CHARACTERS = 1750
+ASSEMBLYAI_MAX_AGENT_CONTEXT_CHARACTERS = 1750
+SMALLEST_MAX_KEYWORDS = 100
+
+SARVAM_MAX_KEYTERMS = 50
+SARVAM_MAX_KEYTERM_CHARACTERS = 64
+
+# Beyond this a phrase list costs Azure accuracy and latency rather than buying either.
+AZURE_MAX_PHRASES = 2000
+
+# Anything outside this set rejects the session.
+ASSEMBLYAI_SUPPORTED_LANGUAGES = {
+    "af",
+    "ar",
+    "ca",
+    "da",
+    "de",
+    "en",
+    "es",
+    "et",
+    "fa",
+    "fi",
+    "fr",
+    "gl",
+    "he",
+    "hi",
+    "it",
+    "ja",
+    "ko",
+    "mr",
+    "nl",
+    "nn",
+    "no",
+    "pt",
+    "ro",
+    "ru",
+    "sv",
+    "tr",
+    "ur",
+    "vi",
+    "xh",
+    "yue",
+    "zh",
+    "zu",
+}
+
+# Deepgram Flux defaults — all overridable via agent transcriber config
+DEEPGRAM_FLUX_EOT_THRESHOLD = 0.7  # confidence to declare end-of-turn
+DEEPGRAM_FLUX_EAGER_EOT_THRESHOLD = 0.5  # confidence to trigger speculative LLM early
+DEEPGRAM_FLUX_EOT_TIMEOUT_MS = 500  # max silence before forcing end-of-turn
+# Min time a Flux turn may stay open with no transcriber events before it is force-closed.
+DEEPGRAM_FLUX_TURN_STALL_FLOOR_S = 3.0
+# Deepgram re-sends a just-finalized sentence ~1s after the final; a word-for-word repeat later than this is real speech
+REDELIVERED_TRANSCRIPT_WINDOW_MS = 2000
+# Past this much silence (no audio playing, both sides silent), force a hangup - the call has
+# made no forward progress at all, e.g. a hung LLM call or an s2s tool task that never
+# completes. BOLNA-2563.
+STALL_HANGUP_HARD_CAP_S = 60.0
+# [silence] re-prompts allowed per silence period (reset when the user speaks or the node changes;
+# raised to what the node's own _silence_repeats exit edge needs). Each re-prompt counts as agent
+# speech and restarts the silence clock, so without a cap a node re-prompt shorter than
+# hangup_after_silence keeps a silent caller on the line until the max call duration.
+DEFAULT_MAX_SILENCE_REPEATS = 2
+# Max time to wait for one LLM reply (_run_llm_task). If the LLM never comes back - no reply,
+# no error, it just hangs - force it to fail after this many seconds and hang up, instead of
+# leaving the call stuck forever. BOLNA-2563.
+LLM_GENERATION_TIMEOUT_S = 60.0
+
+# LLM-driven language-switch defaults, all overridable by the matching LANGUAGE_SWITCH_* env.
+# Read via os.getenv(..., CONSTANT) at call time, never frozen at import (load_dotenv runs later).
+# Ceiling on the Switch-LLM decide. The detector buffer is drained BEFORE the decide, so a
+# timeout loses that utterance — keep above the observed decide tail (~5.9s seen in QA).
+LANGUAGE_SWITCH_DECIDE_TIMEOUT_S = 6.0
+# Let the detector's socket deliver this turn's tail before draining its buffer.
+LANGUAGE_SWITCH_SETTLE_MS = 300
+# Keypad input reaches the LLM as a user turn with this prefix (inject_digits_to_conversation).
+DTMF_MESSAGE_PREFIX = "dtmf_number: "
+# Silence between cutting audible old-language audio and the first new-language audio.
+LANGUAGE_SWITCH_AUDIO_GAP_S = 0.2
+# Ceiling on how long a mismatched turn's AUDIO waits for the switch decision. Generation is not
+# delayed, so this is only paid when synthesis outruns the decide. Capped independently of the
+# decide timeout (sized for the slow tail) because past this point a wrong-language reply the
+# switch then truncates beats more dead air. Wall-clock backstop: the gate cannot wedge on it.
+LANGUAGE_SWITCH_MAX_HOLD_S = 4.0
+# Substance gate: a non-explicit switch needs at least one FOREIGN detector segment this long.
+# Guards against one-word mis-tags switching the call. Sarvam splits real turns into sub-second
+# fragments, so correct verdicts were dying just under the bar (1.0 → 0.8 → 0.7).
+LANGUAGE_SWITCH_MIN_SEGMENT_AUDIO_S = 0.7
+# Idle-flush suppression: while main-ASR interims say the caller is mid-utterance, defer the
+# flush (the coming turn will drain the buffer). Past this buffer age the speaking flag is
+# treated as stale — the detector hears the same audio and has produced nothing that long.
+LANGUAGE_SWITCH_SPEAKING_STALE_CAP_S = 2.5
+# Agent replies after a switch that get the earlier turns as prompt text (language_switch_prompt_transcript
+# flag): some models keep the language of the chat history over every instruction until their own replies flip it.
+LANGUAGE_SWITCH_TRANSCRIPT_REPLIES = 2
+
+# Debounce for overlapped finals: one regenerate after this quiet window instead of per fragment.
+LLM_REGEN_SETTLE_S = 0.7
+
+# Above this, a turn is a restatement of the one just spoken and its audio is dropped. The incident
+# pair (BOLNA-2621) differed only by a leading "कृपया" and scores ~0.94; distinct answers sit far below.
+DUPLICATE_RESPONSE_SIMILARITY = 0.9
+# Class-name prefixes whose endpointing rules out an in-window final: they skip the debounce.
+REGEN_SETTLE_EXCLUDED_TRANSCRIBERS = ("deepgram",)
+
+# Past this much with no new words from the caller, callee_speaking is stale and held audio ships.
+# Deepgram closes a healthy turn within utterance_end_ms (1s floor), so a real speaker stays inside it.
+STUCK_AUDIO_GATE_RELEASE_S = 2.0
+
+# Above __await_stream_sid's own 10s timeout, so that path is what ends the call.
+S2S_STREAM_SID_TIMEOUT_S = 12.0
+# How long an armed goodbye gets before the call is closed without it.
+S2S_GOODBYE_TIMEOUT_S = 10.0
+
+# Soniox real-time STT
+SONIOX_WEBSOCKET_HOST = "stt-rt.soniox.com"
+# Regional real-time hosts; a region's key is read from SONIOX_<REGION>_API_KEY, since keys are region-bound.
+SONIOX_REGION_HOSTS = {
+    "us": "stt-rt.soniox.com",
+    "eu": "stt-rt.eu.soniox.com",
+    "in": "stt-rt.in.soniox.com",
+    "jp": "stt-rt.jp.soniox.com",
+}
+SONIOX_ENDPOINT_TOKEN = "<end>"  # sentinel token emitted when the speaker stops
+SONIOX_FINALIZE_TOKEN = "<fin>"  # closes the tokens a {"type": "finalize"} request flushed
+# Ceiling on dropping a finalized turn's leftovers, in case its <fin> never comes back.
+SONIOX_FINALIZE_DISCARD_S = 3.0
+# Hinted for multilingual auto-detect: Soniox identifies and code-switches across these in one
+# stream; hinting the relevant set sharpens accuracy over fully-open auto. No real-time as/od.
+SONIOX_DEFAULT_MULTILINGUAL_HINTS = ["en", "hi", "ta", "te", "kn", "ml", "mr", "bn", "gu", "pa", "ur"]
+SONIOX_AUTO_LANGUAGE_VALUES = {"", "multi", "auto", "multilingual", "unknown"}
+
+# How each provider words a moderation rejection: OpenAI says "content policy", Azure says
+# "content management policy" and carries code content_filter.
+CONTENT_POLICY_ERROR_MARKERS = ("content policy", "content_policy", "content_filter", "content management")
+
+# Pre-generated clips sent as one mark for the whole message. Not event_proactive: on
+# sequence_id -1 the handlers blank text_synthesized, so its mark never carries text.
+CACHED_SINGLE_MARK_CATEGORIES = ("static_node",)
+
+# OpenAI models on AWS Bedrock's OpenAI-compatible API, by the inference profile Bedrock serves each as.
+# The in. profiles keep requests in India (ap-south-1 / ap-south-2).
+BEDROCK_DEFAULT_BASE_URL = "https://bedrock-runtime.ap-south-1.amazonaws.com/openai/v1"
+BEDROCK_MODEL_IDS = {"gpt-5.6-luna": "in.openai.gpt-5.6-luna"}
+
+# Model prefixes
+GPT5_MODEL_PREFIX = "gpt-5"
+GPT5_4_MODEL_PREFIX = "gpt-5.4"
+GPT5_5_MODEL_PREFIX = "gpt-5.5"
+GPT5_6_MODEL_PREFIX = "gpt-5.6"
+GPT6_MODEL_PREFIX = "gpt-6"
+# Families that fix temperature at 1, take max_completion_tokens rather than max_tokens,
+# reject stop, and carry a reasoning_effort.
+REASONING_MODEL_PREFIXES = (GPT5_MODEL_PREFIX, GPT6_MODEL_PREFIX)
+# Function tools with reasoning_effort are rejected on chat completions for these models,
+# so tool-using agents are routed through the Responses API.
+RESPONSES_API_MODEL_PREFIXES = (
+    GPT5_4_MODEL_PREFIX,
+    GPT5_5_MODEL_PREFIX,
+    GPT5_6_MODEL_PREFIX,
+    GPT6_MODEL_PREFIX,
+)
+
+HIGH_LEVEL_ASSISTANT_ANALYTICS_DATA = {
+    "extraction_details": {},
+    "cost_details": {
+        "average_transcriber_cost_per_conversation": 0,
+        "average_llm_cost_per_conversation": 0,
+        "average_synthesizer_cost_per_conversation": 1.0,
+    },
+    "historical_spread": {
+        "number_of_conversations_in_past_5_days": [],
+        "cost_past_5_days": [],
+        "average_duration_past_5_days": [],
+    },
+    "conversation_details": {"total_conversations": 0, "finished_conversations": 0, "rejected_conversations": 0},
+    "execution_details": {"total_conversations": 0, "total_cost": 0, "average_duration_of_conversation": 0},
+    "last_updated_at": datetime.now(timezone.utc).isoformat(),
+}
+
+ACCIDENTAL_INTERRUPTION_PHRASES = [
+    "stop",
+    "quit",
+    "bye",
+    "wait",
+    "no",
+    "wrong",
+    "incorrect",
+    "hold",
+    "pause",
+    "break",
+    "cease",
+    "halt",
+    "silence",
+    "enough",
+    "excuse",
+    "hold on",
+    "hang on",
+    "cut it",
+    "that's enough",
+    "shush",
+    "listen",
+    "excuse me",
+    "hold up",
+    "not now",
+    "stop there",
+    "stop speaking",
+]
+
+PRE_FUNCTION_CALL_MESSAGE = {
+    "en": "Just give me a moment, I'll be back with you.",
+    "ge": "Geben Sie mir einen Moment Zeit, ich bin gleich wieder bei Ihnen.",
+}
+
+FILLER_PHRASES = [
+    "No worries.",
+    "It's fine.",
+    "I'm here.",
+    "No rush.",
+    "Take your time.",
+    "Great!",
+    "Awesome!",
+    "Fantastic!",
+    "Wonderful!",
+    "Perfect!",
+    "Excellent!",
+    "I get it.",
+    "Noted.",
+    "Alright.",
+    "I understand.",
+    "Understood.",
+    "Got it.",
+    "Sure.",
+    "Okay.",
+    "Right.",
+    "Absolutely.",
+    "Sure thing.",
+    "I see.",
+    "Gotcha.",
+    "Makes sense.",
+]
+
+FILLER_DICT = {
+    "Unsure": ["No worries.", "It's fine.", "I'm here.", "No rush.", "Take your time."],
+    "Positive": ["Great!", "Awesome!", "Fantastic!", "Wonderful!", "Perfect!", "Excellent!"],
+    "Negative": ["I get it.", "Noted.", "Alright.", "I understand.", "Understood.", "Got it."],
+    "Neutral": ["Sure.", "Okay.", "Right.", "Absolutely.", "Sure thing."],
+    "Explaining": ["I see.", "Gotcha.", "Makes sense."],
+    "Greeting": ["Hello!", "Hi there!", "Hi!", "Hey!"],
+    "Farewell": ["Goodbye!", "Thank you!", "Take care!", "Bye!"],
+    "Thanking": ["Welcome!", "No worries!"],
+    "Apology": ["I'm sorry.", "My apologies.", "I apologize.", "Sorry."],
+    "Clarification": ["Please clarify.", "Can you explain?", "More details?", "Can you elaborate?"],
+    "Confirmation": ["Got it.", "Okay.", "Understood."],
+}
+
+CHECKING_THE_DOCUMENTS_FILLER = "Umm, just a moment, getting details..."
+TRANSFERING_CALL_FILLER = {
+    "en": "Sure, I'll transfer the call for you. Please wait a moment...",
+    "fr": "D'accord, je transfère l'appel. Un instant, s'il vous plaît.",
+}
+
+DEFAULT_USER_ONLINE_MESSAGE = "Hey, are you still there?"
+DEFAULT_USER_ONLINE_MESSAGE_TRIGGER_DURATION = 6
+DEFAULT_LANGUAGE_CODE = "en"
+DEFAULT_TIMEZONE = "America/Los_Angeles"
+
+LANGUAGE_NAMES = {
+    "en": "English",
+    "hi": "Hindi",
+    "bn": "Bengali",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "pa": "Punjabi",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "de": "German",
+    "it": "Italian",
+    "nl": "Dutch",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "od": "Odia",
+}
+
+# Request fields the pipeline owns; a custom LLM's extra_body may not override them.
+RESERVED_LLM_REQUEST_KEYS = frozenset(
+    {"model", "messages", "stream", "stream_options", "tools", "tool_choice", "parallel_tool_calls", "response_format"}
+)
+# OpenAI-compatible LLM vendors: (base URL, env var holding the platform key).
+LLM_VENDOR_ENDPOINTS = {
+    LLMProvider.SARVAM.value: ("https://api.sarvam.ai/v1", "SARVAM_API_KEY"),
+}
+# Speech request fields that shape what bolna sends and gets back; a custom TTS's extra_body may not set them.
+RESERVED_TTS_REQUEST_KEYS = frozenset({"model", "voice", "input", "response_format", "stream_format"})
+
+LLM_DEFAULT_CONFIGS = {
+    "summarization": {"model": "gpt-4.1-mini", "provider": "openai"},
+    "extraction": {"model": "gpt-4.1-mini", "provider": "openai"},
+    "google": {"model": "gemini-2.5-flash", "provider": "google"},
+}
+
+# Legacy language-switch tool, injected into the main LLM on multilingual agents
+# when the LLM-driven switch flow is NOT enabled (tools_config["llm_language_switch"]
+# false/absent) — restored from master for the feature-flag fallback path.
+SWITCH_LANGUAGE_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "switch_language",
+        "description": "Switch the conversation language for speech recognition and synthesis. Call this when the user speaks in or requests a different language.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "description": "The language label to switch to (e.g. 'hi' for Hindi, 'en' for English)",
+                }
+            },
+            "required": ["language"],
+        },
+    },
+}
+
+# Control marks carry no playback evidence and must not be used as a trim target.
+NON_EVIDENCE_MARK_TYPES = ("pre_mark_message", "backchanneling")
+
+# message_category of the "are you still there" prompt. The playout estimate and
+# final_chunk_played_observable must exclude the same value or the two silence clocks disagree.
+IS_USER_ONLINE_MESSAGE = "is_user_online_message"
+
+# Formats whose byte length maps directly to playback time. Compressed audio does not.
+UNCOMPRESSED_AUDIO_FORMATS = ("pcm", "wav", "mulaw", "ulaw")
+
+# End-of-stream control signal; telephony pads the single byte to two before sending.
+AUDIO_STREAM_END_SENTINELS = (b"\x00", b"\x00\x00")
+
+END_CALL_FUNCTION_PREFIX = "end_call"
+# meta_info flag a graph end node sets so the task manager hangs up once its reply has played.
+HANGUP_AFTER_REPLY = "hangup_after_reply"
+WEB_SEARCH_FUNCTION_NAME = "web_search"
+
+END_CALL_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "end_call",
+        "description": "End the current call. Use this when the conversation is naturally complete, the user has explicitly said goodbye, or you've fulfilled the purpose of the call. Always say your goodbye message before calling this function.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Brief reason for ending the call (e.g. 'conversation_complete', 'user_goodbye', 'task_fulfilled')",
+                }
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+}
+
+WEB_SEARCH_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": WEB_SEARCH_FUNCTION_NAME,
+        "description": (
+            "Look up current public information on the web. Use this for news, prices, scores, "
+            "and facts that may have changed after your knowledge cutoff. Answer the caller in "
+            "one or two spoken sentences."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "A short search query for the fact the caller asked about.",
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+}
+
+# Provider TTS controls. Config models and synthesizer adapters share these
+# bounds so validation cannot drift between agent setup and direct package use.
+CARTESIA_VOLUME_MIN = 0.5
+CARTESIA_VOLUME_MAX = 2.0
+CARTESIA_VOLUME_MODELS = {"sonic-3", "sonic-3.5", "sonic-3.6", "sonic-preview"}
+
+# Served only from the text-to-dialogue socket; multi-stream-input 403s on these.
+ELEVENLABS_DIALOGUE_MODEL_PREFIXES = ("eleven_v3", "eleven_v4")
+
+DEEPGRAM_AURA_2_SPEED_MIN = 0.7
+DEEPGRAM_AURA_2_SPEED_MAX = 1.5
+
+OPENAI_TTS_SPEED_MIN = 0.25
+OPENAI_TTS_SPEED_MAX = 4.0
+
+RIME_TIME_SCALE_FACTOR_MIN = 0.4
+RIME_TIME_SCALE_FACTOR_MAX = 2.5
+
+SMALLEST_TTS_SPEED_MIN = 0.5
+SMALLEST_TTS_SPEED_MAX = 2.0
+
+SARVAM_LOUDNESS_MIN = 0.3
+SARVAM_LOUDNESS_MAX = 3.0
+
+AZURE_TTS_SPEED_MIN = 0.5
+AZURE_TTS_SPEED_MAX = 2.0
+
+# Per-model TTS controls, read by the config validators in bolna.models and by the dashboard. A config
+# field's ge/le is the provider-wide range; a control listed here applies only to the models named, or has
+# a narrower range on one model. Model ids are lowercase.
+SARVAM_LOUDNESS_MODELS = frozenset({"bulbul:v2"})
+RIME_TIME_SCALE_MODELS = frozenset({"coda", "mistv3"})
+ELEVENLABS_STYLE_MODELS = frozenset({"eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2"})
+
+TTS_CONTROL_MODELS = {
+    SynthesizerProvider.CARTESIA: {"volume": CARTESIA_VOLUME_MODELS},
+    SynthesizerProvider.ELEVENLABS: {"style": ELEVENLABS_STYLE_MODELS},
+    SynthesizerProvider.RIME: {"time_scale_factor": RIME_TIME_SCALE_MODELS},
+    SynthesizerProvider.SARVAM: {"loudness": SARVAM_LOUDNESS_MODELS},
+}
+# Deepgram model ids can carry the voice ("aura-2-thalia-en"), so its controls match on the family prefix.
+TTS_CONTROL_MODEL_PREFIXES = {
+    SynthesizerProvider.DEEPGRAM: {"speed": ("aura-2",)},
+}
+TTS_MODEL_CONTROL_LIMITS = {
+    SynthesizerProvider.SARVAM: {
+        "bulbul:v3": {"speed": (0.5, 2.0)},
+        "bulbul:v4-flash": {"speed": (0.5, 2.0)},
+    },
+}
+# provider_config keys that change how the audio sounds, so cached audio (welcome, static-node clips) keys on them.
+TTS_AUDIO_SETTINGS = {
+    SynthesizerProvider.AZURETTS: frozenset({"speed"}),
+    SynthesizerProvider.CARTESIA: frozenset({"speed", "volume"}),
+    SynthesizerProvider.DEEPGRAM: frozenset({"speed"}),
+    SynthesizerProvider.ELEVENLABS: frozenset({"speed", "similarity_boost", "temperature", "style"}),
+    SynthesizerProvider.GEMINI: frozenset({"style"}),
+    SynthesizerProvider.KALPA: frozenset({"temperature", "acoustic_temperature", "audio_quality"}),
+    SynthesizerProvider.OPENAI: frozenset({"speed"}),
+    SynthesizerProvider.PIXA: frozenset({"top_p", "repetition_penalty"}),
+    SynthesizerProvider.RIME: frozenset({"time_scale_factor"}),
+    SynthesizerProvider.SARVAM: frozenset({"speed", "loudness"}),
+    SynthesizerProvider.SMALLEST: frozenset({"speed"}),
+    SynthesizerProvider.SONIOX: frozenset({"speed", "reduce_silence"}),
+    SynthesizerProvider.CUSTOM: frozenset({"speed", "extra_body"}),
+}
+
+# Provider pronunciation dictionaries, referenced by ID and applied by the provider. A dictionary
+# lives in one provider account, so it only works with that account's API key.
+ELEVENLABS_MAX_PRONUNCIATION_DICTIONARIES = 3
+# Cartesia honours pronunciation_dict_id on sonic-3 and newer, dated snapshots included.
+CARTESIA_PRONUNCIATION_DICT_MODEL_PREFIXES = ("sonic-3", "sonic-preview", "sonic-latest")
+# Limits for a synthesizer's word -> say-as pronunciation rules.
+PRONUNCIATION_RULES_MAX = 100
+PRONUNCIATION_RULE_WORD_MAX_LENGTH = 50
+PRONUNCIATION_RULE_SAY_AS_MAX_LENGTH = 100
+
+SARVAM_MODEL_SAMPLING_RATE_MAPPING = {
+    "bulbul:v2": 22050,
+    "bulbul:v3": 22050,  # NOTE: Documentation claims 24000, but WAV header shows 22050
+    "bulbul:v4-flash": 22050,
+}
+
+# These models open a stream with a bare WAV header and send raw PCM after it.
+SARVAM_STREAMING_WAV_HEADER_MODELS = {"bulbul:v3", "bulbul:v4-flash"}
+
+# bulbul TTS requires a concrete target_language_code (no "unknown"/auto).
+SARVAM_TTS_SUPPORTED_LANGUAGES = {
+    "en-IN",
+    "hi-IN",
+    "bn-IN",
+    "ta-IN",
+    "te-IN",
+    "kn-IN",
+    "ml-IN",
+    "mr-IN",
+    "gu-IN",
+    "pa-IN",
+    "od-IN",
+}
+
+# Maya matches the voice case-sensitively; "ananya" is a 400.
+MAYA_TTS_SUPPORTED_VOICES = {"Ananya", "Arjun"}
+
+# "en" is Indian English; "auto" lets Maya detect per utterance.
+MAYA_TTS_SUPPORTED_LANGUAGES = {
+    "hi",
+    "bn",
+    "gu",
+    "kn",
+    "ml",
+    "mr",
+    "or",
+    "pa",
+    "ta",
+    "te",
+    "en",
+    "auto",
+}
+
+# Gemini TTS (Vertex generateContent). The model id is supplied per agent, so none is pinned.
+GEMINI_TTS_DEFAULT_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-tts")
+GEMINI_TTS_NATIVE_SAMPLE_RATE = 24000
+GEMINI_TTS_LOCATION = "global"
+
+MODEL_REASONING_EFFORT_MAP = {
+    "gpt-5": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5-mini": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5-nano": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5-codex": [RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5-pro": [RE.HIGH],
+    "gpt-5.1": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5.1-codex": [RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5.1-codex-max": [RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-5.1-codex-mini": [RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5.2": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-5.4": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-5.4-mini": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5.4-nano": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gpt-5.5": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-5.5-pro": [RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-5.6-sol": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-5.6-terra": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-5.6-luna": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-6-sol": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-6-luna": [RE.NONE, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-6-astra": [RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH, RE.MAX],
+    # Realtime speech-to-speech. gpt-realtime-1.5 has no reasoning and is deliberately absent.
+    "gpt-realtime-2": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-realtime-2.1": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+    "gpt-realtime-2.1-mini": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH, RE.XHIGH],
+}
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Whether the model takes reasoning parameters. Pass a model family, never a deployment name."""
+    return (model or "").startswith(REASONING_MODEL_PREFIXES)
+
+
+def default_reasoning_effort(model: str) -> str:
+    """Lowest-latency effort the model supports: minimal where available, else the lowest in its map."""
+    supported = MODEL_REASONING_EFFORT_MAP.get(model)
+    if not supported or RE.MINIMAL in supported:
+        return RE.MINIMAL.value
+    return supported[0].value
+
+
+GEMINI_THINKING_LEVEL_MAP = {
+    "gemini-3-flash-preview": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gemini-3.1-flash-lite": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gemini-3.1-flash-lite-preview": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gemini-3.1-pro-preview": [RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gemini-3.5-flash": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gemini-3.5-flash-lite": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gemini-3.6-flash": [RE.MINIMAL, RE.LOW, RE.MEDIUM, RE.HIGH],
+    "gemini-3.7-flash": [RE.LOW, RE.MEDIUM, RE.HIGH],
+}
+
+
+def default_thinking_level(model: str) -> str:
+    """Lowest-latency thinking level the Gemini 3.x model supports.
+
+    Unknown models fall back to "low", the only level the whole 3.x family accepts.
+    """
+    supported = GEMINI_THINKING_LEVEL_MAP.get(model.rsplit("/", 1)[-1])
+    if not supported:
+        return RE.LOW.value
+    return supported[0].value
+
+
+def canonical_model(name: str) -> str:
+    """The known model a deployment serves, e.g. 'ptu-gpt-5.4-mini' -> 'gpt-5.4-mini'.
+
+    Azure deployment names are chosen freely, so model-family checks cannot read them directly.
+    Longest match wins so 'gpt-5.4-mini' beats 'gpt-5.4'. Unrecognised names pass through.
+    """
+    bare = (name or "").rsplit("/", 1)[-1]
+    known = [m for m in MODEL_REASONING_EFFORT_MAP if m in bare]
+    return max(known, key=len) if known else bare
+
+
+# Text chat (turn-based) watchdog: how often idle / max-duration caps are checked.
+CHAT_WATCHDOG_TICK_S = 3.0
+# Text chat: this many failed turns in a row end the chat (LLM_ERROR) instead of answering every message with an
+# empty end_of_stream forever.
+CHAT_MAX_CONSECUTIVE_TURN_FAILURES = 3

@@ -1,0 +1,230 @@
+unit TestBase.LLM;
+
+interface
+
+uses
+  DUnitX.TestFramework,
+  System.Generics.Collections,
+  System.SysUtils,
+  System.IOUtils,
+  FMX.Types,
+  ApiKeyStore,
+  uLLM,
+  uAttributes,
+  TestBase.AI;
+
+type
+  TBaseLLMTests = class abstract(TBaseAITest)
+  protected
+    FKeys: TApiKeyStore;
+    function CreateLLM: TBaseLLM; virtual; abstract;
+    function DefaultModel: string; virtual; abstract;
+    function DefaultVisionModel: string; virtual; abstract;
+    function SupportsSystemRole: Boolean; virtual;
+
+  public
+    [FunctionDescription('Get the weather forecast for a place in Australia')]
+    function GetWeather([ParamDescription('State of the location')]const state: string; [ParamDescription('Location for the weather forecast')]const location: string): string;
+    [FunctionDescription('Get the time')]
+    function GetTimeAt([ParamDescription('State of the location')]const state: string; [ParamDescription('Location for the time')]const location: string): string;
+    [Test] procedure ListModels_And_Chat_User; virtual;
+    [Test] procedure Chat_System_And_User; virtual;
+    [Test] procedure Chat_Vision_Test; virtual;
+    [Test] procedure Chat_Function_Test; virtual;
+  end;
+
+implementation
+
+function TBaseLLMTests.SupportsSystemRole: Boolean;
+begin
+  Result := True;
+end;
+
+procedure TBaseLLMTests.ListModels_And_Chat_User;
+var
+  LLM: TBaseLLM;
+  Model: TBaseModelInfo;
+  Settings: TChatSettings;
+  Messages: TObjectList<TChatMessage>;
+  Msg: TChatMessage;
+  Resp: TChatResponse;
+begin
+  RequireLiveTests;
+
+  LLM := CreateLLM;
+  try
+    // Model list
+    Assert.IsTrue(LLM.ModelInfo.Count > 0, 'No models returned');
+    for Model in LLM.ModelInfo do
+    begin
+      Assert.IsNotEmpty(Model.modelName);
+      Break;
+    end;
+
+    // Chat
+    Settings := Default(TChatSettings);
+    Settings.model := DefaultModel;
+
+    Messages := TObjectList<TChatMessage>.Create(True);
+    try
+      Msg := LLM.CreateChatMessage; // TChatMessage.Create doesn't exist
+      Msg.Role := 'user';
+      Msg.Content := 'How long is a piece of string';
+      Messages.Add(Msg);
+
+      Resp := LLM.ChatCompletion(Settings, Messages);
+      Assert.IsNotEmpty(Resp.Content);
+    finally
+      Messages.Free;
+    end;
+  finally
+    FreeAndNil(LLM);
+  end;
+end;
+
+procedure TBaseLLMTests.Chat_Function_Test;
+var
+  LLM: TBaseLLM;
+  settings: TChatSettings;
+  messages: System.Generics.Collections.TObjectList<TChatMessage>;
+  msg: TChatMessage;
+  chatAnswer: TChatResponse;
+  answer: string;
+begin
+  LLM := CreateLLM;
+  settings := Default(TChatSettings);
+  try
+    LLM.Functions.RegisterFunction(@TBaseLLMTests.GetWeather, Self);
+    LLM.Functions.RegisterFunction(@TBaseLLMTests.GetTimeAt, Self);
+    settings.model := DefaultModel;
+    settings.json_mode := False;
+    settings.max_tokens := 4096;
+    messages := TObjectList<TChatMessage>.Create(True);
+    msg := TChatMessage.Create;
+    msg.Role := 'user';
+    msg.Content := 'What is the weather for Bendigo?';
+    messages.Add(msg);
+    chatAnswer := LLM.ChatCompletion(settings, messages);
+    answer := chatAnswer.Content;
+//    Log.d('Answer : ' + answer);
+
+    msg := TChatMessage.Create;
+    msg.Role := 'user';
+    msg.Content := 'What is the time at Bendigo?';
+    messages.Add(msg);
+    chatAnswer := LLM.ChatCompletion(settings, messages);
+    answer := chatAnswer.Content;
+//    Log.d('Answer : ' + answer);
+
+//    Log.d('=============  Test Multiple function calls at once  ====================');
+    messages.Clear;
+    msg := TChatMessage.Create;
+    msg.Role := 'system';
+    msg.Content := 'You are a helpful assistant';
+    messages.Add(msg);
+    msg := TChatMessage.Create;
+    msg.Role := 'user';
+    msg.Content := 'What is the time and weather for Bendigo?';
+    messages.Add(msg);
+    chatAnswer := LLM.ChatCompletion(settings, messages);
+    answer := chatAnswer.Content;
+//    Log.d('Answer : ' + answer);
+
+
+  finally
+    FreeAndNil(messages);
+    FreeAndNil(LLM);
+  end;
+end;
+
+procedure TBaseLLMTests.Chat_System_And_User;
+var
+  LLM: TBaseLLM;
+  Settings: TChatSettings;
+  Messages: TObjectList<TChatMessage>;
+  Msg: TChatMessage;
+  Resp: TChatResponse;
+begin
+  RequireLiveTests;
+
+//  if not SupportsSystemRole then
+//    Skip('System role not supported by this provider');
+
+  LLM := CreateLLM;
+  try
+    Settings := Default(TChatSettings);
+    Settings.model := DefaultModel;
+
+    Messages := TObjectList<TChatMessage>.Create(True);
+    try
+      Msg := LLM.CreateChatMessage;
+      Msg.Role := 'system';
+      Msg.Content := 'Your name is HAL';
+      Messages.Add(Msg);
+
+      Msg := LLM.CreateChatMessage;
+      Msg.Role := 'user';
+      Msg.Content := 'What is your name?';
+      Messages.Add(Msg);
+
+      Resp := LLM.ChatCompletion(Settings, Messages);
+      Assert.IsNotEmpty(Resp.Content);
+    finally
+      Messages.Free;
+    end;
+  finally
+    LLM.Free;
+  end;
+end;
+
+procedure TBaseLLMTests.Chat_Vision_Test;
+var
+  LLM: TBaseLLM;
+  Settings: TChatSettings;
+  Messages: TObjectList<TChatMessage>;
+  answer: string;
+begin
+  RequireLiveTests;
+
+  if DefaultVisionModel.IsEmpty then
+    Exit;
+
+//  if not SupportsSystemRole then
+//    Skip('System role not supported by this provider');
+
+  LLM := CreateLLM;
+  try
+    Settings := Default(TChatSettings);
+    Settings.model := DefaultVisionModel;
+
+    Messages := TObjectList<TChatMessage>.Create(True);
+    try
+        settings.json_mode := False;
+        settings.max_tokens := 1024;
+        var msg := LLM.CreateChatVisionMessage;
+        msg.Role := 'user';
+        msg.AddImageFile(TPath.Combine(DataPath, 'Chickens  035.jpg'), 'image/jpeg');
+        msg.Content := 'Describe the following image';
+        messages.Add(msg);
+        answer := LLM.ChatCompletion(settings, messages).Content;
+        Assert.IsNotEmpty(answer);
+    finally
+      Messages.Free;
+    end;
+  finally
+    LLM.Free;
+  end;
+end;
+
+function TBaseLLMTests.GetTimeAt(const state, location: string): string;
+begin
+  Result := DateTimeToStr(now);
+end;
+
+function TBaseLLMTests.GetWeather(const state, location: string): string;
+begin
+  Result := 'The Temperature is 28 degrees';
+end;
+
+end.
+

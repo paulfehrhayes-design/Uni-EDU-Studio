@@ -1,0 +1,60 @@
+# pyproject.toml
+
+[build-system]
+requires      = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bolna"
+version = "0.11.32"
+readme = "README.md"
+authors = [
+    { name = "Prateek Sachan", email = "ps@prateeksachan.com" }
+]
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+]
+dynamic = ["dependencies"]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = ["pip-tools", "pre-commit", "pytest", "pytest-asyncio", "ruff"]
+
+[tool.pytest.ini_options]
+# Coroutine tests need no @pytest.mark.asyncio decorator.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-markers"
+
+[tool.setuptools]
+package-dir = {"bolna" = "bolna"}
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# Start minimal, grow over time. Uncomment rules as the codebase is cleaned up.
+# Roadmap: F541 → UP → F401 → F841 → I (isort) → E (pycodestyle)
+select = [
+    "E721",  # type comparison (use isinstance)
+    "F811",  # redefined unused name
+    "ISC",   # implicit string concatenation bugs
+]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "pep621"
+tag_format = "$version"
+version_files = [
+    "bolna/__init__.py:__version__",
+]
+update_changelog_on_bump = false

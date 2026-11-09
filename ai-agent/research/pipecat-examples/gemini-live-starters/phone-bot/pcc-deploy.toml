@@ -1,0 +1,9 @@
+agent_name = "pcc-gemini-twilio"
+secret_set = "pcc-gemini-twilio-secrets"
+agent_profile = "agent-1x"
+
+[krisp_viva]
+	audio_filter = "tel"
+
+[scaling]
+	min_agents = 1

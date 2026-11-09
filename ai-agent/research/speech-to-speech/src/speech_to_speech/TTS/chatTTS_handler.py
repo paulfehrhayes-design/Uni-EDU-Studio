@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import logging
+from threading import Event
+from typing import Any, Iterator
+
+import ChatTTS
+import librosa
+import numpy as np
+import soxr
+import torch
+
+from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.console import console
+from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
+from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
+from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.TTS.base_tts_handler import BaseTTSHandler
+from speech_to_speech.utils.utils import validate_device
+
+logger = logging.getLogger(__name__)
+
+
+class ChatTTSHandler(BaseTTSHandler):
+    def setup(
+        self,
+        should_listen: Event,
+        device: str = "auto",
+        gen_kwargs: dict[str, Any] = {},  # Unused
+        stream: bool = True,
+        chunk_size: int = 512,
+        cancel_scope: CancelScope | None = None,
+        speculative_turns: SpeculativeTurnTracker | None = None,
+    ) -> None:
+        self.should_listen = should_listen
+        self.cancel_scope = cancel_scope
+        self.speculative_turns = speculative_turns
+        validate_device(device, ("cuda", "npu", "mps", "cpu"), "ChatTTS")
+        self.model = ChatTTS.Chat()
+        # With "auto", ChatTTS picks CUDA/NPU (by free memory) or CPU; it skips MPS as slower than CPU.
+        model_device = None if device == "auto" else torch.device(device)
+        if not self.model.load(compile=False, device=model_device):  # Doesn't work for me with compile=True
+            raise RuntimeError("ChatTTS failed to load its models.")
+        self.device = str(self.model.device)
+        self.chunk_size = chunk_size
+        self.stream = stream
+        rnd_spk_emb = self.model.sample_random_speaker()
+        self.params_infer_code = ChatTTS.Chat.InferCodeParams(
+            spk_emb=rnd_spk_emb,
+        )
+        self.warmup()
+
+    def warmup(self) -> None:
+        logger.info(f"Warming up {self.__class__.__name__}")
+        _ = self.model.infer("text")
+
+    def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
+        speculative_turns = getattr(self, "speculative_turns", None)
+        if isinstance(tts_input, EndOfResponse):
+            if speculative_turns and not speculative_turns.wait_for_gate(
+                tts_input.turn_id,
+                tts_input.turn_revision,
+            ):
+                if tts_input.response_key is None:
+                    return
+                tts_input.cleanup_only = True
+            yield AUDIO_RESPONSE_DONE
+            return
+
+        if speculative_turns and not speculative_turns.wait_for_gate(
+            tts_input.turn_id,
+            tts_input.turn_revision,
+            commit=True,
+        ):
+            logger.debug("Dropping stale TTS input for turn=%s rev=%s", tts_input.turn_id, tts_input.turn_revision)
+            return
+
+        text = tts_input.text
+
+        _cancel_gen = self.cancel_scope.generation if self.cancel_scope else None
+        console.print(f"[green]ASSISTANT: {text}")
+        if self.device == "mps":
+            import time
+
+            start = time.time()
+            torch.mps.synchronize()  # Waits for all kernels in all streams on the MPS device to complete.
+            torch.mps.empty_cache()  # Frees all memory allocated by the MPS device.
+            _ = time.time() - start  # Removing this line makes it fail more often. I'm looking into it.
+
+        # Synthesis start: after speculative gate / MPS housekeeping, before provider work.
+        timer = self._latency_timer(tts_input, _cancel_gen)
+        wavs_gen = self.model.infer(text, params_infer_code=self.params_infer_code, stream=self.stream)
+
+        def emit(block: np.ndarray) -> Iterator[TTSOut]:
+            timer.first_yield()
+            yield block
+
+        if self.stream:
+            resampler = soxr.ResampleStream(24000, 16000, 1, dtype="float32", quality="HQ")
+            pending = np.empty(0, dtype="<i2")
+            for gen in wavs_gen:
+                if self._is_stale(_cancel_gen):
+                    logger.info("TTS generation cancelled (interruption)")
+                    return
+                if gen[0] is None:
+                    break
+                # ChatTTS versions emit either (samples,) or (1, samples).
+                chunk = np.asarray(gen[0], dtype=np.float32)
+                if chunk.ndim > 1:
+                    chunk = chunk[0]
+                if chunk.size == 0:
+                    break
+                # Provider samples, before resample / int16 / block assembly.
+                timer.first_provider_audio()
+                converted = resampler.resample_chunk(chunk)
+                converted = np.clip(converted * 32768, -32768, 32767).astype(np.int16)
+                pending = np.concatenate((pending, converted))
+                while len(pending) >= self.chunk_size:
+                    if self._is_stale(_cancel_gen):
+                        return
+                    yield from emit(pending[: self.chunk_size].copy())
+                    pending = pending[self.chunk_size :]
+
+            if self._is_stale(_cancel_gen):
+                return
+            tail = resampler.resample_chunk(np.empty(0, dtype=np.float32), last=True)
+            tail = np.clip(tail * 32768, -32768, 32767).astype(np.int16)
+            pending = np.concatenate((pending, tail))
+            for index in range(0, len(pending), self.chunk_size):
+                if self._is_stale(_cancel_gen):
+                    return
+                block = pending[index : index + self.chunk_size]
+                if len(block) < self.chunk_size:
+                    block = np.pad(block, (0, self.chunk_size - len(block)))
+                yield from emit(block.copy())
+        else:
+            wavs = wavs_gen
+            if len(wavs[0]) == 0:
+                return
+            # Full utterance is available before local resample / block assembly.
+            timer.first_provider_audio()
+            audio_chunk = librosa.resample(wavs[0], orig_sr=24000, target_sr=16000)
+            audio_chunk = (audio_chunk * 32768).astype(np.int16)
+            for i in range(0, len(audio_chunk), self.chunk_size):
+                yield from emit(
+                    np.pad(
+                        audio_chunk[i : i + self.chunk_size],
+                        (0, self.chunk_size - len(audio_chunk[i : i + self.chunk_size])),
+                    )
+                )

@@ -1,0 +1,189 @@
+import bisect
+import json
+import time
+import uuid
+from typing import Callable
+from dotenv import load_dotenv
+from bolna.helpers.logger_config import configure_logger
+
+load_dotenv()
+logger = configure_logger(__name__)
+
+
+class BaseTranscriber:
+    # A multilingual pool with lazy legs closes and reopens a leg mid-call (toggle_connection, then run());
+    # a provider whose connect or close blocks the event loop sets this False to keep its legs connected.
+    reopens_mid_call = True
+
+    def __init__(self, input_queue=None):
+        self.input_queue = input_queue
+        self.connection_on = True
+        self.callee_speaking = False
+        self.caller_speaking = False
+        self.meta_info = None
+        self.transcription_start_time = 0
+        self.last_vocal_frame_time = None
+        self.previous_request_id = None
+        self.current_request_id = None
+        self.connection_time = None
+        self.turn_latencies = []
+        self.connection_error = None
+        self.is_transcript_sent_for_processing = False
+        self.agent_context_source = None
+        self.reset_audio_frame_state()
+        self.closed_connections_billed_s = 0.0
+        self.audio_sent_s = 0.0
+        self.provider_audio_duration_s = None
+
+    def reset_billed_audio(self) -> None:
+        """Start a connection's billing window. A pool reconnect reuses the instance, so the window
+        that ends here moves into the call total rather than carrying into the next connection."""
+        self.closed_connections_billed_s += self._connection_billed_s()
+        self.audio_sent_s = 0.0
+        self.provider_audio_duration_s = None
+
+    def count_audio_sent(self, num_bytes: int, sample_rate: int, mulaw: bool = False) -> None:
+        self.audio_sent_s += num_bytes / ((1 if mulaw else 2) * sample_rate)
+
+    def _connection_billed_s(self) -> float:
+        """The provider's own billed duration when it reports one, else the audio actually sent."""
+        if self.provider_audio_duration_s is not None:
+            return self.provider_audio_duration_s
+        return self.audio_sent_s
+
+    def billed_audio_s(self) -> float:
+        """The call's ASR usage: every closed connection plus the one still open. task_manager reads
+        this at teardown because after a hangup it stops reading closing packets after the first."""
+        return self.closed_connections_billed_s + self._connection_billed_s()
+
+    def closing_meta(self) -> dict:
+        """Meta for the connection's transcriber_connection_closed packet. Closes the billing window, so
+        a second packet for the same connection reports 0 and the call total counts it once."""
+        meta = dict(getattr(self, "meta_info", None) or {})
+        meta["transcriber_duration"] = round(self._connection_billed_s(), 4)
+        self.reset_billed_audio()
+        if self.connection_error:
+            meta["connection_error"] = self.connection_error
+        return meta
+
+    def set_agent_context_source(self, source: Callable[[], str | None]) -> None:
+        """Point at the agent's latest spoken reply, for providers that bias the caller's next turn with it."""
+        self.agent_context_source = source
+
+    def reset_audio_frame_state(self) -> None:
+        """Restart the audio position -> send-time map; ASR stream positions restart per connection."""
+        self.audio_cursor_s = 0.0
+        self.audio_frame_timestamps = []
+        self.num_frames = 0
+        self.connection_start_time = None
+
+    def record_audio_frame(self, frame_seconds: float, send_timestamp: float) -> None:
+        """Book a sent frame against the stream cursor, mapping its audio position to the send time."""
+        if frame_seconds <= 0.0:
+            # 0.0 marks a path that does not hand audio over at real-time pace; no position holds.
+            return
+        frame_start = self.audio_cursor_s
+        self.audio_cursor_s += frame_seconds
+        self.audio_frame_timestamps.append((frame_start, self.audio_cursor_s, send_timestamp))
+        self.num_frames += 1
+
+    def audio_position_wall_time(self, audio_position_s):
+        """Wall-clock seconds the caller spoke this stream position, or None if no frame holds it.
+
+        Each frame is sent as it fills, so its last sample is heard at its send time. Mapping through
+        the frame keeps standby gaps and keepalive bursts out of it, unlike one stream-start anchor."""
+        if audio_position_s is None or not self.audio_frame_timestamps:
+            return None
+        # Frames tile the stream in order, so the first one ending at or after the position holds it.
+        index = bisect.bisect_left(self.audio_frame_timestamps, audio_position_s, key=lambda frame: frame[1])
+        if index == len(self.audio_frame_timestamps):
+            last_start, last_end, last_send = self.audio_frame_timestamps[-1]
+            return last_send / 1000 + (audio_position_s - last_end)
+        frame_start, frame_end, send_timestamp = self.audio_frame_timestamps[index]
+        if audio_position_s < frame_start:
+            return None
+        return send_timestamp / 1000 - (frame_end - audio_position_s)
+
+    def _upsert_turn_latency(self, entry: dict) -> None:
+        """Replace existing turn_latencies entry with matching turn_id, or append if new."""
+        # task_manager overwrites meta_info["turn_id"] with its own counter, so publish the ASR id separately.
+        if entry.get("turn_id") is not None and isinstance(self.meta_info, dict):
+            self.meta_info["asr_turn_id"] = entry["turn_id"]
+        for i, t in enumerate(self.turn_latencies):
+            if t.get("turn_id") == entry.get("turn_id"):
+                self.turn_latencies[i] = entry
+                return
+        self.turn_latencies.append(entry)
+
+    def update_meta_info(self):
+        self.meta_info["request_id"] = self.current_request_id if self.current_request_id else None
+        self.meta_info["previous_request_id"] = self.previous_request_id
+        self.meta_info["origin"] = "transcriber"
+
+    @staticmethod
+    def generate_request_id():
+        return str(uuid.uuid4())
+
+    async def signal_transcription_begin(self, msg):
+        send_begin_packet = False
+        self.meta_info["request_id"] = self.current_request_id
+
+        if not self.callee_speaking:
+            self.callee_speaking = True
+            logger.debug("Making callee speaking true")
+            self.transcription_start_time = time.time() - msg["duration"]
+            send_begin_packet = True
+
+        return send_begin_packet
+
+    async def log_latency_info(self):
+        transcription_completion_time = time.time()
+        if self.last_vocal_frame_time:
+            logger.info(
+                f"################ Time latency: For request {self.meta_info['request_id']}, user started speaking at {self.transcription_start_time}, last audio frame received at {self.last_vocal_frame_time} transcription_completed_at {transcription_completion_time} overall latency {transcription_completion_time - self.last_vocal_frame_time}"
+            )
+        else:
+            logger.info(
+                f"No confidence for the last vocal timeframe. Over transcription time {transcription_completion_time - self.transcription_start_time}"
+            )
+
+    async def _close(self, ws, data):
+        if ws is None:
+            # TEMP LOG
+            logger.warning("Transcriber websocket already closed, skipping close message")
+            return
+        try:
+            await ws.send(json.dumps(data))
+        except Exception as e:
+            logger.error(f"Error while closing transcriber stream {e}")
+
+    async def cleanup(self):
+        """Clean up transcriber resources. Override in subclasses."""
+        pass
+
+    async def discard_open_turn(self):
+        """Close the turn in progress without delivering it, as a multilingual call switches away.
+
+        Override where the provider can leave a turn open; the default has nothing to close.
+        """
+        pass
+
+    def is_connected(self):
+        """True while the provider connection is usable.
+
+        The websocket transcribers own their socket for the lifetime of transcribe(), so the task
+        is the connection. Azure is SDK-driven, owns no such task, and overrides this.
+        """
+        task = getattr(self, "transcription_task", None)
+        return task is not None and not task.done()
+
+    def calculate_interim_to_final_latencies(self, interim_details):
+        """Calculate time from first/last interim to final result."""
+        if not interim_details:
+            return None, None
+        now = time.time()
+        first_received_at = interim_details[0].get("received_at")
+        last_received_at = interim_details[-1].get("received_at")
+        first_interim_to_final_ms = round((now - first_received_at) * 1000, 2) if first_received_at else None
+        last_interim_to_final_ms = round((now - last_received_at) * 1000, 2) if last_received_at else None
+        return first_interim_to_final_ms, last_interim_to_final_ms

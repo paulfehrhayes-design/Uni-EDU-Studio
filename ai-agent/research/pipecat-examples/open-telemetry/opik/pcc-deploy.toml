@@ -1,0 +1,5 @@
+agent_name = "opik-tracing"
+secret_set = "opik-tracing-secrets"
+
+[scaling]
+	min_agents = 1

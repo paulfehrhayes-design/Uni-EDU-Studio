@@ -1,0 +1,151 @@
+/* Hide the trigger textbox */
+#input-trigger {
+  display: none !important;
+}
+
+/* Input Modal Styles */
+#input-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+#input-modal-overlay.show {
+  display: flex;
+}
+#input-modal-overlay .modal-box {
+  position: relative;
+  background: var(--background-fill-primary);
+  border: 1px solid var(--border-color-primary);
+  color: var(--body-text-color);
+  padding: 2rem;
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  min-width: 400px;
+  max-width: 500px;
+  animation: modalSlideIn 0.2s ease-out;
+}
+@keyframes modalSlideIn {
+  from {
+    transform: translateY(-20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+#input-modal-overlay h3 {
+  margin: 0 0 1rem 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--body-text-color);
+}
+#input-modal-overlay p {
+  margin: 0 0 1rem 0;
+  color: var(--body-text-color-subdued);
+  line-height: 1.5;
+  font-size: 0.9rem;
+}
+#input-modal-overlay input[type="text"] {
+  width: 100%;
+  padding: 0.625rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-color-primary);
+  background: var(--input-background-fill);
+  color: var(--body-text-color);
+  font-size: 1rem;
+  font-family: inherit;
+  margin-bottom: 1.5rem;
+  box-sizing: border-box;
+}
+#input-modal-overlay input[type="text"]:focus {
+  outline: none;
+  border-color: var(--border-color-accent);
+  box-shadow: 0 0 0 3px rgba(255, 165, 0, 0.1);
+}
+#input-modal-overlay .modal-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}
+#input-modal-overlay .modal-btn {
+  padding: 0.625rem 1.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--border-color-primary);
+  background: var(--button-secondary-background-fill);
+  color: var(--button-secondary-text-color);
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-weight: 500;
+  font-family: inherit;
+  transition: all 0.15s ease;
+  height: 42px;
+  min-width: 100px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  box-sizing: border-box;
+}
+#input-modal-overlay .modal-btn:hover {
+  background: var(--button-secondary-background-fill-hover);
+  border-color: var(--border-color-accent);
+}
+#input-modal-overlay .modal-btn.primary {
+  background: var(--button-primary-background-fill);
+  color: var(--button-primary-text-color);
+  border-color: var(--button-primary-border-color);
+}
+#input-modal-overlay .modal-btn.primary:hover {
+  background: var(--button-primary-background-fill-hover);
+  border-color: var(--button-primary-border-color-hover);
+}
+#input-modal-overlay p.modal-message.error,
+#input-modal-overlay .modal-message.error {
+  color: #ff4444 !important;
+  font-weight: 700 !important;
+  word-wrap: break-word;
+  animation: errorShake 0.25s ease-in-out;
+}
+@keyframes errorShake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-12px); }
+  40% { transform: translateX(12px); }
+  60% { transform: translateX(-10px); }
+  80% { transform: translateX(8px); }
+}
+
+/* Overwrite confirmation bar inside input modal */
+#input-modal-overlay .modal-confirm-bar {
+  display: none;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--background-fill-primary, #1a1a2e);
+  border-top: 2px solid rgba(255, 165, 0, 0.5);
+  border-radius: 0 0 12px 12px;
+  padding: 1rem 1.5rem;
+  z-index: 10;
+  animation: modalSlideIn 0.15s ease-out;
+}
+#input-modal-overlay .modal-confirm-bar.show {
+  display: block;
+}
+#input-modal-overlay .modal-confirm-bar .confirm-warning {
+  margin: 0 0 0.75rem 0;
+  color: #ff9800;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+#input-modal-overlay .modal-confirm-bar .confirm-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}

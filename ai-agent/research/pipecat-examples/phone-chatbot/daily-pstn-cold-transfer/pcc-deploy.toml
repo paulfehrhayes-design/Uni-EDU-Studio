@@ -1,0 +1,5 @@
+agent_name = "daily-pstn-call-transfer"
+secret_set = "daily-pstn-secrets"
+
+[scaling]
+	min_agents = 1

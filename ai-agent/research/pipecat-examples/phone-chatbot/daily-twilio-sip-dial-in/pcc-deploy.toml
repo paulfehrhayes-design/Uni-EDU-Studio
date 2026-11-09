@@ -1,0 +1,6 @@
+agent_name = "daily-twilio-sip-dial-in"
+secret_set = "daily-twilio-sip-secrets"
+agent_profile = "agent-1x"
+
+[scaling]
+	min_agents = 1

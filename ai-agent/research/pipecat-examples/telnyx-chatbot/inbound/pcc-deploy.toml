@@ -1,0 +1,6 @@
+agent_name = "telnyx-chatbot-dial-in"
+secret_set = "telnyx-chatbot"
+agent_profile = "agent-1x"
+
+[scaling]
+	min_agents = 1

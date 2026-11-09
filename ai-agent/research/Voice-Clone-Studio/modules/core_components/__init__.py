@@ -1,0 +1,73 @@
+"""Core components package for Voice Clone Studio"""
+
+from .ui_components import (
+    CONFIRMATION_MODAL_CSS,
+    CONFIRMATION_MODAL_HEAD,
+    CONFIRMATION_MODAL_HTML,
+    show_confirmation_modal_js,
+    INPUT_MODAL_CSS,
+    INPUT_MODAL_HEAD,
+    INPUT_MODAL_HTML,
+    show_input_modal_js
+)
+
+from .emotion_manager import (
+    CORE_EMOTIONS,
+    load_emotions_from_config,
+    get_emotion_choices,
+    calculate_emotion_values,
+    handle_save_emotion,
+    handle_delete_emotion
+)
+
+from .constants import (
+    MODEL_SIZES,
+    MODEL_SIZES_BASE,
+    MODEL_SIZES_CUSTOM,
+    MODEL_SIZES_DESIGN,
+    MODEL_SIZES_VIBEVOICE,
+    VOICE_CLONE_OPTIONS,
+    DEFAULT_VOICE_CLONE_MODEL,
+    LANGUAGES,
+    CUSTOM_VOICE_SPEAKERS,
+    SUPPORTED_MODELS,
+    SAMPLE_RATE,
+    DEFAULT_CONFIG,
+    QWEN_GENERATION_DEFAULTS,
+    VIBEVOICE_GENERATION_DEFAULTS,
+)
+
+__all__ = [
+    # Confirmation modal
+    "CONFIRMATION_MODAL_CSS",
+    "CONFIRMATION_MODAL_HEAD",
+    "CONFIRMATION_MODAL_HTML",
+    "show_confirmation_modal_js",
+    # Input modal
+    "INPUT_MODAL_CSS",
+    "INPUT_MODAL_HEAD",
+    "INPUT_MODAL_HTML",
+    "show_input_modal_js",
+    # Emotion manager
+    "CORE_EMOTIONS",
+    "load_emotions_from_config",
+    "get_emotion_choices",
+    "calculate_emotion_values",
+    "handle_save_emotion",
+    "handle_delete_emotion",
+    # Constants
+    "MODEL_SIZES",
+    "MODEL_SIZES_BASE",
+    "MODEL_SIZES_CUSTOM",
+    "MODEL_SIZES_DESIGN",
+    "MODEL_SIZES_VIBEVOICE",
+    "VOICE_CLONE_OPTIONS",
+    "DEFAULT_VOICE_CLONE_MODEL",
+    "LANGUAGES",
+    "CUSTOM_VOICE_SPEAKERS",
+    "SUPPORTED_MODELS",
+    "SAMPLE_RATE",
+    "DEFAULT_CONFIG",
+    "QWEN_GENERATION_DEFAULTS",
+    "VIBEVOICE_GENERATION_DEFAULTS",
+]

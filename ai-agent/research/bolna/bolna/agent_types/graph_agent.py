@@ -1,0 +1,1888 @@
+import asyncio
+from collections import OrderedDict
+import hashlib
+import os
+import re
+import time
+from dotenv import load_dotenv
+import json
+import math
+
+from bolna.models import *
+from bolna.agent_types.base_agent import BaseAgent
+from bolna.helpers.logger_config import configure_logger
+from bolna.helpers.rag_service_client import RAGServiceClientSingleton
+from bolna.helpers.prompt_transcript import with_prompt_transcript
+from bolna.helpers.function_calling_helpers import guard_llm_base_url
+from bolna.helpers.utils import (
+    now_ms,
+    format_messages,
+    update_prompt_with_context,
+    render_prompt,
+    enrich_context_with_time_variables,
+    get_md5_hash,
+    select_message_by_language,
+    static_node_ends_call,
+)
+from bolna.helpers.expression_evaluator import evaluate_edge_expression, describe_edge_expression
+from bolna.enums import (
+    ChatRole,
+    EdgeConditionType,
+    EdgeOrder,
+    ExpressionOperator,
+    LLMProvider,
+    NodeType,
+    ToolScope,
+)
+from bolna.llms.types import LLMStreamChunk, LatencyData
+from bolna.llms import AzureLLM, OpenAiLLM, LiteLLM
+from bolna.providers import SUPPORTED_LLM_PROVIDERS
+from bolna.prompts import VOICEMAIL_DETECTION_PROMPT
+from bolna.constants import (
+    END_CALL_FUNCTION_PREFIX,
+    HANGUP_AFTER_REPLY,
+    LANGUAGE_NAMES,
+    LLM_VENDOR_ENDPOINTS,
+    RESPONSES_API_MODEL_PREFIXES,
+    canonical_model,
+    default_reasoning_effort,
+    is_reasoning_model,
+)
+
+from typing import List, Tuple, AsyncGenerator, Optional, Dict, Any
+
+# Conversation providers whose own key authenticates the hangup/voicemail OpenAiLLM hops; any
+# other provider (Gemini, Azure, the LiteLLM backends) needs the platform OpenAI key instead. A
+# Bolna-hosted endpoint or a vendor's own endpoint serves only its own models, so its hops use the
+# platform key too.
+OPENAI_KEYED_PROVIDERS = frozenset(
+    p
+    for p, cls in SUPPORTED_LLM_PROVIDERS.items()
+    if cls is OpenAiLLM and p != LLMProvider.BOLNA.value and p not in LLM_VENDOR_ENDPOINTS
+)
+
+# Conversation LLM settings that belong to the agent's provider, dropped when a node switches provider.
+AGENT_PROVIDER_BOUND_KWARGS = (
+    "llm_key",
+    "base_url",
+    "api_version",
+    "extra_body",
+    "service_tier",
+    "overflow_llm",
+    "openai_model_endpoints",
+)
+
+load_dotenv()
+logger = configure_logger(__name__)
+
+_DETERMINISTIC_REASONING_PREFIX = "deterministic:"
+_ROUTER_REASONING_PREFIX = f"{_DETERMINISTIC_REASONING_PREFIX}router:"
+_OUTRANKING_INTENTS_TRACE = "intent edges ranked above it checked first"
+# Root identifier in either syntax, so {{prior.loans}} still validates against recipient_data["prior"].
+_PROMPT_VAR_PATTERN = re.compile(r"\{\{?\s*([a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z0-9_]+|\[[^\[\]{}]+\])*\s*\}\}?")
+_ROUTER_REASONING_DESC = "Brief explanation of why this routing decision was made"
+_ROUTER_CONFIDENCE_DESC = "Confidence score from 0.0 to 1.0 for this routing decision"
+_END_NODE_INSTRUCTION = (
+    "This is the final turn: the call ends as soon as you finish speaking. Deliver this step's closing "
+    "message now. Do not ask the user anything or invite a reply."
+)
+
+# Time variables frozen per call for the conversation prompt; see _prompt_context.
+_TIME_VAR_KEYS = (
+    "current_date",
+    "current_time",
+    "current_hour",
+    "current_minute",
+    "current_weekday",
+    "current_day",
+    "current_month",
+    "current_year",
+)
+
+
+class GraphAgent(BaseAgent):
+    def __init__(self, config: GraphAgentConfig):
+        super().__init__()
+        self.config = config
+        self.agent_information = self.config.get("agent_information")
+        self.current_node_id = self.config.get("current_node_id")
+        self.context_data = self.config.get("context_data") or {}
+        # Edge-parameter values collected during the call, latest value per variable.
+        self.node_extracted_data: Dict[str, Any] = {}
+        execution_id = self.config.get("execution_id")
+        if execution_id and isinstance(self.context_data.get("recipient_data"), dict):
+            self.context_data["recipient_data"]["execution_id"] = execution_id
+        self.variable_types = self.config.get("variable_types") or {}
+        self.llm_model = self.config.get("model")
+
+        # Get credentials from config (injected by task_manager) or fall back to env vars
+        self.llm_key = self.config.get("llm_key") or os.getenv("OPENAI_API_KEY")
+        self.base_url = self.config.get("base_url")
+        self._base_url_validated = False
+
+        self.node_history = [self.current_node_id]
+        self.current_node_entry_index = 0
+        self._silence_repeats = 0
+        self._event_triggered_generation = False
+        self._active_node_first_response_delivered = True
+        self._end_node_closed = False
+        self._hold_until_first_delivery = not self.config.get("turn_based_conversation", False)
+        self._last_deterministic_eval = None
+        self._frozen_time_vars: Optional[Dict[str, Any]] = None
+        self.rag_configs = self.initialize_rag_configs()
+        self.global_rag_config = self._initialize_global_rag_config()
+        self.rag_server_url = os.getenv("RAG_SERVER_URL", "http://localhost:8000")
+
+        # Cache transition tools per node for faster routing (bounded to prevent unbounded growth)
+        self._transition_tools_cache: Dict[str, List[dict]] = {}
+        self._transition_tools_cache_max_size = 100
+
+        # Per-node conversation LLMs, keyed by the override itself so nodes sharing settings share
+        # an instance. Populated lazily; a graph with no overrides never allocates one.
+        self._conversation_llm_cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._conversation_llm_cache_max_size = 20
+        # The client serving the active node; interruption hooks follow this, not self.llm.
+        self._active_conversation_llm = None
+
+        # Routing runs on its own LLM, built from the same registry as the conversation model.
+        self.routing_provider = self.config.get("routing_provider")
+        self.routing_model = self.config.get("routing_model")
+        self.routing_instructions = self.config.get("routing_instructions")  # Custom routing instructions
+        self.routing_reasoning_effort = self.config.get("routing_reasoning_effort")
+        self._pending_routing_tail = None
+        self.routing_max_tokens = self.config.get("routing_max_tokens")
+        self.service_tier = self.config.get("service_tier")
+        logger.info(
+            f"GraphAgent routing_instructions loaded: {bool(self.routing_instructions)} (length: {len(self.routing_instructions) if self.routing_instructions else 0})"
+        )
+        self._init_routing_client()
+
+        # Initialize main LLM for response generation (supports api_tools/function calling + real streaming)
+        self.llm = self._initialize_llm()
+        self._active_conversation_llm = self.llm
+        self._prewarm_conversation_overrides()
+
+        # Hangup runs on OpenAiLLM, so a conversation on a non-OpenAI provider lends no usable key and it falls
+        # back to the platform OpenAI key. Voicemail always runs on the platform Azure OpenAI deployment.
+        aux_provider = self.config.get("aux_provider") or self.config.get("provider") or "openai"
+        aux_model = (self.config.get("aux_model") or self.llm_model or "").split("/", 1)[-1]
+        llm_kwargs = {}
+        if aux_provider not in OPENAI_KEYED_PROVIDERS and os.getenv("OPENAI_API_KEY"):
+            llm_kwargs["llm_key"] = os.getenv("OPENAI_API_KEY")
+        else:
+            # Otherwise the conversation's own creds serve the hop.
+            if self.llm_key:
+                llm_kwargs["llm_key"] = self.llm_key
+            if self.base_url:
+                llm_kwargs["base_url"] = self.base_url
+            if self.config.get("openai_model_endpoints"):
+                llm_kwargs["openai_model_endpoints"] = self.config["openai_model_endpoints"]
+            if aux_provider == LLMProvider.CUSTOM.value:
+                llm_kwargs["provider"] = aux_provider
+                llm_kwargs["extra_body"] = self.config.get("extra_body")
+        self.conversation_completion_llm = OpenAiLLM(
+            model=os.getenv("CHECK_FOR_COMPLETION_LLM", aux_model or "gpt-4o-mini"), **llm_kwargs
+        )
+        self.voicemail_llm = AzureLLM(
+            model=os.getenv("VOICEMAIL_DETECTION_LLM", "gpt-4.1-mini"),
+            base_url=os.getenv("AZURE_OPENAI_BASE_URL") or os.getenv("AZURE_OPENAI_ENDPOINT"),
+        )
+
+    def _initialize_llm(self):
+        """Initialize LLM with api_tools support (same pattern as KnowledgeBaseAgent)."""
+        try:
+            provider = self.config.get("provider") or self.config.get("llm_provider", "openai")
+            if provider not in SUPPORTED_LLM_PROVIDERS:
+                logger.warning(f"Unknown provider: {provider}, using openai")
+                provider = "openai"
+
+            llm_kwargs = {
+                "model": self.llm_model,
+                "temperature": self.config.get("temperature", 0.7),
+                "max_tokens": self.config.get("max_tokens", 150),
+                "provider": provider,
+                "run_id": self.config.get("execution_id"),
+            }
+
+            for key in [
+                "llm_key",
+                "base_url",
+                "api_version",
+                "language",
+                "api_tools",
+                "buffer_size",
+                "reasoning_effort",
+                "verbosity",
+                "reasoning_summary",
+                "service_tier",
+                "use_responses_api",
+                "compact_threshold",
+                "overflow_llm",
+                "extra_body",
+                "openai_model_endpoints",
+            ]:
+                if self.config.get(key, None):
+                    llm_kwargs[key] = self.config[key]
+
+            # Everything a per-node override starts from, so _conversation_llm_for() inherits the
+            # agent's credentials, tools and tier and changes only what the node names.
+            self._conversation_provider = provider
+            self._conversation_base_kwargs = dict(llm_kwargs)
+
+            llm_class = SUPPORTED_LLM_PROVIDERS[provider]
+            return llm_class(**llm_kwargs)
+        except Exception as e:
+            logger.error(f"Failed to create LLM: {e}, falling back to default OpenAiLLM")
+            fallback_kwargs = {
+                "model": self.llm_model or "gpt-4o-mini",
+                "llm_key": self.llm_key or os.getenv("OPENAI_API_KEY"),
+            }
+            self._conversation_provider = "openai"
+            self._conversation_base_kwargs = dict(fallback_kwargs)
+            return OpenAiLLM(**fallback_kwargs)
+
+    def _conversation_llm_for(self, node: Optional[dict]):
+        """The node's own conversation LLM if it overrides one, else the agent's.
+
+        Unset fields inherit; the agent-level LLM is returned untouched when a node overrides
+        nothing, so the common path allocates nothing and behaves exactly as before.
+        """
+        raw = (node or {}).get("llm_config") or {}
+        # Nodes reach us as dicts, but a shallow dict() of a validated config leaves this one nested
+        # model intact — and an AttributeError here would kill the turn.
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump()
+        override = {k: v for k, v in raw.items() if v is not None}
+        if not override:
+            return self._activate_conversation_llm(self.llm)
+
+        cache_key = self._conversation_cache_key(node, override)
+        llm = self._conversation_llm_cache.get(cache_key)
+        if llm is not None:
+            return self._activate_conversation_llm(llm)
+
+        node_id = (node or {}).get("id")
+        try:
+            built = self._build_conversation_llm(override, node_id)
+        except Exception as e:
+            # _initialize_llm falls back on construction failure; this runs inline in generate(),
+            # which re-raises and ends the call, so it needs the same safety net.
+            logger.error(f"Conversation LLM override failed for node {node_id!r} ({e}) — using the agent LLM")
+            built = None
+        if built is None:
+            return self._activate_conversation_llm(self.llm)
+
+        llm, kwargs = built
+        if len(self._conversation_llm_cache) >= self._conversation_llm_cache_max_size:
+            evicted_key, evicted = self._conversation_llm_cache.popitem(last=False)
+            self._close_conversation_llm(evicted, evicted_key)
+        self._conversation_llm_cache[cache_key] = llm
+        logger.info(
+            f"Conversation LLM override ready: {kwargs.get('model')} on {kwargs.get('provider')} "
+            f"(effort={kwargs.get('reasoning_effort')}, responses_api={kwargs.get('use_responses_api', False)}) "
+            f"for node {node_id!r}"
+        )
+        return self._activate_conversation_llm(llm)
+
+    def _activate_conversation_llm(self, llm):
+        """Make llm the serving client. One that did not serve the previous turn cannot chain onto it."""
+        if llm is not self._active_conversation_llm:
+            llm.invalidate_response_chain()
+        self._active_conversation_llm = llm
+        return llm
+
+    def _conversation_cache_key(self, node: Optional[dict], override: dict) -> str:
+        """Nodes share a client only when their override and their own resolved credentials both match."""
+        key = repr(sorted((k, str(v)) for k, v in override.items()))
+        credentials = (self.config.get("node_llm_credentials") or {}).get((node or {}).get("id"))
+        if credentials is not None:
+            # A fingerprint, so no key material sits in a cache key that may be logged.
+            key += hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest()
+        return key
+
+    def _prewarm_conversation_overrides(self):
+        """Build the override clients at graph load — the nodes are known, and constructing one
+        opens a socket in Responses mode, which would otherwise land in a turn's first-token path."""
+        seen = set()
+        for node in self.config.get("nodes", []) or []:
+            raw = (node or {}).get("llm_config") or {}
+            if hasattr(raw, "model_dump"):
+                raw = raw.model_dump()
+            if not any(v is not None for v in raw.values()):
+                continue
+            key = self._conversation_cache_key(node, {k: v for k, v in raw.items() if v is not None})
+            if key in seen:
+                continue
+            seen.add(key)
+            self._conversation_llm_for(node)
+        # Prewarming resolves nodes that are not active yet; the first turn re-resolves its own.
+        self._active_conversation_llm = self.llm
+
+    def _build_conversation_llm(self, override: dict, node_id=None):
+        """Derive a client from the override's (provider, model), not by patching the agent's.
+
+        Returns (llm, kwargs), or None when the override cannot be served — model, provider,
+        credentials and transport are all coupled, so a changed model or provider invalidates
+        every value the agent derived from its own.
+        """
+        agent_provider = self._conversation_provider
+        provider = override.get("provider") or agent_provider
+        if provider not in SUPPORTED_LLM_PROVIDERS:
+            logger.warning(f"Unknown provider {provider!r} in node llm_config, using {agent_provider!r}")
+            provider = agent_provider
+        switched_provider = provider != agent_provider
+
+        kwargs = dict(self._conversation_base_kwargs)
+        kwargs["provider"] = provider
+        for key in ("temperature", "max_tokens"):
+            if key in override:
+                kwargs[key] = override[key]
+
+        if switched_provider:
+            # Only the caller knows which key the customer uses on the node's provider, so without its answer the
+            # override is refused rather than run on the agent's key or a platform default.
+            node_credentials = (self.config.get("node_llm_credentials") or {}).get(node_id)
+            if node_credentials is None:
+                logger.error(
+                    f"Node {node_id!r} switches provider {agent_provider!r}→{provider!r} with no credentials "
+                    f"resolved for it; override refused, serving the node on the agent LLM"
+                )
+                return None
+            for key in AGENT_PROVIDER_BOUND_KWARGS:
+                kwargs.pop(key, None)
+            kwargs.update({k: v for k, v in node_credentials.items() if v})
+
+        llm_class = SUPPORTED_LLM_PROVIDERS.get(provider, OpenAiLLM)
+        model_changed = "model" in override or switched_provider
+        model = override.get("model") or kwargs.get("model") or ""
+        if llm_class is LiteLLM:
+            # Re-qualify from the BARE name: an inherited "groq/llama-3.3" already has a slash, so
+            # leaving it alone would keep dispatching to groq under a different provider's client.
+            bare = model.split("/")[-1]
+            model = f"{provider}/{bare}"
+        kwargs["model"] = model
+
+        if model_changed:
+            # Transport follows the model. Inheriting the agent's flag put a Responses-only model on
+            # chat completions, and a chat-only model into a Responses previous_response_id chain.
+            if any(prefix in model for prefix in RESPONSES_API_MODEL_PREFIXES):
+                kwargs["use_responses_api"] = True
+            else:
+                kwargs.pop("use_responses_api", None)
+
+        effort = override.get("reasoning_effort")
+        if effort is not None:
+            kwargs["reasoning_effort"] = getattr(effort, "value", effort)
+        # An inherited effort would be rejected by a non-reasoning override model.
+        if not is_reasoning_model(canonical_model(model)):
+            kwargs.pop("reasoning_effort", None)
+
+        return llm_class(**kwargs), kwargs
+
+    @staticmethod
+    def _close_conversation_llm(llm, label=""):
+        """Release an override client. Responses-mode clients hold a socket only close() drops."""
+        close = getattr(llm, "close", None)
+        if close is None:
+            return
+        try:
+            result = close()
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+        except Exception as e:
+            logger.error(f"Error closing conversation LLM override {label}: {e}")
+
+    async def close_conversation_llm_overrides(self):
+        """Close every per-node client built this call. Teardown only walks self.llm and the aux pair."""
+        while self._conversation_llm_cache:
+            key, llm = self._conversation_llm_cache.popitem()
+            close = getattr(llm, "close", None)
+            if close is None:
+                continue
+            try:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error(f"Error closing conversation LLM override {key}: {e}")
+
+    def current_conversation_llm(self):
+        """The client actually serving the active node — interruption hooks must target this one."""
+        return self._active_conversation_llm or self.llm
+
+    @staticmethod
+    def _extract_rag_collections(rag_config: Dict) -> List[str]:
+        """Extract collection/vector IDs from a rag_config dict, supporting all known formats."""
+        collections = []
+        legacy_pc = rag_config.get("provider_config") if isinstance(rag_config.get("provider_config"), dict) else {}
+        provider_config = (rag_config.get("vector_store") or {}).get("provider_config") or {}
+        # Prefer the first location that actually carries a vector id; a present-but-empty
+        # field (e.g. top-level "vector_ids": []) must not shadow a valid vector_store.
+        if isinstance(rag_config.get("vector_ids"), list) and rag_config["vector_ids"]:
+            collections.extend(rag_config["vector_ids"])
+        elif rag_config.get("vector_id"):
+            collections.append(rag_config["vector_id"])
+        elif legacy_pc.get("vector_id"):
+            collections.append(legacy_pc["vector_id"])
+        elif isinstance(provider_config.get("vector_ids"), list) and provider_config["vector_ids"]:
+            collections.extend(provider_config["vector_ids"])
+        elif provider_config.get("vector_id"):
+            collections.append(provider_config["vector_id"])
+        return [c for c in collections if c]
+
+    @staticmethod
+    def _extract_similarity_top_k(rag_config: Dict, default: int = 10) -> int:
+        provider_config = (rag_config.get("vector_store") or {}).get("provider_config") or {}
+        return rag_config.get("similarity_top_k") or provider_config.get("similarity_top_k") or default
+
+    def initialize_rag_configs(self) -> Dict[str, Dict]:
+        """Initialize RAG configurations for each node."""
+        rag_configs = {}
+        for node in self.config.get("nodes", []):
+            rag_config = node.get("rag_config")
+            if not rag_config:
+                continue
+
+            collections = self._extract_rag_collections(rag_config)
+            # Nodes without resolvable collections fall back to the global rag_config
+            if not collections:
+                continue
+
+            rag_configs[node["id"]] = {
+                "collections": collections,
+                "similarity_top_k": self._extract_similarity_top_k(rag_config),
+            }
+
+            logger.info(f"Initialized RAG config for node {node['id']} with collections: {collections}")
+
+        return rag_configs
+
+    def _initialize_global_rag_config(self) -> Dict:
+        """Initialize the agent-level RAG config (same shape as KnowledgeBaseAgent's rag_config)."""
+        rag_config = self.config.get("rag_config")
+        if not rag_config:
+            return {}
+
+        collections = []
+        used_sources = rag_config.get("used_sources")
+        if used_sources:
+            collections = [
+                source["vector_id"] for source in used_sources if isinstance(source, dict) and source.get("vector_id")
+            ]
+        if not collections:
+            collections = self._extract_rag_collections(rag_config)
+
+        if not collections:
+            logger.warning("Global rag_config present but no collections resolved")
+            return {}
+
+        logger.info(f"Initialized global RAG config with collections: {collections}")
+        return {
+            "collections": collections,
+            "similarity_top_k": self._extract_similarity_top_k(rag_config),
+            "used_sources": used_sources or [],
+        }
+
+    def _init_routing_client(self):
+        """Build the routing LLM from the same registry as the conversation model."""
+        conv_provider = self.config.get("provider") or self.config.get("llm_provider") or "openai"
+        # Self-hosted OpenAI-compatible endpoints (custom/ola) have no platform router, so they route on
+        # their own model and endpoint; everything else defaults to the platform OpenAI router. Either can
+        # be told to follow the conversation model explicitly.
+        follow_conversation = self.config.get("route_routing_to_conversation") or (
+            not self.routing_provider and conv_provider in ("custom", "ola")
+        )
+        if follow_conversation:
+            self.routing_provider = conv_provider
+            conv_model = self.config.get("model")
+            if conv_model and not self.routing_model:
+                self.routing_model = conv_model.split("/", 1)[-1]
+        elif not self.routing_provider:
+            self.routing_provider = "openai"
+        if not self.routing_model:
+            self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_OPENAI", "gpt-4.1-mini")
+
+        self.routing_model = self._qualify_routing_model(self.routing_model)
+
+        # Everything but the model: provider, credentials, tier. A per-node routing_model reuses this.
+        base_kwargs = {
+            "provider": self.routing_provider,
+            "temperature": 0,
+            "max_tokens": self.routing_max_tokens or 250,
+        }
+        explicit_routing_creds = {
+            "llm_key": self.config.get("routing_llm_key"),
+            "base_url": self.config.get("routing_base_url"),
+            "api_version": self.config.get("routing_api_version"),
+        }
+        if not follow_conversation and any(explicit_routing_creds.values()):
+            # follow_conversation (a PTU swap) overrides these: routing then rides the conversation's own.
+            base_kwargs.update({k: v for k, v in explicit_routing_creds.items() if v})
+        elif self.routing_provider == conv_provider:
+            for key in ("llm_key", "base_url", "api_version", "extra_body", "openai_model_endpoints"):
+                if self.config.get(key):
+                    base_kwargs[key] = self.config[key]
+            # Tier and overflow belong to the conversation's backend, so only routing riding it takes them.
+            if self.service_tier:
+                base_kwargs["service_tier"] = self.service_tier
+            if self.config.get("overflow_llm"):
+                base_kwargs["overflow_llm"] = self.config["overflow_llm"]
+        self._routing_base_kwargs = base_kwargs
+        self._routing_llm_cache: Dict[Tuple[Optional[str], Optional[str]], Any] = {}
+        self._routing_llm_cache_max_size = 100
+
+        routing_kwargs = self._routing_kwargs_for_model(self.routing_model)
+        self._routing_reasoning_effort_used = routing_kwargs.get("reasoning_effort")
+        self.routing_llm = self._routing_llm_class()(**routing_kwargs)
+        # What the last routing call actually ran on; a node override moves these for one call.
+        self._last_routing_model = self.routing_model
+        self._last_routing_effort = self._routing_reasoning_effort_used
+        logger.info(f"Routing initialized with {self.routing_provider} ({self.routing_model})")
+
+    def _routing_llm_class(self):
+        return SUPPORTED_LLM_PROVIDERS.get(self.routing_provider, OpenAiLLM)
+
+    def _qualify_routing_model(self, model: str) -> str:
+        # LiteLLM addresses a backend by a "provider/model" string; a bare model name resolves to OpenAI.
+        if self._routing_llm_class() is LiteLLM and "/" not in model:
+            return f"{self.routing_provider}/{model}"
+        return model
+
+    def _routing_kwargs_for_model(self, model: str) -> dict:
+        kwargs = {**self._routing_base_kwargs, "model": model}
+        # Only reasoning models take an effort; resolve deployment names to the model family first.
+        family = canonical_model(model)
+        if is_reasoning_model(family):
+            kwargs["reasoning_effort"] = (
+                self.routing_reasoning_effort
+                or os.getenv("GPT5_ROUTING_REASONING_EFFORT")
+                or default_reasoning_effort(family)
+            )
+        return kwargs
+
+    def _reset_routing_identity(self) -> None:
+        """Back to the agent's routing model, so a turn that makes no LLM call reports it."""
+        self._last_routing_model = self.routing_model
+        self._last_routing_effort = self._routing_reasoning_effort_used
+
+    def _routing_llm_for(self, node: Optional[dict]):
+        """The node's own routing model and/or effort on the agent's provider and credentials,
+        else the agent's. Either override alone is enough. Returns (llm, model, reasoning_effort)."""
+        node = node or {}
+        model_override = node.get("routing_model")
+        effort_override = node.get("routing_reasoning_effort")
+        if not model_override and effort_override is None:
+            return self.routing_llm, self.routing_model, self._routing_reasoning_effort_used
+
+        model = self._qualify_routing_model(model_override) if model_override else self.routing_model
+        kwargs = self._routing_kwargs_for_model(model)
+        if effort_override is not None and is_reasoning_model(canonical_model(model)):
+            # A non-reasoning model would reject the effort, so it only lands where it applies.
+            kwargs["reasoning_effort"] = getattr(effort_override, "value", effort_override)
+
+        # Keyed on both: the same model at two efforts is two different clients.
+        cache_key = (model, kwargs.get("reasoning_effort"))
+        llm = self._routing_llm_cache.get(cache_key)
+        if llm is None:
+            if len(self._routing_llm_cache) >= self._routing_llm_cache_max_size:
+                self._routing_llm_cache.pop(next(iter(self._routing_llm_cache)))
+            llm = self._routing_llm_class()(**kwargs)
+            self._routing_llm_cache[cache_key] = llm
+            logger.info(
+                f"Routing override ready: {model} (effort={kwargs.get('reasoning_effort')}) for node {node.get('id')!r}"
+            )
+        return llm, model, kwargs.get("reasoning_effort")
+
+    async def check_for_completion(self, messages, check_for_completion_prompt, meta_info=None):
+        """Check if the conversation should end. Returns (hangup_dict, metadata)."""
+        try:
+            prompt = [
+                {"role": "system", "content": check_for_completion_prompt},
+                {"role": "user", "content": format_messages(messages)},
+            ]
+
+            start_time = time.time()
+            response, metadata = await self.conversation_completion_llm.generate(
+                prompt, request_json=True, ret_metadata=True, meta_info=meta_info
+            )
+            latency_ms = (time.time() - start_time) * 1000
+
+            hangup = json.loads(response)
+            metadata["latency_ms"] = latency_ms
+
+            return hangup, metadata
+        except Exception as e:
+            logger.error(f"check_for_completion exception: {str(e)}")
+            return {"hangup": "No"}, {}
+
+    async def check_for_voicemail(self, user_message, voicemail_detection_prompt=None):
+        """Check if message indicates a voicemail system. Returns (result_dict, metadata)."""
+        try:
+            detection_prompt = voicemail_detection_prompt or VOICEMAIL_DETECTION_PROMPT
+            prompt = [
+                {
+                    "role": "system",
+                    "content": detection_prompt
+                    + """
+                    Respond only in this JSON format:
+                    {
+                      "is_voicemail": "Yes" or "No"
+                    }
+                """,
+                },
+                {"role": "user", "content": f"User message: {user_message}"},
+            ]
+
+            start_time = time.time()
+            response, metadata = await self.voicemail_llm.generate(prompt, request_json=True, ret_metadata=True)
+            latency_ms = (time.time() - start_time) * 1000
+
+            result = json.loads(response)
+            metadata["latency_ms"] = latency_ms
+            return result, metadata
+        except Exception as e:
+            logger.error(f"check_for_voicemail exception: {str(e)}")
+            return {"is_voicemail": "No"}, {}
+
+    @staticmethod
+    def _edge_function_name(edge: dict) -> str:
+        return edge.get("function_name") or f"transition_to_{edge['to_node_id']}"
+
+    @staticmethod
+    def _edge_parameter_schema(param_name: str, spec) -> dict:
+        """A parameter is either a bare type ("string") or a dict with type, description and allowed_values."""
+        if not isinstance(spec, dict):
+            spec = {"type": spec}
+        schema = {
+            "type": spec.get("type") or "string",
+            "description": spec.get("description") or f"The {param_name} provided by the user",
+        }
+        if spec.get("allowed_values"):
+            schema["enum"] = list(spec["allowed_values"])
+        return schema
+
+    def _build_transition_tools_for_edges(self, edges: list, allow_stay: bool = True) -> list:
+        """allow_stay=False omits stay_on_current_node so the model must pick a real edge."""
+        tools = []
+        prompt_context = self._prompt_context()
+        for edge in edges:
+            func_name = self._edge_function_name(edge)
+            func_description = (
+                edge.get("function_description") or f"Call this function when: {edge.get('condition', '')}"
+            )
+            if prompt_context:
+                func_description = update_prompt_with_context(func_description, prompt_context)
+
+            parameters = {"type": "object", "properties": {}, "required": []}
+            if edge.get("parameters"):
+                for param_name, spec in edge["parameters"].items():
+                    parameters["properties"][param_name] = self._edge_parameter_schema(param_name, spec)
+                    parameters["required"].append(param_name)
+
+            parameters["properties"]["reasoning"] = {
+                "type": "string",
+                "description": _ROUTER_REASONING_DESC,
+            }
+            parameters["properties"]["confidence"] = {
+                "type": "number",
+                "description": _ROUTER_CONFIDENCE_DESC,
+            }
+            parameters["required"].extend(["reasoning", "confidence"])
+
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {"name": func_name, "description": func_description, "parameters": parameters},
+                }
+            )
+
+        if allow_stay:
+            stay_properties = {
+                "reasoning": {"type": "string", "description": _ROUTER_REASONING_DESC},
+                "confidence": {"type": "number", "description": _ROUTER_CONFIDENCE_DESC},
+            }
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "stay_on_current_node",
+                        "description": "No transition matches. Need more info or clarification.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": stay_properties,
+                            "required": list(stay_properties),
+                        },
+                    },
+                }
+            )
+        return tools
+
+    def _build_transition_tools(self, node: dict) -> List[dict]:
+        """Build and cache function/tool definitions for all node edges."""
+        node_id = node.get("id")
+        if node_id and node_id in self._transition_tools_cache:
+            return self._transition_tools_cache[node_id]
+
+        tools = self._build_transition_tools_for_edges(node.get("edges", []))
+
+        if node_id:
+            if len(self._transition_tools_cache) >= self._transition_tools_cache_max_size:
+                oldest_key = next(iter(self._transition_tools_cache))
+                del self._transition_tools_cache[oldest_key]
+            self._transition_tools_cache[node_id] = tools
+        return tools
+
+    def _get_edge_by_function_name_from_edges(self, edges: list, function_name: str) -> Optional[dict]:
+        for edge in edges:
+            if self._edge_function_name(edge) == function_name:
+                return edge
+        return None
+
+    def _get_edge_by_function_name(self, node: dict, function_name: str) -> Optional[dict]:
+        return self._get_edge_by_function_name_from_edges(node.get("edges", []), function_name)
+
+    def _classify_edges(self, edges: list) -> tuple:
+        """Split edges into (deterministic_edges, llm_edges), sorted by priority.
+        Event edges are excluded — they only fire via process_event()."""
+        deterministic = []
+        llm = []
+        for edge in edges:
+            ct = edge.get("condition_type")
+            if ct == EdgeConditionType.EVENT:
+                continue  # event edges only fire via process_event()
+            elif ct in (EdgeConditionType.EXPRESSION, EdgeConditionType.UNCONDITIONAL):
+                deterministic.append(edge)
+            else:
+                llm.append(edge)
+
+        deterministic.sort(key=self._edge_priority)
+        llm.sort(key=self._edge_priority)
+        return deterministic, llm
+
+    @staticmethod
+    def _edge_priority(edge: dict) -> int:
+        """The author's priority, else the type default: expression/unconditional 0, intent 100."""
+        if edge.get("priority") is not None:
+            return edge["priority"]
+        if edge.get("condition_type") in (EdgeConditionType.EXPRESSION, EdgeConditionType.UNCONDITIONAL):
+            return 0
+        return 100
+
+    @staticmethod
+    def _is_silence_turn(history: list) -> bool:
+        return bool(history and history[-1].get("content", "").startswith("[silence]"))
+
+    def _intents_outranking(
+        self, node: dict, matched_expression: Optional[dict], intent_edges: list, history: list
+    ) -> list:
+        """Intents outranking the matched expression on a priority node; same-node ones only if they extract."""
+        if matched_expression is None or node.get("edge_order") != EdgeOrder.PRIORITY or self._is_silence_turn(history):
+            return []
+        bar = self._edge_priority(matched_expression)
+        return [
+            edge
+            for edge in intent_edges
+            if self._edge_priority(edge) < bar
+            and (edge["to_node_id"] != matched_expression["to_node_id"] or edge.get("parameters"))
+        ]
+
+    def _evaluate_deterministic_edges(self, edges: list) -> Tuple[Optional[dict], List[str]]:
+        """Return (first matching deterministic edge or None, per-edge evaluation traces)."""
+        evaluations = []
+        for edge in edges:
+            is_match = evaluate_edge_expression(edge, self.context_data, self.variable_types)
+            evaluations.append(
+                f"-> {edge.get('to_node_id')}: {describe_edge_expression(edge, self.context_data, self.variable_types)} | matched={is_match}"
+            )
+            if is_match:
+                return edge, evaluations
+        return None, evaluations
+
+    def process_event(self, event: dict) -> dict:
+        """Process an external event. Merges properties into context_data
+        and checks current node's event edges for a matching transition.
+
+        Returns dict with: matched, event, new_node_id, node_type, etc.
+        """
+        parsed = CallEvent(**event) if not isinstance(event, CallEvent) else event
+        event_name = parsed.event
+        properties = parsed.properties or {}
+
+        # Always merge properties into context_data
+        if properties:
+            self.context_data.update(properties)
+        self.context_data["_last_event"] = event_name
+
+        current_node = self.get_node_by_id(self.current_node_id)
+        if not current_node:
+            logger.warning(f"process_event: current node '{self.current_node_id}' not found")
+            return {"matched": False, "event": event_name}
+
+        # Collect event edges, sorted by priority
+        event_edges = [e for e in current_node.get("edges", []) if e.get("condition_type") == EdgeConditionType.EVENT]
+        event_edges.sort(key=lambda e: e.get("priority") or 0)
+
+        for edge in event_edges:
+            if edge.get("event_name") == event_name:
+                previous_node = self.current_node_id
+                self.current_node_id = edge["to_node_id"]
+                self.current_node_entry_index = 0  # caller should set to len(history)
+                self._silence_repeats = 0
+                self._active_node_first_response_delivered = False
+                self._end_node_closed = False
+
+                if self.current_node_id not in self.node_history or self.node_history[-1] != self.current_node_id:
+                    self.node_history.append(self.current_node_id)
+
+                target_node = self.get_node_by_id(edge["to_node_id"])
+                node_type = self._node_type_of(target_node)
+
+                logger.info(f"Event '{event_name}' matched edge: {previous_node} -> {self.current_node_id}")
+                return {
+                    "matched": True,
+                    "event": event_name,
+                    "previous_node": previous_node,
+                    "new_node_id": edge["to_node_id"],
+                    "node_type": node_type,
+                    "target_node": target_node,
+                }
+
+        logger.info(
+            f"Event '{event_name}' did not match any event edge on node '{self.current_node_id}' — context updated silently"
+        )
+        return {"matched": False, "event": event_name}
+
+    def _compute_turn_counts(self, history: list) -> tuple:
+        """Count (node_turns, total_turns) from history. A node just entered this
+        turn (entry_index == len(history), as during a router hop) has 0 node turns."""
+        total_turns = sum(1 for msg in history if msg.get("role") == "user")
+        node_history = history[self.current_node_entry_index :]
+        node_turns = sum(1 for msg in node_history if msg.get("role") == "user")
+        return node_turns, total_turns
+
+    def _enrich_routing_context(self, history: list) -> None:
+        """Refresh time variables and turn counts in context_data for expression evaluation."""
+        recipient_data = self.context_data.get("recipient_data")
+        timezone_str = recipient_data.get("timezone") if isinstance(recipient_data, dict) else None
+        if timezone_str:
+            enrich_context_with_time_variables(self.context_data, timezone_str)
+
+        node_turns, total_turns = self._compute_turn_counts(history)
+        self.context_data["_node_turns"] = node_turns
+        self.context_data["_total_turns"] = total_turns
+        self.context_data["_silence_repeats"] = self._silence_repeats
+
+    @staticmethod
+    def _node_type_of(node: Optional[dict]) -> str:
+        return node.get("node_type", NodeType.LLM) if node else NodeType.LLM
+
+    def _match_expression_edge(
+        self, node: dict, deterministic_edges: Optional[list] = None
+    ) -> Tuple[Optional[dict], str]:
+        """First matching expression edge in priority order, with the evaluation trace.
+        Pass deterministic_edges from a prior _classify_edges to avoid re-classifying."""
+        if deterministic_edges is None:
+            deterministic_edges, _ = self._classify_edges(node.get("edges", []))
+        expression_edges = [e for e in deterministic_edges if e.get("condition_type") == EdgeConditionType.EXPRESSION]
+        matched_edge, evaluations = self._evaluate_deterministic_edges(expression_edges)
+        return matched_edge, "; ".join(evaluations) or "no expression edge matched"
+
+    @staticmethod
+    def _catch_all_edge(node: dict) -> Optional[dict]:
+        """Lowest-priority unconditional edge, matching the priority precedence used everywhere else."""
+        unconditional = [e for e in node.get("edges", []) if e.get("condition_type") == EdgeConditionType.UNCONDITIONAL]
+        if not unconditional:
+            return None
+        return min(unconditional, key=GraphAgent._edge_priority)
+
+    def _consume_routing_tail(self):
+        tail, self._pending_routing_tail = self._pending_routing_tail, None
+        return tail
+
+    def _begin_routing_turn(self):
+        """Drop a tail whose hop was never built, so a later hop cannot adopt its telemetry."""
+        stranded = self._consume_routing_tail()
+        if stranded is not None:
+            stranded.cancel()
+
+    @staticmethod
+    def _catch_all_reasoning(edge: dict) -> str:
+        ct = edge.get("condition_type", "unconditional")
+        return f"{_DETERMINISTIC_REASONING_PREFIX}{ct}:{edge.get('condition') or ct}"
+
+    def _router_hop_info(
+        self,
+        previous_node: str,
+        *,
+        routing_type: str,
+        latency_ms: float,
+        started_at: float,
+        reasoning: Optional[str],
+        confidence: Optional[float],
+        is_silence_trigger: bool = False,
+        extracted_params: Optional[dict] = None,
+        routing_messages: Optional[List[dict]] = None,
+        routing_tools: Optional[List[dict]] = None,
+        routing_expression: Optional[str] = None,
+        routing_usage: Optional[dict] = None,
+    ) -> dict:
+        # A routing-LLM call happened whenever it produced messages, even on a hop that
+        # then fell back to the catch-all — so its model/usage stay attributed and counted.
+        made_llm_call = routing_messages is not None
+        return {
+            "previous_node": previous_node,
+            "current_node": self.current_node_id,
+            "transitioned": True,
+            "routing_type": routing_type,
+            "routing_model": self._last_routing_model if made_llm_call else None,
+            "routing_provider": self.routing_provider if made_llm_call else None,
+            "routing_latency_ms": round(latency_ms, 1),
+            # Wall clock at hop start — the trace row is written after the hop finished.
+            "routing_started_at": started_at,
+            "extracted_params": extracted_params or {},
+            "node_history": list(self.node_history),
+            "routing_messages": routing_messages,
+            "routing_tools": routing_tools,
+            "reasoning": reasoning,
+            "routing_expression": routing_expression,
+            "confidence": confidence,
+            "routing_usage": routing_usage,
+            "routing_tail": self._consume_routing_tail(),
+            "node_type": self._node_type_of(self.get_node_by_id(self.current_node_id)),
+            "is_silence_trigger": is_silence_trigger,
+        }
+
+    async def _route_node(
+        self, node: dict, history: list, start_time: float
+    ) -> Tuple[Optional[dict], Optional[dict], str, Optional[tuple], Optional[tuple]]:
+        """One routing pass shared by both paths. Returns (matched, catch_all, eval_trace, decision, declined),
+        where decision/declined is the routing call's result when it chose an edge / chose none."""
+        deterministic_edges, intent_edges = self._classify_edges(node.get("edges", []))
+        catch_all = self._catch_all_edge(node)
+        matched, eval_trace = self._match_expression_edge(node, deterministic_edges)
+        contenders = intent_edges if matched is None else self._intents_outranking(node, matched, intent_edges, history)
+        if not contenders:
+            return matched, catch_all, eval_trace, None, None
+        if matched is not None:
+            eval_trace = f"{eval_trace}; {_OUTRANKING_INTENTS_TRACE}"
+        result = await self._decide_next_node_llm(
+            node, contenders, history, start_time, default_edge=matched or catch_all
+        )
+        next_node_id, *_ = result
+        if next_node_id is not None:
+            return matched, catch_all, eval_trace, result, None
+        return matched, catch_all, eval_trace, None, result
+
+    async def _resolve_router_chain(self, history: list) -> List[dict]:
+        """Hop silently through routers to a speaking node, one routing_info per hop.
+        Per hop: expression, then one intent-LLM call, then the unconditional catch-all. On a
+        router with edge_order "priority", intent edges ranked above the matched expression come first.
+        The visited-set bounds the hops so the chain always terminates."""
+        hops = []
+        visited = set()
+        self._begin_routing_turn()
+        is_silence_trigger = self._is_silence_turn(history)
+
+        while self._node_type_of(self.get_node_by_id(self.current_node_id)) == NodeType.ROUTER:
+            if self.current_node_id in visited:
+                logger.error(
+                    f"Router cycle detected at '{self.current_node_id}', stopping chain. "
+                    f"Flow: {' -> '.join(self.node_history)}"
+                )
+                break
+            visited.add(self.current_node_id)
+
+            hop_start = time.perf_counter()
+            hop_started_at = time.time()
+            self._reset_routing_identity()
+            self._enrich_routing_context(history)
+            router_node = self.get_node_by_id(self.current_node_id)
+            previous_node = self.current_node_id
+
+            edge, catch_all, eval_trace, decision, declined = await self._route_node(router_node, history, hop_start)
+
+            if decision is not None:
+                (
+                    next_node_id,
+                    extracted_params,
+                    latency_ms,
+                    routing_messages,
+                    routing_tools,
+                    reasoning,
+                    confidence,
+                    routing_usage,
+                ) = decision
+                self._advance_to_node(next_node_id, entry_index=len(history))
+                self._apply_extracted_params(extracted_params)
+                logger.info(
+                    f"Router dispatch (intent) on node '{previous_node}': -> {self.current_node_id} "
+                    f"| {reasoning} (latency: {latency_ms:.1f}ms)"
+                )
+                hops.append(
+                    self._router_hop_info(
+                        previous_node,
+                        routing_type="llm",
+                        latency_ms=latency_ms,
+                        started_at=hop_started_at,
+                        reasoning=reasoning,
+                        confidence=confidence,
+                        is_silence_trigger=is_silence_trigger,
+                        extracted_params=extracted_params,
+                        routing_messages=routing_messages,
+                        routing_tools=routing_tools,
+                        routing_expression=eval_trace,
+                        routing_usage=routing_usage,
+                    )
+                )
+                continue
+
+            # Telemetry from an intent call that returned no match, carried onto the
+            # deterministic hop so its tokens are still counted and the call is still logged.
+            _, _, _, spent_messages, spent_tools, _, _, spent_usage = declined or (None,) * 8
+            if declined is not None:
+                eval_trace = f"{eval_trace}; intent: no match"
+
+            if edge is None:
+                edge = catch_all
+            if edge is None:
+                logger.error(
+                    f"Router node '{self.current_node_id}' has no matching edge and no catch-all, "
+                    f"stopping chain. Evaluations: {eval_trace}"
+                )
+                break
+
+            self._advance_to_node(edge["to_node_id"], entry_index=len(history))
+            latency_ms = (time.perf_counter() - hop_start) * 1000
+            condition = edge.get("condition") or edge.get("condition_type", "router")
+
+            logger.info(
+                f"Router dispatch on node '{previous_node}': -> {self.current_node_id} "
+                f"| {eval_trace} (latency: {latency_ms:.1f}ms)"
+            )
+            hops.append(
+                self._router_hop_info(
+                    previous_node,
+                    routing_type="deterministic",
+                    latency_ms=latency_ms,
+                    started_at=hop_started_at,
+                    reasoning=f"{_ROUTER_REASONING_PREFIX}{condition}",
+                    confidence=1.0,
+                    is_silence_trigger=is_silence_trigger,
+                    routing_expression=eval_trace,
+                    routing_messages=spent_messages,
+                    routing_tools=spent_tools,
+                    routing_usage=spent_usage,
+                )
+            )
+
+        return hops
+
+    def _advance_to_node(self, node_id: str, entry_index: int) -> None:
+        self.current_node_id = node_id
+        self.current_node_entry_index = entry_index
+        self._silence_repeats = 0
+        self._active_node_first_response_delivered = False
+        self._end_node_closed = False
+        if not self.node_history or self.node_history[-1] != self.current_node_id:
+            self.node_history.append(self.current_node_id)
+
+    def silence_exit_threshold(self) -> int:
+        """[silence] re-prompts the current node needs before one of its _silence_repeats expression
+        edges can fire (0 if it has none), so the task manager's re-prompt cap never cuts that exit off."""
+        node = self.get_node_by_id(self.current_node_id) or {}
+        needed = 0
+        for edge in node.get("edges", []):
+            if edge.get("condition_type") != EdgeConditionType.EXPRESSION:
+                continue
+            for condition in (edge.get("expression") or {}).get("conditions", []):
+                if condition.get("variable") != "_silence_repeats":
+                    continue
+                try:
+                    value = float(condition.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                operator = condition.get("operator")
+                if operator in (ExpressionOperator.GTE, ExpressionOperator.EQ):
+                    needed = max(needed, math.ceil(value))
+                elif operator == ExpressionOperator.GT:
+                    needed = max(needed, math.floor(value) + 1)
+        return needed
+
+    def mark_first_response_delivered(self) -> None:
+        """Unblock routing once the active node's first customer-facing TTS turn is delivered."""
+        self._active_node_first_response_delivered = True
+
+    def _apply_extracted_params(self, extracted_params: Optional[dict]) -> None:
+        if extracted_params:
+            self.context_data.update(extracted_params)
+            self.node_extracted_data.update(extracted_params)
+
+    def _should_hold_for_first_delivery(self, node: Optional[dict]) -> bool:
+        return (
+            self._hold_until_first_delivery
+            and node is not None
+            and self._node_type_of(node) in (NodeType.LLM, NodeType.STATIC)
+            and not self._active_node_first_response_delivered
+        )
+
+    def _hold_routing_info(self, is_silence_trigger: bool) -> dict:
+        return {
+            "previous_node": self.current_node_id,
+            "current_node": self.current_node_id,
+            "transitioned": False,
+            "routing_type": "hold",
+            "routing_model": None,
+            "routing_provider": None,
+            "routing_latency_ms": None,
+            "routing_started_at": time.time(),
+            "extracted_params": {},
+            "node_history": list(self.node_history),
+            "routing_messages": None,
+            "routing_tools": None,
+            "reasoning": f"{_DETERMINISTIC_REASONING_PREFIX}hold:first_response_undelivered",
+            "confidence": 1.0,
+            "node_type": self._node_type_of(self.get_node_by_id(self.current_node_id)),
+            "is_silence_trigger": is_silence_trigger,
+        }
+
+    def _end_turn_chunk(self, meta_info: Optional[dict], start_time: float) -> LLMStreamChunk:
+        """Terminal empty end-of-stream chunk for a turn that produces no speech (a router
+        that could not resolve — only reachable via an invalid config that skipped
+        validation). Closes the stream on the end_of_llm_stream contract; the turn stays
+        silent and the next user turn resumes normally."""
+        return LLMStreamChunk(
+            data="",
+            end_of_stream=True,
+            latency=LatencyData(
+                sequence_id=meta_info.get("sequence_id") if meta_info else None,
+                first_token_latency_ms=0,
+                total_stream_duration_ms=now_ms() - start_time,
+            ),
+        )
+
+    async def _decide_next_node_llm(
+        self, node: dict, llm_edges: list, history: List[dict], start_time: float, default_edge: Optional[dict] = None
+    ) -> Tuple[
+        Optional[str],
+        Optional[Dict[str, Any]],
+        float,
+        Optional[List[dict]],
+        Optional[List[dict]],
+        Optional[str],
+        Optional[float],
+        Optional[dict],
+    ]:
+        """LLM routing over the intent edges. A default_edge (the catch-all or a matched expression) is
+        offered as a described transition instead of stay_on_current_node, so the model commits."""
+        option_edges = list(llm_edges)
+        if default_edge is not None:
+            # Always mark the default so the model can tell it apart from the intent edges,
+            # appending the author's condition/description when there is one.
+            hint = default_edge.get("function_description") or default_edge.get("condition")
+            marker = "Default route: choose this only when none of the other transitions apply."
+            name = self._edge_function_name(default_edge)
+            if default_edge.get("condition_type") == EdgeConditionType.EXPRESSION:
+                # Fixed text keeps the routing prompt prefix cacheable.
+                marker = (
+                    "Default route: a rule on this node already chose this transition. "
+                    "Choose another transition only when the caller clearly asks for it."
+                )
+                # A same-node intent needs a distinct name to keep its parameters.
+                if any(self._edge_function_name(edge) == name for edge in llm_edges):
+                    name = f"{name}_default"
+            default_edge = {
+                **default_edge,
+                "function_name": name,
+                "function_description": f"{marker} {hint}" if hint else marker,
+            }
+            option_edges.append(default_edge)
+        tools = self._build_transition_tools_for_edges(option_edges, allow_stay=default_edge is None)
+
+        # Skip internal _-prefixed keys so the routing prompt prefix stays cacheable.
+        context_section = ""
+        if self.context_data:
+            context_items = [
+                f"{k}={v}"
+                for k, v in self.context_data.items()
+                if v is not None and not isinstance(v, dict) and k != "detected_language" and not k.startswith("_")
+            ]
+            if context_items:
+                context_section = f"\nContext: {', '.join(context_items)}"
+
+        if default_edge is not None:
+            default_instructions = (
+                "Call the transition function that best matches the user's intent. "
+                "Choose the default route only when none of the others clearly apply."
+            )
+        else:
+            default_instructions = (
+                "Call the transition function matching user intent, or stay_on_current_node if unclear."
+            )
+        instructions = self.routing_instructions or default_instructions
+
+        # The same frozen context the spoken prompt uses: the router otherwise reads "{Name}" while
+        # the history shows the real value, and live time variables rewrite the prompt every turn.
+        prompt_context = self._prompt_context()
+
+        if prompt_context and instructions:
+            try:
+                substitution_data = dict(prompt_context)
+                recipient_data = prompt_context.get("recipient_data")
+                if isinstance(recipient_data, dict):
+                    substitution_data.update(recipient_data)
+                instructions = render_prompt(instructions, substitution_data, missing="NULL")
+            except Exception as e:
+                logger.debug(f"Variable substitution in routing_instructions failed: {e}")
+
+        node_objective = node.get("prompt") or node.get("description") or ""
+        if prompt_context:
+            node_objective = update_prompt_with_context(node_objective, prompt_context)
+        system_prompt = f"""Routing Guidelines: \n {instructions}\n Current Node: {node["id"]}{context_section} \n Node Objective: {node_objective}\n\n Node Conversation History:\n"""
+
+        logger.debug(f"Routing system prompt:\n{system_prompt}")
+        messages = [{"role": "system", "content": system_prompt}]
+        node_history = (
+            history[self.current_node_entry_index :] if self.current_node_entry_index < len(history) else history
+        )
+        has_tool_context = any(msg.get("role") == "assistant" and msg.get("tool_calls") for msg in node_history)
+
+        if has_tool_context:
+            for msg in node_history:
+                role = msg.get("role")
+                if role == "assistant":
+                    if msg.get("tool_calls"):
+                        messages.append({"role": "assistant", "content": None, "tool_calls": msg["tool_calls"]})
+                    elif msg.get("content"):
+                        messages.append({"role": "assistant", "content": msg["content"]})
+                elif role == "tool":
+                    content = msg.get("content", "")
+                    messages.append({"role": "tool", "tool_call_id": msg.get("tool_call_id", ""), "content": content})
+                elif role == "user" and msg.get("content"):
+                    messages.append({"role": "user", "content": msg["content"]})
+        else:
+            for msg in node_history:
+                role = msg.get("role")
+                content = msg.get("content")
+                if role in ("user", "assistant") and content:
+                    messages.append({"role": role, "content": content})
+
+        if len(messages) == 1:
+            user_message = history[-1].get("content", "") if history else ""
+            if user_message:
+                messages.append({"role": "user", "content": user_message})
+
+        try:
+            routing_llm, self._last_routing_model, self._last_routing_effort = self._routing_llm_for(node)
+            result = await routing_llm.route(messages, tools)
+            latency_ms = (time.perf_counter() - start_time) * 1000
+
+            if result is None:
+                logger.warning("No tool call in response")
+                return None, None, latency_ms, messages, tools, None, None, None
+
+            function_name = result["function_name"]
+            function_args = result["arguments"]
+            # Read by the routing_info built right after this returns, with no await in between.
+            self._pending_routing_tail = result.get("routing_tail")
+            # Pop reasoning and confidence before they pollute extracted_params/context_data
+            reasoning = function_args.pop("reasoning", None)
+            confidence = function_args.pop("confidence", None)
+
+            # Built even when the streamed decision has no usage yet, so the backend that
+            # served the hop is not lost before the tail supplies the token counts.
+            usage_info = {
+                **(result.get("usage") or {}),
+                "service_tier": result.get("service_tier"),
+                "overflowed": result.get("overflowed", False),
+            }
+
+            logger.info(
+                f"Routing decision (LLM): {function_name} | confidence: {confidence} | reasoning: {reasoning} (latency: {latency_ms:.1f}ms)"
+            )
+
+            if function_name == "stay_on_current_node":
+                return None, None, latency_ms, messages, tools, reasoning, confidence, usage_info
+
+            # Find the edge for this function (may be the default)
+            edge = self._get_edge_by_function_name_from_edges(option_edges, function_name)
+            if edge:
+                return (
+                    edge["to_node_id"],
+                    function_args,
+                    latency_ms,
+                    messages,
+                    tools,
+                    reasoning,
+                    confidence,
+                    usage_info,
+                )
+            logger.warning(f"Function {function_name} not found in edges")
+            return None, None, latency_ms, messages, tools, reasoning, confidence, usage_info
+
+        except Exception as e:
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            logger.error(f"Routing error: {e} (latency: {latency_ms:.1f}ms)")
+            return None, None, latency_ms, messages, tools, None, None, None
+
+    async def decide_next_node_with_functions(
+        self, history: List[dict]
+    ) -> Tuple[
+        Optional[str],
+        Optional[Dict[str, Any]],
+        float,
+        Optional[List[dict]],
+        Optional[List[dict]],
+        Optional[str],
+        Optional[float],
+        Optional[dict],
+    ]:
+        """Precedence: expression edges, then intent edges via one LLM call, then the
+        unconditional default. Without an unconditional edge the node may stay."""
+        self._begin_routing_turn()
+        start_time = time.perf_counter()
+        self._last_deterministic_eval = None
+        self._reset_routing_identity()
+
+        current_node = self.get_node_by_id(self.current_node_id)
+        if not current_node:
+            logger.error(f"Current node '{self.current_node_id}' not found")
+            return None, None, 0, None, None, None, None, None
+
+        edges = current_node.get("edges", [])
+        if not edges:
+            logger.debug(f"Node '{self.current_node_id}' has no edges, staying on current node")
+            return None, None, 0, None, None, None, None, None
+
+        # Inject time variables and turn counts for expression evaluation
+        self._enrich_routing_context(history)
+
+        matched_edge, catch_all, self._last_deterministic_eval, decision, declined = await self._route_node(
+            current_node, history, start_time
+        )
+        if decision is not None:
+            return decision
+        # A declined call's telemetry rides on the deterministic result.
+        _, _, declined_latency_ms, r_messages, r_tools, _, _, r_usage = declined or (None,) * 8
+
+        if matched_edge:
+            if declined is not None:
+                self._last_deterministic_eval = f"{self._last_deterministic_eval}; intent: no match"
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            ct = matched_edge.get("condition_type", EdgeConditionType.EXPRESSION)
+            reasoning = f"{_DETERMINISTIC_REASONING_PREFIX}{ct}:{matched_edge.get('condition', ct)}"
+            logger.info(
+                f"Routing decision (expression) on node '{self.current_node_id}': "
+                f"-> {matched_edge['to_node_id']} | {self._last_deterministic_eval} (latency: {latency_ms:.1f}ms)"
+            )
+            return matched_edge["to_node_id"], None, latency_ms, r_messages, r_tools, reasoning, 1.0, r_usage
+
+        if catch_all is not None:
+            if declined is not None:
+                latency_ms = declined_latency_ms
+                self._last_deterministic_eval = f"intent: no match; default -> {catch_all['to_node_id']}"
+            else:
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                self._last_deterministic_eval = f"default -> {catch_all['to_node_id']}"
+            return (
+                catch_all["to_node_id"],
+                None,
+                latency_ms,
+                r_messages,
+                r_tools,
+                self._catch_all_reasoning(catch_all),
+                1.0,
+                r_usage,
+            )
+
+        # No default: stay.
+        return declined if declined is not None else (None, None, 0, None, None, None, None, None)
+
+    def get_node_by_id(self, node_id: str) -> Optional[dict]:
+        return next((node for node in self.config.get("nodes", []) if node["id"] == node_id), None)
+
+    def _get_prompt_with_example(self, node: dict, detected_lang: str) -> str:
+        """Get node prompt with the language directive (and example, when available) appended."""
+        prompt = node.get("prompt", "")
+        # `or {}`, not a .get default: agent JSONs carry "examples": null explicitly, and a
+        # .get default only covers a MISSING key. None here crashed generate() on every turn
+        # and the agent spoke the exception text (topaz 574cd2f9, 31/31 nodes examples:null).
+        examples = node.get("examples") or {}
+
+        if detected_lang:
+            # Directive is unconditional once the language is known. It used to be emitted only
+            # when the node had an example for that language, so a node without examples (or
+            # without THIS language's example) silently dropped ALL language instruction — after
+            # an LID switch the pools flipped but replies stayed in the node prompt's authored
+            # language (QA 78c4c4a4: hi→en switch, every reply still Hindi).
+            lang_name = LANGUAGE_NAMES.get(detected_lang, detected_lang)
+            directive = (
+                f"\n\nLANGUAGE GUIDELINES\n\nThe user is now speaking {lang_name} ('{detected_lang}'). "
+                f"From this point onward, respond only in {lang_name}, regardless of the language used "
+                f"earlier in the conversation or elsewhere in this prompt. This instruction overrides "
+                f"all other language preferences, language-selection rules, and multilingual script "
+                f"variants in this prompt: preferred-language variables, per-language scripted "
+                f"questions or sample responses, and instructions to speak 'as per' any language "
+                f"preference. For the remainder of the call, use only the {lang_name} version of every "
+                f"question, FAQ, sample response, objection-handling response, and closing line. If a "
+                f"{lang_name} version is not provided, translate the available version into clear, "
+                f"natural {lang_name} while preserving its exact meaning. "
+                f"Never translate or alter proper nouns, brand names, alphanumeric identifiers, "
+                f"digits, codes, or lines this prompt marks as verbatim/legal — read those "
+                f"exactly as written; they are language-neutral."
+            )
+            if examples.get(detected_lang):
+                directive += (
+                    f" You can refer to the example given below to generate a reply in the "
+                    f'given language. Example response: "{examples[detected_lang]}"'
+                )
+            return f"{prompt}{directive}"
+
+        if not examples:
+            return prompt
+
+        # Language not yet detected — include all examples
+        example_lines = [f'  {lang.upper()}: "{text}"' for lang, text in examples.items()]
+        return f"{prompt}\n\nExample responses:\n" + "\n".join(example_lines)
+
+    def _get_tool_choice_for_node(self, history: Optional[List[dict]] = None):
+        """Return forced tool_choice for the current node, or None if not forced.
+
+        Drops the force when required prompt vars aren't in recipient_data,
+        or when the tool has already been called this node visit.
+        """
+        if not self.llm or not getattr(self.llm, "trigger_function_call", False):
+            return None
+
+        current_node = self.get_node_by_id(self.current_node_id)
+        if not current_node:
+            return None
+
+        fn = current_node.get("function_call")
+        if not fn:
+            return None
+        # Forcing end_call hangs up before the node speaks; the closing turn speaks and then hangs up instead,
+        # and "none" keeps end_call offered (an empty tools list breaks Anthropic) without letting the model end first.
+        if fn == END_CALL_FUNCTION_PREFIX:
+            return "none" if self._ends_call(current_node) else None
+
+        missing = self._missing_forced_function_vars(current_node, fn)
+        if missing:
+            logger.warning(
+                f"Dropping forced function call '{fn}' on node '{self.current_node_id}': "
+                f"recipient_data missing required vars referenced in prompt: {missing}"
+            )
+            return None
+
+        if history is not None and self._forced_function_already_called(fn, history):
+            logger.info(
+                f"Dropping forced function call '{fn}' on node '{self.current_node_id}': "
+                f"tool already invoked this node visit, letting LLM speak from the result"
+            )
+            return None
+
+        logger.info(f"Node '{self.current_node_id}' forcing specific function: {fn}")
+        return {"type": "function", "function": {"name": fn}}
+
+    def _tools_for_node(self, node: Optional[dict], forced_name: Optional[str] = None) -> Optional[List[dict]]:
+        """Tools visible on this node (global + node-scoped + forced), or None to use the full set.
+
+        forced_name is the tool the resolved tool_choice forces this turn (or None); a forced tool
+        must stay visible for the tool_choice to be valid, but only when the force actually survives.
+        """
+        if not self.llm or not getattr(self.llm, "trigger_function_call", False):
+            return None
+        raw = getattr(self.llm, "tools", None)
+        if not raw:
+            return None
+        full = json.loads(raw) if isinstance(raw, str) else raw
+        if not full:
+            return None
+
+        api_params = getattr(self.llm, "api_params", {}) or {}
+        node_id = node.get("id") if node else None
+        forced = forced_name
+
+        subset = []
+        for tool in full:
+            name = tool.get("function", {}).get("name")
+            params = api_params.get(name, {}) or {}
+            if name == forced:
+                subset.append(tool)  # must stay visible so the forced tool_choice is valid
+            elif params.get("scope") == ToolScope.NODE.value:
+                if node_id is not None and node_id in (params.get("nodes") or []):
+                    subset.append(tool)
+            else:
+                subset.append(tool)
+
+        if len(subset) == len(full):
+            return None  # nothing filtered -> let generate_stream use self.tools
+        return subset
+
+    def _missing_forced_function_vars(self, node: dict, fn: str) -> List[str]:
+        tools = getattr(self.llm, "tools", None) or []
+        if isinstance(tools, str):
+            tools = json.loads(tools)
+        spec = next(
+            (t["function"] for t in tools if t.get("function", {}).get("name") == fn),
+            None,
+        )
+        required = set((spec or {}).get("parameters", {}).get("required") or [])
+        if not required:
+            return []
+
+        prompt_vars = set(_PROMPT_VAR_PATTERN.findall(node.get("prompt", "") or ""))
+        referenced = prompt_vars & required
+        recipient_data = self.context_data.get("recipient_data") or {}
+        return sorted(v for v in referenced if not recipient_data.get(v))
+
+    def _forced_function_already_called(self, fn: str, history: List[dict]) -> bool:
+        node_history = history[self.current_node_entry_index :] if self.current_node_entry_index < len(history) else []
+        call_ids_for_fn = {
+            tc.get("id")
+            for msg in node_history
+            if msg.get("role") == "assistant" and msg.get("tool_calls")
+            for tc in msg["tool_calls"]
+            if tc.get("function", {}).get("name") == fn
+        }
+        if not call_ids_for_fn:
+            return False
+        return any(msg.get("role") == "tool" and msg.get("tool_call_id") in call_ids_for_fn for msg in node_history)
+
+    def _ends_call(self, node: Optional[dict]) -> bool:
+        # Only the first reply of a visit closes; once a barge-in keeps the call up, the node converses
+        # normally and the model ends the call through the end_call tool when the caller is done.
+        return bool(
+            node
+            and node.get("function_call") == END_CALL_FUNCTION_PREFIX
+            and not self._end_node_closed
+            and self.llm
+            and getattr(self.llm, "trigger_function_call", False)
+        )
+
+    async def _stream_node_reply(self, node_llm, node, messages, meta_info, synthesize, tool_choice, tools):
+        """Stream the node's reply; on an end_call node's closing turn, flag it so the task manager
+        hangs up once the reply has played."""
+        ends_call = self._ends_call(node)
+        if ends_call:
+            # A chained Responses request does not resend the system prompt, which carries the closing instruction.
+            node_llm.invalidate_response_chain()
+        spoke = False
+        async for chunk in node_llm.generate_stream(
+            messages, synthesize=synthesize, meta_info=meta_info, tool_choice=tool_choice, tools=tools
+        ):
+            if ends_call and isinstance(chunk, LLMStreamChunk):
+                if chunk.is_function_call:
+                    ends_call = False  # another tool ran first; the follow-up turn on this node closes
+                    if str(getattr(chunk.data, "called_fun", "")).startswith(END_CALL_FUNCTION_PREFIX):
+                        # The model ended the call itself (Gemini ignores tool_choice); never close a second time.
+                        self._end_node_closed = True
+                elif isinstance(chunk.data, str) and chunk.data.strip():
+                    spoke = True
+            yield chunk
+        # An empty reply leaves the node open, so its next turn closes instead of hanging up in silence.
+        if ends_call and spoke and meta_info is not None:
+            meta_info[HANGUP_AFTER_REPLY] = True
+            self._end_node_closed = True
+
+    def _prompt_context(self) -> Optional[dict]:
+        """Context for prompt substitution with time frozen at call start.
+
+        Routing re-enriches time live each turn for expression edges; the prompt
+        freezes it so its text stays identical across turns and the prompt cache
+        keeps hitting, matching normal agents which render time once at setup.
+        """
+        if not self.context_data or not isinstance(self.context_data.get("recipient_data"), dict):
+            return self.context_data
+        recipient = self.context_data["recipient_data"]
+        if self._frozen_time_vars is None:
+            timezone_str = recipient.get("timezone")
+            if timezone_str:
+                enrich_context_with_time_variables(self.context_data, timezone_str)
+            self._frozen_time_vars = {k: recipient[k] for k in _TIME_VAR_KEYS if k in recipient}
+        if not self._frozen_time_vars:
+            return self.context_data
+        return {**self.context_data, "recipient_data": {**recipient, **self._frozen_time_vars}}
+
+    async def _build_messages(self, history: List[dict], meta_info: Optional[dict] = None) -> List[dict]:
+        """Build messages array: system prompt + conversation history (+ optional trailing RAG)."""
+        current_node = self.get_node_by_id(self.current_node_id)
+        if not current_node:
+            raise ValueError("Current node not found.")
+
+        detected_lang = self.context_data.get("detected_language")  # None if not yet detected
+        node_prompt = self._get_prompt_with_example(current_node, detected_lang)
+
+        prompt_context = self._prompt_context()
+        if prompt_context:
+            node_prompt = update_prompt_with_context(node_prompt, prompt_context)
+        # The call ends after this reply, so a question here would be cut off by the hangup. Part of the
+        # system prompt, not its own message: Gemini keeps only the last system message.
+        if self._ends_call(current_node):
+            node_prompt = f"{node_prompt}\n\n{_END_NODE_INSTRUCTION}"
+
+        if self.agent_information:
+            agent_info = self.agent_information
+            if prompt_context:
+                agent_info = update_prompt_with_context(agent_info, prompt_context)
+            prompt = f"{agent_info}\n\n{node_prompt}"
+        else:
+            prompt = node_prompt
+
+        # Right after a language switch the earlier turns go into the prompt as a transcript instead
+        # (set by TaskManager, which keeps routing on the full history).
+        prompt_transcript = bool(meta_info and meta_info.get("prompt_transcript"))
+        if not prompt_transcript:
+            # Labels the turns that follow as messages, so they read as the call so far and not
+            # as more instructions.
+            prompt = f"{prompt}\n\n## Conversation History"
+
+        # RAG depends on the latest message, so it goes in a trailing message rather
+        # than the system prompt, keeping [system + history] a cacheable prefix.
+        rag_message = None
+        rag_config = self.rag_configs.get(self.current_node_id) or self.global_rag_config
+        if rag_config and rag_config.get("collections"):
+            try:
+                client = await RAGServiceClientSingleton.get_client(self.rag_server_url)
+                latest_message = history[-1]["content"] if history else ""
+                rag_response = await client.query_for_conversation(
+                    query=latest_message,
+                    collections=rag_config["collections"],
+                    max_results=rag_config.get("similarity_top_k", 10),
+                    similarity_threshold=0.0,
+                )
+                if meta_info is not None:
+                    meta_info["rag_latency"] = {
+                        "sequence_id": meta_info.get("sequence_id"),
+                        "total_query_time_ms": rag_response.total_query_time_ms,
+                        "server_processing_time_ms": rag_response.server_processing_time_ms,
+                        "collections_count": len(rag_config["collections"]),
+                        "results_count": rag_response.total_results,
+                    }
+                if rag_response.contexts:
+                    rag_context = await client.format_context_for_prompt(rag_response.contexts)
+                    rag_message = {
+                        "role": "system",
+                        "content": f"Knowledge base for the latest user message:\n{rag_context}\n\nUse this information naturally.",
+                    }
+            except Exception as e:
+                logger.error(f"RAG error for node {self.current_node_id}: {e}")
+
+        max_history = 50
+        start = max(0, len(history) - max_history)
+        # a window opening on a tool result orphans it from its assistant tool_calls, which the LLM API rejects
+        while start > 0 and history[start].get("role") == ChatRole.TOOL:
+            start -= 1
+        history_subset = history[start:]
+
+        # Pass conversation history as-is to preserve tool_calls/tool_call_id fields
+        conversation = [msg for msg in history_subset if msg.get("role") != "system"]
+        messages = [{"role": "system", "content": prompt}] + conversation
+        if rag_message:
+            messages.append(rag_message)
+        return with_prompt_transcript(messages) if prompt_transcript else messages
+
+    def _static_message_chunk(self, current_node: Optional[dict]) -> Optional[dict]:
+        """Resolve a static node's message for the active language and build its
+        playback chunk: context-substituted text plus the audio-cache hash. None if empty."""
+        # Until the caller's language is detected, a call opened by its static start node keeps the opening's language.
+        text = select_message_by_language(
+            current_node.get("static_message") if current_node else None,
+            self.context_data.get("detected_language") or self.config.get("opening_language"),
+        )
+        if not text:
+            return None
+        if self.context_data:
+            text = update_prompt_with_context(text, self.context_data)
+        return {
+            "static_message": text,
+            "static_audio_hash": get_md5_hash(text),
+            # No model runs on a static node, so every play of an end_call node closes the call.
+            HANGUP_AFTER_REPLY: static_node_ends_call(current_node),
+        }
+
+    async def generate(self, message: List[dict], **kwargs) -> AsyncGenerator:
+        meta_info = kwargs.get("meta_info", {})
+        synthesize = kwargs.get("synthesize", True)
+        start_time = now_ms()
+
+        detected_language = meta_info.get("detected_language")  # None if not yet detected
+        if detected_language:
+            self.context_data["detected_language"] = detected_language
+
+        # Ahead of the try so a blocked endpoint ends the call instead of being spoken.
+        is_custom = (self.config.get("provider") or self.config.get("llm_provider")) == "custom"
+        if is_custom and self.base_url and not self._base_url_validated:
+            await guard_llm_base_url(self.base_url)
+            self._base_url_validated = True
+
+        try:
+            # Event-triggered generation: process_event() already handled routing
+            is_event = self._event_triggered_generation
+            if is_event:
+                self._event_triggered_generation = False
+                current_node = self.get_node_by_id(self.current_node_id)
+                node_type = self._node_type_of(current_node)
+
+                yield {
+                    "routing_info": {
+                        "previous_node": self.context_data.get("_event_previous_node", self.current_node_id),
+                        "current_node": self.current_node_id,
+                        "transitioned": True,
+                        "routing_type": "event",
+                        "routing_model": None,
+                        "routing_provider": None,
+                        "routing_latency_ms": 0,
+                        "routing_started_at": time.time(),
+                        "extracted_params": {},
+                        "node_history": list(self.node_history),
+                        "routing_messages": None,
+                        "routing_tools": None,
+                        "reasoning": f"event:{self.context_data.get('_last_event', '')}",
+                        "confidence": 1.0,
+                        "node_type": node_type,
+                        "is_silence_trigger": False,
+                        "event_triggered": True,
+                    }
+                }
+
+                if node_type == NodeType.ROUTER:
+                    for hop in await self._resolve_router_chain(message):
+                        yield {"routing_info": hop}
+                    current_node = self.get_node_by_id(self.current_node_id)
+                    node_type = self._node_type_of(current_node)
+                    if node_type == NodeType.ROUTER:
+                        logger.error(f"Router '{self.current_node_id}' did not resolve to a speaking node")
+                        yield self._end_turn_chunk(meta_info, start_time)
+                        return
+
+                if node_type == NodeType.STATIC:
+                    chunk = self._static_message_chunk(current_node)
+                    if chunk:
+                        yield chunk
+                    return
+
+                messages = await self._build_messages(message, meta_info=meta_info)
+                # Inject ephemeral event hint (NOT persisted in conversation_history)
+                event_name = self.context_data.get("_last_event", "")
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": f"[Event: {event_name}. Respond proactively — speak first, do not wait for the user.]",
+                    }
+                )
+                yield {"messages": messages}
+                tool_choice = self._get_tool_choice_for_node(history=message)
+                forced_name = tool_choice["function"]["name"] if isinstance(tool_choice, dict) else None
+                node_tools = self._tools_for_node(current_node, forced_name)
+                node_llm = self._conversation_llm_for(current_node)
+                async for chunk in self._stream_node_reply(
+                    node_llm, current_node, messages, meta_info, synthesize, tool_choice, node_tools
+                ):
+                    yield chunk
+                return
+
+            is_silence_trigger = self._is_silence_turn(message)
+            if is_silence_trigger:
+                self._silence_repeats += 1
+
+            # Entry-node dispatch: the turn begins on a router start node. Resolve it
+            # and let the resolved node speak this turn — do NOT re-route it through
+            # decide_next (that would stack another routing call and could transition it
+            # away before it speaks, unlike a router reached mid-turn by a transition).
+            active_node = self.get_node_by_id(self.current_node_id)
+            if self._node_type_of(active_node) == NodeType.ROUTER:
+                for hop in await self._resolve_router_chain(message):
+                    yield {"routing_info": hop}
+            elif self._should_hold_for_first_delivery(active_node):
+                logger.info(
+                    f"Holding on node '{self.current_node_id}' until its first response is delivered; "
+                    f"user input registered as context, not a routing trigger"
+                )
+                yield {"routing_info": self._hold_routing_info(is_silence_trigger)}
+            else:
+                previous_node = self.current_node_id
+                routing_started_at = time.time()
+                (
+                    next_node_id,
+                    extracted_params,
+                    routing_latency_ms,
+                    routing_messages,
+                    routing_tools,
+                    reasoning,
+                    confidence,
+                    routing_usage,
+                ) = await self.decide_next_node_with_functions(message)
+
+                if next_node_id:
+                    logger.info(f"Transitioning: {self.current_node_id} -> {next_node_id} (params: {extracted_params})")
+                    self._advance_to_node(next_node_id, entry_index=len(message))
+                    self._apply_extracted_params(extracted_params)
+
+                routing_type = (
+                    "deterministic" if (reasoning and reasoning.startswith(_DETERMINISTIC_REASONING_PREFIX)) else "llm"
+                )
+                node_type = self._node_type_of(self.get_node_by_id(self.current_node_id))
+
+                yield {
+                    "routing_info": {
+                        "previous_node": previous_node,
+                        "current_node": self.current_node_id,
+                        "transitioned": next_node_id is not None,
+                        "routing_type": routing_type,
+                        # Reset each turn, so this names the model any routing call this turn ran on.
+                        "routing_model": self._last_routing_model,
+                        "routing_provider": getattr(self, "routing_provider", None),
+                        "routing_latency_ms": round(routing_latency_ms, 1),
+                        "routing_started_at": routing_started_at,
+                        "routing_reasoning_effort": self._last_routing_effort,
+                        "extracted_params": extracted_params or {},
+                        "node_history": list(self.node_history),
+                        "routing_messages": routing_messages,
+                        "routing_tools": routing_tools,
+                        "reasoning": reasoning,
+                        "routing_expression": self._last_deterministic_eval,
+                        "confidence": confidence,
+                        "routing_usage": routing_usage,
+                        "routing_tail": self._consume_routing_tail(),
+                        "node_type": node_type,
+                        "is_silence_trigger": is_silence_trigger,
+                    }
+                }
+
+                # Silent deterministic dispatch: if the transition landed on a router,
+                # resolve the chain in this turn until a speaking node is reached.
+                if node_type == NodeType.ROUTER:
+                    for hop in await self._resolve_router_chain(message):
+                        yield {"routing_info": hop}
+
+            # A router that could not resolve (invalid config that bypassed validation)
+            # ends the turn cleanly rather than speaking from an empty node prompt.
+            current_node = self.get_node_by_id(self.current_node_id)
+            node_type = self._node_type_of(current_node)
+            if node_type == NodeType.ROUTER:
+                logger.error(f"Router '{self.current_node_id}' did not resolve to a speaking node")
+                yield self._end_turn_chunk(meta_info, start_time)
+                return
+
+            if node_type == NodeType.STATIC:
+                chunk = self._static_message_chunk(current_node)
+                if chunk:
+                    yield chunk
+                return
+
+            messages = await self._build_messages(message, meta_info=meta_info)
+            yield {"messages": messages}
+            tool_choice = self._get_tool_choice_for_node(history=message)
+            forced_name = tool_choice["function"]["name"] if isinstance(tool_choice, dict) else None
+            node_tools = self._tools_for_node(current_node, forced_name)
+            node_llm = self._conversation_llm_for(current_node)
+            async for chunk in self._stream_node_reply(
+                node_llm, current_node, messages, meta_info, synthesize, tool_choice, node_tools
+            ):
+                yield chunk
+
+        except Exception as e:
+            # Never yield the error as text: a chunk here is indistinguishable from model output
+            # and gets spoken. Propagate so the task manager ends the call with an LLMError.
+            logger.error(f"Error in generate: {e}")
+            raise

@@ -1,0 +1,5 @@
+agent_name = "push-to-talk"
+secret_set = "push-to-talk-secrets"
+
+[scaling]
+	min_agents = 1

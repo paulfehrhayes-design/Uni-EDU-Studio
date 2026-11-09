@@ -1,0 +1,839 @@
+#
+# Copyright (c) 2024-2026, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+"""Anthropic AI service integration for Pipecat.
+
+This module provides LLM services and context management for Anthropic's Claude models,
+including support for function calling, vision, and prompt caching features.
+"""
+
+import asyncio
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional, Union
+
+from loguru import logger
+from pydantic import BaseModel, Field
+
+from pipecat.adapters.llm.base_llm_adapter import LLMContextConversionError
+from pipecat.adapters.llm.services.anthropic_adapter import (
+    AnthropicCacheTTL,
+    AnthropicLLMAdapter,
+    AnthropicLLMInvocationParams,
+    anthropic_is_given,
+)
+from pipecat.frames.frames import (
+    Frame,
+    LLMContextFrame,
+    LLMEnablePromptCachingFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMThoughtEndFrame,
+    LLMThoughtStartFrame,
+    LLMThoughtTextFrame,
+)
+from pipecat.metrics.metrics import LLMTokenUsage
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
+from pipecat.services.settings import LLMSettings
+from pipecat.utils.deprecation import deprecated
+from pipecat.utils.errors import ErrorCategory
+from pipecat.utils.http import TIMEOUT_EXCEPTIONS
+from pipecat.utils.tracing.service_decorators import traced_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
+
+try:
+    from anthropic import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
+    from anthropic import (
+        APIStatusError,
+        APITimeoutError,
+        AsyncAnthropic,
+        BadRequestError,
+        RequestTooLargeError,
+        UnprocessableEntityError,
+    )
+    from anthropic import NotGiven as AnthropicNotGiven
+except ModuleNotFoundError as e:
+    logger.error(f"Exception: {e}")
+    logger.error('In order to use Anthropic, you need to `uv add "pipecat-ai[anthropic]"`.')
+    raise ImportError(f"Missing module: {e}") from e
+
+
+# The request fields sent when the caller sets neither ``thinking`` nor
+# ``effort``, keyed by model name. Each is the model's lowest documented
+# setting, for the fastest responses, unless that setting makes the model speak
+# its reasoning: Haiku 5.5 with thinking disabled narrates its decisions before
+# tool calls, so it gets low effort. "between_tools" is Sonnet 5.5's lowest
+# setting, and "disabled" is already the default on the Claude 4 models.
+_THINKING_DEFAULTS: dict[str, dict[str, dict[str, Any]]] = {
+    "claude-fable-5-1": {"output_config": {"effort": "low"}},
+    "claude-fable-5": {"output_config": {"effort": "low"}},
+    "claude-opus-5-5": {"output_config": {"effort": "low"}},
+    "claude-opus-5": {"thinking": {"type": "disabled"}},
+    "claude-sonnet-5-5": {"thinking": {"type": "between_tools"}},
+    "claude-sonnet-5": {"thinking": {"type": "disabled"}},
+    "claude-haiku-5-5": {"output_config": {"effort": "low"}},
+    "claude-opus-4-8": {"thinking": {"type": "disabled"}},
+    "claude-opus-4-7": {"thinking": {"type": "disabled"}},
+    "claude-opus-4-6": {"thinking": {"type": "disabled"}},
+    "claude-sonnet-4-6": {"thinking": {"type": "disabled"}},
+    "claude-opus-4-5": {"thinking": {"type": "disabled"}},
+    "claude-sonnet-4-5": {"thinking": {"type": "disabled"}},
+    "claude-haiku-4-5": {"thinking": {"type": "disabled"}},
+}
+
+
+def _model_name(model: str) -> str:
+    """The name a model id refers to, the key it's looked up by in ``_THINKING_DEFAULTS``.
+
+    Bedrock and Vertex ids wrap the name, and a dated snapshot gets its model's
+    entry: ``us.anthropic.claude-sonnet-5-20260630-v1:0``,
+    ``claude-sonnet-5@20260630`` and ``claude-sonnet-5-20260630`` all name
+    ``claude-sonnet-5``.
+    """
+    name = model.lower().rsplit(".", 1)[-1].split("@", 1)[0]
+    name = re.sub(r"-v\d+:\d+$", "", name)
+    return re.sub(r"-\d{8}$", "", name)
+
+
+def _apply_sampling_settings(params: dict[str, Any], settings: "AnthropicLLMSettings"):
+    """Carry the sampling settings into a request through ``extra_body``.
+
+    ``temperature``, ``top_k`` and ``top_p`` are not parameters of the Messages
+    API methods, since current models don't use them. Older models still honor
+    them, and ``extra_body`` is merged into the request JSON as-is.
+
+    Args:
+        params: Request parameters, updated in place.
+        settings: Settings to read the sampling values from. Values left unset
+            are omitted from the request.
+    """
+    sampling = {
+        name: value
+        for name, value in (
+            ("temperature", settings.temperature),
+            ("top_k", settings.top_k),
+            ("top_p", settings.top_p),
+        )
+        if is_given(value) and anthropic_is_given(value)
+    }
+    # An extra_body supplied through Settings.extra wins key by key, matching
+    # how extra overrides every other request parameter.
+    extra_body = {**sampling, **params.get("extra_body", {})}
+    if extra_body:
+        params["extra_body"] = extra_body
+
+
+class AnthropicThinkingConfig(BaseModel):
+    """Configuration for thinking.
+
+    Parameters:
+        type: Thinking mode. "adaptive" lets the model decide when and how deeply
+            to think; prefer it. "enabled" is legacy manual thinking, sized by
+            ``budget_tokens``: Claude 4.7 and later reject it, and Claude 4.5 and
+            earlier accept only it. "disabled" turns thinking off on the models
+            that allow it. "between_tools" is how Claude Sonnet 5.5, which
+            rejects "disabled", runs without up-front thinking; no other model
+            accepts it.
+        budget_tokens: Maximum number of tokens for thinking.
+            With today's models, the minimum is 1024.
+            Required when type is "enabled", not allowed otherwise.
+        display: How thinking text comes back: "summarized" for readable
+            thinking, which is what :class:`~pipecat.frames.frames.LLMThoughtTextFrame`
+            carries, or "omitted" for thinking blocks whose text is empty. Claude
+            4.7 and later default to "omitted", so set "summarized" there to keep
+            those frames carrying text. Not allowed when type is "disabled".
+    """
+
+    # Why `| str` here? To not break compatibility in case Anthropic adds
+    # more types in the future.
+    type: Literal["adaptive", "enabled", "disabled", "between_tools"] | str
+
+    # No client-side validation on budget_tokens — we let the server
+    # enforce the rules so we stay forward-compatible if they change.
+    budget_tokens: int | None = None
+
+    display: Literal["summarized", "omitted"] | str | None = None
+
+
+@dataclass
+class AnthropicLLMSettings(LLMSettings):
+    """Settings for AnthropicLLMService.
+
+    Parameters:
+        enable_prompt_caching: Whether to enable prompt caching.
+        system_prompt_cache_ttl: Lifetime of the system prompt's cache entry
+            when prompt caching is enabled: "5m" or "1h". ``None`` uses
+            Anthropic's default of 5 minutes. "1h" keeps a system prompt shared
+            by many conversations cached across gaps between them, at twice
+            the base input price per cache write instead of 1.25 times.
+            Anthropic caches nothing when the tools and system prompt together
+            fall below the model's minimum cacheable prompt length.
+        thinking: Thinking configuration. If neither this nor ``effort`` is
+            set, Pipecat sends the lowest thinking setting Anthropic documents
+            for the model, for the fastest responses, and logs what it sent.
+            Models Pipecat doesn't list, and any model when
+            ``use_provider_thinking_default`` is set, run at Anthropic's default.
+        effort: How much the model spends on its response, thinking included:
+            "low", "medium", "high", "xhigh" or "max". Sent as
+            ``output_config.effort``. ``None`` uses the model's default. Lower
+            effort is Anthropic's recommended way to reduce thinking, and the
+            only one on models whose thinking can't be turned off.
+    """
+
+    enable_prompt_caching: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    system_prompt_cache_ttl: AnthropicCacheTTL | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    # Override inherited LLMSettings fields to also accept the Anthropic SDK's
+    # sentinel, which the service stores here so these fields can be passed
+    # through unchanged to the AsyncAnthropic client.
+    temperature: float | None | NotGiven | AnthropicNotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    top_k: int | None | NotGiven | AnthropicNotGiven = field(default_factory=lambda: NOT_GIVEN)
+    top_p: float | None | NotGiven | AnthropicNotGiven = field(default_factory=lambda: NOT_GIVEN)
+    thinking: Union["AnthropicLLMService.ThinkingConfig", NotGiven, AnthropicNotGiven] = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | str | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+
+    @classmethod
+    def from_mapping(cls, settings):
+        """Convert a plain dict to settings, coercing thinking dicts.
+
+        For backward compatibility, a ``thinking`` value that is a plain dict
+        is converted to a :class:`AnthropicLLMService.ThinkingConfig`.
+        """
+        instance = super().from_mapping(settings)
+        if is_given(instance.thinking) and isinstance(instance.thinking, dict):
+            instance.thinking = AnthropicLLMService.ThinkingConfig(**instance.thinking)
+        return instance
+
+
+class AnthropicLLMService(LLMService[AnthropicLLMAdapter]):
+    """LLM service for Anthropic's Claude models.
+
+    Provides inference capabilities with Claude models including support for
+    function calling, vision processing, streaming responses, and prompt caching.
+    Can use custom clients like AsyncAnthropicBedrock and AsyncAnthropicVertex.
+    """
+
+    Settings = AnthropicLLMSettings
+    _settings: Settings
+
+    # Overriding the default adapter to use the Anthropic one.
+    adapter_class = AnthropicLLMAdapter
+
+    supports_response_schema: bool = True
+
+    # Backward compatibility: ThinkingConfig used to be defined inline here.
+    ThinkingConfig = AnthropicThinkingConfig
+
+    @deprecated(
+        "`AnthropicLLMService.InputParams` is deprecated since 0.0.105 and will be removed in 2.0.0. "
+        "Use `AnthropicLLMService.Settings` instead."
+    )
+    class InputParams(BaseModel):
+        """Input parameters for Anthropic model inference.
+
+        .. deprecated:: 0.0.105
+            Use ``AnthropicLLMService.Settings`` instead. Pass settings directly via the
+            ``settings`` parameter of :class:`AnthropicLLMService`. Will be removed in 2.0.0.
+
+        Parameters:
+            enable_prompt_caching: Whether to enable the prompt caching feature.
+            max_tokens: Maximum tokens to generate. Must be at least 1.
+            temperature: Sampling temperature between 0.0 and 1.0.
+            top_k: Top-k sampling parameter.
+            top_p: Top-p sampling parameter between 0.0 and 1.0.
+            thinking: Extended thinking configuration.
+                Enabling extended thinking causes the model to spend more time "thinking" before responding.
+                It also causes this service to emit LLMThinking*Frames during response generation.
+                If this is not provided, Pipecat sends the lowest thinking setting Anthropic
+                documents for the model, for the fastest responses, and logs what it sent.
+                Models Pipecat doesn't list run at Anthropic's default.
+            extra: Additional parameters to pass to the API.
+        """
+
+        # These fields declare the caller-facing type but default to anthropic's
+        # NOT_GIVEN sentinel, which the declaration predates.
+        enable_prompt_caching: bool | None = None
+        max_tokens: int | None = Field(default_factory=lambda: 4096, ge=1)
+        temperature: float | None = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN, ge=0.0, le=1.0
+        )
+        top_k: int | None = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN, ge=0
+        )
+        top_p: float | None = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN, ge=0.0, le=1.0
+        )
+        thinking: Optional["AnthropicLLMService.ThinkingConfig"] = Field(  # pyright: ignore[reportAssignmentType]
+            default_factory=lambda: ANTHROPIC_NOT_GIVEN
+        )
+        extra: dict[str, Any] | None = Field(default_factory=dict)
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str | None = None,
+        params: InputParams | None = None,
+        settings: Settings | None = None,
+        client=None,
+        retry_timeout_secs: float | None = 5.0,
+        retry_on_timeout: bool | None = False,
+        **kwargs,
+    ):
+        """Initialize the Anthropic LLM service.
+
+        Args:
+            api_key: Anthropic API key for authentication.
+            model: Model name to use.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=AnthropicLLMService.Settings(model=...)`` instead.
+                    Will be removed in 2.0.0.
+
+            params: Optional model parameters for inference.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=AnthropicLLMService.Settings(...)`` instead.
+                    Will be removed in 2.0.0.
+
+            settings: Runtime-updatable settings for this service.  When both
+                deprecated parameters and *settings* are provided, *settings*
+                values take precedence.
+            client: Optional custom Anthropic client instance.
+            retry_timeout_secs: Request timeout in seconds for retry logic.
+            retry_on_timeout: Whether to retry the request once if it times out.
+            **kwargs: Additional arguments passed to parent LLMService.
+        """
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = self.Settings(
+            model="claude-sonnet-4-6",
+            system_instruction=None,
+            max_tokens=4096,
+            enable_prompt_caching=False,
+            system_prompt_cache_ttl=None,
+            temperature=ANTHROPIC_NOT_GIVEN,
+            top_k=ANTHROPIC_NOT_GIVEN,
+            top_p=ANTHROPIC_NOT_GIVEN,
+            frequency_penalty=None,
+            presence_penalty=None,
+            seed=None,
+            filter_incomplete_user_turns=False,
+            user_turn_completion_config=None,
+            thinking=ANTHROPIC_NOT_GIVEN,
+            effort=None,
+            extra={},
+        )
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            self._warn_init_param_moved_to_settings("model", "model")
+            default_settings.model = model
+
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            self._warn_init_param_moved_to_settings("params")
+            if not settings:
+                default_settings.max_tokens = params.max_tokens
+                default_settings.temperature = params.temperature
+                default_settings.top_k = params.top_k
+                default_settings.top_p = params.top_p
+                if params.thinking is not None:
+                    default_settings.thinking = params.thinking
+                if isinstance(params.extra, dict):
+                    default_settings.extra = params.extra
+                if params.enable_prompt_caching is not None:
+                    default_settings.enable_prompt_caching = params.enable_prompt_caching
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(settings=default_settings, **kwargs)
+        self._client = client or AsyncAnthropic(
+            api_key=api_key
+        )  # if the client is provided, use it and remove it, otherwise create a new one
+        self._retry_timeout_secs = retry_timeout_secs
+        self._retry_on_timeout = retry_on_timeout
+        if self._settings.system_instruction:
+            logger.debug(f"{self}: Using system instruction: {self._settings.system_instruction}")
+
+    def can_generate_metrics(self) -> bool:
+        """Check if this service can generate usage metrics.
+
+        Returns:
+            True, as Anthropic provides detailed token usage metrics.
+        """
+        return True
+
+    async def _create_message_stream(self, api_call, params):
+        """Create message stream with optional timeout and retry.
+
+        Args:
+            api_call: The Anthropic API method to call.
+            params: Parameters for the API call.
+
+        Returns:
+            Async stream of message events.
+        """
+        if self._retry_on_timeout:
+            try:
+                response = await asyncio.wait_for(
+                    api_call(**params), timeout=self._retry_timeout_secs
+                )
+                return response
+            except (TimeoutError, APITimeoutError):
+                # Retry, this time without a timeout so we get a response
+                logger.debug(f"{self}: Retrying message creation due to timeout")
+                response = await api_call(**params)
+                return response
+        else:
+            response = await api_call(**params)
+            return response
+
+    def _output_config(self, response_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build ``output_config`` from the effort setting and a response schema.
+
+        Args:
+            response_schema: JSON schema the reply must follow, if any.
+
+        Returns:
+            The ``output_config`` request field, empty when there is nothing to send.
+        """
+        output_config: dict[str, Any] = {}
+        effort = assert_given(self._settings.effort)
+        if effort:
+            output_config["effort"] = effort
+        if response_schema is not None:
+            output_config["format"] = {"type": "json_schema", "schema": response_schema}
+        return output_config
+
+    def _maybe_apply_thinking_default(self, params: dict[str, Any]):
+        """Send the model's thinking default when no reasoning is configured.
+
+        Applies the model's entry in ``_THINKING_DEFAULTS``, if it has one. A
+        request that already sets ``thinking`` or an effort, from the settings
+        or from ``extra``, is left as it is, since the two together decide how
+        much the model thinks. So is every request when
+        ``use_provider_thinking_default`` is set. The first request for each model
+        logs the setting sent, or that the model runs at Anthropic's default,
+        warning for an unlisted Claude model.
+
+        Args:
+            params: The request params dict (modified in place).
+        """
+        if "thinking" in params or "effort" in params.get("output_config", {}):
+            return
+        model = assert_given(self._settings.model) or ""
+        name = _model_name(model)
+        self._apply_thinking_default(
+            params,
+            model,
+            _THINKING_DEFAULTS.get(name),
+            can_think=name.startswith("claude-"),
+            provider="Anthropic",
+            settings_fields="`thinking` or `effort`",
+        )
+
+    @staticmethod
+    def model_supports_response_schema(model: str) -> bool:
+        """Whether a model can enforce a response schema.
+
+        Structured outputs arrived with the 4.5 models. A model id without a
+        version, such as a preview, is assumed to support them.
+
+        Args:
+            model: The model name.
+        """
+        match = re.search(r"claude(?:-[a-z]+)?-(\d+)(?:-(\d{1,2})(?!\d))?", model)
+        if not match:
+            return True
+        return (int(match.group(1)), int(match.group(2) or 0)) >= (4, 5)
+
+    async def run_inference(
+        self,
+        context: LLMContext,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+        response_schema: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
+
+        Args:
+            context: The LLM context containing conversation history.
+            max_tokens: Optional maximum number of tokens to generate. If provided,
+                overrides the service's default max_tokens setting.
+            system_instruction: Optional system instruction to use for this inference.
+                If provided, overrides any system instruction in the context.
+            response_schema: Optional JSON schema the reply must follow. The
+                service asks the provider to enforce it, so the reply is JSON
+                text matching the schema.
+
+        Returns:
+            The LLM's response as a string, or None if no response is generated.
+        """
+        messages = []
+        system = ANTHROPIC_NOT_GIVEN
+        tools = []
+        effective_instruction = system_instruction or assert_given(
+            self._settings.system_instruction
+        )
+        adapter = self.get_llm_adapter()
+        invocation_params = await adapter.get_llm_invocation_params(
+            context,
+            enable_prompt_caching=assert_given(self._settings.enable_prompt_caching),
+            system_instruction=effective_instruction,
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
+            system_prompt_cache_ttl=assert_given(self._settings.system_prompt_cache_ttl),
+        )
+        messages = invocation_params["messages"]
+        system = invocation_params["system"]
+        tools = invocation_params["tools"]
+
+        # Build params using the same method as streaming completions
+        params = {
+            "model": self._settings.model,
+            "max_tokens": max_tokens if max_tokens is not None else self._settings.max_tokens,
+            "stream": False,
+            "messages": messages,
+            "system": system,
+            "tools": tools,
+            "betas": ["interleaved-thinking-2025-05-14"],
+        }
+        thinking = assert_given(self._settings.thinking)
+        if thinking:
+            params["thinking"] = thinking.model_dump(exclude_unset=True)
+        output_config = self._output_config(self._check_response_schema(response_schema))
+        if output_config:
+            params["output_config"] = output_config
+
+        params.update(self._settings.extra)
+        _apply_sampling_settings(params, self._settings)
+
+        # Applied last, so an explicit thinking or effort setting, from the
+        # settings or from extra, wins over the low-latency default.
+        self._maybe_apply_thinking_default(params)
+
+        # LLM completion
+        response = await self._client.beta.messages.create(**params)
+        self._handle_stop_reason(response)
+
+        return next((block.text for block in response.content if hasattr(block, "text")), None)
+
+    # Models known to support assistant message prefilling (a request whose
+    # message list ends with an assistant message). Anthropic dropped prefill
+    # support starting with the 4.6-generation models, so this is a frozen
+    # legacy set: any model NOT matching is assumed to reject prefill and gets
+    # a trailing user message injected when needed.
+    _PREFILL_SUPPORTED_PATTERNS = (
+        "claude-2",
+        "claude-instant",
+        "claude-3",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+    )
+
+    def _should_inject_trailing_user_message(self) -> bool:
+        """Whether to fix up requests whose message list ends with an assistant message.
+
+        Models without assistant-prefill support reject such requests, so
+        injection is on for every model not known to support prefill.
+        Subclasses with exotic model naming can override
+        ``_PREFILL_SUPPORTED_PATTERNS``.
+        """
+        model = self._settings.model or ""
+        return not any(model.startswith(p) for p in self._PREFILL_SUPPORTED_PATTERNS)
+
+    async def _get_llm_invocation_params(self, context: LLMContext) -> AnthropicLLMInvocationParams:
+        adapter = self.get_llm_adapter()
+        params = await adapter.get_llm_invocation_params(
+            context,
+            enable_prompt_caching=assert_given(self._settings.enable_prompt_caching),
+            system_instruction=assert_given(self._settings.system_instruction),
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
+            system_prompt_cache_ttl=assert_given(self._settings.system_prompt_cache_ttl),
+        )
+        return params
+
+    @traced_llm
+    async def _process_context(self, context: LLMContext):
+        # Usage tracking. We track the usage reported by Anthropic in prompt_tokens and
+        # completion_tokens. We also estimate the completion tokens from output text
+        # and use that estimate if we are interrupted, because we almost certainly won't
+        # get a complete usage report if the task we're running in is cancelled.
+        prompt_tokens = 0
+        completion_tokens = 0
+        completion_tokens_estimate = 0
+        use_completion_tokens_estimate = False
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+        reasoning_tokens = None
+
+        try:
+            await self.push_frame(LLMFullResponseStartFrame())
+            await self.start_processing_metrics()
+
+            params_from_context = await self._get_llm_invocation_params(context)
+
+            self._log_llm_response(context)
+
+            await self.start_ttfb_metrics()
+
+            params = {
+                "model": self._settings.model,
+                "max_tokens": self._settings.max_tokens,
+                "stream": True,
+            }
+
+            # Add thinking parameter if set
+            thinking = assert_given(self._settings.thinking)
+            if thinking:
+                params["thinking"] = thinking.model_dump(exclude_unset=True)
+
+            output_config = self._output_config()
+            if output_config:
+                params["output_config"] = output_config
+
+            # Messages, system, tools
+            params.update(params_from_context)
+
+            params.update(self._settings.extra)
+            _apply_sampling_settings(params, self._settings)
+
+            # Applied last, so an explicit thinking or effort setting, from the
+            # settings or from extra, wins over the low-latency default.
+            self._maybe_apply_thinking_default(params)
+
+            # "Interleaved thinking" needed to allow thinking between sequences
+            # of function calls, when extended thinking is enabled.
+            # Note that this requires us to use `client.beta`, below.
+            params.update({"betas": ["interleaved-thinking-2025-05-14"]})
+
+            response = await self._create_message_stream(self._client.beta.messages.create, params)
+
+            # Function calling
+            tool_use_block = None
+            json_accumulator = ""
+
+            function_calls = []
+            async for event in response:
+                # Aggregate streaming content, create frames, trigger events
+
+                # The events that open the stream (message_start, ping) carry no
+                # model output, so TTFB ends at the first content block.
+                if event.type in ("content_block_start", "content_block_delta"):
+                    await self.stop_ttfb_metrics()
+
+                if event.type == "content_block_delta":
+                    if hasattr(event.delta, "text"):
+                        await self._push_llm_text(event.delta.text)
+                        completion_tokens_estimate += self._estimate_tokens(event.delta.text)
+                    elif hasattr(event.delta, "partial_json") and tool_use_block:
+                        json_accumulator += event.delta.partial_json
+                        completion_tokens_estimate += self._estimate_tokens(
+                            event.delta.partial_json
+                        )
+                    elif hasattr(event.delta, "thinking"):
+                        await self.push_frame(LLMThoughtTextFrame(text=event.delta.thinking))
+                    elif hasattr(event.delta, "signature"):
+                        await self.push_frame(LLMThoughtEndFrame(signature=event.delta.signature))
+                elif event.type == "content_block_start":
+                    if event.content_block.type == "tool_use":
+                        # A turn that only calls tools produces no answer text, so
+                        # the call itself is what the caller gets and TTFAT ends
+                        # here rather than going unmeasured.
+                        await self.stop_ttfat_metrics()
+                        tool_use_block = event.content_block
+                        json_accumulator = ""
+                    elif event.content_block.type == "thinking":
+                        await self.push_frame(
+                            LLMThoughtStartFrame(
+                                append_to_context=True,
+                                llm=self.get_llm_adapter().id_for_llm_specific_messages,
+                            )
+                        )
+                elif (
+                    event.type == "message_delta"
+                    and hasattr(event.delta, "stop_reason")
+                    and event.delta.stop_reason == "tool_use"
+                ):
+                    if tool_use_block:
+                        args = json.loads(json_accumulator) if json_accumulator else {}
+                        function_calls.append(
+                            FunctionCallFromLLM(
+                                context=context,
+                                tool_call_id=tool_use_block.id,
+                                function_name=tool_use_block.name,
+                                arguments=args,
+                            )
+                        )
+
+                if event.type == "message_delta":
+                    self._handle_stop_reason(event.delta)
+
+                # Usage counts are cumulative: message_start reports them so far
+                # and message_delta for the whole message, so each replaces the
+                # last. A field a message_delta leaves out keeps its earlier value.
+                usage = None
+                if event.type == "message_start":
+                    usage = event.message.usage
+                elif event.type == "message_delta":
+                    usage = event.usage
+                if usage is not None:
+                    if usage.input_tokens is not None:
+                        prompt_tokens = usage.input_tokens
+                    if usage.output_tokens is not None:
+                        completion_tokens = usage.output_tokens
+                    if usage.cache_creation_input_tokens is not None:
+                        cache_creation_input_tokens = usage.cache_creation_input_tokens
+                    if usage.cache_read_input_tokens is not None:
+                        cache_read_input_tokens = usage.cache_read_input_tokens
+                    # Thinking tokens are part of output_tokens.
+                    if usage.output_tokens_details:
+                        reasoning_tokens = usage.output_tokens_details.thinking_tokens
+
+            await self.run_function_calls(function_calls)
+
+        except asyncio.CancelledError:
+            # If we're interrupted, we won't get a complete usage report. So set our flag to use the
+            # token estimate. The reraise the exception so all the processors running in this task
+            # also get cancelled.
+            use_completion_tokens_estimate = True
+            raise
+        except TIMEOUT_EXCEPTIONS:
+            await self._call_event_handler("on_completion_timeout")
+        except LLMContextConversionError as e:
+            await self.push_error(error_msg=str(e), exception=e)
+            # A conversion failure (e.g. an unsupported file MIME type, corrupt
+            # base64 data) can't reach the API at all, but is just as much
+            # evidence of an invalid file as a rejection from Anthropic itself, so
+            # it gets the same best-effort cleanup.
+            context.remove_invalid_file_message()
+        except APIStatusError as e:
+            # Only the payload-shaped errors (bad request, payload too large,
+            # unprocessable content) are grounds to remove a pending file
+            # message on a best-effort basis. The rest of the 4xx range —
+            # auth, permissions, not-found, rate limiting — says nothing
+            # about whether our request (or its file) was bad, and removing
+            # the file there would discard it for no benefit: the file isn't
+            # what needs fixing before the next retry can succeed. When a
+            # message is removed as a result of this error, the fault lay in
+            # application-supplied content and the context is repaired, so the
+            # error is pushed as APPLICATION instead of letting the rejection
+            # classify as permanent and cost the service its usability.
+            removed = (
+                isinstance(e, (BadRequestError, RequestTooLargeError, UnprocessableEntityError))
+                and context.remove_invalid_file_message()
+            )
+            await self.push_error(
+                error_msg=f"Unknown error occurred: {e}",
+                exception=e,
+                category=ErrorCategory.APPLICATION if removed else None,
+            )
+        except Exception as e:
+            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+        finally:
+            await self.stop_processing_metrics()
+            await self.push_frame(LLMFullResponseEndFrame())
+            comp_tokens = (
+                completion_tokens
+                if not use_completion_tokens_estimate
+                else completion_tokens_estimate
+            )
+            await self._report_usage_metrics(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=comp_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                reasoning_tokens=reasoning_tokens if not use_completion_tokens_estimate else None,
+            )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process incoming frames and route them appropriately.
+
+        Handles various frame types including context frames, message frames,
+        vision frames, and settings updates.
+
+        Args:
+            frame: The frame to process.
+            direction: The direction of frame processing.
+        """
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMContextFrame):
+            await self._process_context(frame.context)
+        elif isinstance(frame, LLMEnablePromptCachingFrame):
+            logger.debug(f"Setting enable prompt caching to: [{frame.enable}]")
+            self._settings.enable_prompt_caching = frame.enable
+        else:
+            await self.push_frame(frame, direction)
+
+    def _handle_stop_reason(self, result):
+        """Log why Claude stopped generating, when it stopped for a notable reason.
+
+        Anything other than a normal stop leaves the turn short of what the model
+        would otherwise have said: the request was refused, or the output hit the
+        token limit or the context window. Whatever text did arrive is still
+        passed on.
+
+        Args:
+            result: A streamed ``message_delta``'s delta or a complete message;
+                both carry ``stop_reason`` and ``stop_details``.
+        """
+        stop_reason = getattr(result, "stop_reason", None)
+        if stop_reason in (None, "end_turn", "tool_use", "stop_sequence"):
+            return
+
+        category = getattr(getattr(result, "stop_details", None), "category", None)
+        detail = f" ({category})" if category else ""
+        logger.warning(f"{self}: response incomplete, the model stopped for {stop_reason}{detail}")
+
+    def _estimate_tokens(self, text: str) -> int:
+        return int(len(re.split(r"[^\w]+", text)) * 1.3)
+
+    async def _report_usage_metrics(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_creation_input_tokens: int,
+        cache_read_input_tokens: int,
+        reasoning_tokens: int | None = None,
+    ):
+        if (
+            prompt_tokens
+            or completion_tokens
+            or cache_creation_input_tokens
+            or cache_read_input_tokens
+        ):
+            tokens = LLMTokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                reasoning_tokens=reasoning_tokens,
+                # Anthropic reports input_tokens net of the cache, so the cached
+                # tokens are added back to keep the total comparable with services
+                # whose provider supplies it already gross.
+                total_tokens=(
+                    prompt_tokens
+                    + cache_creation_input_tokens
+                    + cache_read_input_tokens
+                    + completion_tokens
+                ),
+            )
+            await self.start_llm_usage_metrics(tokens)

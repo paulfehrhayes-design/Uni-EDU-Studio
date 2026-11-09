@@ -1,0 +1,45 @@
+# Torch is required by Silero VAD and Kokoro's inference backend.
+# Installing from the CUDA 12.8 wheel index gives GPU-enabled builds on Windows.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1
+torchaudio==2.7.1
+
+# Speech-to-text
+faster-whisper==1.1.0
+ctranslate2==4.8.2
+
+# Text-to-speech (Kokoro)
+kokoro==0.7.4
+misaki[en]==0.7.4
+soundfile==0.13.0
+
+# Bundles the eSpeak NG native library + data as a wheel, so misaki can
+# phonemize words outside its dictionary (names, brands) without a
+# system-wide eSpeak NG install. Has no dependencies of its own, so it
+# can't disturb the pinned spacy subtree below.
+espeakng-loader==0.2.4
+
+# misaki[en] pulls in spacy + spacy-curated-transformers, whose default
+# resolution conflicts (and, for older blis/curated-tokenizers releases,
+# lacks Python 3.13 wheels). Pin the whole subtree to a known-good set.
+spacy==3.8.16
+thinc==8.3.12
+blis==1.3.3
+spacy-curated-transformers==0.3.1
+curated-tokenizers==0.0.10
+
+# LLM client (talks to the local Ollama server over HTTP)
+ollama==0.4.7
+
+# Audio I/O
+sounddevice==0.5.1
+
+# Global push-to-talk key detection (works on Windows without admin rights)
+pynput==1.8.2
+
+# Voice activity detection
+silero-vad==5.1.2
+
+# Shared deps pinned for compatibility across the above
+numpy==1.26.4
+PyYAML==6.0.2

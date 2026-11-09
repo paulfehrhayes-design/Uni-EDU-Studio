@@ -1,0 +1,6 @@
+agent_name = "smallwebrtc-poc"
+secret_set = "smallwebrtc-secrets"
+enable_krisp = true
+
+[scaling]
+	min_agents = 1

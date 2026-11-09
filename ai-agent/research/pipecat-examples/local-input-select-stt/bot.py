@@ -1,0 +1,62 @@
+#
+# Copyright (c) 2024–2025, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+import asyncio
+import sys
+from typing import Tuple
+
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat.services.whisper.stt import Model, WhisperSTTService
+from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.workers.runner import WorkerRunner
+
+from select_audio_device import AudioDevice, run_device_selector
+
+load_dotenv(override=True)
+
+logger.remove(0)
+logger.add(sys.stderr, level="DEBUG")
+
+
+async def main(input_device: int, output_device: int):
+    transport = LocalAudioTransport(
+        LocalAudioTransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=False,
+            input_device_index=input_device,
+            output_device_index=output_device,
+        )
+    )
+
+    stt = WhisperSTTService(
+        device="cuda",
+        no_speech_prob=0.3,
+        settings=WhisperSTTService.Settings(
+            model=Model.LARGE,
+        ),
+    )
+
+    pipeline = Pipeline([transport.input(), stt])
+
+    worker = PipelineWorker(pipeline, observers=[TranscriptionLogObserver()])
+
+    runner = WorkerRunner(handle_sigint=False if sys.platform == "win32" else True)
+
+    await runner.add_workers(worker)
+
+    await asyncio.gather(runner.run())
+
+
+if __name__ == "__main__":
+    res: Tuple[AudioDevice, AudioDevice, int] = asyncio.run(
+        run_device_selector()  # runs the textual app that allows to select input device
+    )
+
+    asyncio.run(main(res[0].index, res[1].index))

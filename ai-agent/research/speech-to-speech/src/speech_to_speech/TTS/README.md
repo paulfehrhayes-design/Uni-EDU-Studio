@@ -1,0 +1,391 @@
+# TTS Summary
+
+The default voice is Qwen3-TTS CustomVoice with speaker `Aiden`, through MLX Audio on Apple Silicon and GGML elsewhere. To change the speaker:
+
+```bash
+speech-to-speech local --qwen3_tts_speaker Ryan
+```
+
+Change `--tts` to pick another synthesizer, installing its extra where needed; the other stages keep their local defaults. `--tts openai` connects to a separate speech endpoint and `--tts minimax` to a hosted provider, as described below.
+
+## Available TTS modes (`--tts`)
+
+Runtime-supported values in `s2s_pipeline.py`:
+
+- `chatTTS` → `chatTTS_handler.py`
+- `facebookMMS` → `facebookmms_handler.py`
+- `pocket` → `pocket_tts_handler.py`
+- `phonon` → `phonon_tts_handler.py`
+- `kokoro` → `kokoro_handler.py`
+- `kitten` → `kitten_tts_handler.py`
+- `omnivoice` → `omnivoice_handler.py`
+- `qwen3` → `qwen3_tts_handler.py`
+- `openai` → `openai_compatible_handler.py`
+- `drama3` → `drama3_handler.py`
+- `supertonic` → `supertonic_tts_handler.py`
+- `minimax` → `minimax_tts_handler.py`
+
+Deprecated TTS implementations, including MeloTTS, live in [`../../../archive/TTS`](../../../archive/TTS) and are no longer wired into `s2s_pipeline.py`.
+
+## Usage
+
+### 1) ChatTTS (`--tts chatTTS`)
+
+Primary args prefix: `--chat_tts_*`
+
+```bash
+speech-to-speech serve \
+  --tts chatTTS \
+  --chat_tts_device cuda \
+  --chat_tts_stream true \
+  --chat_tts_chunk_size 512
+```
+
+### 2) Facebook MMS (`--tts facebookMMS`)
+
+Primary args prefix: `--facebook_mms_*` plus `--tts_language`
+
+```bash
+speech-to-speech serve \
+  --tts facebookMMS \
+  --facebook_mms_device cuda \
+  --tts_language en
+```
+
+This handler maps incoming language codes (e.g. `en`, `fr`, `es`) to MMS model suffixes (e.g. `eng`, `fra`, `spa`) and reloads the model on language changes. The code comes from STT by default, or from assistant text when `--detect_llm_output_language` is enabled.
+
+### 3) Pocket TTS (`--tts pocket`)
+
+Primary args prefix: `--pocket_tts_*`
+
+```bash
+speech-to-speech serve \
+  --tts pocket \
+  --pocket_tts_voice jean \
+  --pocket_tts_device cpu \
+  --pocket_tts_sample_rate 16000
+```
+
+Available preset voices include:
+`alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`.
+
+For Persian speech, see the [Pocket TTS Farsi v2 setup](../../../README.md#pocket-tts-farsi-v2).
+Select `--pocket_tts_model_name mehdi-hf/pocket-tts-farsi-v2` and provide reference
+audio with `--pocket_tts_voice`. This requires the author's Pocket TTS fork and
+uses a separate G2P model to convert Persian text to phonemes.
+
+### 4) Kokoro (`--tts kokoro`)
+
+Install the optional runtime on every platform:
+
+```bash
+pip install "speech-to-speech[kokoro]"
+```
+
+On macOS, use Python 3.11 or 3.12: Kokoro's Misaki phonemizer requires Python
+<3.13. These dependencies are not needed by the default Qwen3-TTS backend.
+
+Primary args prefix: `--kokoro_*`
+
+```bash
+speech-to-speech serve \
+  --tts kokoro \
+  --kokoro_device auto \
+  --kokoro_voice bm_fable \
+  --kokoro_lang_code b
+```
+
+Behavior:
+- Uses MLX backend on Apple Silicon (`mlx-community/Kokoro-82M-bf16`)
+- Uses native kokoro pipeline otherwise (`hexgrad/Kokoro-82M`)
+- Can auto-switch voice/language based on the incoming language code
+
+### 5) KittenTTS (`--tts kitten`)
+
+Install the optional runtime:
+
+```bash
+pip install "speech-to-speech[kitten]"
+```
+
+Primary args prefix: `--kitten_*`
+
+```bash
+speech-to-speech serve \
+  --tts kitten \
+  --kitten_device cpu \
+  --kitten_voice Bruno \
+  --kitten_model_name KittenML/kitten-tts-mini-0.8
+```
+
+Behavior:
+- Uses Kitten's English ONNX models on CPU, defaulting to the 80M-parameter mini 0.8 checkpoint.
+- The supported `kittenml` runtime loads the checkpoint's configuration and handles preprocessing and voice embeddings. The handler keeps upstream text boundaries when they fit and subdivides chunks that exceed the checkpoint's 512-token context after phonemization. The extra installs the runtime's declared dependencies, including its larger model family's dependencies; this handler uses only the ONNX models.
+- Synthesizes each incoming text segment before delivering audio in fixed-size blocks. Delivery blocks do not imply incremental model generation.
+- Resamples native 24 kHz output to the pipeline's 16 kHz signed PCM audio.
+- Supports Bella, Jasper, Luna, Bruno, Rosie, Hugo, Kiki, and Leo, as well as their checkpoint voice identifiers. Realtime response voice settings override session voice settings; otherwise the configured voice is used. Unsupported overrides fall back to the configured voice.
+- The runtime bundles eSpeak NG through `espeakng-loader`; a separate system installation is not required.
+- CUDA and KittenTTS 2 models are outside this integration's scope.
+
+### 6) Qwen3-TTS (`--tts qwen3`)
+
+Primary args prefix: `--qwen3_tts_*`
+
+```bash
+speech-to-speech serve \
+  --tts qwen3 \
+  --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --qwen3_tts_device cuda \
+  --qwen3_tts_backend ggml \
+  --qwen3_tts_speaker Aiden \
+  --qwen3_tts_language auto \
+  --qwen3_tts_non_streaming_mode True
+```
+
+Behavior:
+- Uses `faster-qwen3-tts` on non-macOS platforms, defaulting to the GGML backend. Pass `--qwen3_tts_backend torch` to use the CUDA-graphs backend instead.
+- Supports GGML quantization selection via `--qwen3_tts_ggml_quantization BF16|Q8_0|Q4_K_M|F32`.
+- Accepts a local talker/codec GGUF pair via `--qwen3_tts_gguf_talker_path` and `--qwen3_tts_gguf_codec_path`.
+- Automatically caches `.spk` and `.rvq` voice references when GGML voice cloning uses raw reference audio. Set `--qwen3_tts_ref_cache_dir` to override the default `~/.cache/faster-qwen3-tts/qwentts_refs` location.
+- Reuses precomputed GGML references via `--qwen3_tts_ref_spk` and the optional `--qwen3_tts_ref_rvq`.
+- Uses `mlx-audio` on Apple Silicon and auto-maps `Qwen/...` model IDs to `mlx-community/...`, defaulting to the `6bit` MLX variant unless the model name already pins a suffix.
+- Supports MLX quantization overrides on Apple Silicon via `--qwen3_tts_mlx_quantization bf16|4bit|6bit|8bit`.
+- Keeps the existing voice-clone/custom-voice/voice-design handler flow intact.
+- Defaults to the CustomVoice model with speaker `Aiden`, so no reference audio is required. Voice-clone/base models can still use `--qwen3_tts_ref_audio`.
+
+Install notes for Linux GGML:
+- The default PyPI `qwentts-cpp-python` wheel targets CUDA 12.8 and `manylinux_2_39` (for example, Ubuntu 24.04).
+- If that wheel does not match your CUDA runtime or glibc, install one of the Hugging Face wheelhouse builds before installing `speech-to-speech`.
+
+```bash
+pip install "qwentts-cpp-python==0.3.1+cu130" \
+  -f https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/tree/main/whl/cu130
+pip install speech-to-speech
+```
+
+Available wheelhouse directories include `cu124`, `cu128`, `cu130`, and `cpu`.
+
+Select a quantized GGUF from the public model resolver:
+
+```bash
+speech-to-speech serve \
+  --tts qwen3 \
+  --qwen3_tts_backend ggml \
+  --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --qwen3_tts_ggml_quantization Q4_K_M \
+  --qwen3_tts_speaker Aiden
+```
+
+Load local GGUF files by providing both the talker and codec paths. Keep the model name aligned with the local talker's model type so the handler selects the correct generation mode:
+
+```bash
+speech-to-speech serve \
+  --tts qwen3 \
+  --qwen3_tts_backend ggml \
+  --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --qwen3_tts_gguf_talker_path /models/qwen-talker-1.7b-voicedesign-Q4_K_M.gguf \
+  --qwen3_tts_gguf_codec_path /models/qwen-tokenizer-12hz-BF16.gguf \
+  --qwen3_tts_instruct "Warm, confident narrator"
+```
+
+For GGML voice cloning, a raw reference is cached on its first use:
+
+```bash
+speech-to-speech serve \
+  --tts qwen3 \
+  --qwen3_tts_backend ggml \
+  --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --qwen3_tts_ref_audio /voices/freeman.wav \
+  --qwen3_tts_ref_text "The transcript for the reference audio." \
+  --qwen3_tts_ref_cache_dir /voices/cache
+```
+
+Automatic cache entries use the same SHA-256 cache key for their `.spk`, `.rvq`, and `.json` filenames. Inspect the cache directory for the matching key and replace `CACHE_KEY` below with that filename stem. You can then pass its `.spk` by itself for speaker-only conditioning, or pair it with the corresponding `.rvq` codes and transcript for ICL conditioning:
+
+```bash
+speech-to-speech serve \
+  --tts qwen3 \
+  --qwen3_tts_backend ggml \
+  --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --qwen3_tts_ref_spk /voices/cache/CACHE_KEY.spk \
+  --qwen3_tts_ref_rvq /voices/cache/CACHE_KEY.rvq \
+  --qwen3_tts_ref_text "The transcript for the reference audio."
+```
+
+Raw `--qwen3_tts_ref_audio` and cached `--qwen3_tts_ref_spk`/`--qwen3_tts_ref_rvq` inputs are mutually exclusive. `.rvq` input requires both `.spk` and reference text.
+
+Example for Apple Silicon using the default 6-bit MLX variant:
+
+```bash
+speech-to-speech serve \
+  --tts qwen3 \
+  --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --qwen3_tts_speaker Aiden
+```
+
+You can override the default and select `bf16`, `4bit`, or `8bit` explicitly:
+
+```bash
+speech-to-speech serve \
+  --tts qwen3 \
+  --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --qwen3_tts_mlx_quantization 4bit \
+  --qwen3_tts_speaker Aiden
+```
+
+To benchmark the Apple Silicon MLX variants side by side:
+
+```bash
+.venv/bin/python benchmark_tts.py \
+  --handlers qwen3 \
+  --iterations 3 \
+  --qwen3_mlx_quantizations bf16 4bit 6bit 8bit
+```
+
+This will run separate benchmark entries for `qwen3[bf16]`, `qwen3[4bit]`, `qwen3[6bit]`, and `qwen3[8bit]`.
+
+### 7) OpenAI-compatible endpoint (`--tts openai`)
+
+The handler sends text to `POST /v1/audio/speech`. It supports streaming raw
+PCM16 and complete WAV responses, resamples them to the pipeline's 16 kHz
+format, and closes the active transport when response generation is cancelled.
+The default settings target Qwen3-TTS on vLLM-Omni.
+
+See [`docs/openai-compatible-tts.md`](../../../docs/openai-compatible-tts.md)
+for server commands and all relevant flags.
+
+### 8) OmniVoice (`--tts omnivoice`)
+
+Primary args prefix: `--omnivoice_*`
+
+Install the optional dependency and select a device supported by your PyTorch installation. This example uses CUDA on Linux or Windows; use `mps` on Apple Silicon or `xpu` with an Intel XPU-enabled PyTorch installation:
+
+```bash
+pip install "speech-to-speech[omnivoice]"
+speech-to-speech serve \
+  --tts omnivoice \
+  --omnivoice_model_name k2-fsa/OmniVoice \
+  --omnivoice_device cuda \
+  --omnivoice_dtype float16 \
+  --omnivoice_ref_audio /voices/reference.wav \
+  --omnivoice_ref_text "Transcript of the reference clip."
+```
+
+The reference is encoded once during handler setup and the resulting voice-clone prompt is reused for every text chunk. To reuse an upstream `VoiceClonePrompt.save(...)` file without re-encoding the reference, replace the two reference flags with:
+
+```bash
+--omnivoice_voice_clone_prompt /voices/saved-prompt.pt
+```
+
+OmniVoice reproduces the reference speaker's accent, so one reference makes every language sound like the reference language. To give each language its own reference, add a directory of `<language>.wav` files with matching `<language>.txt` transcripts:
+
+```bash
+--omnivoice_ref_voices_dir /voices/langs   # fr.wav + fr.txt, es.wav + es.txt, ...
+```
+
+Every reference is encoded once during setup. Each utterance uses the reference for its language code (exact code such as `es-419`, then the base language `es`), and falls back to the default voice above when none matches. Each reference adds a prepared prompt in memory and to startup time.
+
+Voice design omits the cloning flags and supplies an instruction:
+
+```bash
+speech-to-speech serve \
+  --tts omnivoice \
+  --omnivoice_device mps \
+  --omnivoice_instruct "female, low pitch, British accent"
+```
+
+For auto voice, omit `--omnivoice_ref_audio`, `--omnivoice_voice_clone_prompt`, and `--omnivoice_instruct`. `--omnivoice_language` pins a language name or code; when it is unset, the handler forwards the language code carried by each pipeline utterance. `--omnivoice_num_steps` controls diffusion steps (32 by default), and `--omnivoice_speed` controls speaking rate.
+
+Supported upstream device values include CUDA (`cuda` or `cuda:0`), Apple Silicon (`mps`), and Intel GPU (`xpu`). Choose `float16`, `bfloat16`, or `float32` with `--omnivoice_dtype` according to device support.
+
+The `speech-to-speech[omnivoice]` dependency set is supported on Linux, Windows, and macOS. On non-macOS platforms, `faster-qwen3-tts>=0.4.0` and OmniVoice share Transformers 5, so the extra can be installed alongside the built-in Qwen3 backend. Linux uses Qwen3's GGML extra by default; install a matching `qwentts-cpp-python` wheel as described above when the default CUDA 12.8 / `manylinux_2_39` wheel does not match the host. Intel XPU requires the matching Intel PyTorch build.
+
+OmniVoice returns complete 24 kHz float arrays. This handler downsamples them to 16 kHz, clips to `int16`, and then emits fixed-size blocks. It is playback chunking rather than model streaming: upstream `generate()` is blocking, so time to first audio includes synthesis of the entire utterance, and an interruption during generation discards the result after the blocking call returns. Upstream reports real-time factors as low as 0.025 in its accelerated benchmarks, but actual latency depends on the device, dtype, diffusion-step count, and text length.
+
+> [!WARNING]
+> The [OmniVoice code](https://github.com/k2-fsa/OmniVoice) is Apache-2.0, but the [`k2-fsa/OmniVoice` pretrained weights](https://huggingface.co/k2-fsa/OmniVoice) are CC-BY-NC because of training-data constraints and are not licensed for commercial use. Voice cloning requires authorization and consent. Unauthorized cloning, impersonation, fraud, scams, and other illegal or unethical use are prohibited by the upstream model's safety notice.
+
+### 9) Supertonic (`--tts supertonic`)
+
+Primary args prefix: `--supertonic_tts_*`
+
+```bash
+speech-to-speech serve \
+  --tts supertonic \
+  --supertonic_tts_voice M1 \
+  --supertonic_tts_speed 1.0
+```
+
+Behavior:
+- Supports real-time text-to-speech using Supertone's ONNX runtime models
+- Downloads the models locally to `~/.cache/supertonic3/`
+- Supports 10 built-in voice models: `M1`-`M5` and `F1`-`F5`
+- Uses per-utterance language codes when supported and falls back to `--supertonic_tts_lang` otherwise
+- Outputs natively at 44.1kHz but gets downsampled in the pipeline to 16kHz for uniform playback
+
+Install the optional dependency with:
+
+```bash
+pip install "speech-to-speech[supertonic]"
+```
+
+### 10) Phonon (`--tts phonon`)
+
+Primary args prefix: `--phonon_tts_*`
+
+```bash
+pip install "speech-to-speech[phonon]"
+speech-to-speech serve --tts phonon
+```
+
+- Uses the published `ptts==0.4.0` Python bindings on CPU. It streams mono float audio and resamples continuously to 16 kHz PCM16 in 512-sample blocks. GPU flags for other components do not move Phonon off CPU.
+- Defaults to `gradium/phonon-31m-en`, a public English checkpoint under Apache-2.0 that needs no Hub login. A local directory/config path or another Hub repository ID can override it, with `--phonon_tts_revision` when appropriate. The Phonon 40M checkpoints, such as `gradium/phonon-40m-en`, are gated and CC BY-NC 4.0 (non-commercial); accept their Hub terms and log in before the first download. The checkpoint needs its own config, tokenizer JSON, weights and voice files. Keep private checkpoint files outside this repository.
+- `--phonon_tts_quant q8` is the default and loads `model.q8.gguf`. Other formats require matching checkpoint weights.
+- `--phonon_tts_voice VOICE_NAME` selects a checkpoint voice or a [voice catalog](https://huggingface.co/gradium/phonon-voices) voice in the checkpoint's languages; catalog voices download on first use. If the catalog cannot be reached at startup, only checkpoint voices are offered. Omitting it uses the upstream default. Realtime session and response voice overrides accept the same names. Raw reference-audio voice cloning is not exposed by this handler.
+- With multiple voices, the `local` client enables arrow-key voice selection in an interactive macOS or Linux terminal. Left/up selects the previous voice; right/down selects the next. Changes wait until the current response completes and keep the session and conversation intact. The standalone `talk` client accepts `--voices VOICE_NAME ...` to enable the same controls.
+- `--phonon_tts_language en|fr|de|es|pt|none` selects text normalization at startup, not a different model. It cannot change per utterance, so session language selections must match it; `auto` keeps the configured normalizer. Checkpoint language coverage is independent of text normalization.
+- `--phonon_tts_blocksize` changes the number of samples per output block; the output rate stays 16 kHz.
+- `--phonon_tts_num_threads N` sets a positive CPU thread count before loading the model; the default is 4. The native pool is shared process-wide, so this is a startup setting shared by all Phonon pipelines. Four threads performed better than the runtime's twelve-thread default on an Apple M3 Pro in local testing. Tune for your hardware and workload; more threads are not always faster.
+- Interruptions and generator cleanup close the native stream and release its workers. Resampling state is fresh for each utterance, and the model remains loaded across sessions.
+
+For a checkout, install with `pip install -e ".[phonon]"`. An optional real-checkpoint test can be run with `PHONON_TEST_CHECKPOINT=/path/to/checkpoint pytest tests/test_phonon_tts_handler.py`; ordinary tests use a fake runtime and require no weights.
+
+Upstream: [runtime](https://github.com/gradium-ai/xn-ptts/releases/tag/v0.4.0), [Python guide](https://github.com/gradium-ai/xn-ptts/tree/v0.4.0/ptts-pyo3), and [default checkpoint](https://huggingface.co/gradium/phonon-31m-en).
+
+## Setup
+
+### Low-latency GPU setup
+
+```bash
+speech-to-speech serve \
+  --stt whisper \
+  --tts pocket
+```
+
+### Apple Silicon setup
+
+```bash
+speech-to-speech local
+```
+
+Apple Silicon selects MLX automatically. The optional `--mac-optimal-settings` preset also sets MPS device defaults.
+
+`--tts pocket`, `--tts phonon`, `--tts kokoro`, and `--tts omnivoice` are also valid options on macOS.
+
+## MiniMax
+
+Set `MINIMAX_API_KEY` and select the hosted MiniMax TTS provider:
+
+```bash
+speech-to-speech serve --tts minimax \
+  --minimax_tts_model speech-2.8-hd \
+  --minimax_tts_voice English_Graceful_Lady
+```
+
+`speech-2.8-turbo` is also supported. Voice IDs may be system or custom voices.
+The adapter requests streamed mono PCM at 16 kHz and uses the existing pipeline
+transport for cancellation, response identity, and shutdown. It makes no paid
+warmup request. `--minimax_tts_timeout` bounds each synthesis request (30 seconds
+by default); `--minimax_tts_base_url` selects a regional endpoint.
+
+See the [MiniMax API reference](https://platform.minimax.io/docs/api-reference/speech-t2a-http).

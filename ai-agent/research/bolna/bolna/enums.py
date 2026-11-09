@@ -1,0 +1,376 @@
+from enum import Enum
+
+
+class ChatRole(str, Enum):
+    """Chat message roles."""
+
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+class TelephonyProvider(str, Enum):
+    """Enum for telephony/IO providers (input/output handlers)."""
+
+    TWILIO = "twilio"
+    EXOTEL = "exotel"
+    PLIVO = "plivo"
+    VOBIZ = "vobiz"
+    SIP_TRUNK = "sip-trunk"
+    FREESWITCH = "freeswitch"  # linear16 16k in / 24k out (not ulaw/8k) — deliberately not a telephony_provider
+    # Agent/execution label for calls on client or platform SIP trunks. Their audio is the 16 kHz
+    # freeswitch fork, so it stays out of the lists below, which switch ASR to 8 kHz carrier audio.
+    TRUNK = "trunk"
+    DEFAULT = "default"
+    DATABASE = "database"
+
+    @classmethod
+    def telephony_providers(cls):
+        """Return only telephony providers (excluding default and database)."""
+        return [cls.TWILIO, cls.EXOTEL, cls.PLIVO, cls.VOBIZ, cls.SIP_TRUNK]
+
+    @classmethod
+    def all_values(cls):
+        """Return all provider values as a list of strings."""
+        return [provider.value for provider in cls]
+
+    @classmethod
+    def telephony_values(cls):
+        """Return telephony provider values as a list of strings."""
+        return [provider.value for provider in cls.telephony_providers()]
+
+    @classmethod
+    def mulaw_providers(cls):
+        """Telephony providers that stream mulaw; every other telephony provider streams linear16."""
+        return [cls.TWILIO, cls.SIP_TRUNK]
+
+    @classmethod
+    def mulaw_values(cls):
+        """Return mulaw telephony provider values as a list of strings."""
+        return [provider.value for provider in cls.mulaw_providers()]
+
+
+class SynthesizerProvider(str, Enum):
+    """Enum for synthesizer (TTS) providers."""
+
+    POLLY = "polly"
+    ELEVENLABS = "elevenlabs"
+    OPENAI = "openai"
+    DEEPGRAM = "deepgram"
+    AZURETTS = "azuretts"
+    CARTESIA = "cartesia"
+    SMALLEST = "smallest"
+    SARVAM = "sarvam"
+    RIME = "rime"
+    PIXA = "pixa"
+    MAYA = "maya"
+    KALPA = "kalpa"
+    GEMINI = "gemini"
+    SONIOX = "soniox"
+    NAVANA = "navana"
+    # A customer's own TTS server, over the OpenAI speech API.
+    CUSTOM = "custom"
+
+    @classmethod
+    def all_values(cls):
+        """Return all provider values as a list of strings."""
+        return [provider.value for provider in cls]
+
+
+class TranscriberProvider(str, Enum):
+    """Enum for transcriber (STT) providers."""
+
+    DEEPGRAM = "deepgram"
+    AZURE = "azure"
+    SARVAM = "sarvam"
+    ASSEMBLY = "assembly"
+    GOOGLE = "google"
+    PIXA = "pixa"
+    GLADIA = "gladia"
+    ELEVENLABS = "elevenlabs"
+    SMALLEST = "smallest"
+    OPENAI = "openai"
+    SONIOX = "soniox"
+    GEMINI = "gemini"
+    # Our self-hosted ASR, over the OpenAI Realtime transcription protocol.
+    BOLNA = "bolna"
+
+    @classmethod
+    def all_values(cls):
+        """Return all provider values as a list of strings."""
+        return [provider.value for provider in cls]
+
+
+class LLMProvider(str, Enum):
+    """Enum for LLM providers."""
+
+    OPENAI = "openai"
+    COHERE = "cohere"
+    OLLAMA = "ollama"
+    DEEPINFRA = "deepinfra"
+    TOGETHER = "together"
+    FIREWORKS = "fireworks"
+    AZURE_OPENAI = "azure-openai"
+    PERPLEXITY = "perplexity"
+    VLLM = "vllm"
+    ANYSCALE = "anyscale"
+    CUSTOM = "custom"
+    OLA = "ola"
+    GROQ = "groq"
+    ANTHROPIC = "anthropic"
+    DEEPSEEK = "deepseek"
+    OPENROUTER = "openrouter"
+    AZURE = "azure"
+    GOOGLE = "google"
+    BOLNA = "bolna"
+    SARVAM = "sarvam"
+    BEDROCK = "bedrock"
+
+    @classmethod
+    def all_values(cls):
+        """Return all provider values as a list of strings."""
+        return [provider.value for provider in cls]
+
+
+class ReasoningEffort(str, Enum):
+    NONE = "none"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+    @classmethod
+    def all_values(cls):
+        """Return all reasoning effort values as a list of strings."""
+        return [effort.value for effort in cls]
+
+
+class Verbosity(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+    @classmethod
+    def all_values(cls):
+        """Return all verbosity values as a list of strings."""
+        return [verbosity.value for verbosity in cls]
+
+
+class ResponseStreamEvent(str, Enum):
+    """Responses API event types (server-sent and client commands)."""
+
+    # Server stream events
+    CREATED = "response.created"
+    COMPLETED = "response.completed"
+    FAILED = "response.failed"
+    INCOMPLETE = "response.incomplete"
+    IN_PROGRESS = "response.in_progress"
+    OUTPUT_TEXT_DELTA = "response.output_text.delta"
+    OUTPUT_ITEM_ADDED = "response.output_item.added"
+    OUTPUT_ITEM_DONE = "response.output_item.done"
+    FUNCTION_CALL_ARGS_DELTA = "response.function_call_arguments.delta"
+    REASONING_SUMMARY_TEXT_DELTA = "response.reasoning_summary_text.delta"
+    REASONING_SUMMARY_TEXT_DONE = "response.reasoning_summary_text.done"
+    ERROR = "error"
+
+    # WebSocket client commands
+    CREATE = "response.create"
+    CANCEL = "response.cancel"
+
+    @classmethod
+    def terminal_events(cls):
+        """Events that signal the end of a response stream."""
+        return frozenset({cls.COMPLETED, cls.FAILED, cls.INCOMPLETE, cls.ERROR})
+
+    @classmethod
+    def response_terminal_events(cls):
+        """Terminals that settle the response itself. `error` is excluded: it can be raised
+        against the session and still be followed by the response's own terminal event."""
+        return frozenset({cls.COMPLETED, cls.FAILED, cls.INCOMPLETE})
+
+    @classmethod
+    def all_values(cls):
+        return [e.value for e in cls]
+
+
+class ResponseItemType(str, Enum):
+    """Responses API input item types."""
+
+    MESSAGE = "message"
+    FUNCTION_CALL = "function_call"
+    FUNCTION_CALL_OUTPUT = "function_call_output"
+    FUNCTION = "function"
+
+    @classmethod
+    def all_values(cls):
+        return [e.value for e in cls]
+
+
+class HangupReason(str, Enum):
+    """Enum for hangup_detail values — why the call ended."""
+
+    LLM_PROMPTED_HANGUP = "llm_prompted_hangup"
+    VOICEMAIL_DETECTED = "voicemail_detected"
+    WEB_CALL_MAX_DURATION_REACHED = "web_call_max_duration_reached"
+    MAX_DURATION_REACHED = "max_duration_reached"
+    INACTIVITY_TIMEOUT = "inactivity_timeout"
+    TRANSCRIBER_ERROR = "transcriber_error"
+    TRANSCRIBER_CONNECTION_ERROR = "transcriber_connection_error"
+    SYNTHESIZER_ERROR = "synthesizer_error"
+    LLM_ERROR = "llm_error"
+    END_CALL_TOOL = "end_call_tool"
+    S2S_ERROR = "s2s_error"
+    CLIENT_DISCONNECTED = "client_disconnected"
+
+    @classmethod
+    def all_values(cls):
+        return [r.value for r in cls]
+
+
+class LogComponent(str, Enum):
+    """Enum for CSV trace log component types."""
+
+    ERROR = "error"
+    FUNCTION_CALL = "function_call"
+    GRAPH_ROUTING = "graph_routing"
+    LLM = "llm"
+    LLM_HANGUP = "llm_hangup"
+    LLM_LANGUAGE_DETECTION = "llm_language_detection"
+    LLM_LANGUAGE_SWITCH = "llm_language_switch"
+    LLM_VOICEMAIL = "llm_voicemail"
+    S2S = "s2s"
+    SYNTHESIZER = "synthesizer"
+    TRANSCRIBER = "transcriber"
+    WARNING = "warning"
+
+    @property
+    def display_name(self):
+        return _DISPLAY_NAMES.get(self, self.value)
+
+    @classmethod
+    def all_values(cls):
+        return [c.value for c in cls]
+
+
+_DISPLAY_NAMES = {
+    LogComponent.TRANSCRIBER: "Speech recognition",
+    LogComponent.SYNTHESIZER: "Text-to-speech",
+    LogComponent.LLM: "LLM",
+    LogComponent.LLM_HANGUP: "LLM hangup check",
+    LogComponent.LLM_VOICEMAIL: "LLM voicemail check",
+    LogComponent.LLM_LANGUAGE_DETECTION: "LLM language detection",
+    LogComponent.LLM_LANGUAGE_SWITCH: "LLM language switch",
+    LogComponent.FUNCTION_CALL: "Function call",
+    LogComponent.GRAPH_ROUTING: "Graph routing",
+}
+
+
+class AudioPlaybackReason(str, Enum):
+    """Why the agent's audio-playing state flipped. Grepped in the logs to attribute a stuck flag."""
+
+    # Enum.__str__ would render the member name, and these are logged with lazy %s args.
+    __str__ = str.__str__
+
+    AUDIO_SENT = "audio_sent"
+    BARGE_IN = "barge_in"
+    DOWNSTREAM_CLEANUP = "downstream_cleanup"
+    FINAL_CHUNK_ACK = "final_chunk_ack"
+    FREESWITCH_PLAYOUT_DONE_EVENT = "freeswitch_playout_done_event"
+    FREESWITCH_PLAYOUT_TIMER = "freeswitch_playout_timer"
+    FREESWITCH_SOCKET_CLOSED = "freeswitch_socket_closed"
+    LID_SWITCH_TRUNCATE = "lid_switch_truncate"
+    PRE_MARK_ACK = "pre_mark_ack"
+    S2S_AUDIO_SENT = "s2s_audio_sent"
+    S2S_DROP_QUEUED = "s2s_drop_queued"
+    SILENCE_HANGUP_INTERRUPT = "silence_hangup_interrupt"
+    SIP_INTERRUPTION = "sip_interruption"
+    SIP_PLAYBACK_FINISHED = "sip_playback_finished"
+    SYNTHESIZER_STREAM_END = "synthesizer_stream_end"
+    WELCOME_MESSAGE_SENT = "welcome_message_sent"
+
+
+class LogDirection(str, Enum):
+    """Enum for CSV trace log direction types."""
+
+    ERROR = "error"
+    REQUEST = "request"
+    RESPONSE = "response"
+    WARNING = "warning"
+
+    @classmethod
+    def all_values(cls):
+        return [d.value for d in cls]
+
+
+class ExpressionOperator(str, Enum):
+    EQ = "eq"
+    NEQ = "neq"
+    GT = "gt"
+    GTE = "gte"
+    LT = "lt"
+    LTE = "lte"
+    IN = "in"
+    NOT_IN = "not_in"
+    CONTAINS = "contains"
+    EXISTS = "exists"
+    NOT_EXISTS = "not_exists"
+
+
+class ExpressionLogic(str, Enum):
+    AND = "and"
+    OR = "or"
+
+
+class VariableType(str, Enum):
+    STRING = "string"
+    NUMBER = "number"
+    BOOLEAN = "boolean"
+
+
+class EdgeConditionType(str, Enum):
+    LLM = "llm"
+    EXPRESSION = "expression"
+    UNCONDITIONAL = "unconditional"
+    EVENT = "event"
+
+
+class NodeType(str, Enum):
+    LLM = "llm"
+    STATIC = "static"
+    ROUTER = "router"
+
+
+class EdgeOrder(str, Enum):
+    """TIERED ranks edges by type, then priority; PRIORITY lets an intent edge outrank an expression."""
+
+    TIERED = "tiered"
+    PRIORITY = "priority"
+
+
+class S2SProvider(str, Enum):
+    """Enum for speech-to-speech providers."""
+
+    OPENAI_REALTIME = "openai_realtime"
+    GEMINI_LIVE = "gemini_live"
+
+    @classmethod
+    def all_values(cls):
+        return [p.value for p in cls]
+
+
+class ToolScope(str, Enum):
+    """Where a graph-agent tool is exposed: GLOBAL (every node) or NODE (only its listed nodes)."""
+
+    GLOBAL = "global"
+    NODE = "node"
+
+
+class UsageSource(str, Enum):
+    """Indicates whether token counts came from the API or text estimation."""
+
+    API_REPORTED = "api_reported"
+    ESTIMATED = "estimated"
+    PARTIAL = "partial"  # Mix of api_reported and estimated (e.g., interrupted streams)

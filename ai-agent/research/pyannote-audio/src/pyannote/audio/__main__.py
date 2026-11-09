@@ -1,0 +1,1073 @@
+# MIT License
+#
+# Copyright (c) 2024-2025 CNRS
+# Copyright (c) 2025- pyannoteAI
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import json
+import os
+import sys
+import tempfile
+import time
+import types
+from contextlib import nullcontext
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
+from typing import Annotated
+
+import numpy as np
+import pyannote.database
+import torch
+import typer
+import yaml
+from filelock import FileLock
+from pyannote.core import Annotation
+from pyannote.metrics.base import BaseMetric
+from pyannote.metrics.diarization import (
+    DiarizationCoverage,
+    DiarizationErrorRate,
+    DiarizationPurity,
+    DiarizationSpeakerCountError,
+    JaccardErrorRate,
+)
+from pyannote.pipeline.optimizer import Optimizer
+from rich.progress import track
+
+from pyannote.audio import Audio, Model, Pipeline
+from pyannote.audio.core.pipeline import expand_subfolders
+
+
+class Subset(str, Enum):
+    train = "train"
+    development = "development"
+    test = "test"
+
+
+class Device(str, Enum):
+    CPU = "cpu"
+    CUDA = "cuda"
+    MPS = "mps"
+    AUTO = "auto"
+
+
+class NumSpeakers(str, Enum):
+    ORACLE = "oracle"
+    AUTO = "auto"
+
+
+class Metric(str, Enum):
+    DiarizationErrorRate = "DiarizationErrorRate"
+    JaccardErrorRate = "JaccardErrorRate"
+    DiarizationPurity = "DiarizationPurity"
+    DiarizationCoverage = "DiarizationCoverage"
+    DiarizationSpeakerCountError = "DiarizationSpeakerCountError"
+
+    @classmethod
+    def from_str(cls, metric: str) -> BaseMetric:
+        """Convert a string to a Metric enum value."""
+
+        metric = cls(metric)
+        if metric == cls.DiarizationErrorRate:
+            return DiarizationErrorRate()
+        if metric == cls.JaccardErrorRate:
+            return JaccardErrorRate()
+        if metric == cls.DiarizationPurity:
+            return DiarizationPurity()
+        if metric == cls.DiarizationCoverage:
+            return DiarizationCoverage()
+        if metric == cls.DiarizationSpeakerCountError:
+            return DiarizationSpeakerCountError()
+
+        raise ValueError(f"Unsupported metric: {metric}")
+
+    @property
+    def direction(self) -> str:
+        """Return the optimization direction of this metric."""
+        if self in {self.DiarizationPurity, self.DiarizationCoverage}:
+            return "maximize"
+        return "minimize"
+
+
+def parse_device(device: Device) -> torch.device:
+    if device == Device.AUTO:
+        if torch.cuda.is_available():
+            device = Device.CUDA
+
+        elif torch.backends.mps.is_available():
+            device = Device.MPS
+
+        else:
+            device = Device.CPU
+
+    return torch.device(device.value)
+
+
+def get_diarization(prediction) -> Annotation:
+
+    # if result is an Annotation, assume it is speaker diarization
+    if isinstance(prediction, Annotation):
+        return prediction
+
+    # if result contains a dedicated output for diarization, use it
+    if hasattr(prediction, "speaker_diarization"):
+        return prediction.speaker_diarization
+
+    raise ValueError("Could not find speaker diarization in prediction.")
+
+
+class DiarizationMetricAdapter:
+    """Apply a diarization metric to legacy and rich pipeline outputs."""
+
+    def __init__(self, metric: BaseMetric):
+        self.metric = metric
+        self.name = metric.name
+
+    def __call__(self, reference, hypothesis, **kwargs):
+        return self.metric(reference, get_diarization(hypothesis), **kwargs)
+
+    def __abs__(self):
+        return abs(self.metric)
+
+    def confidence_interval(self, **kwargs):
+        return self.metric.confidence_interval(**kwargs)
+
+
+app = typer.Typer()
+
+
+def resolve_pipeline_config(
+    pipeline: Path,
+    metric: Metric | None = None,
+) -> dict:
+    """Resolve a local pipeline configuration and select a Pareto trial if needed.
+
+    Parameters
+    ----------
+    pipeline : Path
+        Path to a local pipeline YAML file, including a Pareto manifest.
+    metric : Metric, optional
+        Preferred objective when selecting a trial from a Pareto manifest.
+        Defaults to the first objective in the manifest. Ties are resolved by
+        the remaining objectives in manifest order, then by trial number.
+        Has no effect on single-objective configurations.
+
+    Returns
+    -------
+    config : dict
+        Configuration ready to serialize as YAML or pass directly to
+        Pipeline.from_pretrained. No file is written by this function.
+
+    Notes
+    -----
+    References such as ``$model/segmentation`` are expanded into checkpoint
+    dictionaries whose ``checkpoint`` is the absolute path to the source
+    YAML's directory and whose ``subfolder`` is ``segmentation``. Any revision
+    specified in the reference is preserved.
+
+    """
+    # load the original pipeline configuration
+    path = Path(pipeline)
+    with open(path) as fp:
+        config = yaml.safe_load(fp)
+
+    # keep optimization provenance, without carrying the whole Pareto front
+    # into the configuration of the selected pipeline
+    optimization = config.pop("optimization", {})
+    status = optimization.pop("status", {})
+    metadata = {
+        key: value
+        for key, value in (optimization | status).items()
+        if key
+        in (
+            "metric",
+            "protocol",
+            "subset",
+            "trial",
+            "values",
+            "best_loss",
+            "last_updated",
+        )
+    }
+    # older single-objective configurations may not record the metric
+    metadata.setdefault("metric", None)
+
+    # a Pareto manifest contains several possible sets of parameters
+    if "pareto_front" in status:
+        metrics = [Metric(name) for name in optimization.get("metrics", [])]
+        front = status["pareto_front"]
+        if not metrics or not front:
+            raise typer.BadParameter(
+                "The Pareto manifest must contain objectives and trials."
+            )
+        # use the first optimization objective when no preference is provided
+        preferred = metric or metrics[0]
+        if preferred not in metrics:
+            raise typer.BadParameter(
+                f"Metric {preferred.value} is not in the Pareto manifest. "
+                f"Available metrics: {', '.join(m.value for m in metrics)}.",
+                param_hint="--metric",
+            )
+        # rank trials by the preferred metric, then by the remaining objectives
+        # and trial number to resolve ties deterministically
+        ordered = [preferred] + [m for m in metrics if m != preferred]
+        selected = min(
+            front,
+            key=lambda point: (
+                tuple(
+                    # negate maximized metrics so that min handles both directions
+                    (1 if m.direction == "minimize" else -1) * point["values"][m.value]
+                    for m in ordered
+                )
+                + (point["trial"],)
+            ),
+        )
+        # replace the original parameters with those of the selected trial
+        # and keep its objective values for later reference
+        config["params"] = selected["params"]
+        metadata.update(
+            metric=preferred.value,
+            trial=selected["trial"],
+            values=selected["values"],
+        )
+        typer.echo(
+            f"Selected trial {selected['trial']} using {preferred.value}: "
+            + ", ".join(
+                f"{name}={value:g}" for name, value in selected["values"].items()
+            ),
+            err=True,
+        )
+
+    # resolve $model/... against the original YAML directory so that model
+    # locations are preserved when the config is moved or passed as a dictionary
+    expand_subfolders(config, str(path.parent.resolve()))
+
+    # record when this configuration was resolved and where it came from
+    metadata.update(
+        date=datetime.now(UTC).isoformat(),
+        source=str(path.resolve()),
+    )
+    config["optimization"] = metadata
+    return config
+
+
+@app.command("optimize")
+def optimize(
+    pipeline: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to pipeline YAML configuration file",
+            exists=True,
+            dir_okay=False,
+            file_okay=True,
+            writable=True,
+            resolve_path=True,
+        ),
+    ],
+    protocol: Annotated[
+        str,
+        typer.Argument(help="Protocol used for optimization"),
+    ],
+    subset: Annotated[
+        Subset,
+        typer.Option(
+            help="Subset used for optimization",
+            case_sensitive=False,
+        ),
+    ] = Subset.development,
+    device: Annotated[
+        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS)")
+    ] = Device.AUTO,
+    registry: Annotated[
+        Path | None,
+        typer.Option(
+            help="Loaded registry",
+            exists=True,
+            dir_okay=False,
+            file_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    max_iterations: Annotated[
+        int | None,
+        typer.Option(help="Number of iterations to run. Defaults to run indefinitely."),
+    ] = None,
+    num_speakers: Annotated[
+        NumSpeakers, typer.Option(help="Number of speakers (oracle or auto)")
+    ] = NumSpeakers.AUTO,
+    metric: Annotated[
+        list[Metric],
+        typer.Option(
+            help="Metric to optimize against. Repeat for multi-objective optimization.",
+            case_sensitive=False,
+        ),
+    ] = [Metric.DiarizationErrorRate],
+    average_case: Annotated[
+        bool,
+        typer.Option(help="Optimize for average case rather than worst case."),
+    ] = False,
+):
+    """
+    Optimize a PIPELINE
+    """
+
+    if not metric:
+        raise typer.BadParameter("At least one metric must be provided.")
+    if len(metric) != len(set(metric)):
+        raise typer.BadParameter("Each optimization metric must be unique.")
+
+    # load pipeline configuration file in memory. this will
+    # be dumped later to disk with optimized parameters
+    with open(pipeline) as fp:
+        original_config = yaml.load(fp, Loader=yaml.SafeLoader)
+
+    # load pipeline
+    optimized_pipeline = Pipeline.from_pretrained(pipeline)
+    if optimized_pipeline is None:
+        print(f"Could not load pipeline from {pipeline}.")
+        raise typer.Exit(code=1)
+
+    # send pipeline to device
+    torch_device = parse_device(device)
+    optimized_pipeline.to(torch_device)
+
+    # load protocol from (optional) registry
+    if registry:
+        pyannote.database.registry.load_database(registry)
+
+    preprocessors = {"audio": pyannote.database.FileFinder()}
+
+    # pass number of speakers to pipeline if requested
+    if num_speakers == NumSpeakers.ORACLE:
+        preprocessors["pipeline_kwargs"] = lambda protocol_file: {
+            "num_speakers": len(protocol_file["annotation"].labels())
+        }
+
+    loaded_protocol = pyannote.database.registry.get_protocol(
+        protocol, preprocessors=preprocessors
+    )
+
+    files: list[pyannote.database.ProtocolFile] = list(
+        getattr(loaded_protocol, subset.value)()
+    )
+
+    # update `get_metric` and `get_direction` methods to return one value per
+    # requested objective
+    def _get_metric(self):
+        metrics = tuple(
+            DiarizationMetricAdapter(Metric.from_str(current_metric))
+            for current_metric in metric
+        )
+        return metrics if len(metrics) > 1 else metrics[0]
+
+    def _get_direction(self):
+        directions = tuple(current_metric.direction for current_metric in metric)
+        return directions if len(directions) > 1 else directions[0]
+
+    optimized_pipeline.get_metric = types.MethodType(_get_metric, optimized_pipeline)
+    optimized_pipeline.get_direction = types.MethodType(
+        _get_direction, optimized_pipeline
+    )
+
+    # setting study name to this allows to store multiple optimizations
+    # for the same pipeline in the same database
+    study_name = f"{protocol}.{subset.value}"
+
+    # add suffix if we are using oracle number of speakers
+    if num_speakers == NumSpeakers.ORACLE:
+        study_name += ".OracleNumSpeakers"
+
+    # add suffix with optimized metric(s)
+    study_name += f".{'+'.join(current_metric.value for current_metric in metric)}"
+
+    # journal file to store optimization results
+    # if pipeline path is "config.yml", it will be stored in "config.journal"
+    journal = pipeline.with_suffix(".journal")
+
+    if len(metric) > 1:
+        result: Path = pipeline.with_suffix(f".{study_name}.pareto.yaml")
+    else:
+        result: Path = pipeline.with_suffix(f".{study_name}.yaml")
+
+    optimizer = Optimizer(
+        optimized_pipeline,
+        db=journal,
+        study_name=study_name,
+        sampler=None,  # TODO: support sampler
+        pruner=None,  # TODO: support pruner
+        average_case=average_case,
+    )
+
+    try:
+        warm_start = optimized_pipeline.default_parameters()
+    except NotImplementedError:
+        warm_start = None
+
+    if optimizer.multi_objective:
+        previous_pareto_trials: set[int] = set()
+        iterations = optimizer.tune_iter(files, warm_start=warm_start)
+
+        for i, status in enumerate(iterations):
+            pareto_front = status["pareto_front"]
+            pareto_trials = {point["number"] for point in pareto_front}
+
+            if pareto_trials != previous_pareto_trials:
+                with FileLock(str(result) + ".lock"):
+                    pareto_front = optimizer.pareto_front
+                    pareto_trials = {point["number"] for point in pareto_front}
+                    serialized_front = []
+                    for point in pareto_front:
+                        serialized_front.append(
+                            {
+                                "trial": point["number"],
+                                "values": {
+                                    current_metric.value: float(value)
+                                    for current_metric, value in zip(
+                                        metric, point["values"]
+                                    )
+                                },
+                                "params": point["params"],
+                            }
+                        )
+
+                    original_config["optimization"] = {
+                        "protocol": protocol,
+                        "subset": subset.value,
+                        "metrics": [current_metric.value for current_metric in metric],
+                        "status": {
+                            "pareto_front": serialized_front,
+                            "last_updated": datetime.now().isoformat(),
+                        },
+                    }
+                    temporary_result = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="w",
+                            dir=result.parent,
+                            prefix=f".{result.name}.",
+                            suffix=".tmp",
+                            delete=False,
+                        ) as fp:
+                            temporary_result = Path(fp.name)
+                            yaml.dump(original_config, fp)
+                        os.replace(temporary_result, result)
+                    finally:
+                        if temporary_result is not None:
+                            temporary_result.unlink(missing_ok=True)
+
+                    previous_pareto_trials = pareto_trials
+
+            if max_iterations and i + 1 >= max_iterations:
+                break
+
+        return
+
+    direction = 1 if optimized_pipeline.get_direction() == "minimize" else -1
+
+    # read best loss so far
+    global_best_loss: float = optimizer.best_loss
+    local_best_loss: float = global_best_loss
+
+    iterations = optimizer.tune_iter(files, warm_start=warm_start)
+
+    # TODO: use pipeline.default_params() as warm_start?
+
+    for i, status in enumerate(iterations):
+        loss = status["loss"]
+
+        # check whether this iteration led to a better loss
+        # than all previous iterations for this run
+        if direction * (loss - local_best_loss) < 0:
+            # new (local) best loss
+            local_best_loss = loss
+
+            # if it did, also check directly from the central database if this is a new global best loss
+            # (we might have multiple optimizations going on simultaneously)
+            if local_best_loss == (global_best_loss := optimizer.best_loss):
+                # if we have a new global best loss, save it to disk
+                original_config["params"] = status["params"]
+                original_config["optimization"] = {
+                    "metric": metric[0].value,
+                    "protocol": protocol,
+                    "subset": subset.value,
+                    "status": {
+                        "best_loss": local_best_loss,
+                        "last_updated": datetime.now().isoformat(),
+                    },
+                }
+                with open(result, "w") as fp:
+                    yaml.dump(original_config, fp)
+
+            local_best_loss = global_best_loss
+
+        if max_iterations and i + 1 >= max_iterations:
+            break
+
+
+@app.command("download")
+def download(
+    pipeline: Annotated[
+        str,
+        typer.Argument(
+            help="Pretrained pipeline (e.g. pyannote/speaker-diarization-community-1)"
+        ),
+    ],
+    revision: Annotated[
+        str | None,
+        typer.Option(
+            help="Pretrained pipeline revision.",
+        ),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Argument(help="Huggingface token."),
+    ] = None,
+    cache: Annotated[
+        Path | None,
+        typer.Option(
+            help="Path to the folder where files downloaded from Huggingface are stored.",
+            exists=True,
+            dir_okay=True,
+            file_okay=False,
+            writable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+):
+    """
+    Download a pretrained PIPELINE to disk for later offline use.
+    """
+
+    # load pretrained pipeline
+    pretrained_pipeline = Pipeline.from_pretrained(
+        pipeline, revision=revision, token=token, cache_dir=cache
+    )
+    if pretrained_pipeline is None:
+        print(f"Could not load pretrained pipeline from {pipeline}.")
+        raise typer.Exit(code=1)
+
+
+@app.command("apply")
+def apply(
+    pipeline: Annotated[
+        str,
+        typer.Argument(
+            help="Pretrained pipeline (e.g. pyannote/speaker-diarization-community-1)"
+        ),
+    ],
+    audio: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to audio file or directory",
+            exists=True,
+            file_okay=True,
+            dir_okay=True,
+            readable=True,
+        ),
+    ],
+    into: Annotated[
+        Path | None,
+        typer.Option(
+            help="Path to file or directory where results are saved.",
+            exists=False,
+            dir_okay=True,
+            file_okay=True,
+            writable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+    revision: Annotated[
+        str | None,
+        typer.Option(
+            help="Pretrained pipeline revision.",
+        ),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Argument(help="Huggingface token."),
+    ] = None,
+    cache: Annotated[
+        Path | None,
+        typer.Option(
+            help="Path to the folder where files downloaded from Huggingface are stored.",
+            exists=True,
+            dir_okay=True,
+            file_okay=False,
+            writable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+    device: Annotated[
+        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS)")
+    ] = Device.AUTO,
+):
+    """
+    Apply a pretrained PIPELINE to an AUDIO file or directory
+    """
+
+    # load pretrained pipeline
+    pretrained_pipeline = Pipeline.from_pretrained(
+        pipeline, revision=revision, token=token, cache_dir=cache
+    )
+    if pretrained_pipeline is None:
+        print(f"Could not load pretrained pipeline from {pipeline}.")
+        raise typer.Exit(code=1)
+
+    # send pipeline to device
+    torch_device = parse_device(device)
+    pretrained_pipeline.to(torch_device)
+
+    if audio.is_dir():
+        if into is None or not into.is_dir():
+            typer.echo("When AUDIO is a directory, INTO must also be a directory.")
+            raise typer.Exit(code=1)
+
+        inputs: list[Path] = sorted(path for path in audio.iterdir() if path.is_file())
+        rttms: list[Path | None] = [into / (path.stem + ".rttm") for path in inputs]
+        jsons: list[Path | None] = [into / (path.stem + ".json") for path in inputs]
+
+    else:
+        if not (into is None or into.is_file()):
+            typer.echo("When AUDIO is a file, INTO must also be a file.")
+            raise typer.Exit(code=1)
+
+        inputs = [audio]
+        rttms: list[Path | None] = [into]
+        jsons: list[Path | None] = [into.with_suffix(".json") if into else None]
+
+    for current_input, current_rttm, current_json in zip(inputs, rttms, jsons):
+        prediction = pretrained_pipeline(current_input)
+
+        speaker_diarization = get_diarization(prediction)
+
+        with open(current_rttm, "w") if current_rttm else nullcontext(sys.stdout) as r:
+            speaker_diarization.write_rttm(r)
+
+        if hasattr(prediction, "serialize") and current_json:
+            serialized: dict = prediction.serialize()
+            with open(current_json, "w") as j:
+                json.dump(serialized, j, indent=2)
+
+
+@app.command("benchmark")
+def benchmark(
+    pipeline: Annotated[
+        str,
+        typer.Argument(
+            help="Pretrained pipeline (e.g. pyannote/speaker-diarization-community-1)"
+        ),
+    ],
+    protocol: Annotated[
+        str,
+        typer.Argument(help="Benchmarked protocol"),
+    ],
+    into: Annotated[
+        Path,
+        typer.Argument(
+            help="Directory into which benchmark results are saved",
+            exists=True,
+            dir_okay=True,
+            file_okay=False,
+            writable=True,
+            resolve_path=True,
+        ),
+    ],
+    subset: Annotated[
+        Subset,
+        typer.Option(
+            help="Benchmarked subset",
+            case_sensitive=False,
+        ),
+    ] = Subset.test,
+    revision: Annotated[
+        str | None,
+        typer.Option(
+            help="Pretrained pipeline revision.",
+        ),
+    ] = None,
+    subfolder: Annotated[
+        str | None,
+        typer.Option(
+            help="Folder inside the hf.co model repo (or local directory) to load the pipeline from.",
+        ),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Argument(help="Huggingface token."),
+    ] = None,
+    cache: Annotated[
+        Path | None,
+        typer.Option(
+            help="Path to the folder where files downloaded from Huggingface are stored.",
+            exists=True,
+            dir_okay=True,
+            file_okay=False,
+            writable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+    device: Annotated[
+        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS)")
+    ] = Device.AUTO,
+    registry: Annotated[
+        Path | None,
+        typer.Option(
+            help="Loaded registry",
+            exists=True,
+            dir_okay=False,
+            file_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    num_speakers: Annotated[
+        NumSpeakers, typer.Option(help="Number of speakers (oracle or auto)")
+    ] = NumSpeakers.AUTO,
+    progress: Annotated[
+        bool,
+        typer.Option(
+            help="Show progress",
+        ),
+    ] = False,
+    per_file: Annotated[
+        bool, typer.Option(help="Save one RTTM/JSON file per processed audio file.")
+    ] = False,
+    metric: Annotated[
+        list[Metric] | None,
+        typer.Option(
+            help="Preferred Pareto objective (defaults to the first objective). Repeat to benchmark each selected configuration. Explicit selections save results in OptimizedFor<Metric> subdirectories.",
+            case_sensitive=False,
+        ),
+    ] = None,
+):
+    """
+    Benchmark a pretrained diarization PIPELINE
+
+    This will run the pipeline on all files in the specified protocol and subset,
+    save the results in RTTM format, and compute the Diarization Error Rate (DER)
+    for each file. Repeated `--metric` options select separate configurations from
+    a Pareto manifest; each is evaluated with the same metrics. Explicit metric
+    selections save results in OptimizedFor<Metric> subdirectories of INTO.
+    """
+
+    objectives = list(dict.fromkeys(metric)) if metric else [None]
+    for objective in objectives:
+        output_dir = (
+            into if objective is None else into / f"OptimizedFor{objective.value}"
+        )
+        output_dir.mkdir(exist_ok=True)
+        _benchmark(
+            pipeline=pipeline,
+            protocol=protocol,
+            into=output_dir,
+            subset=subset,
+            revision=revision,
+            subfolder=subfolder,
+            token=token,
+            cache=cache,
+            device=device,
+            registry=registry,
+            num_speakers=num_speakers,
+            progress=progress,
+            per_file=per_file,
+            metric=objective,
+        )
+
+
+def _benchmark(
+    pipeline: str,
+    protocol: str,
+    into: Path,
+    subset: Subset,
+    revision: str | None,
+    subfolder: str | None,
+    token: str | None,
+    cache: Path | None,
+    device: Device,
+    registry: Path | None,
+    num_speakers: NumSpeakers,
+    progress: bool,
+    per_file: bool,
+    metric: Metric | None,
+):
+    benchmark_name = f"{protocol}.{subset.value}"
+    if num_speakers == NumSpeakers.ORACLE:
+        benchmark_name += ".OracleNumSpeakers"
+    output_config = into / f"{benchmark_name}.config.yaml"
+
+    checkpoint: str | dict = pipeline
+    if Path(pipeline).is_file():
+        checkpoint = resolve_pipeline_config(Path(pipeline), metric=metric)
+    pretrained_pipeline = Pipeline.from_pretrained(
+        checkpoint,
+        revision=revision,
+        subfolder=subfolder,
+        token=token,
+        cache_dir=cache,
+    )
+    if pretrained_pipeline is None:
+        print(f"Could not load pretrained pipeline from {pipeline}.")
+        raise typer.Exit(code=1)
+
+    # send pipeline to device
+    torch_device = parse_device(device)
+    pretrained_pipeline.to(torch_device)
+
+    # load protocol from (optional) registry
+    if registry:
+        pyannote.database.registry.load_database(registry)
+
+    # make sure an "audio" key is available in protocol files
+    preprocessors = {"audio": pyannote.database.FileFinder()}
+
+    # pass number of speakers to pipeline if requested
+    if num_speakers == NumSpeakers.ORACLE:
+        preprocessors["pipeline_kwargs"] = lambda protocol_file: {
+            "num_speakers": len(protocol_file["annotation"].labels())
+        }
+
+    # load benchmark files
+    loaded_protocol = pyannote.database.registry.get_protocol(
+        protocol, preprocessors=preprocessors
+    )
+    files = list(getattr(loaded_protocol, subset.value)())
+
+    # check that manual annotation is available for all files
+    # (condition to actually run the benchmark)
+    skip_metric = False
+    if any(file.get("annotation", None) is None for file in files):
+        print(
+            f"Manual annotation is not available for files in {protocol} {subset.value} subset so skipping metric evaluation."
+        )
+        skip_metric = True
+
+    if Path(pipeline).is_file():
+        with open(output_config, "x") as fp:
+            fp.write(f"# created_at: {checkpoint['optimization']['date']}\n")
+            yaml.safe_dump(checkpoint, fp)
+
+    # used to store raw predictions in JSON format
+    serialized_predictions: dict[str, dict] = {}
+
+    if not skip_metric:
+        metric = DiarizationErrorRate()
+
+    # speaker count confusion matrix
+    # speaker_count[i][j] is the number of files with i speakers in the
+    # manual annotation and j speakers in the prediction
+    speaker_count: dict[int, dict[int, int]] = {}
+
+    if per_file:
+        benchmark_dir = into / benchmark_name
+        if benchmark_dir.exists():
+            raise FileExistsError(f"{benchmark_dir} already exists.")
+
+        rttm_dir = benchmark_dir / "rttm"
+        rttm_dir.mkdir(parents=True)
+
+    else:
+        rttm_file = into / f"{benchmark_name}.rttm"
+        # make sure we don't overwrite previous results
+        if rttm_file.exists():
+            raise FileExistsError(f"{rttm_file} already exists.")
+
+    if hasattr(pretrained_pipeline, "apply_batch"):
+        iterator = pretrained_pipeline(files, progress=progress)
+    else:
+        iterator = track(pretrained_pipeline(files), disable=not progress)
+
+    tic: float = time.time()
+    for file, prediction in iterator:
+        uri = file["uri"]
+
+        # if prediction has a built-in serialize method, save serialized version
+        if hasattr(prediction, "serialize"):
+            if per_file:
+                json_dir = benchmark_dir / "json"
+                json_dir.mkdir(exist_ok=True)
+
+                with open(json_dir / f"{uri}.json", "w") as f:
+                    json.dump(prediction.serialize(), f, indent=2)
+            else:
+                serialized_predictions[uri] = prediction.serialize()
+
+        # get speaker diarization from raw prediction
+        speaker_diarization = get_diarization(prediction)
+
+        # dump prediction to RTTM file
+        if per_file:
+            rttm_file = rttm_dir / f"{uri}.rttm"
+
+        with open(rttm_file, "w" if per_file else "a") as rttm:
+            speaker_diarization.write_rttm(rttm)
+
+        # compute metric when possible
+        if not skip_metric:
+            metric(
+                file["annotation"],
+                speaker_diarization,
+                uem=file.get("annotated", None),
+            )
+
+        # increment speaker count confusion matrix
+        pred_num_speakers: int = len(speaker_diarization.labels())
+        true_num_speakers: int = len(file["annotation"].labels())
+        speaker_count.setdefault(true_num_speakers, {}).setdefault(pred_num_speakers, 0)
+        speaker_count[true_num_speakers][pred_num_speakers] += 1
+
+    tac: float = time.time()
+
+    # save serialized predictions to disk (might contain more than just diarization results)
+    if serialized_predictions and not per_file:
+        with open(into / f"{benchmark_name}.json", "w") as f:
+            json.dump(serialized_predictions, f, indent=2)
+
+    # log processing time and capacity
+    processing = {}
+    total_processing_time = tac - tic
+    total_playing_time = sum(Audio().get_duration(file) for file in files)
+    processing["seconds_per_hour"] = total_processing_time / (total_playing_time / 3600)
+    processing["times_faster_than_realtime"] = (
+        total_playing_time / total_processing_time
+    )
+    processing["total_processing_time"] = total_processing_time
+
+    # keep track of GPU device properties
+    if torch_device.type == "cuda":
+        props = torch.cuda.get_device_properties(torch_device)
+        props_dict = {}
+        for attr in dir(props):
+            if not attr.startswith("_"):
+                value = getattr(props, attr)
+                # Only include basic types (skip unpicklable like _CUuuid)
+                if isinstance(value, (int, float, str, bool, tuple, list)):
+                    props_dict[attr] = value
+
+        processing["device"] = props_dict
+        device_name = props_dict["name"].replace(" ", "-")
+        speed_yml = into / f"{benchmark_name}.{device_name}.yml"
+
+    else:
+        speed_yml = into / f"{benchmark_name}.yml"
+
+    with open(speed_yml, "w") as yml:
+        yaml.dump(processing, yml)
+
+    # no need to go further than this point if evaluation is not possible
+    if skip_metric:
+        raise typer.Exit()
+
+    # save metric results in both CSV and human-readable formats
+    with open(into / f"{benchmark_name}.csv", "w") as csv:
+        metric.report().to_csv(csv)
+
+    with open(into / f"{benchmark_name}.txt", "w") as txt:
+        txt.write(str(metric))
+
+    # turn speaker count confusion matrix into numpy array
+    # and save it to disk as a CSV file
+    max_true_speakers = max(speaker_count.keys())
+    max_pred_speakers = max(
+        max(speaker_count[true_speakers].keys()) for true_speakers in speaker_count
+    )
+    speaker_count_matrix = np.zeros(
+        (max_true_speakers + 1, max_pred_speakers + 1), dtype=int
+    )
+    for true_speakers, pred_counts in speaker_count.items():
+        for pred_speakers, count in pred_counts.items():
+            speaker_count_matrix[true_speakers, pred_speakers] = count
+
+    # compute the average error in the speaker count prediction
+    speaker_count_error: float = np.sum(
+        [
+            abs(true_speakers - pred_speakers) * count
+            for true_speakers, pred_counts in speaker_count.items()
+            for pred_speakers, count in pred_counts.items()
+        ]
+    ) / np.sum(speaker_count_matrix)
+
+    # compute the accuracy of the speaker count prediction
+    speaker_count_accuracy: float = np.sum(np.diag(speaker_count_matrix)) / np.sum(
+        speaker_count_matrix
+    )
+
+    np.savetxt(
+        into / f"{benchmark_name}.SpeakerCount.csv",
+        speaker_count_matrix,
+        delimiter=",",
+        fmt="%3d",
+        footer=f"Accuracy = {speaker_count_accuracy:.1%} / Average error = {speaker_count_error:.2f} speakers off",
+    )
+
+
+@app.command("strip")
+def strip(
+    checkpoint: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to pyannote.audio model checkpoint",
+            exists=True,
+            dir_okay=False,
+            file_okay=True,
+            resolve_path=True,
+        ),
+    ],
+    into: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to the stripped checkpoint",
+            exists=False,
+            dir_okay=False,
+            file_okay=True,
+            writable=True,
+            resolve_path=True,
+        ),
+    ],
+):
+    """
+    Strip a pretrained CHECKPOINT to only keep the parts needed for inference.
+    """
+
+    keys = [
+        "pytorch-lightning_version",  # * pytorch-lightning needs
+        "hparams_name",  #   those values to initialize
+        "hyper_parameters",  #   the model architecture
+        "state_dict",  # * actual weights
+        "pyannote.audio",  # * pyannote.audio dependencies
+    ]
+
+    old_checkpoint = torch.load(
+        checkpoint, map_location=torch.device("cpu"), weights_only=False
+    )
+    new_checkpoint = {
+        key: value for key, value in old_checkpoint.items() if key in keys
+    }
+    torch.save(new_checkpoint, into)
+
+    # check that the stripped checkpoint can be loaded again
+    try:
+        _ = Model.from_pretrained(into)
+    except Exception as e:
+        sys.exit(
+            f"Something went wrong while stripping the checkpoint as it could not be reloaded: {e}"
+        )
+
+
+if __name__ == "__main__":
+    app()

@@ -1,0 +1,186 @@
+#
+# Copyright (c) 2024–2025, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+import os
+import uuid
+
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import (
+    EndWorkerFrame,
+    LLMRunFrame,
+    TTSSpeakFrame,
+)
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.daily.transport import DailyParams
+from pipecat.workers.runner import WorkerRunner
+
+from bot_utils.audio_upload_util import AudioUploader
+
+logger.info(f"Starting bot")
+
+load_dotenv(override=True)
+
+
+async def terminate_call(params: FunctionCallParams) -> None:
+    """Terminate the call when user says 'Goodbye' and the call is over."""
+    logger.info("Conversation complete. Terminating call.")
+
+    await params.llm.queue_frame(TTSSpeakFrame("Goodbye."))
+    await params.llm.queue_frame(EndWorkerFrame())
+
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    idle_timeout_secs = 10
+    conversation_id = f"{uuid.uuid4()}"
+
+    # set buffer_size; min chunk size for s3 multipart upload is 5mb
+    audio_buffer_size = 5 * 1024 * 1024
+
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+
+    tts = CartesiaTTSService(
+        api_key=os.getenv("CARTESIA_API_KEY"),
+        settings=CartesiaTTSService.Settings(
+            voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+        ),
+    )
+
+    llm = GoogleLLMService(
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        settings=GoogleLLMService.Settings(
+            system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
+        ),
+    )
+
+    context = LLMContext(tools=[terminate_call])
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
+    audio_buffer = AudioBufferProcessor(buffer_size=audio_buffer_size)
+
+    # set up audio uploader to write to audio files to s3
+    audio_uploader = AudioUploader(
+        conversation_id, audio_buffer_size, "000000000000_test_conversations"
+    )
+
+    pipeline = Pipeline(
+        [
+            transport.input(),  # Transport user input
+            stt,  # STT
+            user_aggregator,  # User responses
+            llm,  # LLM
+            tts,  # TTS
+            transport.output(),  # Transport bot output
+            audio_buffer,  # collect all audio (user and bot)
+            assistant_aggregator,  # Assistant/bot spoken responses
+        ]
+    )
+
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+        idle_timeout_secs=idle_timeout_secs,
+    )
+
+    #############################
+    # audio_buffer event_handlers
+    # We show `"on_audio_data"` and `"on_track_audio_data"` examples here
+    # Only one event_handler is needed, but as many as all four event_handlers
+    # can be set. Find supported events here:
+    # https://github.com/pipecat-ai/pipecat/blob/main/src/pipecat/processors/audio/audio_buffer_processor.py#L42-L45
+
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.add_workers(worker)
+
+    # Triggered when buffer_size is reached, providing merged audio
+    @audio_buffer.event_handler("on_audio_data")
+    async def on_audio_data(buffer, audio, sample_rate, num_channels):
+        logger.info(f"`on_audio_data` event fired")
+        await audio_uploader.upload_audio_wav_to_s3(audio, sample_rate, num_channels)
+
+    # Triggered when buffer_size is reached, providing separate tracks
+    # One track for user audio; One track for bot audio
+    @audio_buffer.event_handler("on_track_audio_data")
+    async def on_track_audio_data(buffer, user_audio, bot_audio, sample_rate, num_channels):
+        logger.info(f"`on_track_audio_data` event fired")
+
+        await audio_uploader.upload_audio_wav_to_s3(bot_audio, sample_rate, num_channels, "bot")
+        await audio_uploader.upload_audio_wav_to_s3(user_audio, sample_rate, num_channels, "user")
+
+    #############################
+
+    @worker.rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        logger.info(f"Client ready")
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected")
+        # start recording audio
+        await audio_buffer.start_recording()
+        context.add_message(
+            {"role": "developer", "content": "Please introduce yourself to the user."}
+        )
+        await worker.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_left")
+    async def on_left(transport):
+        logger.info(f"Bot left the call")
+
+    @worker.event_handler("on_pipeline_finished")
+    async def on_pipeline_finished(worker, frame):
+        logger.info(f"Pipeline finished")
+        await audio_uploader.finalize_upload_audio_wav_to_s3()
+
+    await runner.run()
+
+
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point for the bot starter."""
+
+    transport_params = {
+        "daily": lambda: DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+        "webrtc": lambda: TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+    }
+
+    transport = await create_transport(runner_args, transport_params)
+
+    await run_bot(transport, runner_args)
+
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+
+    main()

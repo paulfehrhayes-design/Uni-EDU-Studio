@@ -1,0 +1,9 @@
+agent_name = "gemini-screen-ui-kit"
+secret_set = "gemini-screen-ui-kit-secrets"
+agent_profile = "agent-2x"
+
+[krisp_viva]
+	audio_filter = "tel"
+
+[scaling]
+	min_agents = 1

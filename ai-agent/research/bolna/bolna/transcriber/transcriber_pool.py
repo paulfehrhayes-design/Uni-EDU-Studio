@@ -1,0 +1,844 @@
+import asyncio
+import os
+import time
+from typing import Awaitable, Callable, Optional
+
+from bolna.helpers.logger_config import configure_logger
+from bolna.helpers.utils import create_ws_data_packet, process_task_cancellation
+from bolna.lid import LIDProvider
+
+logger = configure_logger(__name__)
+
+# Legacy-flow LID mode (only consulted when on_lid_switch is wired, i.e. the
+# LLM-driven switch flow is NOT enabled for this call).
+#   "shadow"  — log detections + suppressed_reason but never call on_lid_switch
+#   "active"  — live switching (opt-in)
+_LID_MODE = os.getenv("LID_MODE", "shadow").lower()
+
+
+# Providers bound single-frame duration; AssemblyAI rejects anything under 50ms.
+KEEPALIVE_SILENCE_MS = 100
+
+
+class TranscriberPool:
+    """
+    Holds multiple pre-warmed transcriber connections and routes audio to the active one.
+
+    Each transcriber gets its own private asyncio.Queue. An _audio_router task reads
+    from the shared input queue and forwards packets to whichever transcriber is
+    currently active. Standby transcribers receive periodic silence keepalives so
+    their provider connections stay alive for instant switching. On the way out, each
+    transcriber writes to its own private output queue and only the active one's
+    events reach the call (forward_leg_output).
+
+    Duck-types the single-transcriber interface so TaskManager needs no changes
+    in run()/finally.
+    """
+
+    # Interval between silence keepalives to standby transcribers (seconds).
+    # Deepgram closes connections after ~45s with no audio even when KeepAlive
+    # heartbeats are being sent, and sarvam saarika has been observed dropping
+    # standby sockets well under 10s (QA standbys died ~5-7s after pool start,
+    # before the first 10s keepalive ever fired).  4s with an immediate first
+    # round covers both.
+    _KEEPALIVE_INTERVAL = 4
+
+    # Cap on ACTIVE-transcriber-death reconnects (the loop-prone path) so a provider
+    # rejecting connections can't put the call in a reconnect loop. Switch-time
+    # reconnects are not gated by this — they're bounded by the number of switch
+    # decisions in the call — and only bump the reconnect_count telemetry total.
+    _MAX_RECONNECTS_PER_CALL = 5
+
+    # Lazy legs: how long closing a leg waits for its transcription task to end before reopening may proceed.
+    LEG_CLOSE_WAIT_S = 3.0
+
+    # ── Legacy LID heuristic defaults (flag-off flow only) ────────────────
+    # Require this many consecutive same-language detections before switching.
+    _LID_DEBOUNCE_COUNT = 1
+    # Minimum confidence score to accept a LID detection.
+    _LID_CONFIDENCE_THRESHOLD = 0.70
+    # Seconds to wait after a switch before accepting new LID signals.
+    _LID_COOLDOWN_S = 3.0
+
+    def __init__(
+        self,
+        transcribers,
+        shared_input_queue,
+        output_queue,
+        active_label,
+        multilingual_config,
+        lid_provider: str = None,
+        lid_config: dict = None,
+        on_lid_switch: Optional[Callable[..., Awaitable[None]]] = None,
+        lazy_legs: bool = False,
+    ):
+        """
+        Args:
+            transcribers: dict mapping label -> transcriber instance.
+                          Each instance already has its own private input_queue set.
+            shared_input_queue: the original audio_queue from TaskManager that
+                                receives raw audio packets from the input handler.
+            output_queue: the call's transcriber_output_queue. Each transcriber
+                          writes to its own private output queue; the pool forwards
+                          into this one.
+            active_label: which transcriber label should receive audio initially.
+            multilingual_config: raw multilingual config dict from task_config
+            lid_provider: "sarvam" | None (disables LID tap)
+            lid_config: extra config forwarded to the LID backend
+            on_lid_switch: LEGACY flow only — async callback(label, triggered_by)
+                           invoked when the per-segment LID heuristic confirms a
+                           switch (LID_MODE=active). When None (LLM-driven flow),
+                           the detector runs purely as an unbiased transcript
+                           source: it buffers recognition internally and
+                           TaskManager drains it per turn via take_lid_transcript().
+            lazy_legs: connect only the active leg; switch() opens the target and closes the leg it leaves.
+        """
+        self.transcribers = transcribers
+        self.shared_input_queue = shared_input_queue
+        self.output_queue = output_queue
+
+        if active_label not in self.transcribers:
+            raise ValueError(f"active_label '{active_label}' not in transcribers: {list(self.transcribers.keys())}")
+        self.active_label = active_label
+        self._router_task = None
+        self._keepalive_task = None
+        self.output_forwarder_tasks: list[asyncio.Task] = []
+        self._multilingual_config = multilingual_config
+        # Serializes switch() — it has an await (reconnecting a dropped standby)
+        # between reading and writing active_label, so concurrent switches (e.g.
+        # overlapping LLM switch_language cycles) could interleave. Mirrors the
+        # SynthesizerPool lock so transcriber/synthesizer stay consistent.
+        self.switch_lock = asyncio.Lock()
+
+        # ── Unbiased detector (LID tap) state ──────────────────────────────
+        self._lid_provider_name = lid_provider
+        self._lid_config = lid_config or {}
+        self._lid: Optional[object] = None  # LIDProvider instance
+        self._lid_feed_error_logged = False
+        self._detector_health_recorded = False
+        self._lid_task: Optional[asyncio.Task] = None
+        self._on_lid_switch = on_lid_switch
+        self._lid_mode = _LID_MODE
+        # Legacy-flow detection events (populated by _handle_lid_signal when
+        # on_lid_switch is wired). In the LLM-driven flow this stays empty —
+        # decisions are recorded via LanguageSwitcher logging +
+        # TaskManager.language_switch_events instead — but the key is kept for
+        # the task_output / DB shape that server.py persists.
+        self.lid_detection_events: list[dict] = []
+
+        # Legacy heuristic debounce/cooldown state.
+        self._lid_pending_lang: Optional[str] = None
+        self._lid_pending_count: int = 0
+        self._lid_last_switch_time: float = 0.0
+
+        # Map language ISO codes → transcriber labels (built from multilingual_config)
+        # e.g. {"hi": "hindi", "en": "english"}
+        self._lang_to_label: dict[str, str] = {}
+        if multilingual_config:
+            for label, cfg in multilingual_config.items():
+                lang = (cfg.get("language_code") or cfg.get("language") or label or "").lower()
+                short = lang.split("-")[0]
+                if short:
+                    self._lang_to_label[short] = label
+
+        # Counts how many times a standby transcriber was reconnected mid-call
+        # (e.g. provider inactivity timeout on a transcriber that never received audio).
+        # Telemetry total across BOTH switch-time and active-death reconnects.
+        self.reconnect_count: int = 0
+        # Separate budget for ACTIVE-transcriber-death reconnects (the loop-prone path:
+        # socket dies → listener reconnects → dies → ...). Kept distinct from switch-time
+        # reconnects so legitimate per-switch standby reconnects can't starve it and end
+        # an otherwise-healthy call on the first active death.
+        self.active_reconnect_count: int = 0
+
+        # Set when the input stream ends (eos packet from the telephony handler on
+        # user hangup / stop event). The active transcriber closing AFTER eos is the
+        # call's normal teardown trigger — reconnecting it then resurrects a zombie
+        # call (QA f544513a: 33 min of post-hangup switches, LLM replies to nobody,
+        # and sarvam connection churn).
+        self.call_ended: bool = False
+
+        self.lazy_legs = lazy_legs
+        always_connected = [label for label in transcribers if lazy_legs and not self.is_lazy(label)]
+        if always_connected:
+            logger.info(f"TranscriberPool: {always_connected} stay connected (cannot reopen mid-call)")
+        # Lazy legs whose connection has been started and not closed since.
+        self.open_labels: set[str] = set()
+        self.leg_opened_at: dict[str, float] = {}
+        self.leg_start_tasks: dict[str, asyncio.Task] = {}
+        self.leg_close_tasks: dict[str, asyncio.Task] = {}
+
+    # ------------------------------------------------------------------
+    # Properties that delegate to the active transcriber
+    # ------------------------------------------------------------------
+
+    @property
+    def connection_time(self):
+        return self.transcribers[self.active_label].connection_time
+
+    @property
+    def turn_latencies(self):
+        """Aggregate turn latencies from all transcribers, in true turn order.
+
+        Each per-language transcriber instance only accumulates the turns it was active
+        for, so after a mid-call language switch the turns are spread across instances.
+        Iterating by dict (label) order interleaves them out of turn order (e.g. a switch
+        produced turn_3 from the new instance before turn_1/turn_2 from the old one),
+        which mis-pairs the user transcript with the wrong agent turn downstream. Sort by
+        ASR start time so the latency dict always reflects the real conversation order.
+        """
+        all_latencies = []
+        for t in self.transcribers.values():
+            all_latencies.extend(t.turn_latencies)
+
+        # Order by ASR start (same-scale ms within a call). Relative keys exist only
+        def _order_key(d):
+            v = d.get("asr_turn_start_ms")
+            if v is None:
+                v = d.get("asr_start_ms")
+            if v is None:
+                v = d.get("asr_start_epoch_ms")
+            return v if v is not None else 0
+
+        all_latencies.sort(key=_order_key)
+        return all_latencies
+
+    @property
+    def labels(self):
+        return list(self.transcribers.keys())
+
+    def is_active_transcriber_alive(self):
+        """True if the active transcriber's provider connection is still usable."""
+        return self.transcribers[self.active_label].is_connected()
+
+    # ------------------------------------------------------------------
+    # Duck-typed interface
+    # ------------------------------------------------------------------
+
+    def get_meta_info(self):
+        return self.transcribers[self.active_label].get_meta_info()
+
+    def billed_audio_s(self):
+        return sum(transcriber.billed_audio_s() for transcriber in self.transcribers.values())
+
+    async def run(self):
+        """Start all transcribers, the audio router, standby keepalive, and LID tap."""
+        for label, transcriber in self.transcribers.items():
+            leg_queue = getattr(transcriber, "transcriber_output_queue", None)
+            # A leg already writing to the call's queue has nothing to forward (and would loop).
+            if leg_queue is not None and leg_queue is not self.output_queue:
+                self.output_forwarder_tasks.append(asyncio.create_task(self.forward_leg_output(label, leg_queue)))
+
+        for label, transcriber in self.transcribers.items():
+            if self.is_lazy(label) and label != self.active_label:
+                continue
+            logger.info(f"TranscriberPool: starting transcriber '{label}'")
+            await transcriber.run()
+        if self.is_lazy(self.active_label):
+            self.open_labels.add(self.active_label)
+
+        self._router_task = asyncio.create_task(self._audio_router())
+        # A lazy leg is never a connected standby, so only legs that stay connected need the keepalive.
+        if not all(self.is_lazy(label) for label in self.transcribers):
+            self._keepalive_task = asyncio.create_task(self._standby_keepalive())
+        logger.info(f"TranscriberPool: audio router started, active='{self.active_label}'")
+
+        # Start LID tap if configured
+        if self._lid_provider_name:
+            await self._start_lid_tap()
+
+    @staticmethod
+    def _silence_frame(encoding, sample_rate):
+        """Silence sized for the leg's own rate and encoding."""
+        samples = int(sample_rate * KEEPALIVE_SILENCE_MS / 1000)
+        if encoding == "mulaw":
+            return b"\xff" * samples
+        return b"\x00" * samples * 2
+
+    async def _audio_router(self):
+        """Read from the shared input queue, forward to active transcriber, and feed LID tap."""
+        try:
+            while True:
+                packet = await self.shared_input_queue.get()
+                meta = packet.get("meta_info") if isinstance(packet, dict) else None
+                if meta and meta.get("eos") is True:
+                    self.call_ended = True
+                    logger.info("TranscriberPool: eos received — call ended, reconnects disabled")
+                active = self.active_label
+                self.transcribers[active].input_queue.put_nowait(packet)
+
+                # Feed raw audio to LID tap (if running)
+                if self._lid is not None:
+                    audio_data = packet.get("data") if isinstance(packet, dict) else None
+                    if audio_data and isinstance(audio_data, bytes):
+                        try:
+                            self._lid.feed(audio_data)
+                        except Exception as e:
+                            # Was debug: a feed raising every chunk silently killed switching.
+                            if not self._lid_feed_error_logged:
+                                self._lid_feed_error_logged = True
+                                logger.warning(f"TranscriberPool: LID feed error: {e}")
+        except asyncio.CancelledError:
+            logger.info("TranscriberPool: audio router cancelled")
+
+    async def forward_leg_output(self, label, leg_queue):
+        """Pass one transcriber's events to the call only while it is the active one.
+
+        A transcriber switched away from mid-sentence still holds that sentence's undecoded audio,
+        and every keepalive silence frame advances it — it kept re-emitting interims of words the
+        caller already finished, which the call took as barge-ins on its own replies. A standby's
+        connection close is dropped too: while a transfer or goodbye is in progress the listener
+        ends the call on any close, and nothing needs one (switch() reconnects a dropped standby).
+        """
+        try:
+            while True:
+                packet = await leg_queue.get()
+                if label == self.active_label:
+                    self.output_queue.put_nowait(packet)
+                    continue
+                data = packet.get("data") if isinstance(packet, dict) else None
+                kind = data.get("type") if isinstance(data, dict) else data
+                logger.info(f"TranscriberPool: dropped standby '{label}' output ({kind}), active='{self.active_label}'")
+        except asyncio.CancelledError:
+            logger.info(f"TranscriberPool: output forwarder for '{label}' cancelled")
+
+    async def _standby_keepalive(self):
+        """Periodically send silence frames to standby transcribers.
+
+        Some providers (Deepgram) close WebSocket connections after ~45s of no
+        audio data even when KeepAlive heartbeats are being sent.  Feeding a
+        tiny silence frame keeps the provider-side session alive so switching
+        is instant.  The silence produces empty transcripts that are filtered
+        out by each transcriber's receiver (e.g. ``if transcript.strip()``).
+        """
+        try:
+            while True:
+                for label, transcriber in self.transcribers.items():
+                    if label == self.active_label:
+                        continue
+                    # Skip if this transcriber's connection already dropped —
+                    # reconnect-on-demand in switch() handles that case.
+                    if not transcriber.is_connected():
+                        continue
+                    encoding = getattr(transcriber, "encoding", "linear16")
+                    sample_rate = (
+                        getattr(transcriber, "sampling_rate", None) or getattr(transcriber, "sample_rate", None) or 8000
+                    )
+                    silence = self._silence_frame(encoding, int(sample_rate))
+                    # Tagged so the leg books it at its real 100 ms, not its telephony frame constant.
+                    transcriber.input_queue.put_nowait(
+                        {
+                            "data": silence,
+                            "meta_info": {},
+                            "keepalive": True,
+                        }
+                    )
+                # Sleep AFTER sending so the first keepalive round goes out
+                # immediately at pool start, not _KEEPALIVE_INTERVAL later.
+                await asyncio.sleep(self._KEEPALIVE_INTERVAL)
+        except asyncio.CancelledError:
+            logger.info("TranscriberPool: standby keepalive cancelled")
+
+    async def _start_lid_tap(self) -> None:
+        """Instantiate and connect the configured LID provider."""
+        try:
+            # LLM-driven flow (on_lid_switch=None): the detector runs as an unbiased
+            # transcript source only — it buffers recognition internally (drained
+            # per-turn via take_lid_transcript) and on_language stays unwired.
+            # Legacy flow: on_language feeds the per-segment debounce heuristic.
+            self._lid = LIDProvider.create(
+                provider=self._lid_provider_name,
+                on_language=self._handle_lid_signal if self._on_lid_switch is not None else None,
+                config=self._lid_config,
+            )
+            # New flow needs the per-turn buffer API; a backend without it goes silently
+            if self._on_lid_switch is None and not hasattr(self._lid, "take_turn_transcript"):
+                logger.error(
+                    f"TranscriberPool: LID provider '{self._lid_provider_name}' has no per-turn buffer API — "
+                    f"language switching will be INERT (no transcripts drained, no idle-flush). "
+                    f"Use LID_PROVIDER=sarvam or implement take_turn_transcript/buffer_age_seconds on this backend."
+                )
+            await self._lid.start()
+            logger.info(f"TranscriberPool: LID tap started (provider={self._lid_provider_name})")
+        except Exception as e:
+            logger.error(f"TranscriberPool: failed to start LID tap: {e}")
+            self._lid = None
+
+    def _record_lid_event(
+        self,
+        detected_lang: str,
+        confidence: float,
+        target_label: Optional[str],
+        would_switch: bool,
+        suppressed_reason: Optional[str],
+    ) -> None:
+        """Append a legacy-flow detection event to lid_detection_events.
+
+        Events are collected in-memory during the call and returned in task_output
+        so server.py can persist them in bulk — identical to how
+        function_tool_api_call_details works for tool_call_api_logs.
+        """
+        self.lid_detection_events.append(
+            {
+                "detected_lang": detected_lang,
+                "confidence": confidence,
+                "active_label": self.active_label,
+                "target_label": target_label,
+                "lid_mode": self._lid_mode,
+                "lid_provider": self._lid_provider_name,
+                "would_switch": would_switch,
+                "suppressed_reason": suppressed_reason,
+                "detected_at": time.time(),
+            }
+        )
+
+    async def _handle_lid_signal(self, lang: str, confidence: float) -> None:
+        """LEGACY flow: per-segment LID detection → debounced auto-switch.
+
+        Applies debounce (N consecutive same-language detections above threshold)
+        and cooldown (no switching within X seconds of the last switch).
+
+        In shadow mode (LID_MODE=shadow, the default): logs what would happen but
+        never calls on_lid_switch. In active mode: delegates the full transition
+        to on_lid_switch (TaskManager.switch_language), which owns transcriber +
+        synthesizer + system-prompt atomically — we do NOT call self.switch()
+        here, avoiding the double-switch race where the transcriber flips before
+        the synthesizer and prompt catch up.
+        """
+        if confidence is not None and confidence < self._LID_CONFIDENCE_THRESHOLD:
+            logger.debug(
+                f"TranscriberPool LID: {lang} conf={f'{confidence:.2f}' if confidence is not None else 'n/a'} below threshold — suppressed"
+            )
+            self._record_lid_event(lang, confidence, None, False, "low_confidence")
+            return
+
+        if lang not in self._lang_to_label:
+            logger.debug(
+                f"TranscriberPool LID: {lang} not in supported languages {list(self._lang_to_label.keys())} — ignored"
+            )
+            self._record_lid_event(lang, confidence, None, False, "unsupported_language")
+            return
+
+        logger.info(
+            f"TranscriberPool LID: {lang} conf={f'{confidence:.2f}' if confidence is not None else 'n/a'} (provider={self._lid_provider_name})"
+        )
+
+        active_cfg = self._multilingual_config.get(self.active_label, {})
+        active_lang = (
+            (active_cfg.get("language_code") or active_cfg.get("language") or self.active_label or "")
+            .split("-")[0]
+            .lower()
+        )
+        if lang == active_lang:
+            self._lid_pending_lang = None
+            self._lid_pending_count = 0
+            self._record_lid_event(lang, confidence, None, False, "already_active")
+            return
+
+        now = time.monotonic()
+        if now - self._lid_last_switch_time < self._LID_COOLDOWN_S:
+            logger.debug(f"TranscriberPool LID: cooldown active — suppressed {lang} (suppressed_reason=cooldown)")
+            self._record_lid_event(lang, confidence, self._lang_to_label[lang], False, "cooldown")
+            return
+
+        # Debounce accumulation
+        if lang == self._lid_pending_lang:
+            self._lid_pending_count += 1
+        else:
+            self._lid_pending_lang = lang
+            self._lid_pending_count = 1
+
+        logger.debug(
+            f"TranscriberPool LID: {lang} conf={f'{confidence:.2f}' if confidence is not None else 'n/a'} "
+            f"count={self._lid_pending_count}/{self._LID_DEBOUNCE_COUNT}"
+        )
+
+        if self._lid_pending_count < self._LID_DEBOUNCE_COUNT:
+            self._record_lid_event(lang, confidence, self._lang_to_label[lang], False, "debounce_pending")
+            return
+
+        target_label = self._lang_to_label[lang]
+
+        if target_label == self.active_label:
+            return
+
+        self._lid_pending_lang = None
+        self._lid_pending_count = 0
+
+        if self._lid_mode == "shadow":
+            logger.info(
+                f"TranscriberPool LID [shadow]: would switch {self.active_label} → {target_label} "
+                f"(lang={lang}, conf={f'{confidence:.2f}' if confidence is not None else 'n/a'}, suppressed_reason=shadow_mode)"
+            )
+            self._lid_last_switch_time = now
+            self._record_lid_event(
+                detected_lang=lang,
+                confidence=confidence,
+                target_label=target_label,
+                would_switch=False,
+                suppressed_reason="shadow_mode",
+            )
+            return
+
+        # Active mode — hand full transition to on_lid_switch so transcriber,
+        # synthesizer, and system-prompt all flip atomically.
+        logger.info(
+            f"TranscriberPool LID [active]: switching {self.active_label} → {target_label} "
+            f"(lang={lang}, conf={f'{confidence:.2f}' if confidence is not None else 'n/a'})"
+        )
+        self._lid_last_switch_time = now
+        self._record_lid_event(
+            detected_lang=lang,
+            confidence=confidence,
+            target_label=target_label,
+            would_switch=True,
+            suppressed_reason=None,
+        )
+        if self._on_lid_switch:
+            try:
+                await self._on_lid_switch(target_label, triggered_by="lid")
+            except Exception as e:
+                logger.error(f"TranscriberPool: on_lid_switch callback error: {e}")
+
+    def take_lid_transcript(self):
+        """Drain the unbiased detector's buffered transcript for the current turn.
+
+        Returns (transcript, detected_lang); ("", None) if no detector is running.
+        Called once per conversational turn by TaskManager.handle_language_switch.
+        """
+        if self._lid is None or not hasattr(self._lid, "take_turn_transcript"):
+            return "", None
+        return self._lid.take_turn_transcript()
+
+    def lid_buffer_age(self):
+        """Seconds since the detector last buffered a segment, or None if empty/absent.
+
+        Used by TaskManager's idle-flush watcher to detect speech the active (locked)
+        transcriber could not decode (buffered detector text but no main turn).
+        """
+        if self._lid is None or not hasattr(self._lid, "buffer_age_seconds"):
+            return None
+        return self._lid.buffer_age_seconds()
+
+    def lid_buffer_language(self):
+        """Latest detected language of the buffered detector speech (peek, no drain)."""
+        if self._lid is None or not hasattr(self._lid, "buffer_language"):
+            return None
+        return self._lid.buffer_language()
+
+    def lid_buffer_event(self):
+        """The detector's buffer event (set while undrained speech exists), or None."""
+        if self._lid is None or not hasattr(self._lid, "buffer_event"):
+            return None
+        return self._lid.buffer_event()
+
+    def lid_buffer_language_confidence(self):
+        """Detector's confidence for the buffered language (None if absent). Peek, no drain."""
+        if self._lid is None or not hasattr(self._lid, "buffer_language_confidence"):
+            return None
+        return self._lid.buffer_language_confidence()
+
+    def lid_buffer_segments(self):
+        """Per-segment detector detections [{lang, prob, text, audio_s}] (peek, no drain)."""
+        if self._lid is None or not hasattr(self._lid, "buffer_segments"):
+            return []
+        return self._lid.buffer_segments()
+
+    def lid_buffer_max_segment_seconds(self) -> float:
+        """Duration of the longest buffered detector segment (0.0 if absent)."""
+        if self._lid is None or not hasattr(self._lid, "buffer_max_segment_seconds"):
+            return 0.0
+        return self._lid.buffer_max_segment_seconds()
+
+    async def reconnect_active(self) -> bool:
+        """Reconnect the ACTIVE transcriber in place after its connection died.
+
+        Sarvam saarika drops sockets mid-call (observed 3-9s after a language
+        switch in QA, even with keepalives flowing) — without this, the pool's
+        'active transcriber closed → end call' policy hangs up an otherwise
+        healthy call. Audio queued in the transcriber's private input_queue
+        while the socket was down is flushed to the new connection.
+
+        Returns True on success; False if the call already ended, the reconnect
+        cap is hit, or the provider connection fails (caller should then end
+        the call).
+
+        Runs under switch_lock: it reads active_label and awaits run(), so without
+        the lock a concurrent switch() (which mutates active_label under the same
+        lock) could make us reconnect the wrong/standby transcriber.
+        """
+        async with self.switch_lock:
+            if self.call_ended:
+                # The active transcriber closed BECAUSE the input stream ended (eos on
+                # hangup) — this closure is the teardown trigger, not a socket fault.
+                logger.info("TranscriberPool: input stream ended (eos) — not reconnecting active transcriber")
+                return False
+            if self.active_reconnect_count >= self._MAX_RECONNECTS_PER_CALL:
+                logger.error(
+                    f"TranscriberPool: active-reconnect cap ({self._MAX_RECONNECTS_PER_CALL}) reached — "
+                    f"not reconnecting active '{self.active_label}'"
+                )
+                return False
+            active = self.transcribers[self.active_label]
+            # Stale error would ride the next close and end a recovered call.
+            active.connection_error = None
+            try:
+                await active.run()
+            except Exception as e:
+                logger.error(f"TranscriberPool: reconnect of active '{self.active_label}' failed: {e}")
+                return False
+            self.active_reconnect_count += 1
+            self.reconnect_count += 1
+            logger.info(
+                f"TranscriberPool: active transcriber '{self.active_label}' reconnected "
+                f"(active reconnect {self.active_reconnect_count}/{self._MAX_RECONNECTS_PER_CALL})"
+            )
+            return True
+
+    async def switch(self, label):
+        """Switch which transcriber receives audio.
+
+        This is atomic from the router's perspective — the next packet read
+        will go to the new transcriber.
+
+        If the target transcriber's connection has dropped (e.g. provider-side
+        inactivity timeout on a standby that never received audio), we
+        transparently reconnect it before routing audio to it.
+
+        Serialized by switch_lock so concurrent switches can't interleave across
+        the reconnect await and leave active_label inconsistent.
+        """
+        async with self.switch_lock:
+            # Re-check inside the lock — a switch we were queued behind may have
+            # already made this label active.
+            if label == self.active_label:
+                logger.info(f"TranscriberPool: already active on '{label}', no-op")
+                return
+
+            if label not in self.transcribers:
+                raise ValueError(f"Unknown transcriber label '{label}'. Available: {list(self.transcribers.keys())}")
+
+            old = self.active_label
+
+            # Reconnect if the target transcriber's connection has dropped — but never
+            # after eos: a switch decision landing post-hangup must not resurrect
+            # connections on a call that is tearing down.
+            target = self.transcribers[label]
+            if self.is_lazy(label) and label not in self.open_labels:
+                if self.call_ended:
+                    # Only the active leg can deliver the close that ends the call now; a leg that never opened
+                    # would never send one, and the call would wait for it forever.
+                    logger.info(f"TranscriberPool: input ended — not switching to closed leg '{label}'")
+                    return
+                # Closed by design rather than dropped: start it without waiting for the connect.
+                await self.open_leg(label)
+            # is_connected(), not the task: Azure never sets transcription_task, so the old probe
+            # read None and never reconnected a dropped standby here.
+            elif not target.is_connected() and not self.call_ended:
+                logger.info(f"TranscriberPool: transcriber '{label}' connection dropped, reconnecting")
+                target.connection_error = None
+                await target.run()
+                self.reconnect_count += 1
+
+            # Close the old leg's turn: a sentence it was cut off in must not survive to prefix the
+            # caller's words on a later switch back.
+            old_transcriber = self.transcribers[old]
+            discard_open_turn = getattr(old_transcriber, "discard_open_turn", None)
+            if discard_open_turn is not None:
+                await discard_open_turn()
+
+            # Re-checked after every await above (a pending close, a reopen, the finalize): eos that arrived meanwhile
+            # went to the old leg, and only it can deliver the close that ends the call.
+            if self.call_ended:
+                logger.info(f"TranscriberPool: input ended — keeping '{old}' active instead of switching to '{label}'")
+                return
+
+            # Carry turn_counter forward so the incoming transcriber continues
+            # the turn sequence rather than restarting from 0. The next speech
+            # event on the new transcriber will increment the counter normally.
+            # Not current_turn_id: a target handed an open turn never starts its own, and drops the
+            # caller's next utterance (the endpoint finds it already sent and emits only speech_ended).
+            inherited_turn_counter = getattr(old_transcriber, "turn_counter", 0)
+            if hasattr(target, "turn_counter"):
+                target.turn_counter = inherited_turn_counter
+
+            self.active_label = label
+            logger.info(f"TranscriberPool: switched {old} -> {label} (inherited turn_counter={inherited_turn_counter})")
+
+            if self.is_lazy(old):
+                self.close_leg_later(old)
+
+    def is_lazy(self, label):
+        """Lazy legs connect on a switch to them and close when the call leaves. A provider whose connect or close
+        blocks the event loop (reopens_mid_call False) would stall every call on the pod there, so it stays connected."""
+        return self.lazy_legs and getattr(self.transcribers[label], "reopens_mid_call", True)
+
+    async def open_leg(self, label):
+        """Start a lazy leg's connection and return at once; the router queues its audio until it is up."""
+        closing = self.leg_close_tasks.pop(label, None)
+        if closing is not None:
+            # The leg's previous connection is still shutting down; a new one must not race it on the same queues.
+            await closing
+        transcriber = self.transcribers[label]
+        stale = getattr(transcriber, "transcription_task", None)
+        if stale is not None and not stale.done():
+            # connection_on=True below would revive it next to the new connection, splitting the caller's audio.
+            await process_task_cancellation(stale, f"stale transcription task of '{label}'")
+        leg_queue = getattr(transcriber, "transcriber_output_queue", None)
+        if leg_queue is not None and leg_queue is not self.output_queue:
+            # What the closed connection left behind, its close event above all, must not reach the call now
+            # that this leg is about to be the active one.
+            while not leg_queue.empty():
+                leg_queue.get_nowait()
+        transcriber.connection_on = True
+        transcriber.connection_error = None
+        self.open_labels.add(label)
+        self.leg_opened_at[label] = time.monotonic()
+        self.leg_start_tasks[label] = asyncio.create_task(self.run_leg(label))
+        self.record_leg_event({"type": "leg_open", "component": "asr", "language": label, "reason": "switch"})
+
+    async def run_leg(self, label):
+        """run() in the background: Azure and Google connect inside it, which would hold up the switch."""
+        transcriber = self.transcribers[label]
+        try:
+            await transcriber.run()
+        except Exception as e:
+            logger.error(f"TranscriberPool: starting '{label}' failed: {e}")
+            transcriber.connection_error = str(e)
+            leg_queue = getattr(transcriber, "transcriber_output_queue", None)
+            if leg_queue is not None:
+                # The same signal a dying connection sends, so the call's usual recovery takes over.
+                leg_queue.put_nowait(create_ws_data_packet("transcriber_connection_closed", transcriber.closing_meta()))
+
+    def close_leg_later(self, label):
+        self.open_labels.discard(label)
+        self.leg_close_tasks[label] = asyncio.create_task(self.close_leg(label))
+
+    async def close_leg(self, label):
+        """Close a leg the call switched away from; it reopens through open_leg() on a switch back."""
+        transcriber = self.transcribers[label]
+        starting = self.leg_start_tasks.pop(label, None)
+        if starting is not None and not starting.done():
+            # A connect still in progress would come up after the close below and stay open.
+            await starting
+        try:
+            await transcriber.toggle_connection()
+        except Exception as e:
+            logger.warning(f"TranscriberPool: closing '{label}' failed: {e}")
+        task = getattr(transcriber, "transcription_task", None)
+        if task is not None and not task.done():
+            done, _ = await asyncio.wait({task}, timeout=self.LEG_CLOSE_WAIT_S)
+            if not done:
+                # Still connecting when toggle_connection ran (no socket to close yet) or stuck: once connected with
+                # no audio it would never notice connection_on and stay open, so end it here.
+                logger.warning(f"TranscriberPool: '{label}' still running after {self.LEG_CLOSE_WAIT_S}s — cancelling")
+                await process_task_cancellation(task, f"transcription task of '{label}'")
+        opened_at = self.leg_opened_at.pop(label, None)
+        self.record_leg_event(
+            {
+                "type": "leg_close",
+                "component": "asr",
+                "language": label,
+                "reason": "switched_away",
+                "open_s": round(time.monotonic() - opened_at, 3) if opened_at is not None else None,
+            }
+        )
+        logger.info(f"TranscriberPool: closed '{label}'")
+
+    def record_leg_event(self, event):
+        event["ts"] = time.time()
+        self.lid_detection_events.append(event)
+
+    def set_agent_context_source(self, source):
+        # Standbys too, so a language switch keeps the conversation context.
+        for transcriber in self.transcribers.values():
+            transcriber.set_agent_context_source(source)
+
+    async def toggle_connection(self):
+        """Stop all transcriber connections."""
+        for label, transcriber in self.transcribers.items():
+            logger.info(f"TranscriberPool: toggling connection for '{label}'")
+            await transcriber.toggle_connection()
+
+    def get_active_transcriber_info(self):
+        """Return metadata about the active transcriber (e.g. provider)."""
+        active_transcriber_cfg = self._multilingual_config.get(self.active_label, {})
+        info = {"provider": active_transcriber_cfg.get("provider", active_transcriber_cfg.get("model"))}
+
+        return info
+
+    def _record_detector_health(self):
+        """Record a detector_health event when the tap produced NOTHING while the caller spoke.
+
+        Silent-failure only: a dead tap fires no decides, so it writes no telemetry at all and
+        looks identical to a call where nobody switched (topaz 389b16aa/df3479eb/5b063ddd).
+        """
+        lid = self._lid
+        if lid is None or self._detector_health_recorded:
+            return
+        segments = getattr(lid, "segments_received", None)
+        if segments is None or segments > 0:
+            return
+        # Main-ASR turns prove the caller actually spoke — without this a silent call
+        # (nobody said anything) would be reported as a broken detector.
+        user_turns = getattr(self.transcribers.get(self.active_label), "turn_counter", 0) or 0
+        if user_turns < 1:
+            return
+        self._detector_health_recorded = True
+        self.lid_detection_events.append(
+            {
+                "type": "detector_health",
+                "ts": time.time(),
+                "provider": self._lid_provider_name,
+                "segments_received": 0,
+                "user_turns": user_turns,
+                "chunks_fed": getattr(lid, "chunks_fed", 0),
+                "chunks_dropped": getattr(lid, "chunks_dropped", 0),
+                "unknown_frames": getattr(lid, "unknown_frames", 0),
+                "ws_dead": bool(getattr(lid, "_dead", False)),
+                "reconnects": getattr(lid, "_reconnect_attempts", 0),
+            }
+        )
+        logger.warning(
+            f"TranscriberPool: LID tap produced NO segments across {user_turns} user turns "
+            f"(provider={self._lid_provider_name}, chunks_fed={getattr(lid, 'chunks_fed', 0)}, "
+            f"unknown_frames={getattr(lid, 'unknown_frames', 0)}) — language switching was inert"
+        )
+
+    def lid_audio_seconds(self) -> float | None:
+        """Detector usage: seconds of caller audio streamed to the LID tap, or None if no tap."""
+        lid = self._lid
+        if lid is None:
+            return None
+        return lid.audio_seconds_fed()
+
+    async def cleanup(self):
+        """Clean up all transcribers, cancel pool tasks, and stop LID tap."""
+        for task_name, task in [("router", self._router_task), ("keepalive", self._keepalive_task)]:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                logger.info(f"TranscriberPool: {task_name} task cancelled")
+        # The listener has exited by now, so nothing reads what a forwarder would still pass on.
+        for task in self.output_forwarder_tasks:
+            await process_task_cancellation(task, "transcriber output forwarder")
+        for task in [*self.leg_start_tasks.values(), *self.leg_close_tasks.values()]:
+            await process_task_cancellation(task, "transcriber leg start/close")
+
+        # Stop LID tap
+        if self._lid is not None:
+            self._record_detector_health()
+            try:
+                await self._lid.stop()
+                logger.info("TranscriberPool: LID tap stopped")
+            except Exception as e:
+                logger.warning(f"TranscriberPool: error stopping LID tap: {e}")
+
+        for label, transcriber in self.transcribers.items():
+            logger.info(f"TranscriberPool: cleaning up '{label}'")
+            await transcriber.cleanup()
+
+        logger.info("TranscriberPool: cleanup complete")

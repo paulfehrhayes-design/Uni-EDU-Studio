@@ -1,0 +1,5 @@
+agent_name = "plivo-chatbot-dial-out"
+secret_set = "plivo-chatbot"
+
+[scaling]
+	min_agents = 1

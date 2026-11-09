@@ -1,0 +1,1094 @@
+import json
+import annotated_types
+from typing import Annotated, Any, Literal, Optional, List, Union, Dict, Callable
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    field_validator,
+    ValidationError,
+    Json,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
+from .providers import *
+from .enums import (
+    TelephonyProvider,
+    SynthesizerProvider,
+    TranscriberProvider,
+    S2SProvider,
+    LLMProvider,
+    ReasoningEffort,
+    Verbosity,
+    ExpressionOperator,
+    ExpressionLogic,
+    EdgeConditionType,
+    EdgeOrder,
+    NodeType,
+    VariableType,
+)
+from .constants import (
+    AZURE_TTS_SPEED_MAX,
+    AZURE_TTS_SPEED_MIN,
+    CARTESIA_VOLUME_MAX,
+    CARTESIA_VOLUME_MIN,
+    DEEPGRAM_AURA_2_SPEED_MAX,
+    DEEPGRAM_AURA_2_SPEED_MIN,
+    ELEVENLABS_MAX_PRONUNCIATION_DICTIONARIES,
+    MODEL_REASONING_EFFORT_MAP,
+    RESERVED_LLM_REQUEST_KEYS,
+    RESERVED_TTS_REQUEST_KEYS,
+    OPENAI_TTS_SPEED_MAX,
+    OPENAI_TTS_SPEED_MIN,
+    PRONUNCIATION_RULE_SAY_AS_MAX_LENGTH,
+    PRONUNCIATION_RULE_WORD_MAX_LENGTH,
+    PRONUNCIATION_RULES_MAX,
+    RIME_TIME_SCALE_FACTOR_MAX,
+    RIME_TIME_SCALE_FACTOR_MIN,
+    SARVAM_LOUDNESS_MAX,
+    SARVAM_LOUDNESS_MIN,
+    SMALLEST_TTS_SPEED_MAX,
+    SMALLEST_TTS_SPEED_MIN,
+    TTS_AUDIO_SETTINGS,
+    TTS_CONTROL_MODEL_PREFIXES,
+    TTS_CONTROL_MODELS,
+    TTS_MODEL_CONTROL_LIMITS,
+)
+
+AGENT_WELCOME_MESSAGE = "This call is being recorded for quality assurance and training. Please speak now."
+
+# A message that is either a single string or a per-language {lang_code: text} map.
+LocalizedText = Union[str, Dict[str, str]]
+
+
+def validate_attribute(value, allowed_values, value_type="provider"):
+    if value not in allowed_values:
+        raise ValueError(f"Invalid value for {value_type}:'{value}' provided. Supported values: {allowed_values}.")
+    return value
+
+
+def validate_reasoning_effort_for_model(model: str, reasoning_effort: str) -> None:
+    if "gpt" not in model:
+        return
+
+    if "/" in model:
+        model = model.split("/")[-1]
+
+    supported = MODEL_REASONING_EFFORT_MAP.get(model, None)
+    if supported is not None and reasoning_effort not in supported:
+        raise ValueError(f"reasoning_effort '{reasoning_effort}' is not supported for model '{model}'.")
+
+
+def tts_control_applies(provider: str, key: str, model: Optional[str]) -> bool:
+    """Whether `model` takes the `key` provider_config control; one not listed per model applies to all."""
+    model = (model or "").lower()
+    models = TTS_CONTROL_MODELS.get(provider, {}).get(key)
+    prefixes = TTS_CONTROL_MODEL_PREFIXES.get(provider, {}).get(key)
+    if models is None and prefixes is None:
+        return True
+    return (models is not None and model in models) or (prefixes is not None and model.startswith(prefixes))
+
+
+def tts_control_limits(provider: str, key: str, model: Optional[str]) -> Optional[tuple]:
+    """The (min, max) `model` narrows `key` to, or None when the config field's own bounds apply."""
+    return TTS_MODEL_CONTROL_LIMITS.get(provider, {}).get((model or "").lower(), {}).get(key)
+
+
+def _tts_range_message(provider: str, key: str, low, high, model: Optional[str] = None) -> str:
+    scope = f"{provider.capitalize()} {model}" if model else provider.capitalize()
+    if low is None:
+        return f"{scope} {key} must be at most {high}"
+    if high is None:
+        return f"{scope} {key} must be at least {low}"
+    return f"{scope} {key} must be between {low} and {high}"
+
+
+def validate_tts_model_control_limits(provider: SynthesizerProvider, config: BaseModel) -> None:
+    for key, (low, high) in TTS_MODEL_CONTROL_LIMITS.get(provider, {}).get((config.model or "").lower(), {}).items():
+        value = getattr(config, key, None)
+        if value is not None and not low <= value <= high:
+            raise ValueError(_tts_range_message(provider.value, key, low, high, config.model))
+
+
+def tts_control_range(provider: str, key: str, model: Optional[str]) -> Optional[tuple]:
+    """The (min, max) bolna allows for provider_config.<key> on `model`: the model's own limit, else the
+    config field's ge/le (one side may be None). None when the provider's config has no bounded `key`."""
+    limits = tts_control_limits(provider, key, model)
+    if limits:
+        return limits
+    config_model = SYNTHESIZER_CONFIG_MODELS.get(provider)
+    config_field = config_model.model_fields.get(key) if config_model else None
+    if config_field is None:
+        return None
+    ge = next((m.ge for m in config_field.metadata if isinstance(m, annotated_types.Ge)), None)
+    le = next((m.le for m in config_field.metadata if isinstance(m, annotated_types.Le)), None)
+    return None if ge is None and le is None else (ge, le)
+
+
+def _render_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return f"{float(value):g}"
+    return str(value)
+
+
+def tts_render_settings(provider: str, provider_config: Optional[dict], exclude=()) -> str:
+    """The TTS_AUDIO_SETTINGS values in provider_config, as a stable string for audio cache keys.
+    Values at bolna's default are left out, so keys built before a setting was set still match."""
+    config_model = SYNTHESIZER_CONFIG_MODELS.get(provider)
+    if config_model is None or not isinstance(provider_config, dict):
+        return ""
+    settings = []
+    for key in sorted(TTS_AUDIO_SETTINGS.get(provider, frozenset()) - set(exclude)):
+        value = provider_config.get(key)
+        if value is None or value == "":
+            continue
+        config_field = config_model.model_fields.get(key)
+        default = config_field.default if config_field else None
+        rendered = _render_value(value)
+        if default is not None and rendered == _render_value(default):
+            continue
+        settings.append(f"{key}={rendered}")
+    return ",".join(settings)
+
+
+def _pronunciation_locators_error(locators) -> Optional[str]:
+    if locators is None:
+        return None
+    if not isinstance(locators, list):
+        return "ElevenLabs pronunciation_dictionary_locators must be a list"
+    if len(locators) > ELEVENLABS_MAX_PRONUNCIATION_DICTIONARIES:
+        return f"ElevenLabs accepts at most {ELEVENLABS_MAX_PRONUNCIATION_DICTIONARIES} pronunciation dictionaries"
+    for locator in locators:
+        if not (isinstance(locator, dict) and locator.get("pronunciation_dictionary_id") and locator.get("version_id")):
+            return "Each ElevenLabs pronunciation dictionary needs both pronunciation_dictionary_id and version_id"
+    return None
+
+
+def tts_provider_config_error(provider: str, provider_config: Optional[dict]) -> Optional[str]:
+    """Why a provider_config value is outside bolna's range for its model, or None when every value fits.
+
+    Checks each value on its own, so it works on a partial or per-language config that the provider's
+    config model would reject for missing fields. Building the config model enforces the same ranges."""
+    if not isinstance(provider_config, dict):
+        return None
+    if provider == SynthesizerProvider.ELEVENLABS.value:
+        locators_error = _pronunciation_locators_error(provider_config.get("pronunciation_dictionary_locators"))
+        if locators_error:
+            return locators_error
+    model = provider_config.get("model")
+    for key, value in provider_config.items():
+        bounds = tts_control_range(provider, key, model)
+        if bounds is None or value is None:
+            continue
+        low, high = bounds
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return f"{provider.capitalize()} {key} must be a number"
+        if (low is not None and number < low) or (high is not None and number > high):
+            per_model = tts_control_limits(provider, key, model) is not None
+            return _tts_range_message(provider, key, low, high, model if per_model else None)
+    return None
+
+
+class PollyConfig(BaseModel):
+    voice: str
+    engine: str
+    language: str
+    # volume: Optional[str] = '0dB'
+    # rate: Optional[str] = '100%'
+
+
+class PronunciationDictionaryLocator(BaseModel):
+    # The streaming socket requires both IDs, and every rule edit on ElevenLabs mints a new version.
+    pronunciation_dictionary_id: str = Field(min_length=1)
+    version_id: str = Field(min_length=1)
+
+
+class ElevenLabsConfig(BaseModel):
+    voice: str
+    voice_id: str
+    model: str
+    temperature: Optional[float] = Field(default=0.5, ge=0.0, le=1.0)
+    similarity_boost: Optional[float] = Field(default=0.75, ge=0.0, le=1.0)
+    speed: Optional[float] = Field(default=1.0, ge=0.7, le=1.2)
+    style: Optional[float] = Field(default=0.0, ge=0.0, le=1.0)
+    # Applied in order. Phoneme rules only take effect on eleven_flash_v2, eleven_v3 and eleven_v4.
+    pronunciation_dictionary_locators: Optional[List[PronunciationDictionaryLocator]] = Field(
+        default=None, max_length=ELEVENLABS_MAX_PRONUNCIATION_DICTIONARIES
+    )
+
+
+class OpenAIConfig(BaseModel):
+    voice: str
+    model: str
+    speed: Optional[float] = Field(default=1.0, ge=OPENAI_TTS_SPEED_MIN, le=OPENAI_TTS_SPEED_MAX)
+
+
+def _no_reserved_tts_keys(extra_body):
+    reserved = sorted(RESERVED_TTS_REQUEST_KEYS.intersection(extra_body))
+    if reserved:
+        raise ValueError(f"extra_body cannot override request fields: {', '.join(reserved)}")
+    return extra_body
+
+
+class CustomTTSConfig(OpenAIConfig):
+    # Merged into every speech request to the customer's server. Checked on the field's own type, so the
+    # agent PATCH, which validates field by field, enforces it too.
+    extra_body: Optional[Annotated[Dict[str, Any], AfterValidator(_no_reserved_tts_keys)]] = None
+
+
+class DeepgramConfig(BaseModel):
+    voice_id: str
+    voice: str
+    model: str
+    # Opt out of Deepgram's Model Improvement Program (zero retention after processing).
+    mip_opt_out: Optional[bool] = None
+    speed: Optional[float] = Field(
+        default=1.0,
+        ge=DEEPGRAM_AURA_2_SPEED_MIN,
+        le=DEEPGRAM_AURA_2_SPEED_MAX,
+    )
+
+
+class StandardVoiceConfig(BaseModel):
+    """The four fields every voice provider needs; extend it with provider-specific knobs."""
+
+    voice: str
+    voice_id: str
+    model: str
+    language: str
+
+
+class CartesiaConfig(StandardVoiceConfig):
+    speed: Optional[float] = Field(default=1.0, ge=0.6, le=1.5)
+    volume: Optional[float] = Field(default=1.0, ge=CARTESIA_VOLUME_MIN, le=CARTESIA_VOLUME_MAX)
+    # Sent on sonic-3 and newer only.
+    pronunciation_dict_id: Optional[str] = None
+    # Set on save from the customer's dictionary contents: Cartesia edits keep the ID, so cached clips key on this.
+    pronunciation_dict_fingerprint: Optional[str] = None
+
+
+class RimeConfig(StandardVoiceConfig):
+    time_scale_factor: Optional[float] = Field(
+        default=1.0,
+        ge=RIME_TIME_SCALE_FACTOR_MIN,
+        le=RIME_TIME_SCALE_FACTOR_MAX,
+    )
+
+
+class SmallestConfig(StandardVoiceConfig):
+    speed: Optional[float] = Field(default=1.0, ge=SMALLEST_TTS_SPEED_MIN, le=SMALLEST_TTS_SPEED_MAX)
+
+
+class SarvamConfig(StandardVoiceConfig):
+    speed: Optional[float] = Field(default=1.0, ge=0.3, le=3.0)
+    loudness: Optional[float] = Field(default=1.0, ge=SARVAM_LOUDNESS_MIN, le=SARVAM_LOUDNESS_MAX)
+
+    @model_validator(mode="after")
+    def validate_model_controls(self):
+        validate_tts_model_control_limits(SynthesizerProvider.SARVAM, self)
+        return self
+
+
+class PixaConfig(StandardVoiceConfig):
+    top_p: Optional[float] = 0.95
+    repetition_penalty: Optional[float] = 1.3
+
+
+class MayaConfig(BaseModel):
+    # "Ananya" (female) or "Arjun" (male) — the only two voices, both speak every language.
+    # Case-sensitive: Maya rejects "ananya" with a 400.
+    voice_id: str
+    voice: str
+    model: str
+    # One of hi/bn/gu/kn/ml/mr/or/pa/ta/te/en/auto. "en" is Indian English, "auto" lets Maya
+    # detect per utterance. Region-qualified codes ("en-IN") reduce to the primary subtag.
+    language: Optional[str] = "en"
+
+
+class KalpaConfig(BaseModel):
+    voice: str = "Arjun"
+    voice_id: Optional[str] = None
+    model: str = "kalpa-tts-1"
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=1.5)
+    acoustic_temperature: Optional[float] = Field(default=None, ge=0.0, le=1.5)
+    audio_quality: Optional[Literal["low", "medium", "high"]] = None
+    chunk_length_schedule: Optional[List[int]] = None
+
+
+class AzureConfig(BaseModel):
+    voice: str
+    model: str
+    language: str
+    speed: Optional[float] = Field(default=1.0, ge=AZURE_TTS_SPEED_MIN, le=AZURE_TTS_SPEED_MAX)
+
+
+class GeminiConfig(StandardVoiceConfig):
+    # voice_id holds the Gemini voice_name; style feeds structured speech_metadata.
+    style: Optional[str] = None
+
+
+class SonioxConfig(StandardVoiceConfig):
+    # `voice` carries a built-in voice name ("Adrian"); a cloned voice's id goes in voice_id.
+    speed: Optional[float] = Field(default=None, ge=0.7, le=1.3)
+    reduce_silence: Optional[bool] = None
+
+
+class NavanaConfig(StandardVoiceConfig):
+    # voice_id is the id Navana addresses ("default_female", or a cloned "cv_..."); every voice speaks
+    # every language. model is "navana-tts", or "navana-tts-fast" for the distilled model.
+    pass
+
+
+# The config class each provider's provider_config is validated against. Adding a provider means
+# one entry here.
+SYNTHESIZER_CONFIG_MODELS = {
+    SynthesizerProvider.POLLY.value: PollyConfig,
+    SynthesizerProvider.ELEVENLABS.value: ElevenLabsConfig,
+    SynthesizerProvider.OPENAI.value: OpenAIConfig,
+    SynthesizerProvider.DEEPGRAM.value: DeepgramConfig,
+    SynthesizerProvider.AZURETTS.value: AzureConfig,
+    SynthesizerProvider.CARTESIA.value: CartesiaConfig,
+    SynthesizerProvider.SMALLEST.value: SmallestConfig,
+    SynthesizerProvider.SARVAM.value: SarvamConfig,
+    SynthesizerProvider.RIME.value: RimeConfig,
+    SynthesizerProvider.PIXA.value: PixaConfig,
+    SynthesizerProvider.MAYA.value: MayaConfig,
+    SynthesizerProvider.KALPA.value: KalpaConfig,
+    SynthesizerProvider.GEMINI.value: GeminiConfig,
+    SynthesizerProvider.SONIOX.value: SonioxConfig,
+    SynthesizerProvider.NAVANA.value: NavanaConfig,
+    SynthesizerProvider.CUSTOM.value: CustomTTSConfig,
+}
+
+
+class AssemblyAITranscriberConfig(BaseModel):
+    """AssemblyAI streaming session parameters; an unset field keeps AssemblyAI's default."""
+
+    mode: Optional[Literal["min_latency", "balanced", "max_accuracy"]] = None
+    min_turn_silence: Optional[int] = Field(default=None, ge=0)
+    max_turn_silence: Optional[int] = Field(default=None, ge=0)
+    interruption_delay: Optional[int] = Field(default=None, ge=0, le=1000)
+    vad_threshold: Optional[float] = Field(default=None, ge=0, le=1)
+    voice_focus: Optional[Literal["near-field", "far-field"]] = None
+    voice_focus_threshold: Optional[float] = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_voice_focus_threshold(self):
+        if self.voice_focus_threshold is not None and self.voice_focus is None:
+            raise ValueError("voice_focus_threshold requires voice_focus")
+        return self
+
+
+class Transcriber(BaseModel):
+    model: Optional[str] = "nova-2"
+    language: Optional[str] = None
+    stream: bool = False
+    sampling_rate: Optional[int] = 16000
+    encoding: Optional[str] = "linear16"
+    endpointing: Optional[int] = 500
+    keywords: Optional[str] = None
+    # Free-form ASR biasing text.
+    context: Optional[str] = None
+    task: Optional[str] = "transcribe"
+    provider: Optional[str] = "deepgram"
+    multilingual: Optional[Dict[str, Any]] = None
+    active: Optional[str] = None
+    # Per-call self-hosted Deepgram endpoint override; unset falls back to DEEPGRAM_HOST* env.
+    deepgram_host: Optional[str] = None
+    deepgram_flux_host: Optional[str] = None
+    deepgram_host_protocol: Optional[str] = None
+    # Opt out of Deepgram's Model Improvement Program (zero retention after processing).
+    mip_opt_out: Optional[bool] = None
+    # Flux model parameters
+    eot_threshold: Optional[float] = None
+    eager_eot_threshold: Optional[float] = None
+    eot_timeout_ms: Optional[int] = None
+    language_hints: Optional[List[str]] = None
+    hinglish_mode: Optional[bool] = False
+    delay: Optional[str] = "medium"
+    noise_reduction: Optional[bool] = False
+    vad_threshold: Optional[float] = 0.5
+    vad_prefix_padding_ms: Optional[int] = 300
+    assemblyai_config: Optional[AssemblyAITranscriberConfig] = None
+
+    @field_validator("provider")
+    def validate_model(cls, value):
+        return validate_attribute(value, TranscriberProvider.all_values())
+
+
+class PronunciationRule(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    word: str = Field(min_length=1, max_length=PRONUNCIATION_RULE_WORD_MAX_LENGTH)
+    say_as: str = Field(min_length=1, max_length=PRONUNCIATION_RULE_SAY_AS_MAX_LENGTH)
+
+
+def unique_pronunciation_words(rules):
+    seen = set()
+    for rule in rules or []:
+        word = rule.word.casefold()
+        if word in seen:
+            raise ValueError(f"Pronunciation rule for '{rule.word}' is listed more than once.")
+        seen.add(word)
+    return rules
+
+
+# One voice's word list, wherever it is declared, so every list follows the same limits.
+PronunciationRules = Annotated[
+    List[PronunciationRule], Field(max_length=PRONUNCIATION_RULES_MAX), AfterValidator(unique_pronunciation_words)
+]
+
+
+class Synthesizer(BaseModel):
+    provider: str
+    # Derived from the registry so a provider registered there is always accepted here.
+    provider_config: Union[tuple(SYNTHESIZER_CONFIG_MODELS.values())] = Field(union_mode="smart")
+    stream: bool = False
+    buffer_size: Optional[int] = 40  # 40 characters in a buffer
+    audio_format: Optional[str] = "pcm"
+    caching: Optional[bool] = True
+    # Word -> say-as pairs to build a provider dictionary from; synthesis applies dictionaries by ID only.
+    pronunciation_rules: Optional[PronunciationRules] = None
+
+    @model_validator(mode="before")
+    def preprocess(cls, values):
+        provider = values.get("provider")
+        config = values.get("provider_config", {})
+
+        if not isinstance(config, dict):
+            return values
+
+        if provider == SynthesizerProvider.ELEVENLABS.value and (not config.get("voice") or not config.get("voice_id")):
+            raise ValueError("ElevenLabs config requires both 'voice' and 'voice_id'.")
+
+        config_model = SYNTHESIZER_CONFIG_MODELS.get(provider)
+        if config_model:
+            values["provider_config"] = config_model(**config)
+
+        return values
+
+    @field_validator("provider")
+    def validate_model(cls, value):
+        return validate_attribute(value, SynthesizerProvider.all_values())
+
+
+class IOModel(BaseModel):
+    provider: str
+    format: Optional[str] = "wav"
+
+    @field_validator("provider")
+    def validate_provider(cls, value):
+        return validate_attribute(value, TelephonyProvider.all_values())
+
+
+class MongoDBProviderConfig(BaseModel):
+    connection_string: Optional[str] = None
+    db_name: Optional[str] = None
+    collection_name: Optional[str] = None
+    index_name: Optional[str] = None
+    llm_model: Optional[str] = "gpt-3.5-turbo"
+    embedding_model: Optional[str] = "text-embedding-3-small"
+    embedding_dimensions: Optional[int] = 256
+
+
+class RerankerConfig(BaseModel):
+    """Configuration for document reranking in RAG systems."""
+
+    enabled: bool = False
+    model_type: str = "minilm-l6-v2"  # bge-base, bge-large, bge-multilingual, minilm-l6-v2
+    candidate_count: int = 20  # How many candidates to retrieve before reranking
+    final_count: int = 5  # Final number of results to return after reranking
+
+    @field_validator("model_type")
+    def validate_reranker_model(cls, value):
+        allowed_models = ["bge-base", "bge-large", "bge-multilingual", "minilm-l6-v2"]
+        if value not in allowed_models:
+            raise ValueError(f"Invalid reranker model: '{value}'. Supported models: {allowed_models}")
+        return value
+
+    @field_validator("candidate_count")
+    def validate_candidate_count(cls, value):
+        if value < 1 or value > 100:
+            raise ValueError("candidate_count must be between 1 and 100")
+        return value
+
+    @field_validator("final_count")
+    def validate_final_count(cls, value):
+        if value < 1 or value > 50:
+            raise ValueError("final_count must be between 1 and 50")
+        return value
+
+
+class LanceDBProviderConfig(BaseModel):
+    # extra="allow" keeps call-time enrichment fields (chunk_size, overlapping) that the
+    # backend injects into provider_config before sending the config to the engine.
+    model_config = {"extra": "allow"}
+
+    vector_id: Optional[str] = None
+    vector_ids: Optional[List[str]] = None
+    similarity_top_k: Optional[int] = 5
+    score_threshold: Optional[float] = 0.1
+    reranker: Optional[RerankerConfig] = RerankerConfig()  # Default to disabled reranker
+
+    @model_validator(mode="after")
+    def require_vector_identifier(self):
+        if not self.vector_id and not self.vector_ids:
+            raise ValueError("Either vector_id or vector_ids must be provided")
+        return self
+
+
+class VectorStore(BaseModel):
+    provider: str
+    provider_config: Union[LanceDBProviderConfig, MongoDBProviderConfig] = Field(union_mode="left_to_right")
+
+
+class UsedSource(BaseModel):
+    rag_id: Optional[str] = None
+    vector_id: Optional[str] = None
+    source: Optional[str] = None
+
+
+class RagConfig(BaseModel):
+    """Canonical knowledge-base config shared by the knowledgebase agent, graph agents
+    (global) and graph nodes. used_sources is populated server-side at call time.
+    """
+
+    # extra="allow" preserves server-injected enrichment keys and any node-level extras.
+    model_config = {"extra": "allow"}
+
+    vector_store: VectorStore
+    similarity_top_k: Optional[int] = None
+    used_sources: Optional[List[UsedSource]] = None
+
+
+class Llm(BaseModel):
+    model: Optional[str] = "gpt-3.5-turbo"
+    max_tokens: Optional[int] = 100
+    family: Optional[str] = "openai"
+    temperature: Optional[float] = 0.1
+    request_json: Optional[bool] = False
+    stop: Optional[List[str]] = None
+    top_k: Optional[int] = 0
+    top_p: Optional[float] = 0.9
+    min_p: Optional[float] = 0.1
+    frequency_penalty: Optional[float] = 0.0
+    presence_penalty: Optional[float] = 0.0
+    provider: Optional[str] = "openai"
+    base_url: Optional[str] = None
+    reasoning_effort: Optional[ReasoningEffort] = None
+    verbosity: Optional[Verbosity] = None
+    use_responses_api: Optional[bool] = False
+    compact_threshold: Optional[int] = None
+    extra_body: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def validate_reasoning_effort_for_model(self):
+        if self.reasoning_effort is not None and self.model is not None:
+            effort_value = self.reasoning_effort.value
+            validate_reasoning_effort_for_model(self.model, effort_value)
+        return self
+
+    @model_validator(mode="after")
+    def validate_extra_body(self):
+        if not self.extra_body:
+            return self
+        if self.provider != LLMProvider.CUSTOM.value:
+            raise ValueError("extra_body is only supported for custom LLM providers")
+        reserved = sorted(RESERVED_LLM_REQUEST_KEYS.intersection(self.extra_body))
+        if reserved:
+            raise ValueError(f"extra_body cannot override request fields: {', '.join(reserved)}")
+        return self
+
+
+class SimpleLlmAgent(Llm):
+    agent_flow_type: Optional[str] = "streaming"  # It is used for backwards compatibility
+    extraction_details: Optional[str] = None
+    summarization_details: Optional[str] = None
+
+
+class Node(BaseModel):
+    id: str
+    type: str  # Can be router or conversation for now
+    llm: Llm
+    exit_criteria: str
+    exit_response: Optional[str] = None
+    exit_prompt: Optional[str] = None
+    is_root: Optional[bool] = False
+
+
+class Edge(BaseModel):
+    start_node: str  # Node ID
+    end_node: str
+    condition: Optional[tuple] = None  # extracted value from previous step and it's value
+
+
+class LlmAgentGraph(BaseModel):
+    nodes: List[Node]
+    edges: List[Edge]
+
+
+class ExpressionCondition(BaseModel):
+    variable: str  # dot-notation key, e.g. "detected_language" or "recipient_data.timezone"
+    operator: ExpressionOperator
+    value: Optional[Any] = None
+
+
+class ExpressionGroup(BaseModel):
+    logic: ExpressionLogic = ExpressionLogic.AND
+    conditions: List[ExpressionCondition] = Field(default_factory=list)
+
+
+class CallEvent(BaseModel):
+    """Incoming external event payload."""
+
+    event: str
+    properties: Optional[Dict[str, Any]] = None
+    timestamp: Optional[float] = None
+
+
+class GraphEdgeParameter(BaseModel):
+    """A value an edge collects. description and allowed_values are what the routing model sees on the key."""
+
+    type: str = "string"
+    description: Optional[str] = None
+    allowed_values: Optional[List[str]] = None
+
+    @model_validator(mode="after")
+    def validate_allowed_values(self):
+        if self.allowed_values is None:
+            return self
+        if self.type != "string":
+            raise ValueError("allowed_values is only supported on string parameters")
+        if not self.allowed_values:
+            raise ValueError("allowed_values must list at least one value")
+        return self
+
+
+# Names the routing call or the agent's context_data already use: a parameter with one of these
+# names would lose its value or overwrite theirs. Names starting with "_" are internal state.
+RESERVED_EDGE_PARAMETER_NAMES = frozenset({"reasoning", "confidence", "recipient_data", "detected_language"})
+
+# Discriminated so an invalid definition reports its own error, not also "Input should be a valid string".
+GraphEdgeParameterSpec = Annotated[
+    Union[Annotated[str, Tag("type")], Annotated[GraphEdgeParameter, Tag("definition")]],
+    Discriminator(lambda value: "type" if isinstance(value, str) else "definition"),
+]
+
+
+class GraphEdge(BaseModel):
+    """Edge definition for graph-based conversation flow.
+
+    Each edge represents a possible transition from the current node.
+    The LLM will call the transition function when the condition is met.
+    """
+
+    to_node_id: str
+    condition: str = ""  # Human-readable description of when to transition
+    label: Optional[str] = None
+    condition_type: Optional[EdgeConditionType] = None  # None → "llm" (backward compat)
+    expression: Optional[ExpressionGroup] = None  # required when condition_type == "expression"
+    event_name: Optional[str] = None  # Matches CallEvent.event when condition_type="event"
+    # Function definition for LLM to call (auto-generated if not provided)
+    function_name: Optional[str] = None  # e.g., "go_to_city_question"
+    function_description: Optional[str] = None  # Detailed description for LLM
+    # Optional parameters to collect during transition
+    # Name -> type, e.g. {"city": "string"}, or name -> GraphEdgeParameter for a per-key definition.
+    parameters: Optional[Dict[str, GraphEdgeParameterSpec]] = None
+    # lower = evaluated first within a tier; across intent and expression only on an edge_order "priority" node.
+    # Defaults: expression/unconditional=0, llm=100
+    priority: Optional[int] = None
+
+    @field_validator("parameters")
+    @classmethod
+    def validate_parameter_names(cls, parameters):
+        for name in parameters or {}:
+            if name in RESERVED_EDGE_PARAMETER_NAMES or name.startswith("_"):
+                raise ValueError(f'Edge parameter "{name}" is a reserved name; rename it.')
+        return parameters
+
+
+class GraphNodeLlmOverride(BaseModel):
+    """Per-node conversation LLM settings. Every field None inherits the agent-level value.
+
+    Mirrors the "LLM overrides" controls in the graph editor's node inspector. Without this declared,
+    the whole object was an unknown key and Pydantic's default extra="ignore" dropped it on save.
+    """
+
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    reasoning_effort: Optional[ReasoningEffort] = None
+
+    @model_validator(mode="after")
+    def validate_effort_for_model(self):
+        # Only checkable when the node names its own model; otherwise the effort rides whatever the
+        # agent-level model is, which GraphAgentConfig validates.
+        if self.reasoning_effort is not None and self.model:
+            validate_reasoning_effort_for_model(self.model, self.reasoning_effort.value)
+        return self
+
+
+class GraphNode(BaseModel):
+    id: str
+    description: Optional[str] = None
+    node_type: NodeType = NodeType.LLM
+    prompt: str = ""
+    static_message: Optional[LocalizedText] = None
+    repeat_after_silence_seconds: Optional[float] = None
+    # Per-node override of ConversationConfig.number_of_words_for_interruption; None inherits it.
+    number_of_words_for_interruption: Optional[int] = None
+    # Per-node conversation LLM (the model that speaks); None inherits the agent's.
+    llm_config: Optional[GraphNodeLlmOverride] = None
+    # Per-node routing model, served on the agent's routing provider and credentials; None inherits.
+    routing_model: Optional[str] = None
+    # Per-node routing effort; None inherits the agent's routing_reasoning_effort.
+    routing_reasoning_effort: Optional[ReasoningEffort] = None
+    # None routes tiered.
+    edge_order: Optional[EdgeOrder] = None
+    examples: Optional[Dict[str, str]] = None
+    edges: List[GraphEdge] = Field(default_factory=list)
+    function_call: Optional[str] = None
+    completion_check: Optional[Callable[[List[dict]], bool]] = None
+    rag_config: Optional[RagConfig] = None
+
+    @model_validator(mode="after")
+    def validate_routing_effort_for_model(self):
+        if self.routing_reasoning_effort is not None and self.routing_model:
+            validate_reasoning_effort_for_model(self.routing_model, self.routing_reasoning_effort.value)
+        return self
+
+    @model_validator(mode="after")
+    def validate_router_node(self):
+        """A router node dispatches silently: it never speaks and must have a
+        catch-all so it always advances."""
+        if self.node_type != NodeType.ROUTER:
+            return self
+
+        if self.prompt or self.static_message:
+            raise ValueError(f"Router node '{self.id}' must not set a prompt or static_message; it never speaks.")
+
+        for edge in self.edges:
+            if edge.condition_type == EdgeConditionType.EVENT:
+                raise ValueError(
+                    f"Router node '{self.id}' edge to '{edge.to_node_id}' cannot be an event edge; "
+                    f"a call never rests on a router, so event edges there would never fire."
+                )
+
+        if not any(edge.condition_type == EdgeConditionType.UNCONDITIONAL for edge in self.edges):
+            raise ValueError(
+                f"Router node '{self.id}' must have one unconditional catch-all edge so it always advances."
+            )
+        return self
+
+
+class GraphAgentConfig(Llm):
+    agent_information: str
+    nodes: List[GraphNode]
+    current_node_id: str
+    context_data: Optional[dict] = None
+    # Variable path -> declared type, used to coerce expression-routing comparisons into
+    # the right domain. Keys match the condition's variable exactly (e.g. "recipient_data.age").
+    variable_types: Optional[Dict[str, VariableType]] = None
+    # Global knowledge base. Nodes without their own rag_config fall back to this at retrieval time.
+    rag_config: Optional[RagConfig] = None
+    # Routing configuration
+    routing_model: Optional[str] = None  # Model for routing decisions (default: same as main model)
+    routing_provider: Optional[str] = None  # Provider for routing (e.g., "groq" for fast inference)
+    routing_instructions: Optional[str] = None  # Custom instructions for routing LLM
+    routing_reasoning_effort: Optional[ReasoningEffort] = (
+        None  # GPT-5 reasoning effort: "minimal", "low", "medium", "high"
+    )
+    routing_max_tokens: Optional[int] = None  # Max tokens for routing response
+
+    @model_validator(mode="after")
+    def validate_routing_reasoning_effort_for_model(self):
+        if self.routing_reasoning_effort is not None:
+            effort_value = self.routing_reasoning_effort.value
+            # Use routing_model if set, otherwise fall back to the main model
+            target_model = self.routing_model or self.model
+            if target_model is not None:
+                validate_reasoning_effort_for_model(target_model, effort_value)
+        return self
+
+    @model_validator(mode="after")
+    def validate_router_graph(self):
+        """Router edges must target existing nodes and routers must not cycle; either would
+        leave the chain unable to reach a speaking node. Chained intent routers are allowed
+        (each makes its own routing call, a latency tradeoff, not a correctness one)."""
+        router_nodes = [n for n in self.nodes if n.node_type == NodeType.ROUTER]
+        if not router_nodes:
+            return self
+
+        node_ids = {n.id for n in self.nodes}
+        for node in router_nodes:
+            for edge in node.edges:
+                if edge.to_node_id not in node_ids:
+                    raise ValueError(f"Router node '{node.id}' routes to unknown node '{edge.to_node_id}'.")
+
+        router_ids = {n.id for n in router_nodes}
+        adjacency = {n.id: [e.to_node_id for e in n.edges if e.to_node_id in router_ids] for n in router_nodes}
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {rid: WHITE for rid in router_ids}
+
+        def has_cycle(rid):
+            color[rid] = GRAY
+            for nxt in adjacency.get(rid, []):
+                if color[nxt] == GRAY or (color[nxt] == WHITE and has_cycle(nxt)):
+                    return True
+            color[rid] = BLACK
+            return False
+
+        for rid in router_ids:
+            if color[rid] == WHITE and has_cycle(rid):
+                raise ValueError(
+                    f"Router nodes form a cycle involving '{rid}'; a router chain must terminate at a non-router node."
+                )
+        return self
+
+
+class KnowledgeAgentConfig(Llm):
+    agent_information: Optional[str] = "Knowledge-based AI assistant"
+    prompt: Optional[str] = None
+    rag_config: Optional[Dict] = None
+    llm_provider: Optional[str] = "openai"
+    context_data: Optional[dict] = None
+
+
+class AgentRouteConfig(BaseModel):
+    utterances: List[str]
+    threshold: Optional[float] = 0.85
+
+
+class MultiAgent(BaseModel):
+    agent_map: Dict[str, Union[Llm]]
+    agent_routing_config: Dict[str, AgentRouteConfig]
+    default_agent: str
+    embedding_model: Optional[str] = "Snowflake/snowflake-arctic-embed-l"
+
+
+class KnowledgebaseAgent(Llm):
+    vector_store: VectorStore
+    provider: Optional[str] = "openai"
+    model: Optional[str] = "gpt-3.5-turbo"
+
+
+class LlmAgent(BaseModel):
+    agent_flow_type: str
+    agent_type: str
+    llm_config: Union[
+        KnowledgebaseAgent, LlmAgentGraph, MultiAgent, SimpleLlmAgent, GraphAgentConfig, KnowledgeAgentConfig
+    ]
+
+    @field_validator("llm_config", mode="before")
+    def validate_llm_config(cls, value, info):
+        agent_type = info.data.get("agent_type")
+
+        valid_config_types = {
+            "knowledgebase_agent": KnowledgeAgentConfig,
+            "graph_agent": GraphAgentConfig,
+            "llm_agent_graph": LlmAgentGraph,
+            "multiagent": MultiAgent,
+            "simple_llm_agent": SimpleLlmAgent,
+        }
+
+        if agent_type not in valid_config_types:
+            raise ValueError(f"Unsupported agent_type: {agent_type}")
+
+        expected_type = valid_config_types[agent_type]
+
+        if not isinstance(value, dict):
+            raise ValueError(f"llm_config must be a dict, got {type(value)}")
+
+        try:
+            return expected_type(**value)
+        except Exception as e:
+            raise ValueError(f"Failed to create {expected_type.__name__} from llm_config: {str(e)}")
+
+
+class ToolFunction(BaseModel):
+    name: str
+    description: str
+    parameters: Dict
+    strict: bool = True
+
+
+class ToolDescription(BaseModel):
+    type: str = "function"
+    function: ToolFunction
+
+
+class ToolDescriptionLegacy(BaseModel):
+    name: str
+    description: str
+    parameters: Dict
+
+
+from bolna.llms.types import APIParams  # noqa: E402 — canonical definition in llms/types.py
+
+
+class ToolModel(BaseModel):
+    tools: Optional[Union[str, List[Union[ToolDescription, ToolDescriptionLegacy]]]] = None
+    tools_params: Dict[str, APIParams]
+
+
+class OpenAIRealtimeConfig(BaseModel):
+    model: str = "gpt-realtime-2.1"
+    voice: str = "marin"
+    # Playback rate (0.25 to 1.5), not how the reply is worded.
+    speed: Optional[float] = 1.0
+    # semantic_vad scores whether the caller has actually finished from what they said, so
+    # it waits longer on a trailing "ummm" than on a finished sentence. That is the job the
+    # llm pipeline does with a word count and a phrase list, done by a model instead.
+    turn_detection_type: str = "semantic_vad"
+    # auto | low | medium | high. Lower gives the caller longer before the model takes over.
+    eagerness: Optional[str] = "auto"
+    # server_vad only; ignored under semantic_vad.
+    vad_threshold: Optional[float] = 0.5
+    vad_silence_duration_ms: Optional[int] = 500
+    vad_prefix_padding_ms: Optional[int] = 300
+    reasoning_effort: Optional[ReasoningEffort] = None
+    max_output_tokens: Optional[int] = None
+    transcription_model: Optional[str] = "gpt-4o-mini-transcribe"
+    language: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_reasoning(self):
+        if self.reasoning_effort:
+            if self.model not in MODEL_REASONING_EFFORT_MAP:
+                raise ValueError(f"reasoning_effort is not supported for realtime model '{self.model}'.")
+            validate_reasoning_effort_for_model(self.model, self.reasoning_effort.value)
+        return self
+
+
+class GeminiLiveConfig(BaseModel):
+    model: str = "gemini-3.1-flash-live-preview"
+    voice: str = "Kore"
+    language: Optional[str] = None
+    temperature: Optional[float] = None
+    start_sensitivity: Optional[str] = None
+    end_sensitivity: Optional[str] = None
+    # Gemini's guide puts the usable band at 500-800ms: below it utterances fragment and
+    # transcription quality drops, above it the caller waits on every reply.
+    vad_silence_duration_ms: Optional[int] = 600
+    vad_prefix_padding_ms: Optional[int] = None
+    # Gemini closes an audio session at ~15 minutes, so both stay on unless explicitly disabled.
+    enable_session_resumption: bool = True
+    enable_context_compression: bool = True
+
+
+S2S_PROVIDER_CONFIGS = {
+    S2SProvider.OPENAI_REALTIME.value: OpenAIRealtimeConfig,
+    S2SProvider.GEMINI_LIVE.value: GeminiLiveConfig,
+}
+
+
+class S2SConfig(BaseModel):
+    provider: str
+    provider_config: Union[OpenAIRealtimeConfig, GeminiLiveConfig]
+    # Suppresses inbound audio while the agent opens, so its own greeting cannot trip provider VAD.
+    welcome_audio_gate_ms: int = 1500
+
+    @model_validator(mode="before")
+    def preprocess(cls, values):
+        if not isinstance(values, dict):
+            return values
+        provider = values.get("provider")
+        validate_attribute(provider, S2SProvider.all_values())
+        config = values.get("provider_config") or {}
+        if isinstance(config, BaseModel):
+            config = config.model_dump()
+        values["provider_config"] = S2S_PROVIDER_CONFIGS[provider](**config)
+        return values
+
+
+class WebSearchConfig(BaseModel):
+    enabled: bool = False
+    provider: Literal["openai", "firecrawl", "exa", "parallel"] = "openai"
+    api_key: Optional[str] = None
+    max_results: int = Field(default=3, ge=1, le=10)
+    max_snippet_chars: int = Field(default=400, ge=50, le=4000)
+    timeout_seconds: float = Field(default=8.0, gt=0, le=30)
+    pre_call_message: Optional[LocalizedText] = None
+    scope: Optional[str] = None
+    nodes: List[str] = []
+    description: Optional[str] = None
+    # Used only by the openai provider's Responses side call.
+    model: str = "gpt-5.4-mini"
+
+
+class ToolsConfig(BaseModel):
+    llm_agent: Optional[Union[LlmAgent, SimpleLlmAgent]] = None
+    synthesizer: Optional[Synthesizer] = None
+    transcriber: Optional[Transcriber] = None
+    input: Optional[IOModel] = None
+    output: Optional[IOModel] = None
+    api_tools: Optional[ToolModel] = None
+    web_search: Optional[WebSearchConfig] = None
+    s2s: Optional[S2SConfig] = None
+    switch_tool_description: Optional[str] = None
+    switch_handoff_messages: Optional[Dict[str, str]] = None
+    agent_names: Optional[Dict[str, str]] = None
+
+
+class ToolsChainModel(BaseModel):
+    execution: str = Field(..., pattern="^(parallel|sequential)$")
+    pipelines: List[List[str]]
+
+
+class ConversationConfig(BaseModel):
+    optimize_latency: Optional[bool] = True  # This will work on in conversation
+    hangup_after_silence: Optional[int] = 20
+    # [silence] re-prompts per silence period; None uses DEFAULT_MAX_SILENCE_REPEATS, 0 turns them off
+    # unless the node has a _silence_repeats exit edge; ignored when hangup_after_silence is 0
+    max_silence_repeats: Optional[int] = None
+    incremental_delay: Optional[int] = 900  # use this to incrementally delay to handle long pauses
+    number_of_words_for_interruption: Optional[int] = (
+        1  # Maybe send half second of empty noise if needed for a while as soon as we get speaking true in nitro, use that to delay
+    )
+    interruption_backoff_period: Optional[int] = 100
+    hangup_after_LLMCall: Optional[bool] = False
+    interruptible_hangup_message: Optional[bool] = False
+    call_cancellation_prompt: Optional[str] = None
+    backchanneling: Optional[bool] = False
+    backchanneling_message_gap: Optional[int] = 5
+    backchanneling_start_delay: Optional[int] = 5
+    ambient_noise: Optional[bool] = False
+    call_terminate: Optional[int] = 90
+    use_fillers: Optional[bool] = False
+    trigger_user_online_message_after: Optional[int] = 10
+    check_user_online_message: Optional[Union[str, Dict[str, str]]] = "Hey, are you still there"
+    check_if_user_online: Optional[bool] = True
+    user_online_message_in_llm_history: Optional[bool] = False
+    dtmf_enabled: Optional[bool] = False
+    # Voicemail detection configuration
+    voicemail: Optional[bool] = False
+    voicemail_detection_duration: Optional[float] = 30.0  # Time window in seconds
+    voicemail_check_interval: Optional[float] = 7.0  # Min time between interim checks
+    voicemail_min_transcript_length: Optional[int] = 7  # Min words for interim check
+
+    @field_validator("hangup_after_silence", mode="before")
+    def set_hangup_after_silence(cls, v):
+        return v if v is not None else 10  # Set default value if None is passed
+
+
+class Task(BaseModel):
+    tools_config: ToolsConfig
+    toolchain: ToolsChainModel
+    task_type: Optional[str] = "conversation"  # extraction, summarization, notification
+    task_config: ConversationConfig = dict()
+
+
+class AgentModel(BaseModel):
+    agent_name: str
+    agent_type: str = "other"
+    tasks: List[Task]
+    agent_welcome_message: Optional[str] = AGENT_WELCOME_MESSAGE

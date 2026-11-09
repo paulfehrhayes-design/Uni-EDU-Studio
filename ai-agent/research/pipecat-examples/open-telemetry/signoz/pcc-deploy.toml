@@ -1,0 +1,5 @@
+agent_name = "signoz-tracing"
+secret_set = "signoz-tracing-secrets"
+
+[scaling]
+	min_agents = 1

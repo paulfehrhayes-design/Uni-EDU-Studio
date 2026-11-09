@@ -1,0 +1,62 @@
+unit Test.LLM.DeepSeek;
+
+interface
+
+uses
+  DUnitX.TestFramework,
+  uLLM,
+  uLLM.DeepSeek,
+  ApiKeyStore,
+  TestBase.LLM;
+
+type
+  [TestFixture]
+  TDeepSeekLLMTests = class(TBaseLLMTests)
+  protected
+    function CreateLLM: TBaseLLM; override;
+    function DefaultModel: string; override;
+    function DefaultVisionModel: string; override;
+  public
+    [Setup] procedure Setup;
+    [TearDown] procedure TearDown;
+    [Test][Ignore('Not Supported by Deepseek.com')] procedure Chat_Vision_Test; override;
+  end;
+
+implementation
+
+function TDeepSeekLLMTests.DefaultModel: string;
+begin
+  Result := 'deepseek-chat';
+end;
+
+function TDeepSeekLLMTests.DefaultVisionModel: string;
+begin
+  Result := '';
+end;
+
+procedure TDeepSeekLLMTests.Setup;
+begin
+end;
+
+procedure TDeepSeekLLMTests.TearDown;
+begin
+end;
+
+procedure TDeepSeekLLMTests.Chat_Vision_Test;
+begin
+//  inherited;
+end;
+
+function TDeepSeekLLMTests.CreateLLM: TBaseLLM;
+var
+  FKeys: TApiKeyStore;
+begin
+  FKeys := TApiKeyStore.GetInstance;
+  Result := TDeepSeek.Create(FKeys.LoadApiKey('Deepseek_Key'));
+end;
+
+initialization
+  TDUnitX.RegisterTestFixture(TDeepSeekLLMTests);
+
+end.
+

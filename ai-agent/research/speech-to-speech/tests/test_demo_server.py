@@ -1,0 +1,697 @@
+import importlib
+import json
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+DEMO_DIR = Path(__file__).resolve().parents[1] / "demo"
+sys.path.insert(0, str(DEMO_DIR))
+demo_auth = importlib.import_module("auth")
+demo_server = importlib.import_module("server")
+
+
+@pytest.mark.parametrize("filename", list(demo_server.LOCAL_VAD_ASSETS))
+@pytest.mark.parametrize("bundled", [False, True])
+async def test_local_vad_assets_are_served_with_browser_content_types(monkeypatch, tmp_path, filename, bundled):
+    monkeypatch.setattr(demo_server, "HERE", str(tmp_path))
+    package, media_type = demo_server.LOCAL_VAD_ASSETS[filename]
+    installed = tmp_path / "node_modules" / package / "dist" / filename
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_bytes(b"installed asset")
+    if bundled:
+        destination = tmp_path / "vendor" / "local-vad" / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"bundled asset")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=demo_server.app), base_url="http://test") as client:
+        response = await client.get(f"/vendor/local-vad/{filename}")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(media_type)
+    assert response.content == (b"bundled asset" if bundled else b"installed asset")
+
+
+async def test_local_vad_missing_assets_fail_without_exposing_other_package_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(demo_server, "HERE", str(tmp_path))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=demo_server.app), base_url="http://test") as client:
+        assert (await client.get("/vendor/local-vad/not-an-asset.js")).status_code == 404
+        response = await client.get("/vendor/local-vad/silero_vad_v6.onnx")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Run npm ci in demo/"
+
+
+def _mock_whoami(monkeypatch, payload):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr(demo_auth, "_whoami_cache", {})
+    return calls
+
+
+def test_resolve_tier_prefers_oauth_pro_without_hub_lookup(monkeypatch):
+    def unexpected_get(*args, **kwargs):
+        pytest.fail("OAuth PRO users must not require a whoami-v2 lookup")
+
+    monkeypatch.setattr(httpx, "get", unexpected_get)
+
+    assert demo_auth.resolve_tier({"is_pro": True}, "hf_user_token") == "pro"
+
+
+@pytest.mark.parametrize("oauth_is_pro", [None, False])
+def test_user_view_uses_token_backed_pro_status(monkeypatch, oauth_is_pro):
+    calls = _mock_whoami(
+        monkeypatch,
+        {"name": "alice", "isPro": True, "orgs": [], "private": "server-only"},
+    )
+    monkeypatch.setattr(
+        demo_auth,
+        "current_oauth",
+        lambda request: {
+            "access_token": "hf_user_token",
+            "user_info": {
+                "sub": "123",
+                "preferred_username": "alice",
+                "is_pro": oauth_is_pro,
+            },
+        },
+    )
+
+    assert demo_auth.user_view(object()) == {
+        "loggedIn": True,
+        "username": "alice",
+        "avatar": None,
+        "tier": "pro",
+    }
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("whoami", "expected"),
+    [
+        ({"isPro": False, "orgs": []}, "free"),
+        ({"isPro": False, "orgs": [{"name": "smolagents"}]}, "org"),
+    ],
+)
+def test_token_backed_non_pro_tiers_remain_unchanged(monkeypatch, whoami, expected):
+    _mock_whoami(monkeypatch, whoami)
+
+    assert demo_auth.resolve_tier({"is_pro": False}, "hf_user_token") == expected
+
+
+def test_failed_whoami_falls_back_without_blocking_retry(monkeypatch):
+    monkeypatch.setattr(demo_auth, "_whoami_cache", {})
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        if len(calls) == 1:
+            raise httpx.ConnectError("Hub unavailable")
+        return httpx.Response(
+            200,
+            json={"isPro": True, "orgs": []},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    assert demo_auth.resolve_tier({"is_pro": False}, "hf_user_token") == "free"
+    assert demo_auth._whoami_cache == {}
+    assert demo_auth.resolve_tier({"is_pro": False}, "hf_user_token") == "pro"
+    assert demo_auth.resolve_tier({"is_pro": False}, "hf_user_token") == "pro"
+    assert len(calls) == 2
+
+
+async def test_me_reuses_whoami_resolution_and_retries_next_request(monkeypatch):
+    monkeypatch.setattr(demo_server, "LIMITER_ENABLED", True)
+    monkeypatch.setattr(demo_server, "AUTH_ENABLED", True)
+    monkeypatch.setattr(demo_auth, "_whoami_cache", {})
+    monkeypatch.setattr(demo_server.limiter, "remaining", lambda keys, tier: 600)
+    monkeypatch.setattr(
+        demo_auth,
+        "current_oauth",
+        lambda request: {
+            "access_token": "hf_user_token",
+            "user_info": {"sub": "123", "preferred_username": "alice"},
+        },
+    )
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        if len(calls) == 1:
+            raise httpx.ConnectError("Hub unavailable")
+        return httpx.Response(
+            200,
+            json={"isPro": True, "orgs": []},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    first = json.loads((await demo_server.me(object())).body)
+
+    assert first["tier"] == "free"
+    assert first["remainingSec"] == 600
+    assert first["limitSec"] == 600
+    assert demo_auth._whoami_cache == {}
+    assert len(calls) == 1
+
+    second = json.loads((await demo_server.me(object())).body)
+
+    assert second["tier"] == "pro"
+    assert second["remainingSec"] is None
+    assert second["limitSec"] is None
+    assert len(calls) == 2
+
+
+def test_tier_and_org_resolution_share_one_whoami_request(monkeypatch):
+    calls = _mock_whoami(
+        monkeypatch,
+        {"isPro": False, "orgs": [{"name": "smolagents"}]},
+    )
+    user = {"is_pro": False}
+
+    assert demo_auth.resolve_tier(user, "hf_user_token") == "org"
+    assert demo_auth._org_names(user, "hf_user_token") == {"smolagents"}
+    assert len(calls) == 1
+
+
+def test_current_access_token_normalizes_oauth_token(monkeypatch):
+    monkeypatch.setattr(
+        demo_auth,
+        "current_oauth",
+        lambda request: {"access_token": "  hf_user_token  "},
+    )
+
+    assert demo_auth.current_access_token(object()) == "hf_user_token"
+
+
+def test_current_access_token_rejects_missing_or_empty_token(monkeypatch):
+    monkeypatch.setattr(demo_auth, "current_oauth", lambda request: None)
+    assert demo_auth.current_access_token(object()) is None
+
+    monkeypatch.setattr(demo_auth, "current_oauth", lambda request: {"access_token": "  "})
+    assert demo_auth.current_access_token(object()) is None
+
+
+def test_expiring_oauth_token_requires_fresh_login(monkeypatch):
+    monkeypatch.setattr(
+        demo_auth,
+        "current_oauth",
+        lambda request: {
+            "access_token": "hf_user_token",
+            "access_token_expires_at": datetime.now() + timedelta(seconds=15),
+            "user_info": {"sub": "123", "preferred_username": "alice"},
+        },
+    )
+
+    assert demo_auth.current_access_token(object()) is None
+    assert demo_auth.oauth_login_required_reason(object()) == "token_expired"
+    assert demo_auth.user_view(object()) == {
+        "loggedIn": False,
+        "tier": "anon",
+        "reason": "token_expired",
+    }
+
+
+def test_load_balancer_headers_use_user_token_for_both_hops_without_service_token(monkeypatch):
+    monkeypatch.setattr(demo_server, "LB_HF_TOKEN", "")
+    monkeypatch.setattr(
+        demo_server.auth,
+        "current_access_token",
+        lambda request: "hf_user_token",
+    )
+
+    assert demo_server._load_balancer_headers(object()) == {
+        "Authorization": "Bearer hf_user_token",
+        "Content-Type": "application/json",
+        "User-Agent": "speech-to-speech-demo",
+        "X-Reachy-Mini-Authorization": "Bearer hf_user_token",
+    }
+
+
+def test_load_balancer_headers_keep_service_and_user_tokens_separate(monkeypatch):
+    monkeypatch.setattr(demo_server, "LB_HF_TOKEN", "hf_service_token")
+    monkeypatch.setattr(
+        demo_server.auth,
+        "current_access_token",
+        lambda request: "hf_user_token",
+    )
+
+    assert demo_server._load_balancer_headers(object()) == {
+        "Authorization": "Bearer hf_service_token",
+        "Content-Type": "application/json",
+        "User-Agent": "speech-to-speech-demo",
+        "X-Reachy-Mini-Authorization": "Bearer hf_user_token",
+    }
+
+
+def test_load_balancer_headers_keep_anonymous_requests_credential_free(monkeypatch):
+    monkeypatch.setattr(demo_server, "LB_HF_TOKEN", "")
+    monkeypatch.setattr(demo_server.auth, "current_access_token", lambda request: None)
+
+    headers = demo_server._load_balancer_headers(object())
+
+    assert headers == {
+        "Content-Type": "application/json",
+        "User-Agent": "speech-to-speech-demo",
+    }
+
+
+def test_load_balancer_headers_authenticate_anonymous_request_with_service_token(monkeypatch):
+    monkeypatch.setattr(demo_server, "LB_HF_TOKEN", "hf_service_token")
+    monkeypatch.setattr(demo_server.auth, "current_access_token", lambda request: None)
+
+    assert demo_server._load_balancer_headers(object()) == {
+        "Authorization": "Bearer hf_service_token",
+        "Content-Type": "application/json",
+        "User-Agent": "speech-to-speech-demo",
+    }
+
+
+def test_load_balancer_failure_logs_safe_diagnostic_headers(caplog):
+    response = httpx.Response(
+        429,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "text/html",
+            "RateLimit": '"api";r=0;t=42',
+            "Retry-After": "42",
+            "X-Request-Id": "request-id",
+        },
+        text="<html>\n  rate limited\n</html>",
+    )
+
+    with caplog.at_level("WARNING", logger="s2s.search"):
+        demo_server._log_load_balancer_failure("session handshake", response)
+
+    assert "request-id" in caplog.text
+    assert "retry-after" in caplog.text
+    assert "<html> rate limited </html>" in caplog.text
+    assert "Bearer secret" not in caplog.text
+
+
+async def test_session_preserves_load_balancer_authentication_failure(monkeypatch):
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(401, json={"reason": "token_invalid"})
+
+    monkeypatch.setattr(demo_server, "LOAD_BALANCER_URL", "https://load-balancer.example")
+    monkeypatch.setattr(demo_server, "AUTH_ENABLED", True)
+    monkeypatch.setattr(demo_server, "LIMITER_ENABLED", False)
+    monkeypatch.setattr(demo_server.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(demo_server.auth, "oauth_login_required_reason", lambda request: None)
+    monkeypatch.setattr(demo_server.auth, "resolve_identity", lambda request: ("free", ["key"], None))
+    monkeypatch.setattr(demo_server.auth, "current_access_token", lambda request: "hf_user_token")
+
+    request = SimpleNamespace(scope={"session": {"oauth_info": {"access_token": "hf_user_token"}}})
+    response = await demo_server.session(request)
+
+    assert response.status_code == 401
+    assert json.loads(response.body) == {
+        "reason": "token_invalid",
+        "loginUrl": demo_auth.OAUTH_LOGIN_PATH,
+    }
+    assert "oauth_info" not in request.scope["session"]
+
+
+async def test_session_rejects_locally_expired_oauth_before_proxying(monkeypatch):
+    monkeypatch.setattr(demo_server, "LOAD_BALANCER_URL", "https://load-balancer.example")
+    monkeypatch.setattr(demo_server, "AUTH_ENABLED", True)
+    monkeypatch.setattr(
+        demo_server.auth,
+        "oauth_login_required_reason",
+        lambda request: "token_expired",
+    )
+
+    response = await demo_server.session(object())
+
+    assert response.status_code == 401
+    assert json.loads(response.body) == {
+        "reason": "token_expired",
+        "loginUrl": demo_auth.OAUTH_LOGIN_PATH,
+    }
+
+
+async def test_queue_rejects_locally_expired_oauth_before_polling(monkeypatch):
+    monkeypatch.setattr(demo_server, "LOAD_BALANCER_URL", "https://load-balancer.example")
+    monkeypatch.setattr(demo_server, "AUTH_ENABLED", True)
+    monkeypatch.setattr(
+        demo_server.auth,
+        "oauth_login_required_reason",
+        lambda request: "token_expired",
+    )
+    monkeypatch.setattr(
+        demo_server.auth,
+        "resolve_identity",
+        lambda request: pytest.fail("expired OAuth must not resolve as anonymous"),
+    )
+
+    response = await demo_server.queue_status("ticket", object())
+
+    assert response.status_code == 401
+    assert json.loads(response.body) == {
+        "reason": "token_expired",
+        "loginUrl": demo_auth.OAUTH_LOGIN_PATH,
+    }
+
+
+@pytest.fixture
+def space_search(monkeypatch, tmp_path):
+    """A deployed Space with a server Serper key, a fresh usage DB, and a fake
+    Serper that records which key each request spent."""
+    serper_keys = []
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, url, headers=None, json=None):
+            serper_keys.append(headers["X-API-KEY"])
+            return httpx.Response(200, json={"organic": [{"title": "t", "link": "u"}]})
+
+    monkeypatch.setattr(demo_server, "SPACE_ID", "smolagents/hf-realtime-voice")
+    monkeypatch.setattr(demo_server, "SERPER_KEY", "server-key")
+    monkeypatch.setattr(demo_server, "SERVER_SEARCH", True)
+    monkeypatch.setattr(demo_server.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(demo_server.auth, "oauth_login_required_reason", lambda request: None)
+    monkeypatch.setenv("USAGE_DB_PATH", str(tmp_path / "usage.sqlite3"))
+    monkeypatch.setattr(demo_server.limiter, "_db_path", None)
+    demo_server.limiter.init()
+    return serper_keys
+
+
+def _as(monkeypatch, tier, keys=("k_alice",)):
+    monkeypatch.setattr(demo_server.auth, "resolve_identity", lambda request: (tier, list(keys), None))
+
+
+async def _search(session_id=None, key=None):
+    req = demo_server.SearchRequest.model_validate({"query": "weather", "sessionId": session_id, "key": key})
+    return await demo_server.search(req, object())
+
+
+async def test_search_on_space_refuses_anonymous_callers(monkeypatch, space_search):
+    _as(monkeypatch, "anon", ("k_ip", "k_cookie"))
+
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search()
+
+    assert exc.value.status_code == 401
+    assert space_search == []
+
+
+async def test_search_on_space_refuses_expired_sign_in(monkeypatch, space_search):
+    monkeypatch.setattr(demo_server.auth, "oauth_login_required_reason", lambda request: "token_expired")
+    monkeypatch.setattr(
+        demo_server.auth,
+        "resolve_identity",
+        lambda request: pytest.fail("expired OAuth must not resolve as anonymous"),
+    )
+
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search()
+
+    assert exc.value.status_code == 401
+    assert space_search == []
+
+
+@pytest.mark.parametrize("tier", ["free", "pro", "org"])
+async def test_search_needs_the_callers_live_session(monkeypatch, space_search, tier):
+    _as(monkeypatch, tier)
+    demo_server.limiter.begin("mine", ["k_alice"], tier)
+    demo_server.limiter.begin("theirs", ["k_bob"], tier)
+
+    for session_id in (None, "unknown", "theirs"):
+        with pytest.raises(demo_server.HTTPException) as exc:
+            await _search(session_id)
+        assert exc.value.status_code == 403
+
+    response = await _search("mine")
+    assert response.status_code == 200
+    assert space_search == ["server-key"]
+
+    demo_server.limiter.end("mine")
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search("mine")
+    assert exc.value.status_code == 403
+    assert space_search == ["server-key"]
+
+
+async def test_search_needs_a_heartbeating_session(monkeypatch, space_search):
+    _as(monkeypatch, "pro")
+    demo_server.limiter.begin("mine", ["k_alice"], "pro")
+    _advance(monkeypatch, demo_server.limiter.REAP_AFTER_SEC + 1)
+
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search("mine")
+    assert exc.value.status_code == 403
+
+    assert demo_server.limiter.heartbeat("mine")
+    assert (await _search("mine")).status_code == 200
+
+
+def _advance(monkeypatch, seconds):
+    later = demo_server.limiter.time.time() + seconds
+    monkeypatch.setattr(demo_server.limiter.time, "time", lambda: later)
+
+
+async def test_unlimited_search_recovers_after_a_sweep(monkeypatch, space_search):
+    _as(monkeypatch, "pro")
+    demo_server.limiter.begin("mine", ["k_alice"], "pro")
+    _advance(monkeypatch, demo_server.limiter.REAP_AFTER_SEC * 2 + 1)
+    demo_server.limiter.sweep()
+
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search("mine")
+    assert exc.value.status_code == 403
+
+    assert demo_server.limiter.heartbeat("mine")
+    assert (await _search("mine")).status_code == 200
+
+    demo_server.limiter.end("mine")
+    assert not demo_server.limiter.heartbeat("mine")
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search("mine")
+    assert exc.value.status_code == 403
+
+
+def test_sweep_still_reaps_silent_metered_sessions(monkeypatch, space_search):
+    demo_server.limiter.begin("mine", ["k_alice"], "free")
+    _advance(monkeypatch, demo_server.limiter.REAP_AFTER_SEC * 2 + 1)
+    demo_server.limiter.sweep()
+
+    assert not demo_server.limiter.heartbeat("mine")
+
+
+def test_reservation_never_exceeds_a_partially_spent_budget(monkeypatch, space_search):
+    limiter = demo_server.limiter
+    keys = ["k_ip", "k_cookie"]
+    with limiter._lock, limiter._connect() as con:
+        limiter._add(con, keys, limiter._today(), limiter.ANON_SEC - 13)
+
+    assert limiter.begin("mine", keys, "anon") == limiter.CHUNK_SEC
+    _advance(monkeypatch, 12)
+    assert limiter.heartbeat("mine")  # reserves the last 3 s, not a full chunk
+    _advance(monkeypatch, 3)
+    assert not limiter.heartbeat("mine")
+
+    assert limiter.remaining(keys, "anon") == 0
+    with limiter._lock, limiter._connect() as con:
+        assert limiter._spent_max(con, keys, limiter._today()) == limiter.ANON_SEC
+
+
+async def test_unlimited_grants_are_recorded_but_never_debited(monkeypatch, space_search):
+    monkeypatch.setattr(demo_server, "LIMITER_ENABLED", True)
+
+    response = await demo_server._finalize_grant({"session_id": "mine"}, ["k_alice"], "org", False, None)
+    _advance(monkeypatch, 600)
+    assert demo_server.limiter.heartbeat("mine")
+
+    grant = json.loads(response.body)
+    assert grant["limited"] is False
+    assert grant["heartbeatSec"] == demo_server.limiter.HEARTBEAT_SEC
+    assert demo_server.limiter.session_live("mine", ["k_alice"])
+    # Were it debited, a tier that falls back to "free" would find its budget spent.
+    assert demo_server.limiter.remaining(["k_alice"], "free") == demo_server.limiter.FREE_SEC
+
+
+async def test_server_key_searches_are_capped_per_user_per_day(monkeypatch, space_search):
+    monkeypatch.setattr(demo_server.limiter, "SEARCH_PER_DAY", 2)
+    _as(monkeypatch, "org")
+    demo_server.limiter.begin("mine", ["k_alice"], "org")
+
+    await _search("mine")
+    await _search("mine")
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search("mine")
+
+    assert exc.value.status_code == 429
+    assert space_search == ["server-key", "server-key"]
+    _as(monkeypatch, "org", ("k_someone_else",))
+    demo_server.limiter.begin("theirs", ["k_someone_else"], "org")
+    assert (await _search("theirs")).status_code == 200
+
+
+async def test_user_supplied_key_skips_the_server_key_gate(monkeypatch, space_search):
+    _as(monkeypatch, "anon", ("k_ip", "k_cookie"))
+
+    response = await _search(key="their-key")
+
+    assert response.status_code == 200
+    assert space_search == ["their-key"]
+
+
+async def test_server_key_is_never_spent_without_server_search(monkeypatch, space_search):
+    monkeypatch.setattr(demo_server, "SERVER_SEARCH", False)
+
+    with pytest.raises(demo_server.HTTPException) as exc:
+        await _search()
+
+    assert exc.value.status_code == 503
+    assert space_search == []
+    assert demo_server.config()["search"] is False
+
+
+async def test_local_search_is_not_gated(monkeypatch, space_search):
+    monkeypatch.setattr(demo_server, "SPACE_ID", "")
+    monkeypatch.setattr(
+        demo_server.auth,
+        "resolve_identity",
+        lambda request: pytest.fail("local search must not resolve an identity"),
+    )
+
+    response = await _search()
+
+    assert response.status_code == 200
+    assert space_search == ["server-key"]
+
+
+def test_websocket_client_classifies_session_401_as_login_required():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for demo client tests")
+
+    script = """
+globalThis.localStorage = { getItem() { return null; } };
+globalThis.fetch = async () => ({
+  status: 401,
+  ok: false,
+  async json() {
+    return { reason: "token_invalid", loginUrl: "/oauth/huggingface/login" };
+  },
+});
+const { S2sRealtimeClient } = await import("./demo/s2s-realtime-client.js");
+const client = new S2sRealtimeClient({
+  transport: "websocket",
+  voice: "Aiden",
+  instructions: "Be helpful.",
+  sessionUrl: "api/session",
+});
+try {
+  await client._postSession();
+  throw new Error("expected the session request to fail");
+} catch (error) {
+  if (error.code !== "login-required") throw error;
+  if (error.loginUrl !== "/oauth/huggingface/login") {
+    throw new Error(`unexpected login URL: ${error.loginUrl}`);
+  }
+}
+"""
+    subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_login_required_state_wins_over_inflight_account_refresh():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for demo client tests")
+
+    script = """
+globalThis.localStorage = { getItem() { return null; } };
+const elements = new Map();
+function element() {
+  return {
+    hidden: false,
+    innerHTML: "",
+    textContent: "",
+    href: "",
+    open: false,
+    addEventListener() {},
+    contains() { return false; },
+    setAttribute() {},
+    showModal() { this.open = true; },
+    close() { this.open = false; },
+  };
+}
+globalThis.document = {
+  querySelector(selector) {
+    if (!elements.has(selector)) elements.set(selector, element());
+    return elements.get(selector);
+  },
+  addEventListener() {},
+  getElementById(id) { return this.querySelector(`#${id}`); },
+};
+
+let resolveFetch;
+globalThis.fetch = () => new Promise((resolve) => { resolveFetch = resolve; });
+
+const { Account } = await import("./demo/ui/account.js");
+const account = new Account();
+const refresh = account.refresh();
+account.showLoginRequired("/oauth/huggingface/login");
+resolveFetch({
+  ok: true,
+  async json() {
+    return {
+      enabled: true,
+      auth: true,
+      loggedIn: true,
+      username: "alice",
+      tier: "free",
+      loginUrl: "/oauth/huggingface/login",
+    };
+  },
+});
+await refresh;
+
+if (account.tier !== "anon") throw new Error(`unexpected tier: ${account.tier}`);
+const root = elements.get("#account");
+if (!root.innerHTML.includes("signin-pill")) {
+  throw new Error(`stale account refresh won: ${root.innerHTML}`);
+}
+"""
+    subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

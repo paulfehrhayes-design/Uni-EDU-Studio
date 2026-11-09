@@ -1,0 +1,185 @@
+"""One config class per synthesizer provider, resolved through SYNTHESIZER_CONFIG_MODELS."""
+
+import pytest
+
+from bolna.enums import SynthesizerProvider
+from bolna.models import (
+    SYNTHESIZER_CONFIG_MODELS,
+    CartesiaConfig,
+    ElevenLabsConfig,
+    GeminiConfig,
+    PixaConfig,
+    RimeConfig,
+    SarvamConfig,
+    SmallestConfig,
+    StandardVoiceConfig,
+    Synthesizer,
+)
+
+# provider -> {field: is_required}. Stored agent snapshots are validated against these classes,
+# so a field silently appearing, vanishing, or changing requiredness breaks existing agents.
+EXPECTED_FIELDS = {
+    "polly": {"voice": True, "engine": True, "language": True},
+    "elevenlabs": {
+        "voice": True,
+        "voice_id": True,
+        "model": True,
+        "temperature": False,
+        "similarity_boost": False,
+        "speed": False,
+        "style": False,
+        "pronunciation_dictionary_locators": False,
+    },
+    "openai": {"voice": True, "model": True, "speed": False},
+    "deepgram": {
+        "voice_id": True,
+        "voice": True,
+        "model": True,
+        "mip_opt_out": False,
+        "speed": False,
+    },
+    "azuretts": {"voice": True, "model": True, "language": True, "speed": False},
+    "cartesia": {
+        "voice": True,
+        "voice_id": True,
+        "model": True,
+        "language": True,
+        "speed": False,
+        "volume": False,
+        "pronunciation_dict_id": False,
+        "pronunciation_dict_fingerprint": False,
+    },
+    "smallest": {"voice": True, "voice_id": True, "model": True, "language": True, "speed": False},
+    "sarvam": {
+        "voice": True,
+        "voice_id": True,
+        "model": True,
+        "language": True,
+        "speed": False,
+        "loudness": False,
+    },
+    "rime": {
+        "voice": True,
+        "voice_id": True,
+        "model": True,
+        "language": True,
+        "time_scale_factor": False,
+    },
+    "pixa": {
+        "voice": True,
+        "voice_id": True,
+        "model": True,
+        "language": True,
+        "top_p": False,
+        "repetition_penalty": False,
+    },
+    "maya": {"voice_id": True, "voice": True, "model": True, "language": False},
+    "gemini": {"voice": True, "voice_id": True, "model": True, "language": True, "style": False},
+    "soniox": {
+        "voice": True,
+        "voice_id": True,
+        "model": True,
+        "language": True,
+        "speed": False,
+        "reduce_silence": False,
+    },
+    "kalpa": {
+        "voice": False,
+        "voice_id": False,
+        "model": False,
+        "temperature": False,
+        "acoustic_temperature": False,
+        "audio_quality": False,
+        "chunk_length_schedule": False,
+    },
+    "navana": {"voice": True, "voice_id": True, "model": True, "language": True},
+    "custom": {"voice": True, "model": True, "speed": False, "extra_body": False},
+}
+
+
+# Every required field on every config is a plain string, so one filler serves them all.
+def _minimal_config(provider):
+    return {field: "x" for field, required in EXPECTED_FIELDS[provider].items() if required}
+
+
+def test_every_provider_resolves_to_a_config_model():
+    assert set(SYNTHESIZER_CONFIG_MODELS) == set(SynthesizerProvider.all_values())
+
+
+@pytest.mark.parametrize("provider", sorted(EXPECTED_FIELDS))
+def test_config_shapes_are_stable(provider):
+    fields = SYNTHESIZER_CONFIG_MODELS[provider].model_fields
+    assert {name: f.is_required() for name, f in fields.items()} == EXPECTED_FIELDS[provider]
+
+
+@pytest.mark.parametrize(
+    "config_model", [CartesiaConfig, RimeConfig, SmallestConfig, SarvamConfig, PixaConfig, GeminiConfig]
+)
+def test_standard_shape_providers_extend_the_base(config_model):
+    assert issubclass(config_model, StandardVoiceConfig)
+
+
+@pytest.mark.parametrize("provider", sorted(EXPECTED_FIELDS))
+def test_preprocess_builds_the_registered_config(provider):
+    synth = Synthesizer(provider=provider, provider_config=_minimal_config(provider))
+    assert type(synth.provider_config) is SYNTHESIZER_CONFIG_MODELS[provider]
+
+
+def test_an_already_built_config_is_left_alone():
+    config = ElevenLabsConfig(voice="George", voice_id="JBFqnCBsd6RMkjVDRZzb", model="eleven_turbo_v2_5")
+    assert Synthesizer(provider="elevenlabs", provider_config=config).provider_config is config
+
+
+def test_elevenlabs_still_requires_both_voice_and_voice_id():
+    with pytest.raises(ValueError):
+        Synthesizer(provider="elevenlabs", provider_config={"voice": "George", "model": "eleven_turbo_v2_5"})
+
+
+def test_elevenlabs_control_defaults_are_stable():
+    config = ElevenLabsConfig(voice="George", voice_id="voice-id", model="eleven_turbo_v2_5")
+
+    assert config.temperature == 0.5
+    assert config.similarity_boost == 0.75
+    assert config.speed == 1.0
+    assert config.style == 0.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", -0.01),
+        ("temperature", 1.01),
+        ("similarity_boost", -0.01),
+        ("similarity_boost", 1.01),
+        ("speed", 0.69),
+        ("speed", 1.21),
+        ("style", -0.01),
+        ("style", 1.01),
+    ],
+)
+def test_elevenlabs_rejects_out_of_range_controls(field, value):
+    with pytest.raises(ValueError):
+        ElevenLabsConfig(
+            voice="George",
+            voice_id="voice-id",
+            model="eleven_turbo_v2_5",
+            **{field: value},
+        )
+
+
+def test_sarvam_loudness_uses_documented_bounds():
+    kwargs = {
+        "voice": "Ritu",
+        "voice_id": "ritu",
+        "model": "bulbul:v2",
+        "language": "hi-IN",
+    }
+
+    assert SarvamConfig(**kwargs, loudness=0.3).loudness == 0.3
+    with pytest.raises(ValueError):
+        SarvamConfig(**kwargs, loudness=0.29)
+
+
+def test_an_unknown_provider_is_rejected():
+    with pytest.raises(ValueError):
+        Synthesizer(provider="nope", provider_config={"voice": "x"})

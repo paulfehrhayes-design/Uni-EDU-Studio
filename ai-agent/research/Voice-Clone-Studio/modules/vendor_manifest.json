@@ -1,0 +1,42 @@
+{
+    "vibevoice_tts": {
+        "source": "https://github.com/ShoukanLabs/VibeVoice",
+        "version": "0.1.0",
+        "commit": "abc1234",
+        "vendored_date": "2026-02-10",
+        "path": "modules/vibevoice_tts",
+        "notes": "Removed internal requirements.txt, fixed imports"
+    },
+    "vibevoice_asr": {
+        "source": "https://github.com/ShoukanLabs/VibeVoice",
+        "version": "0.1.0",
+        "commit": "abc1234",
+        "vendored_date": "2026-02-10",
+        "path": "modules/vibevoice_asr",
+        "notes": "ASR subset of VibeVoice repo"
+    },
+    "mmaudio": {
+        "source": "https://github.com/hkchengrex/MMAudio",
+        "version": "0.5.0",
+        "commit": "def5678",
+        "vendored_date": "2026-02-10",
+        "path": "modules/mmaudio",
+        "notes": ""
+    },
+    "qwen_finetune": {
+        "source": "https://github.com/QwenLM/Qwen2.5-Coder",
+        "version": "1.0.0",
+        "commit": "jkl3456",
+        "vendored_date": "2026-02-10",
+        "path": "modules/qwen_finetune",
+        "notes": ""
+    },
+    "fish_speech": {
+        "source": "https://github.com/fishaudio/fish-speech",
+        "version": "2.0.0",
+        "vendored_date": "2025-07-17",
+        "path": "modules/fish_speech",
+        "license": "Fish Audio Research License (non-commercial free, commercial requires license)",
+        "notes": "Inference-only subset: models/text2semantic, content_sequence, conversation, tokenizer, configs/modded_dac_vq.yaml. loralib import made conditional. click import made conditional."
+    }
+}

@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import asyncio
+import os
+
+import aiohttp
+
+from livekit import api, rtc
+from livekit.agents import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    AgentSession,
+    APIConnectionError,
+    APIConnectOptions,
+    APIStatusError,
+    NotGivenOr,
+    get_job_context,
+    utils,
+)
+from livekit.agents.voice.avatar import AvatarSession as BaseAvatarSession, DataStreamAudioOutput
+from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
+
+from .log import logger
+
+EGE_STOCK_AVATAR_ID = "b9be11b8-89fb-4227-8f86-4a881393cbdb"
+_DEFAULT_API_URL = "https://api.bey.dev"
+# The avatar worker renders and publishes 16 kHz audio
+SAMPLE_RATE = 16000
+
+_AVATAR_AGENT_IDENTITY = "bey-avatar-agent"
+_AVATAR_AGENT_NAME = "bey-avatar-agent"
+
+
+class BeyException(Exception):
+    """Exception for Beyond Presence errors"""
+
+
+class AvatarSession(BaseAvatarSession):
+    """A Beyond Presence avatar session"""
+
+    def __init__(
+        self,
+        *,
+        avatar_id: NotGivenOr[str | None] = NOT_GIVEN,
+        api_url: NotGivenOr[str] = NOT_GIVEN,
+        api_key: NotGivenOr[str] = NOT_GIVEN,
+        avatar_participant_identity: NotGivenOr[str] = NOT_GIVEN,
+        avatar_participant_name: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> None:
+        super().__init__()
+        self._avatar_id = avatar_id or EGE_STOCK_AVATAR_ID
+        self._api_url = api_url or os.getenv("BEY_API_URL", _DEFAULT_API_URL)
+        self._api_key = api_key or os.getenv("BEY_API_KEY")
+        if self._api_key is None:
+            raise BeyException(
+                "The api_key must be set either by passing api_key to the client or "
+                "by setting the BEY_API_KEY environment variable"
+            )
+
+        self._avatar_participant_identity = avatar_participant_identity or _AVATAR_AGENT_IDENTITY
+        self._avatar_participant_name = avatar_participant_name or _AVATAR_AGENT_NAME
+        self._http_session: aiohttp.ClientSession | None = None
+        self._conn_options = conn_options
+
+    @property
+    def avatar_identity(self) -> str:
+        return self._avatar_participant_identity
+
+    @property
+    def provider(self) -> str:
+        return "bey"
+
+    def _ensure_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session is None:
+            self._http_session = utils.http_context.http_session()
+
+        return self._http_session
+
+    async def start(
+        self,
+        agent_session: AgentSession,
+        room: rtc.Room,
+        *,
+        livekit_url: NotGivenOr[str] = NOT_GIVEN,
+        livekit_api_key: NotGivenOr[str] = NOT_GIVEN,
+        livekit_api_secret: NotGivenOr[str] = NOT_GIVEN,
+    ) -> None:
+        await super().start(agent_session, room)
+
+        livekit_url = livekit_url or (os.getenv("LIVEKIT_URL") or NOT_GIVEN)
+        livekit_api_key = livekit_api_key or (os.getenv("LIVEKIT_API_KEY") or NOT_GIVEN)
+        livekit_api_secret = livekit_api_secret or (os.getenv("LIVEKIT_API_SECRET") or NOT_GIVEN)
+        if not livekit_url or not livekit_api_key or not livekit_api_secret:
+            raise BeyException(
+                "livekit_url, livekit_api_key, and livekit_api_secret must be set "
+                "by arguments or environment variables"
+            )
+
+        job_ctx = get_job_context()
+        local_participant_identity = job_ctx.local_participant_identity
+        livekit_token = (
+            api.AccessToken(api_key=livekit_api_key, api_secret=livekit_api_secret)
+            .with_kind("agent")
+            .with_identity(self._avatar_participant_identity)
+            .with_name(self._avatar_participant_name)
+            .with_grants(api.VideoGrants(room_join=True, room=room.name))
+            # allow the avatar agent to publish audio and video on behalf of your local agent
+            .with_attributes({ATTRIBUTE_PUBLISH_ON_BEHALF: local_participant_identity})
+            .to_jwt()
+        )
+
+        logger.debug("starting avatar session")
+        await self._start_agent(livekit_url, livekit_token)
+
+        agent_session.output.replace_audio_tail(
+            DataStreamAudioOutput(
+                room=room,
+                destination_identity=self._avatar_participant_identity,
+                wait_remote_track=rtc.TrackKind.KIND_VIDEO,
+                sample_rate=SAMPLE_RATE,
+            ),
+        )
+
+    async def _start_agent(self, livekit_url: str, livekit_token: str) -> None:
+        assert self._api_key is not None
+
+        for attempt in range(self._conn_options.max_retry + 1):
+            try:
+                async with self._ensure_http_session().post(
+                    f"{self._api_url}/v1/sessions",
+                    headers={
+                        "x-api-key": self._api_key,
+                    },
+                    json={
+                        "transport": "livekit",
+                        "avatar_id": self._avatar_id,
+                        "url": livekit_url,
+                        "token": livekit_token,
+                    },
+                    timeout=aiohttp.ClientTimeout(sock_connect=self._conn_options.timeout),
+                ) as response:
+                    if not response.ok:
+                        text = await response.text()
+                        raise APIStatusError(
+                            "Server returned an error", status_code=response.status, body=text
+                        )
+                    return
+
+            except APIStatusError as e:
+                # A 4xx such as a bad API key will fail the same way every time.
+                if not e.retryable:
+                    raise
+                logger.warning(
+                    "failed to call bey presence api",
+                    extra={"attempt": attempt + 1, "status_code": e.status_code},
+                )
+                if attempt >= self._conn_options.max_retry:
+                    raise
+                await asyncio.sleep(self._conn_options.retry_interval)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(
+                    "failed to call bey presence api",
+                    extra={"attempt": attempt + 1, "error": str(e)},
+                )
+                if attempt >= self._conn_options.max_retry:
+                    raise APIConnectionError(
+                        "Failed to start Bey Avatar Session after all retries"
+                    ) from e
+                await asyncio.sleep(self._conn_options.retry_interval)
+
+        raise APIConnectionError("Failed to start Bey Avatar Session after all retries")

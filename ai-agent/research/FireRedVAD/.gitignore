@@ -1,0 +1,18 @@
+__pycache__
+out
+*.tar.gz
+*.wav
+*.TextGrid
+*.srt
+text
+wav.scp
+utt2event
+pretrained_models/
+*.swp
+*.swo
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.egg

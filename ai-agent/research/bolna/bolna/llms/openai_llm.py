@@ -1,0 +1,905 @@
+import os
+import asyncio
+import json
+from contextlib import suppress
+import re
+import time
+from typing import Optional
+from urllib.parse import urlparse
+from bolna.llms.http_client_pool import get_shared_http_client
+from dotenv import load_dotenv
+from openai import (
+    AsyncOpenAI,
+    OpenAI,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    RateLimitError,
+    APIError,
+    APIConnectionError,
+)
+
+import websockets
+from websockets.protocol import State as WSState
+
+from bolna.constants import (
+    DEFAULT_LANGUAGE_CODE,
+    LLM_VENDOR_ENDPOINTS,
+    default_reasoning_effort,
+    is_reasoning_model,
+)
+from bolna.enums import LLMProvider, ResponseStreamEvent, ResponseItemType, Verbosity
+from bolna.helpers.ssl_context import get_ssl_context
+from bolna.helpers.utils import compute_function_pre_call_message, now_ms
+from bolna.helpers.function_calling_helpers import guard_llm_base_url, resolve_tool_name, tool_names
+from .openai_base import OpenAICompatibleLLM
+from .schema_forced_tool_call import SCHEMA_FORCED_TOOL_PROVIDERS, force_tools_by_schema
+from .message_models import strip_internal_keys
+from .tool_call_accumulator import ToolCallAccumulator
+from .types import APIParams, LLMStreamChunk, LatencyData
+from bolna.helpers.logger_config import configure_logger
+
+logger = configure_logger(__name__)
+load_dotenv()
+
+# OpenAI hosts verified to serve Responses over WebSocket; any other endpoint streams over HTTP.
+RESPONSES_WS_HOSTS = frozenset({"api.openai.com", "eu.api.openai.com", "in.api.openai.com"})
+
+
+def responses_ws_url(base_url: Optional[str]) -> Optional[str]:
+    """The Responses WebSocket URL for this endpoint, or None when it only streams over HTTP."""
+    host = urlparse(base_url).hostname if base_url else "api.openai.com"
+    return f"wss://{host}/v1/responses" if host in RESPONSES_WS_HOSTS else None
+
+
+class WSConnectError(Exception):
+    """The Responses WebSocket could not be opened."""
+
+
+class OpenAIWSConnection:
+    """Persistent WebSocket connection to an OpenAI Responses endpoint.
+
+    - Eager connect at init, ready before first LLM call
+    - Auto-reconnect on connection drop or before 60-min server limit
+    - Sequential: one in-flight response at a time (API constraint)
+    """
+
+    RECONNECT_BEFORE_SECS = 55 * 60
+    OPEN_TIMEOUT_SECS = 3
+    TERMINAL_EVENTS = ResponseStreamEvent.terminal_events()
+    RESPONSE_TERMINAL_EVENTS = ResponseStreamEvent.response_terminal_events()
+
+    def __init__(self, api_key: str, url: str):
+        self._api_key = api_key
+        self._url = url
+        self._ws = None
+        self._needs_reset = False
+        self._connected_at: float = 0
+        self._lock = asyncio.Lock()
+        self._connect_task: Optional[asyncio.Task] = None
+
+    def start_connect(self):
+        """Kick off WS connection eagerly. Must be called from a running event loop."""
+        self._connect_task = asyncio.create_task(self._do_connect())
+
+    async def _do_connect(self):
+        """Background connect with error handling — exceptions surface in ensure_connected."""
+        try:
+            await self._connect()
+        except Exception as e:
+            logger.warning(f"Eager WS connect failed, will retry on first use: {e}")
+
+    async def ensure_connected(self):
+        if self._connect_task and not self._connect_task.done():
+            await self._connect_task
+            self._connect_task = None
+
+        if self._ws is not None:
+            if self._needs_reset:
+                # An abandoned stream's queued events would be read as the next turn's.
+                logger.info("WebSocket dirty after an abandoned stream, reconnecting")
+                self.discard_socket(prewarm=False)
+            elif self._ws.state is not WSState.OPEN:
+                logger.info("WebSocket closed unexpectedly, reconnecting")
+                await self._close_ws()
+            elif time.monotonic() - self._connected_at >= self.RECONNECT_BEFORE_SECS:
+                logger.info("WebSocket approaching 60-min limit, reconnecting")
+                await self._close_ws()
+            else:
+                return
+
+        self._needs_reset = False
+        await self._connect()
+
+    async def _connect(self):
+        self._ws = await websockets.connect(
+            self._url,
+            additional_headers={"Authorization": f"Bearer {self._api_key}"},
+            max_size=None,
+            open_timeout=self.OPEN_TIMEOUT_SECS,
+            close_timeout=5,
+            ssl=get_ssl_context(self._url),
+        )
+        self._connected_at = time.monotonic()
+        logger.info("WebSocket connected to OpenAI Responses API")
+
+    async def stream_response(self, create_params: dict):
+        """Send response.create and yield raw event dicts until terminal event."""
+        async with self._lock:
+            try:
+                await self.ensure_connected()
+            except Exception as e:
+                raise WSConnectError(str(e)) from e
+            # Before the send: a cancelled send may still have put the frame on the wire,
+            # and leaves the connection inconsistent either way. The try covers it too.
+            self._needs_reset = True
+            try:
+                await self._ws.send(json.dumps({"type": ResponseStreamEvent.CREATE, **create_params}))
+                async for raw_msg in self._ws:
+                    evt = json.loads(raw_msg)
+                    evt_type = evt.get("type", "")
+                    if evt_type in self.RESPONSE_TERMINAL_EVENTS:
+                        # Before the yield: consumers break here and never let this resume.
+                        self._needs_reset = False
+                        yield evt
+                        return
+                    yield evt
+                    if evt_type in self.TERMINAL_EVENTS:
+                        return
+            finally:
+                if self._needs_reset:
+                    self.discard_socket()
+
+    async def cancel_response(self, response_id: str):
+        """Best-effort cancel: signal the server to terminate the in-flight
+        response. We do not drain events here — the concurrent stream_response
+        loop is the sole recv consumer and will see the resulting terminal
+        event itself. Holding the lock would block the cancel until the
+        stream completes naturally, defeating its purpose."""
+        if self._ws is None or self._ws.state is not WSState.OPEN:
+            return
+        try:
+            await self._ws.send(json.dumps({"type": ResponseStreamEvent.CANCEL, "response_id": response_id}))
+        except Exception:
+            pass
+
+    async def disconnect(self):
+        # Settle any in-flight pre-warm first: it assigns _ws after the fact, so closing
+        # before it lands would leave a live socket nobody owns.
+        task, self._connect_task = self._connect_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        await self._close_ws()
+
+    async def _close_ws(self):
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+    def discard_socket(self, prewarm=True):
+        """Drop a socket carrying an abandoned response. The close is not awaited and the
+        replacement is warmed in the background, so no handshake lands on the next turn."""
+        ws, self._ws = self._ws, None
+        self._needs_reset = False
+        if ws is not None:
+            asyncio.ensure_future(self._close_quietly(ws))
+        if prewarm:
+            self.start_connect()
+
+    @staticmethod
+    async def _close_quietly(ws):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+class OpenAiLLM(OpenAICompatibleLLM):
+    _base_url = None
+    _base_url_validated = False
+
+    def __init__(
+        self,
+        max_tokens=100,
+        buffer_size=40,
+        model="gpt-3.5-turbo-16k",
+        temperature=0.1,
+        language=DEFAULT_LANGUAGE_CODE,
+        **kwargs,
+    ):
+        super().__init__(max_tokens, buffer_size)
+        self.model = model
+
+        self.custom_tools = kwargs.get("api_tools", None)
+        self.language = language
+        logger.info("API Tools %s", tool_names(self.custom_tools))
+        if self.custom_tools is not None:
+            self.trigger_function_call = True
+            self.api_params = self.custom_tools["tools_params"]
+            self.tools = self.custom_tools["tools"]
+        else:
+            self.trigger_function_call = False
+
+        self.started_streaming = False
+        logger.info(f"Initializing OpenAI LLM with model: {self.model} and maxc tokens {max_tokens}")
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+
+        max_tokens_key = "max_tokens"
+        self.model_args = {}
+        if is_reasoning_model(model):
+            max_tokens_key = "max_completion_tokens"
+            self.model_args["reasoning_effort"] = kwargs.get("reasoning_effort") or default_reasoning_effort(model)
+            self.model_args["verbosity"] = kwargs.get("verbosity", None) or Verbosity.LOW.value
+            self.reasoning_summary = kwargs.get("reasoning_summary")
+
+        self.model_args.update({max_tokens_key: self.max_tokens, "temperature": self.temperature, "model": self.model})
+
+        provider = kwargs.get("provider")
+        model_endpoint = (kwargs.get("openai_model_endpoints") or {}).get(model)
+        if model_endpoint and provider in (None, LLMProvider.OPENAI.value):
+            # A model with its own OpenAI endpoint runs there; every other model keeps the caller's.
+            kwargs = {**kwargs, **model_endpoint}
+        vendor_endpoint = LLM_VENDOR_ENDPOINTS.get(provider)
+        if vendor_endpoint:
+            vendor_url, key_env = vendor_endpoint
+            vendor_key = kwargs.get("llm_key") or os.getenv(key_env)
+            if not vendor_key:
+                raise ValueError(f"No API key for LLM provider {provider}: pass llm_key or set {key_env}")
+            kwargs = {**kwargs, "base_url": vendor_url, "llm_key": vendor_key}
+        compatible_endpoint = vendor_endpoint is not None or provider in (
+            LLMProvider.CUSTOM.value,
+            LLMProvider.BOLNA.value,
+        )
+        self._forces_tools_by_schema = provider in SCHEMA_FORCED_TOOL_PROVIDERS
+        is_custom = provider == LLMProvider.CUSTOM.value
+        if compatible_endpoint:
+            if kwargs.get("extra_body"):
+                self.model_args["extra_body"] = kwargs["extra_body"]
+        else:
+            self.model_args["service_tier"] = kwargs.get("service_tier", "default")
+
+        # http2=False: cancelled h2 requests leak streams until the connection pins at 100 (barge-in)
+        http_client = get_shared_http_client(base_url=kwargs.get("base_url"), http2=False)
+
+        if compatible_endpoint:
+            base_url = kwargs.get("base_url")
+            api_key = kwargs.get("llm_key", None)
+            run_id = kwargs.get("run_id")
+            # Bolna's inference gateway hashes on this to keep a call's turns on the replica holding its cache.
+            call_headers = {"X-Call-Id": run_id} if provider == LLMProvider.BOLNA.value and run_id else None
+            self.async_client = AsyncOpenAI(
+                base_url=base_url, api_key=api_key, http_client=http_client, default_headers=call_headers
+            )
+        else:
+            llm_key = kwargs.get("llm_key", os.getenv("OPENAI_API_KEY"))
+            base_url = kwargs.get("base_url")
+            if base_url:
+                self.async_client = AsyncOpenAI(base_url=base_url, api_key=llm_key, http_client=http_client)
+            else:
+                self.async_client = AsyncOpenAI(api_key=llm_key, http_client=http_client)
+            api_key = llm_key
+        self.llm_host = urlparse(base_url).netloc if base_url else None
+        # Only a customer endpoint is guarded; platform ones keep the SDK's connection retries.
+        self._base_url = base_url if is_custom else None
+        self._base_url_validated = False
+        self.assistant_id = kwargs.get("assistant_id", None)
+        if self.assistant_id:
+            logger.info(f"Initializing OpenAI assistant with assistant id {self.assistant_id}")
+            self.openai = OpenAI(api_key=api_key)
+            # self.thread_id = self.openai.beta.threads.create().id
+            self.model_args = {"max_completion_tokens": self.max_tokens, "temperature": self.temperature}
+            my_assistant = self.openai.beta.assistants.retrieve(self.assistant_id)
+            if my_assistant.tools is not None:
+                self.tools = [i for i in my_assistant.tools if i.type == "function"]
+            # logger.info(f'thread id : {self.thread_id}')
+        self.run_id = kwargs.get("run_id", None)
+
+        # Responses-API chaining is OpenAI-specific.
+        use_responses_api = kwargs.get("use_responses_api", False) and not compatible_endpoint
+        self._init_responses_api(use_responses_api, compact_threshold=kwargs.get("compact_threshold"))
+
+        self._ws_transport = None
+        ws_url = responses_ws_url(base_url)
+        if self.use_responses_api and not compatible_endpoint and ws_url:
+            self._ws_transport = OpenAIWSConnection(api_key=api_key, url=ws_url)
+            self._ws_transport.start_connect()
+
+    async def _ensure_base_url_allowed(self):
+        """SSRF-guard a customer-supplied base_url once before the first outbound request."""
+        if self._base_url_validated:
+            return
+        await guard_llm_base_url(self._base_url)
+        self._base_url_validated = True
+
+    async def generate_stream(
+        self, messages, synthesize=True, request_json=False, meta_info=None, tool_choice=None, tools=None
+    ):
+        await self._ensure_base_url_allowed()
+        if self.use_responses_api:
+            if self._ws_transport:
+                async for chunk in self._generate_stream_ws_responses(
+                    messages, synthesize, request_json, meta_info, tool_choice, tools
+                ):
+                    yield chunk
+            else:
+                async for chunk in self._generate_stream_responses(
+                    messages, synthesize, request_json, meta_info, tool_choice, tools
+                ):
+                    yield chunk
+        else:
+            async for chunk in self._generate_stream_chat(
+                messages, synthesize, request_json, meta_info, tool_choice, tools
+            ):
+                yield chunk
+
+    async def _generate_stream_chat(
+        self, messages, synthesize=True, request_json=False, meta_info=None, tool_choice=None, tools=None
+    ):
+        if not messages or len(messages) == 0:
+            raise Exception("No messages provided")
+
+        response_format = self.get_response_format(request_json)
+        model_args = {
+            **self.model_args,
+            "response_format": response_format,
+            "messages": strip_internal_keys(messages),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        if not is_reasoning_model(self.model_family):
+            model_args["stop"] = ["User:"]
+
+        if self.trigger_function_call:
+            _tools = self._parse_tools(tools)
+            if _tools:  # omit tools when none are visible this turn (an empty array is a 400)
+                model_args["tools"] = _tools
+                model_args["tool_choice"] = tool_choice or "auto"
+                model_args["parallel_tool_calls"] = False
+
+        answer, buffer = "", ""
+        tools = model_args.get("tools", [])
+        accumulator = None
+        if self.trigger_function_call:
+            accumulator = ToolCallAccumulator(self.api_params, tools, self.language, self.model, self.run_id)
+
+        text_tool_buffer = None
+        captured_tool_text = None
+
+        start_time = now_ms()
+        first_token_time = None
+        latency_data = None
+        service_tier = None
+        stream_usage = None
+        finish_reason = None
+
+        forced = force_tools_by_schema(model_args) if self._forces_tools_by_schema else None
+        try:
+            completion_stream = await self.async_client.chat.completions.create(**model_args)
+        except AuthenticationError as e:
+            logger.error(f"OpenAI authentication failed: Invalid or expired API key - {e}")
+            raise
+        except PermissionDeniedError as e:
+            logger.error(f"OpenAI permission denied (403): {e}")
+            raise
+        except NotFoundError as e:
+            logger.error(f"OpenAI resource not found (404): Check model name or endpoint - {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"OpenAI rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"OpenAI connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"OpenAI unexpected error: {e}")
+            raise
+
+        _connection_latency_ms: Optional[float] = None
+        chunks = forced.stream(completion_stream) if forced else completion_stream
+        async for chunk in chunks:
+            now = now_ms()
+            # First chunk = TCP+TLS+HTTP headers received, before any content or token.
+            if _connection_latency_ms is None:
+                _connection_latency_ms = round(now - start_time, 2)
+            if hasattr(chunk, "service_tier") and chunk.service_tier:
+                service_tier = chunk.service_tier
+                if latency_data:
+                    latency_data.service_tier = service_tier
+
+            # Final usage-only chunk (choices=[]) from stream_options
+            if hasattr(chunk, "usage") and chunk.usage and (not chunk.choices or len(chunk.choices) == 0):
+                stream_usage = chunk.usage
+                continue
+
+            if not first_token_time:
+                first_token_time = now
+                self.started_streaming = True
+
+                latency_data = LatencyData(
+                    sequence_id=meta_info.get("sequence_id") if meta_info else None,
+                    first_token_latency_ms=first_token_time - start_time,
+                    total_stream_duration_ms=None,
+                    connection_latency_ms=_connection_latency_ms,
+                    service_tier=service_tier,
+                    llm_host=self.llm_host,
+                )
+                self._log_llm_request_id(completion_stream, getattr(chunk, "id", None))
+
+            delta = chunk.choices[0].delta
+            finish_reason = getattr(chunk.choices[0], "finish_reason", None) or finish_reason
+
+            if hasattr(delta, "tool_calls") and delta.tool_calls and accumulator:
+                if buffer:
+                    yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data)
+                    buffer = ""
+
+                accumulator.process_delta(delta.tool_calls)
+
+                pre_call = accumulator.get_pre_call_message(meta_info)
+                if pre_call:
+                    yield LLMStreamChunk(
+                        data=pre_call[0],
+                        end_of_stream=True,
+                        latency=latency_data,
+                        function_name=pre_call[1],
+                        function_message=pre_call[2],
+                    )
+
+            elif hasattr(delta, "content") and delta.content is not None:
+                if accumulator:
+                    accumulator.note_content(delta.content)
+                content = delta.content
+
+                if text_tool_buffer is not None:
+                    text_tool_buffer += content
+                    end_pos = self._find_tool_call_end(text_tool_buffer)
+                    if end_pos != -1:
+                        if captured_tool_text is not None:
+                            logger.warning(
+                                f"Multiple text tool calls in one stream — dropping earlier: {captured_tool_text[:60]!r}"
+                            )
+                        captured_tool_text = text_tool_buffer[:end_pos]
+                        remainder = text_tool_buffer[end_pos:].lstrip("\n")
+                        text_tool_buffer = None
+                        answer += remainder
+                        buffer = remainder
+                elif (idx := self._find_text_tool_call_start(buffer + content, tools)) != -1:
+                    combined = buffer + content
+                    before = combined[:idx]
+                    after = combined[idx:]
+                    if before:
+                        answer += before
+                        if synthesize:
+                            yield LLMStreamChunk(data=before, end_of_stream=False, latency=latency_data)
+                    end_pos = self._find_tool_call_end(after)
+                    if end_pos != -1:
+                        if captured_tool_text is not None:
+                            logger.warning(
+                                f"Multiple text tool calls in one stream — dropping earlier: {captured_tool_text[:60]!r}"
+                            )
+                        captured_tool_text = after[:end_pos]
+                        remainder = after[end_pos:].lstrip("\n")
+                        answer += remainder
+                        buffer = remainder
+                    else:
+                        text_tool_buffer = after
+                        buffer = ""
+                else:
+                    answer += content
+                    buffer += content
+                    if synthesize and len(buffer) >= self.buffer_size:
+                        split = buffer.rsplit(" ", 1)
+                        yield LLMStreamChunk(data=split[0], end_of_stream=False, latency=latency_data)
+                        buffer = split[1] if len(split) > 1 else ""
+
+        if latency_data:
+            latency_data.total_stream_duration_ms = now_ms() - start_time
+        if isinstance(meta_info, dict):
+            meta_info["llm_finish_reason"] = finish_reason
+
+        if text_tool_buffer is not None:
+            captured_tool_text = text_tool_buffer
+
+        if captured_tool_text and not (accumulator and accumulator.final_tool_calls):
+            logger.warning(f"Text tool call detected in content stream, attempting rescue: {captured_tool_text[:80]}")
+            rescue_chunk = self._try_rescue_text_tool_call(
+                captured_tool_text, model_args, meta_info, answer, latency_data
+            )
+            if rescue_chunk:
+                yield rescue_chunk
+            else:
+                # A functions.<name>(...) fragment is never speech; drop it rather than speak ids aloud.
+                logger.warning(f"Text tool call rescue failed, dropping fragment: {captured_tool_text[:80]!r}")
+
+        if accumulator and accumulator.final_tool_calls:
+            api_call_payload = accumulator.build_api_payload(model_args, meta_info, answer)
+            if api_call_payload:
+                fc_chunk = LLMStreamChunk(
+                    data=api_call_payload, end_of_stream=False, latency=latency_data, is_function_call=True
+                )
+                if stream_usage:
+                    fc_chunk.input_tokens = getattr(stream_usage, "prompt_tokens", None)
+                    fc_chunk.output_tokens = getattr(stream_usage, "completion_tokens", None)
+                    _d = getattr(stream_usage, "completion_tokens_details", None)
+                    if _d:
+                        fc_chunk.reasoning_tokens = getattr(_d, "reasoning_tokens", None)
+                    _pd = getattr(stream_usage, "prompt_tokens_details", None)
+                    if _pd:
+                        fc_chunk.cached_tokens = getattr(_pd, "cached_tokens", None)
+                yield fc_chunk
+
+        usage_kwargs = {}
+        if stream_usage:
+            usage_kwargs["input_tokens"] = getattr(stream_usage, "prompt_tokens", None)
+            usage_kwargs["output_tokens"] = getattr(stream_usage, "completion_tokens", None)
+            details = getattr(stream_usage, "completion_tokens_details", None)
+            if details:
+                usage_kwargs["reasoning_tokens"] = getattr(details, "reasoning_tokens", None)
+            prompt_details = getattr(stream_usage, "prompt_tokens_details", None)
+            if prompt_details:
+                usage_kwargs["cached_tokens"] = getattr(prompt_details, "cached_tokens", None)
+
+        if synthesize:
+            yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+        else:
+            yield LLMStreamChunk(data=answer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+
+        self.started_streaming = False
+
+    async def generate(self, messages, request_json=False, ret_metadata=False, meta_info=None):
+        await self._ensure_base_url_allowed()
+        if self.use_responses_api:
+            return await self._generate_responses(messages, request_json, ret_metadata, meta_info)
+        return await self._generate_chat(messages, request_json, ret_metadata)
+
+    async def _generate_chat(self, messages, request_json=False, ret_metadata=False):
+        response_format = self.get_response_format(request_json)
+
+        try:
+            completion = await self.async_client.chat.completions.create(
+                model=self.model,
+                temperature=0.0,
+                # Same guarantee as the streaming path: bookkeeping keys never reach the wire.
+                messages=strip_internal_keys(messages),
+                stream=False,
+                response_format=response_format,
+                extra_body=self.model_args.get("extra_body"),
+            )
+            res = completion.choices[0].message.content
+            if ret_metadata:
+                metadata = {
+                    "llm_host": self.llm_host,
+                    "service_tier": completion.service_tier if hasattr(completion, "service_tier") else None,
+                }
+                if completion.usage:
+                    metadata["input_tokens"] = completion.usage.prompt_tokens
+                    metadata["output_tokens"] = completion.usage.completion_tokens
+                    details = getattr(completion.usage, "completion_tokens_details", None)
+                    if details:
+                        metadata["reasoning_tokens"] = getattr(details, "reasoning_tokens", None)
+                    prompt_details = getattr(completion.usage, "prompt_tokens_details", None)
+                    if prompt_details:
+                        metadata["cached_tokens"] = getattr(prompt_details, "cached_tokens", None)
+                return res, metadata
+            else:
+                return res
+        except AuthenticationError as e:
+            logger.error(f"OpenAI authentication failed: Invalid or expired API key - {e}")
+            raise
+        except PermissionDeniedError as e:
+            logger.error(f"OpenAI permission denied (403): {e}")
+            raise
+        except NotFoundError as e:
+            logger.error(f"OpenAI resource not found (404): Check model name or endpoint - {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"OpenAI rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"OpenAI connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"OpenAI unexpected error: {e}")
+            raise
+
+    def get_response_format(self, is_json_format: bool):
+        if is_json_format and self.model in ("gpt-4-1106-preview", "gpt-3.5-turbo-1106", "gpt-4o-mini", "gpt-4.1-mini"):
+            return {"type": "json_object"}
+        else:
+            return {"type": "text"}
+
+    async def _retry_full_history(self, messages, synthesize, request_json, meta_info, tool_choice, tools):
+        """Drop the chain and re-run the turn on full history (single home for both WS retries)."""
+        self.previous_response_id = None
+        async for chunk in self._generate_stream_ws_responses(
+            messages, synthesize, request_json, meta_info, tool_choice, tools
+        ):
+            yield chunk
+
+    async def _generate_stream_ws_responses(
+        self, messages, synthesize=True, request_json=False, meta_info=None, tool_choice=None, tools=None
+    ):
+        """Stream via persistent WebSocket — same interface as _generate_stream_responses."""
+        if not messages:
+            raise ValueError("No messages provided")
+
+        # store=True activates server-side prompt-cache (cached_tokens in usage)
+        # on top of the WS connection-local cache. Storage is free per OpenAI.
+        create_params, responses_tools = self._build_responses_create_kwargs(
+            messages, meta_info, request_json, tool_choice, store=True, tools=tools
+        )
+
+        answer, buffer = "", ""
+        func_call_args = {}
+        func_call_names = {}
+        func_call_ids = {}
+        gave_pre_call_msg = False
+        received_textual = False
+        reasoning_summary_parts = []
+
+        start_time = now_ms()
+        first_token_time = None
+        latency_data = None
+        ws_service_tier = None
+        llm_host = self.llm_host
+        response_usage = None
+        incomplete = False
+        incomplete_reason = None
+
+        try:
+            async for evt in self._ws_transport.stream_response(create_params):
+                now = now_ms()
+                evt_type = evt.get("type", "")
+
+                if evt_type == ResponseStreamEvent.ERROR:
+                    error_info = evt.get("error", {})
+                    error_code = error_info.get("code", "")
+                    if error_code == "previous_response_not_found" and self.previous_response_id:
+                        logger.warning(f"WS previous_response_id not found, retrying with full history")
+                        async for chunk in self._retry_full_history(
+                            messages, synthesize, request_json, meta_info, tool_choice, tools
+                        ):
+                            yield chunk
+                        return
+                    # lineage/pairing rejection of a CHAINED request (code None, param input — e.g.
+                    # "No tool output found ...") gets one full-history retry; nothing yielded yet.
+                    # Coded errors like context_length_exceeded raise — a retry can't fix those.
+                    if (
+                        self.previous_response_id
+                        and error_info.get("type") == "invalid_request_error"
+                        and not error_code
+                        and error_info.get("param") == "input"
+                        and not answer
+                        and not func_call_args
+                        and not gave_pre_call_msg
+                    ):
+                        logger.warning(
+                            f"WS chained request rejected ({error_info.get('message')}), retrying with full history"
+                        )
+                        if isinstance(meta_info, dict):
+                            meta_info.setdefault("_non_fatal_errors", []).append(
+                                {
+                                    "error_type": "chained_request_rejected",
+                                    "error": error_info.get("message"),
+                                    "model": self.model,
+                                }
+                            )
+                        async for chunk in self._retry_full_history(
+                            messages, synthesize, request_json, meta_info, tool_choice, tools
+                        ):
+                            yield chunk
+                        return
+                    logger.error(f"WebSocket Responses API error: {error_info}")
+                    raise APIError(message=f"WS response error: {error_info}", request=None, body=None)
+
+                if evt_type == ResponseStreamEvent.CREATED:
+                    resp = evt.get("response", {})
+                    self._on_response_created(resp.get("id"))
+                    self._log_llm_request_id(response_id=resp.get("id"))
+                    ws_service_tier = resp.get("service_tier")
+                    if latency_data is None:
+                        latency_data = LatencyData(
+                            sequence_id=meta_info.get("sequence_id") if meta_info else None,
+                            connection_latency_ms=round(now - start_time, 2),
+                        )
+                    else:
+                        latency_data.connection_latency_ms = round(now - start_time, 2)
+                    continue
+
+                if evt_type == ResponseStreamEvent.FAILED:
+                    resp = evt.get("response", {})
+                    error_info = resp.get("error") or resp.get("last_error")
+                    logger.error(f"WS Responses API stream failed: {error_info}")
+                    self.invalidate_response_chain()
+                    raise APIError(message=f"Response failed: {error_info}", request=None, body=None)
+
+                if evt_type == ResponseStreamEvent.INCOMPLETE:
+                    incomplete = True
+                    incomplete_reason = ((evt.get("response") or {}).get("incomplete_details") or {}).get("reason")
+                    logger.warning(f"WS Responses API stream incomplete, reason={incomplete_reason}")
+                    self.invalidate_response_chain()
+                    break
+
+                if not first_token_time and evt_type in (
+                    ResponseStreamEvent.OUTPUT_TEXT_DELTA,
+                    ResponseStreamEvent.FUNCTION_CALL_ARGS_DELTA,
+                ):
+                    first_token_time = now
+                    self.started_streaming = True
+                    latency_data = LatencyData(
+                        sequence_id=meta_info.get("sequence_id") if meta_info else None,
+                        first_token_latency_ms=first_token_time - start_time,
+                        total_stream_duration_ms=None,
+                        service_tier=ws_service_tier,
+                        llm_host=llm_host,
+                    )
+
+                if evt_type == ResponseStreamEvent.OUTPUT_TEXT_DELTA:
+                    received_textual = True
+                    delta = evt.get("delta", "")
+                    answer += delta
+                    buffer += delta
+                    if synthesize and len(buffer) >= self.buffer_size:
+                        split = buffer.rsplit(" ", 1)
+                        yield LLMStreamChunk(data=split[0], end_of_stream=False, latency=latency_data)
+                        buffer = split[1] if len(split) > 1 else ""
+
+                elif evt_type == ResponseStreamEvent.REASONING_SUMMARY_TEXT_DELTA:
+                    reasoning_summary_parts.append(evt.get("delta", ""))
+
+                elif evt_type == ResponseStreamEvent.OUTPUT_ITEM_ADDED:
+                    item = evt.get("item", {})
+                    if item.get("type") == ResponseItemType.FUNCTION_CALL:
+                        if buffer:
+                            yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data)
+                            buffer = ""
+                        item_id = item.get("id", "")
+                        func_call_args[item_id] = ""
+                        func_call_names[item_id] = resolve_tool_name(item.get("name", ""), self.api_params)
+                        func_call_ids[item_id] = item.get("call_id", "")
+
+                        # An unconfigured tool is dropped later, so a filler would promise a reply that never comes.
+                        if (
+                            not gave_pre_call_msg
+                            and not received_textual
+                            and self.trigger_function_call
+                            and func_call_names[item_id] in self.api_params
+                        ):
+                            gave_pre_call_msg = True
+                            func_name = func_call_names[item_id]
+                            func_params = self.api_params.get(func_name)
+                            api_tool_pre_call_message = (
+                                APIParams.model_validate(func_params).pre_call_message if func_params else None
+                            )
+                            detected_lang = meta_info.get("detected_language") if meta_info else None
+                            active_language = detected_lang or self.language
+                            pre_msg = compute_function_pre_call_message(
+                                active_language, func_name, api_tool_pre_call_message
+                            )
+                            if pre_msg:
+                                yield LLMStreamChunk(
+                                    data=pre_msg,
+                                    end_of_stream=True,
+                                    latency=latency_data,
+                                    function_name=func_name,
+                                    function_message=api_tool_pre_call_message,
+                                )
+
+                elif evt_type == ResponseStreamEvent.FUNCTION_CALL_ARGS_DELTA:
+                    item_id = evt.get("item_id", "")
+                    func_call_args[item_id] = func_call_args.get(item_id, "") + evt.get("delta", "")
+
+                elif evt_type == ResponseStreamEvent.COMPLETED:
+                    resp = evt.get("response", {})
+                    self._on_response_completed(resp.get("id"), func_call_ids.values())
+                    ws_service_tier = ws_service_tier or resp.get("service_tier")
+                    response_usage = resp.get("usage")
+                    break
+
+        except APIError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"WS streaming error: {e}, falling back to HTTP SSE")
+            self.invalidate_response_chain()
+            if isinstance(e, WSConnectError):
+                # A socket that cannot open now is not retried each turn; HTTP serves the rest of the call.
+                transport, self._ws_transport = self._ws_transport, None
+                asyncio.ensure_future(transport.disconnect())
+            async for chunk in self._generate_stream_responses(
+                messages, synthesize, request_json, meta_info, tool_choice, tools
+            ):
+                yield chunk
+            return
+
+        # Nothing was yielded yet, so a retry cannot duplicate speech.
+        if incomplete and not answer and not func_call_args:
+            logger.warning(f"WS Responses API returned no output (reason={incomplete_reason}), retrying once over HTTP")
+            if isinstance(meta_info, dict):
+                meta_info.setdefault("_non_fatal_errors", []).append(
+                    {"error_type": "incomplete_empty_response", "error": incomplete_reason, "model": self.model}
+                )
+            async for chunk in self._generate_stream_responses(
+                messages, synthesize, request_json, meta_info, tool_choice, tools, retry_on_empty=False
+            ):
+                yield chunk
+            return
+
+        if latency_data:
+            latency_data.total_stream_duration_ms = now_ms() - start_time
+            if ws_service_tier:
+                latency_data.service_tier = ws_service_tier
+
+        fc_chunk = self._build_function_call_chunk(
+            func_call_args,
+            func_call_names,
+            func_call_ids,
+            responses_tools,
+            create_params,
+            meta_info,
+            answer,
+            received_textual,
+            latency_data,
+        )
+        if fc_chunk:
+            if response_usage and isinstance(response_usage, dict):
+                fc_chunk.input_tokens = response_usage.get("input_tokens")
+                fc_chunk.output_tokens = response_usage.get("output_tokens")
+                _od = response_usage.get("output_tokens_details") or {}
+                if _od.get("reasoning_tokens"):
+                    fc_chunk.reasoning_tokens = _od["reasoning_tokens"]
+                _id = response_usage.get("input_tokens_details") or {}
+                if _id.get("cached_tokens"):
+                    fc_chunk.cached_tokens = _id["cached_tokens"]
+            yield fc_chunk
+
+        usage_kwargs = {}
+        if response_usage and isinstance(response_usage, dict):
+            usage_kwargs["input_tokens"] = response_usage.get("input_tokens")
+            usage_kwargs["output_tokens"] = response_usage.get("output_tokens")
+            output_details = response_usage.get("output_tokens_details", {}) or {}
+            if output_details.get("reasoning_tokens"):
+                usage_kwargs["reasoning_tokens"] = output_details["reasoning_tokens"]
+            input_details = response_usage.get("input_tokens_details", {}) or {}
+            if input_details.get("cached_tokens"):
+                usage_kwargs["cached_tokens"] = input_details["cached_tokens"]
+
+        reasoning_content = "".join(reasoning_summary_parts) if reasoning_summary_parts else None
+        if reasoning_content:
+            usage_kwargs["reasoning_content"] = reasoning_content
+
+        if synthesize:
+            yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+        else:
+            yield LLMStreamChunk(data=answer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+
+        self.started_streaming = False
+
+    def cancel_in_flight_response(self):
+        """Cancel the in-flight WS response and drop the chain — a lost cancel race can leave a
+        server-committed function_call this client never saw, poisoning every later chained
+        request. Chain state only: the hint sync_history sets right after this must survive."""
+        if self._ws_transport and self.previous_response_id:
+            asyncio.ensure_future(self._ws_transport.cancel_response(self.previous_response_id))
+            self.previous_response_id = None
+            self._in_flight_response_id = None
+            self._pending_call_ids = set()
+
+    async def close(self):
+        # httpx client is shared via pool, don't close it here
+        if self._ws_transport:
+            await self._ws_transport.disconnect()
