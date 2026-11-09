@@ -174,6 +174,7 @@ The sequence reports measured arm joints and command/controller state, but it ca
 - [Student Guide](docs/student_guide.md)
 - [Teacher Guide](docs/teacher_guide.md)
 - [Environment and Host Setup](docs/environment_and_host_setup.md)
+- [AI Voice Conversation Implementation Plan](docs/ai-voice-chat-implementation-plan.md)
 
 ## Usage Instructions
 
