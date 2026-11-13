@@ -35,6 +35,37 @@ test('DUET connection rejects legacy commands before sending a request', async (
   assert.deepEqual(requests, []);
 });
 
+test('DUET connection stores and deletes measured motion recordings', async () => {
+  const requests = [];
+  const connection = new DuetRobotConnection(async (...args) => {
+    requests.push(args);
+    return { recordings: [] };
+  });
+  const recording = {
+    name: 'Wave',
+    controller_version: 'duet',
+    command: 'duet.wave_right("mid", 1.5)',
+    joint_names: Array(10).fill('joint'),
+    frames: [
+    { time: 0, joints: Array(10).fill(0) },
+    { time: 0.1, joints: Array(10).fill(0.1) },
+    ],
+  };
+
+  await connection.recordings();
+  await connection.saveRecording(recording);
+  await connection.deleteRecording('capture-1');
+
+  assert.deepEqual(requests.map(([url]) => url), [
+    '/api/robot/recordings',
+    '/api/robot/recordings',
+    '/api/robot/recordings/capture-1',
+  ]);
+  assert.deepEqual(requests[0][1], { cache: 'no-store' });
+  assert.deepEqual(JSON.parse(requests[1][1].body), recording);
+  assert.deepEqual(requests[2][1], { method: 'DELETE' });
+});
+
 test('DUET commissioning exposes isolated evidence and review endpoints', async () => {
   const requests = [];
   const connection = new DuetRobotConnection(async (...args) => {

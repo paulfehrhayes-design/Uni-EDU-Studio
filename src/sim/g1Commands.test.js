@@ -5,6 +5,8 @@ import { pythonGenerator } from 'blockly/python';
 import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './g1Commands.js';
 import { compileMotionPrompt } from './textToMotion.js';
 import { buildG1SimulationFrames } from './g1Edu23Env.js';
+import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
+import { G1_MESH_ARM_JOINT_NAMES } from './g1MeshRigAxes.js';
 
 test('G1 command catalog emits matching bounded Blockly commands', () => {
   const blocks = getG1BlocklyCommandBlocks();
@@ -453,7 +455,7 @@ test('G1 posture commands parse and preview distinct simulator transitions', () 
   });
 
   const squat = buildG1SimulationFrames('robot.stand_to_squat()').at(-1);
-  assert.equal(squat.joints.left_knee_pitch, 105);
+  assert.equal(squat.joints.left_knee_joint, 105);
   assert.equal(squat.torsoPitch, 16);
   const standing = buildG1SimulationFrames('robot.squat_to_stand()').at(-1);
   assert.equal(standing.torsoPitch, 0);
@@ -506,18 +508,83 @@ test('simulation expands the same bounded IDE loop syntax', () => {
   assert.ok(Math.abs(finalFrame.x - 2 * G1_NOMINAL_STEP_METERS) < 1e-9);
 });
 
-test('legacy arm presets preserve their selected pose in simulation and executable code', () => {
+test('legacy arm presets preview differentiated DUET pose sequences', () => {
   const frames = buildG1SimulationFrames('robot.arm_action("hands up")');
+  const poseFrame = frames.find((frame) => Math.abs(frame.time - 0.8) < 0.001);
   const finalFrame = frames.at(-1);
+  const catalog = getDuetArmCatalog();
+  const handsUp = getDuetArmPoseTarget('both_hands_up');
 
+  assert.ok(poseFrame, 'the first gesture target should be previewed');
   assert.equal(finalFrame.actions.at(-1).label, 'Arm preset preview: hands up');
-  assert.equal(Number(finalFrame.joints.left_shoulder_pitch), -75);
-  assert.equal(Number(finalFrame.joints.right_shoulder_pitch), -75);
+  catalog.jointOrder.forEach((joint, index) => {
+    assert.ok(Math.abs(
+      Number(poseFrame.joints[joint]) - handsUp[index] * 180 / Math.PI,
+    ) < 0.01, `hands up should target catalog joint ${joint}`);
+    assert.ok(Math.abs(
+      Number(finalFrame.joints[joint]) - handsUp[index] * 180 / Math.PI,
+    ) < 0.01, `hands up should finish at catalog joint ${joint}`);
+  });
 
   const presets = G1_COMMANDS.find((entry) => entry.method === 'arm_action').args[0].choices;
   presets.forEach(([, preset]) => {
     const presetProgram = parseG1Program(`robot.arm_action(${JSON.stringify(preset)})`);
     assert.deepEqual(presetProgram.map(({ values }) => values[0]), [preset]);
+
+    const presetFrames = buildG1SimulationFrames(`robot.arm_action(${JSON.stringify(preset)})`);
+    const presetPose = presetFrames
+      .find((frame) => Math.abs(frame.time - 0.8) < 0.001)?.joints;
+    assert.ok(presetPose, `${preset} should preview its first pose`);
+    presetFrames.forEach(({ joints }) => {
+      assert.equal(Object.keys(joints).length, 23, `${preset} frame uses exactly 23 joint states`);
+      G1_MESH_ARM_JOINT_NAMES.forEach((joint) => {
+        assert.ok(Object.hasOwn(joints, joint), `${preset} frame includes ${joint}`);
+        assert.ok(Number.isFinite(Number(joints[joint])), `${preset} ${joint} stays finite`);
+      });
+    });
+    for (const side of ['left', 'right']) {
+      const elbow = presetPose[`${side}_elbow_joint`];
+      if (elbow !== undefined) {
+        assert.ok(elbow >= 0 && elbow <= 120, `${preset} ${side} elbow should use the G1 positive-flexion range`);
+      }
+    }
+  });
+});
+
+test('legacy raise and wave motions animate catalog shoulder, elbow, and wrist targets', () => {
+  const raised = buildG1SimulationFrames('robot.raiseleftarm("high")').at(-1).joints;
+  const raiseTarget = getDuetArmPoseTarget('left_raise_high');
+  const order = getDuetArmCatalog().jointOrder;
+  order.slice(0, 5).forEach((joint, index) => {
+    assert.ok(Math.abs(
+      Number(raised[joint]) - raiseTarget[index] * 180 / Math.PI,
+    ) < 0.01, `raise should target catalog joint ${joint}`);
+  });
+  assert.ok(raised.left_shoulder_roll_joint > 30, 'raised arm should move out from the torso');
+  assert.ok(raised.left_elbow_joint > 40, 'raised arm should bend its elbow');
+
+  const wave = buildG1SimulationFrames('robot.waveleft("high")');
+  assert.ok(wave.some((frame) => Math.abs(frame.joints.left_wrist_roll_joint) > 20), 'wave should animate wrist roll');
+  assert.ok(wave.at(-1).joints.left_shoulder_roll_joint > 30, 'wave should keep the shoulder out from the torso');
+});
+
+test('legacy face and high wave presets use the SDK right-arm side', () => {
+  const faceWaveFrame = buildG1SimulationFrames('robot.arm_action("face wave")')
+    .find((frame) => Math.abs(frame.joints.right_wrist_roll_joint) > 20);
+  const faceWave = faceWaveFrame?.joints;
+  const highWave = buildG1SimulationFrames('robot.arm_action("high wave")')
+    .find((frame) => Math.abs(frame.time - 0.8) < 0.001).joints;
+  const rightHighPose = getDuetArmPoseTarget('right_wave_high');
+  const armJointOrder = getDuetArmCatalog().jointOrder;
+
+  assert.ok(faceWave, 'face wave rotates the active right wrist-roll joint');
+  assert.ok(faceWave.right_shoulder_pitch_joint < 0, 'face wave raises the right arm');
+  assert.ok(faceWave.right_elbow_joint > 30, 'face wave bends the right elbow');
+  assert.equal(faceWave.left_wrist_roll_joint, 0, 'the inactive left wrist stays neutral');
+  armJointOrder.slice(5, 10).forEach((joint, index) => {
+    assert.ok(Math.abs(
+      Number(highWave[joint]) - rightHighPose[index + 5] * 180 / Math.PI,
+    ) < 0.01, `high wave targets right-side catalog joint ${joint}`);
   });
 });
 
@@ -547,8 +614,12 @@ test('timed arm pose block uses supported static presets and previews the reques
 
   const frames = buildG1SimulationFrames(program[0].code);
   assert.ok(Math.abs(frames.at(-1).time - 3.8) < 1e-9);
-  assert.equal(Number(frames.at(-1).joints.left_shoulder_pitch), -75);
-  assert.equal(Number(frames.at(-1).joints.right_shoulder_pitch), -75);
+  const handsUp = getDuetArmPoseTarget('both_hands_up');
+  getDuetArmCatalog().jointOrder.forEach((joint, index) => {
+    assert.ok(Math.abs(
+      Number(frames.at(-1).joints[joint]) - handsUp[index] * 180 / Math.PI,
+    ) < 0.01, `hold arm should hold catalog joint ${joint}`);
+  });
   assert.equal(frames.at(-1).actions.at(-1).label, 'Hold arm pose');
 
   for (const code of [

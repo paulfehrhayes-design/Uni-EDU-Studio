@@ -142,6 +142,57 @@ lower-body entries from the policy and the ten arm entries from the most recent 
 on `rt/arm_targets`. If that stream goes quiet for 200 ms the arms fall back to an
 operator-selected pose.
 
+### DUET gateway on a G1 host
+
+The modified controller entry point is `deploy/robots/g1_23dof/main.cpp`; CMake builds
+it as `deploy/robots/g1_23dof/build/g1_ctrl`. It takes the DDS network interface via
+`--network <interface>`. The CMake target expects the Unitree SDK2 C++ libraries,
+`ddsc`/`ddscxx` and Iceoryx headers at the locations in its CMake file, Eigen,
+Boost `program_options`, yaml-cpp, fmt, and zlib. ONNX Runtime is vendored for x86_64
+and aarch64. The controller also loads its YAML and policy relative to the executable,
+so keep the built binary inside this deployment tree.
+
+On the robot host, build using that host's installed SDK/DDS toolchain. Then, as the
+same non-root local user that runs the Uni-EDU backend, install a manually started
+user unit, passing the interface used for G1 DDS:
+
+```bash
+cd deploy/robots/g1_23dof
+python3 install_user_service.py --interface eth0
+systemctl --user daemon-reload
+```
+
+Replace `eth0` with the actual G1-host interface. The installer checks that it exists
+and that `build/g1_ctrl` and the configured policy are present. It writes
+`~/.config/systemd/user/duet-g1-controller.service` with an **absolute**
+`DUET_CONTROL_DIR=$HOME/.cache/uni-edu-duet` and `DUET_GATEWAY_ENABLED=true`. This is
+the same-user default used by the backend when `DUET_CONTROL_DIR` is unset. The script
+does not start or enable the service; inspect the unit and only start it when an
+operator is ready:
+
+```bash
+systemctl --user start duet-g1-controller.service
+systemctl --user status duet-g1-controller.service
+journalctl --user -u duet-g1-controller.service
+```
+
+`g1_ctrl` initializes the robot connection and starts its FSM in **Handoff**. This
+state copies fresh measured joint positions into the command buffer but does not
+publish `rt/lowcmd`; it also remains non-publishing if low-state times out. Handoff
+does not establish the robot's physical posture or whether a mode transition is
+appropriate. If the robot is already in `Velocity`, leave it there; do not press
+L2+Up (or F1) to send it back through `FixStand`. If the actual controller state
+cannot be verified, do not guess at a transition based on the missing gateway.
+Only a qualified onsite operator who has verified the robot and controller state
+may use the configured L2+Up/F1 transition into `FixStand`, followed by R2+A to
+enter `Velocity`, when the model-specific procedure requires it. The local gateway
+socket starts only in Velocity, so a running service by itself is not evidence that
+the app can reach the gateway. The interface check does not prove DDS connectivity,
+and this software handoff is not physical-safety acceptance.
+Never enable the unit at boot. Before stopping the unit, use the app's explicit stop
+and have the operator return the controller to Passive; a systemd stop is not an
+emergency stop.
+
 ## Running a VLA on top
 
 `vla_bridge/` holds the two scripts that make a manipulation policy drive the arms. Each
@@ -175,6 +226,12 @@ wrist-mounted D405 for close range during grasping.
 Run the locomotion controller first, then the bridge. The locomotion policy is never
 restarted, never told which model is publishing, and never receives the arm targets or a
 task description.
+
+The unit-generator checks can be run without a robot or controller binary:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_install_user_service.py' -v
+```
 
 ## Licence
 

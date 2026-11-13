@@ -62,6 +62,27 @@ export class SdkRobotConnection {
     return this.request('/api/robot/status', { cache: 'no-store' });
   }
 
+  async jointState() {
+    return this.request('/api/robot/joint-state', { cache: 'no-store' });
+  }
+
+  async recordings() {
+    return this.request('/api/robot/recordings', { cache: 'no-store' });
+  }
+
+  async saveRecording(recording) {
+    return this.request('/api/robot/recordings', {
+      method: 'POST',
+      body: JSON.stringify(recording),
+    });
+  }
+
+  async deleteRecording(recordingId) {
+    return this.request(`/api/robot/recordings/${encodeURIComponent(recordingId)}`, {
+      method: 'DELETE',
+    });
+  }
+
   async run(code) {
     getPhysicalCommands(code, 'SDK', (method) => commandDefinitions.get(method)?.adapters.sdk === true);
     return this.request('/api/run', {

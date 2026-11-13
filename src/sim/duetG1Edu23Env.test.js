@@ -77,8 +77,12 @@ test('DUET simulator maps preset locomotion blocks to the same bounded velocity 
 
 test('DUET simulator previews named arm-pose presets', () => {
   const final = simulateDuetG1Edu23Program('duet.arm_reach(1)').at(-1);
+  const forwardPose = getDuetArmPoseTarget('forward');
   assert.ok(final.joints.left_shoulder_pitch_joint < 0);
-  assert.equal(final.joints.left_elbow_joint, Number((0.87 * 180 / Math.PI).toFixed(2)));
+  assert.equal(
+    final.joints.left_elbow_joint,
+    Number((forwardPose[3] * 180 / Math.PI).toFixed(2)),
+  );
   assert.equal(final.joints.right_shoulder_roll_joint < 0, true);
 });
 
@@ -152,7 +156,8 @@ test('DUET simulator retains until-reset poses, resets explicitly, and resets he
     + 'duet.reset_arms()',
   );
   const duringWait = explicitlyReset.find((frame) => Math.abs(frame.time - 1.5) < 0.001);
-  assert.ok(duringWait.joints.left_shoulder_pitch_joint < -50);
+  assert.ok(duringWait.joints.left_shoulder_roll_joint > 30);
+  assert.ok(duringWait.joints.left_elbow_joint > 0);
   assert.ok(explicitlyReset.at(-1).joints.left_shoulder_pitch_joint > 0);
 
   const completed = simulateDuetG1Edu23Program(
@@ -179,9 +184,15 @@ test('DUET side-specific wave gestures move only the selected mirrored arm', () 
   const leftFrame = simulateDuetG1Edu23Program('duet.wave_left_mid(1)').find((frame) => frame.time === 1);
   const rightFrame = simulateDuetG1Edu23Program('duet.wave_right_mid(1)').find((frame) => frame.time === 1);
 
-  assert.ok(leftFrame.joints.left_shoulder_pitch_joint < -50);
+  assert.ok(leftFrame.joints.left_shoulder_pitch_joint < -20);
+  assert.ok(leftFrame.joints.left_shoulder_roll_joint > 50);
+  assert.ok(leftFrame.joints.left_shoulder_yaw_joint > 15);
+  assert.ok(leftFrame.joints.left_elbow_joint > 10);
   assert.ok(leftFrame.joints.right_shoulder_pitch_joint > 0);
-  assert.ok(rightFrame.joints.right_shoulder_pitch_joint < -50);
+  assert.ok(rightFrame.joints.right_shoulder_pitch_joint < -20);
+  assert.ok(rightFrame.joints.right_shoulder_roll_joint < -50);
+  assert.ok(rightFrame.joints.right_shoulder_yaw_joint < -15);
+  assert.ok(rightFrame.joints.right_elbow_joint > 10);
   assert.ok(rightFrame.joints.left_shoulder_pitch_joint > 0);
 });
 

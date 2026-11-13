@@ -33,8 +33,18 @@ public:
 
         // set initial position
         std::vector<float> q0;
+        const auto *motor_states =
+            lowstate ? &lowstate->msg_.motor_state() : nullptr;
+        const bool measured_pose_available =
+            motor_states && !lowstate->isTimeout() &&
+            motor_states->size() >= kp.size();
         for(int i(0); i < kp.size(); ++i) {
-            q0.push_back(lowcmd->msg_.motor_cmd()[i].q());
+            // Handoff enters FixStand without having published a Passive
+            // command, so seed from measurements when fresh. Retain the prior
+            // command-buffer fallback for later transitions during low-state loss.
+            q0.push_back(measured_pose_available
+                ? (*motor_states)[i].q()
+                : lowcmd->msg_.motor_cmd()[i].q());
         }
         qs_[0] = q0;
         t0_ = (double)unitree::common::GetCurrentTimeMillisecond() * 1e-3;

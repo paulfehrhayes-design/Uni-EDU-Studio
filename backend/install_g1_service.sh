@@ -7,9 +7,15 @@ if [[ ! -x "$SDK_ENV_DIR/bin/python" ]]; then
   SDK_ENV_DIR="$HOME/venvs/g1-sdk-py312"
 fi
 PYTHON="$SDK_ENV_DIR/bin/python"
+DUET_CONTROL_DIR="${DUET_CONTROL_DIR:-$HOME/.cache/uni-edu-duet}"
+UNITREE_INTERFACE="${UNITREE_INTERFACE:-eth0}"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "Unitree SDK virtual environment not found. Set G1_SDK_ENV_DIR to its path." >&2
+  exit 1
+fi
+if [[ "$DUET_CONTROL_DIR" != /* ]]; then
+  echo "DUET_CONTROL_DIR must be an absolute path." >&2
   exit 1
 fi
 if ! command -v npm >/dev/null 2>&1; then
@@ -43,6 +49,14 @@ echo "Checking Unitree SDK imports using $PYTHON"
 CYCLONEDDS_HOME="$HOME/cyclonedds/install" "$PYTHON" -c \
   "from unitree_sdk2py.core.channel import ChannelFactoryInitialize; from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient"
 
+echo "Preparing the vendored DUET G1 controller (without starting it)"
+python3 "$PROJECT_DIR/backend/duet_setup.py" --prepare
+DUET_EXPECTED_POLICY_ID="$(python3 "$PROJECT_DIR/backend/duet_setup.py" --policy-id)"
+echo "DUET backend policy identity: $DUET_EXPECTED_POLICY_ID"
+python3 "$PROJECT_DIR/vendor/DUET/deploy/robots/g1_23dof/install_user_service.py" \
+  --interface "$UNITREE_INTERFACE" \
+  --control-dir "$DUET_CONTROL_DIR"
+
 echo "Installing backend dependencies"
 "$PYTHON" -m pip install -r "$PROJECT_DIR/backend/requirements.txt"
 
@@ -68,8 +82,10 @@ Type=simple
 WorkingDirectory=$PROJECT_DIR
 Environment=CYCLONEDDS_HOME=$HOME/cyclonedds/install
 Environment=UNITREE_DOMAIN_ID=0
-Environment=UNITREE_INTERFACE=eth0
+Environment=UNITREE_INTERFACE=$UNITREE_INTERFACE
 Environment=UNI_EDU_PORT=5179
+Environment=DUET_CONTROL_DIR=$DUET_CONTROL_DIR
+Environment=DUET_EXPECTED_POLICY_ID=$DUET_EXPECTED_POLICY_ID
 ExecStart=$PYTHON $PROJECT_DIR/backend/server.py
 Restart=on-failure
 RestartSec=3
@@ -188,6 +204,10 @@ echo
 echo "Uni EDU Studio is serving its frontend and will start automatically at boot."
 echo "Open http://<this-computer-wifi-ip>:5179 on a device connected to the same Wi-Fi."
 echo "Check service status with: systemctl --user status uni-edu-studio"
+echo "DUET controller unit is installed but is NOT enabled or started."
+echo "Before any operator start: verify robot model, clear the area, have a qualified operator present, review the unit, and confirm the chosen DDS interface."
+echo "Only when the operator is ready, start it explicitly with: systemctl --user start duet-g1-controller.service"
+echo "DUET backend socket directory: $DUET_CONTROL_DIR"
 if [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" != "1" ]]; then
   echo "The app/backend is installed without LiDAR. SDK connection and supported non-conditional SDK commands remain available."
 elif [[ "$LIDAR_CONFIGURED" != "1" && "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then

@@ -4,7 +4,7 @@ import {
   Save, FolderOpen, Download, Settings, Play, Square,
   Code, X, RefreshCw, FileJson, Check, Loader2,
   Menu, Undo, Redo, ChevronRight, Sidebar, MoreVertical, Trash2,
-  Upload, FileText, Edit3, FunctionSquare
+  Upload, FileText, Edit3, FunctionSquare, Eye, EyeOff
 } from 'lucide-react';
 import * as Blockly from 'blockly/core';
 import { pythonGenerator } from 'blockly/python';
@@ -40,9 +40,11 @@ import {
   validateDuetArmMotion,
 } from './sim/duetArmMotions.js';
 import { simulateDuetG1Edu23Program } from './sim/duetG1Edu23Env.js';
+import { buildG1RecordedMotionFrames } from './sim/g1RecordedArmMotion.js';
 import { analyzeDuetVideo, captureDuetLiveMotion } from './sim/duetVisionMotion.js';
 import { createRobotConnection } from './robot/RobotConnection';
 import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
+import TeacherArmMotionRecorder from './components/TeacherArmMotionRecorder.jsx';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -879,6 +881,8 @@ export default function App() {
   const [projectMenuPosition, setProjectMenuPosition] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
+  const [isArmMotionRecording, setIsArmMotionRecording] = useState(false);
+  const [recordedMotionPreview, setRecordedMotionPreview] = useState(null);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
   const [promptState, setPromptState] = useState({ isOpen: false, message: '', defaultValue: '', callback: null, inputValue: '' });
@@ -1066,8 +1070,9 @@ export default function App() {
   const [isQueueReviewRunning, setIsQueueReviewRunning] = useState(false);
   const [isQueueReviewPreviewing, setIsQueueReviewPreviewing] = useState(false);
   const [teacherRoster, setTeacherRoster] = useState([]);
-  const [loginForm, setLoginForm] = useState({ username: 'teacher', password: 'teacher', role: 'teacher' });
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
+  const [isLoginPasswordVisible, setIsLoginPasswordVisible] = useState(false);
   const [isRegistering, setIsRegistering] = useState(false);
   const [newStudent, setNewStudent] = useState({ username: '', password: '', role: 'student' });
   const [accountManagementError, setAccountManagementError] = useState('');
@@ -1917,7 +1922,7 @@ export default function App() {
     try {
       const response = await apiFetch('/api/classroom/login', {
         method: 'POST',
-        body: JSON.stringify(loginForm)
+        body: JSON.stringify({ username: loginForm.username, password: loginForm.password })
       }, false);
       setSession({ token: response.token, user: response.user });
     } catch (err) {
@@ -2471,6 +2476,17 @@ export default function App() {
       alert('Teacher login is required to connect the robot.');
       return;
     }
+    if (controllerVersion === 'duet' && !isRobotConnected) {
+      const approved = window.confirm(
+        'Start the DUET controller in its no-command Handoff state? '
+        + 'Connect will not change the FSM or put the robot into Velocity, and Handoff does not '
+        + 'actively hold the robot posture. An idle legacy SDK connection may remain initialized, but its '
+        + 'motion commands are blocked while DUET is active. Connect does not change the FSM. '
+        + 'Do not use FixStand as a generic Ready step. '
+        + 'Continue only if a qualified onsite operator has verified the robot and its active controller state.',
+      );
+      if (!approved) return;
+    }
     if (controllerVersion === 'duet' && isRobotConnected && isDuetProgramActive) {
       alert('Stop the active DUET program and wait for confirmed completion before disconnecting.');
       return;
@@ -2478,7 +2494,7 @@ export default function App() {
 
     setIsRobotConnecting(true);
     setRobotConnectionStatus(controllerVersion === 'duet'
-      ? 'Connecting to the DUET G1 23-DOF controller gateway...'
+      ? 'Starting or connecting to the DUET G1 23-DOF controller...'
       : 'Connecting through the G1 host network interface...');
     try {
       if (controllerVersion === 'duet' && isRobotConnected) {
@@ -2493,6 +2509,16 @@ export default function App() {
         return;
       }
       const connection = await activeRobotConnection.connect();
+      if (controllerVersion === 'duet' && connection.operatorActionRequired === true) {
+        setIsRobotConnected(false);
+        duetProgramActiveRef.current = false;
+        setIsDuetProgramActive(false);
+        setIsRunning(false);
+        setRobotConnectionStatus(connection.message || connection.error || (
+          'DUET gateway is unavailable. Do not attempt a mode transition from the app; have a qualified operator verify the robot and follow its recovery procedure.'
+        ));
+        return;
+      }
       if (connection.status !== 'connected' || (controllerVersion === 'duet' && connection.ready !== true)) {
         throw new Error('Backend did not confirm a connected robot.');
       }
@@ -2927,33 +2953,21 @@ export default function App() {
       alert('Wait for the current robot operation or connection attempt to finish before switching versions.');
       return;
     }
-    let duetOwnershipUnverified = false;
-    if (
-      controllerVersion === 'duet'
-      && nextVersion === 'legacy'
-      && (isRobotConnected || isDuetProgramActive)
-    ) {
+    if (controllerVersion === 'duet' && nextVersion === 'legacy') {
       setIsRobotConnecting(true);
       try {
-        let status = await duetRobotConnection.status();
-        if (status.connected === true || status.motionOwner === 'duet') {
-          const disconnected = await duetRobotConnection.disconnect();
-          if (disconnected.status !== 'disconnected' || disconnected.lowcmd_owner !== 'none') {
-            throw new Error('DUET did not confirm release of rt/lowcmd ownership.');
-          }
-          status = await duetRobotConnection.status();
-        }
-        if (status.connected === true || status.ready === true || status.motionOwner !== 'none') {
-          throw new Error(status.error || 'DUET motion ownership is not confirmed released.');
+        const status = await duetRobotConnection.status();
+        if (status.motionOwner !== 'none' || status.controllerServiceActive !== false) {
+          throw new Error(
+            'The DUET controller service is active or its state cannot be verified. '
+            + 'The app will not stop it; do not switch to legacy until an onsite operator has stopped DUET '
+            + 'and backend status confirms the service is inactive and ownership is released.',
+          );
         }
       } catch (error) {
-        if (error.status === 401) {
-          duetOwnershipUnverified = true;
-        } else {
-          setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
-          alert(`Cannot switch to legacy mode: ${error.message}`);
-          return;
-        }
+        setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
+        alert(`Cannot switch to legacy mode: ${error.message}`);
+        return;
       } finally {
         setIsRobotConnecting(false);
       }
@@ -2980,13 +2994,6 @@ export default function App() {
     setSafetyNotice('');
     setIsRobotConnected(false);
 
-    if (duetOwnershipUnverified) {
-      setRobotConnectionStatus(
-        'Legacy preview selected • DUET ownership could not be checked because the session expired. Sign in again before robot connection or motion; the backend ownership interlock remains active.',
-      );
-      return;
-    }
-
     if (!session || session.user.role !== 'teacher') {
       setRobotConnectionStatus(nextVersion === 'duet'
         ? 'DUET preview selected • teacher login required for physical connection.'
@@ -2998,7 +3005,10 @@ export default function App() {
     try {
       const status = await nextConnection.status();
       const connected = nextVersion === 'duet'
-        ? status.connected === true && status.ready === true && status.motionOwner === 'duet'
+        ? status.connected === true
+          && status.ready === true
+          && status.controlLease === true
+          && status.motionOwner === 'duet'
         : status.sdkAvailable === true;
       if (nextVersion === 'duet') {
         const motionActive = status.motionActive === true;
@@ -4615,14 +4625,26 @@ export default function App() {
     }
   }, [controllerVersion, generatedCode, simulatorMode, activeObstacles]);
 
+  const previewRecordedArmMotion = (recording) => {
+    try {
+      buildG1RecordedMotionFrames(recording);
+      setRecordedMotionPreview(recording);
+      setPlaybackProgress(0);
+      setIsPreviewPlaying(true);
+      setShowAppSettings(false);
+    } catch (error) {
+      alert(`Recorded motion cannot be previewed: ${error.message}`);
+    }
+  };
+
   const startSimulationPreview = () => {
-    if (!generatedCode.trim()) {
+    if (!recordedMotionPreview && !generatedCode.trim()) {
       alert('Add some robot commands before starting the simulation preview.');
       return;
     }
     setPlaybackProgress((progress) => progress >= 1 ? 0 : progress);
     setIsPreviewPlaying(true);
-    previewPreviewState();
+    if (!recordedMotionPreview) previewPreviewState();
   };
 
   const pauseSimulationPreview = () => {
@@ -4639,6 +4661,7 @@ export default function App() {
       alert('Add code or blocks before running the simulation.');
       return;
     }
+    setRecordedMotionPreview(null);
     setPlaybackProgress(0);
     setIsPreviewPlaying(true);
     setIsWaypointPlacementEnabled(false);
@@ -5586,27 +5609,27 @@ export default function App() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-                <input
-                  type="password"
-                  value={loginForm.password}
-                  onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                  autoComplete={isRegistering ? 'new-password' : 'current-password'}
-                  minLength={isRegistering ? 8 : undefined}
-                  required
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+                <div className="flex overflow-hidden rounded-xl border border-slate-200 focus-within:ring-2 focus-within:ring-blue-500">
+                  <input
+                    type={isLoginPasswordVisible ? 'text' : 'password'}
+                    value={loginForm.password}
+                    onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                    autoComplete={isRegistering ? 'new-password' : 'current-password'}
+                    minLength={isRegistering ? 8 : undefined}
+                    required
+                    className="min-w-0 flex-1 px-3 py-2 focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    aria-label={isLoginPasswordVisible ? 'Hide password' : 'Show password'}
+                    aria-pressed={isLoginPasswordVisible}
+                    onClick={() => setIsLoginPasswordVisible((visible) => !visible)}
+                    className="px-3 text-slate-500 hover:bg-slate-50 hover:text-slate-700"
+                  >
+                    {isLoginPasswordVisible ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
+                  </button>
+                </div>
               </div>
-              {!isRegistering && <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Role</label>
-                <select
-                  value={loginForm.role}
-                  onChange={(e) => setLoginForm({ ...loginForm, role: e.target.value })}
-                  className="w-full border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="teacher">Teacher</option>
-                  <option value="student">Student</option>
-                </select>
-              </div>}
               {loginError && <p className="text-red-600 text-sm">{loginError}</p>}
               <button type="submit" className="w-full bg-blue-600 text-white rounded-xl py-2.5 font-semibold hover:bg-blue-700 transition-colors">
                 {isRegistering ? 'Create Student Account' : 'Log In'}
@@ -5625,9 +5648,7 @@ export default function App() {
                 {isRegistering
                   ? <p>Student accounts only. Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
                   : <>
-                    <p>Teacher demo: teacher / teacher</p>
-                    <p>Student demo: student1 / student1</p>
-                    <p>Create a student account to join the classroom.</p>
+                    <p>Sign in with your classroom account or create a student account to join.</p>
                   </>}
               </div>
           </form>
@@ -5731,9 +5752,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowAppSettings(false)}
+                disabled={isArmMotionRecording}
                 className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
               >
-                Close
+                {isArmMotionRecording ? 'Recording…' : 'Close'}
               </button>
             </div>
             <div className="space-y-3 overflow-y-auto p-5">
@@ -5819,6 +5841,30 @@ export default function App() {
               </fieldset>
               {currentUser.role === 'teacher' && (
                 <>
+              <TeacherArmMotionRecorder
+                connection={activeRobotConnection}
+                controllerVersion={controllerVersion}
+                onBusyChange={setIsArmMotionRecording}
+                onPreview={previewRecordedArmMotion}
+              />
+              {recordedMotionPreview && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-white px-3 py-2">
+                  <p className="text-xs text-violet-900">
+                    Previewing measured motion: <strong>{recordedMotionPreview.name}</strong>
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRecordedMotionPreview(null);
+                      setIsPreviewPlaying(false);
+                      setPlaybackProgress(0);
+                    }}
+                    className="rounded-md border border-violet-300 px-2 py-1 text-[11px] font-semibold text-violet-900"
+                  >
+                    Return to command preview
+                  </button>
+                </div>
+              )}
               <section className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">Manage classroom accounts</h3>
                 <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
@@ -6140,7 +6186,7 @@ export default function App() {
                   type="checkbox"
                   aria-label="Enable DUET version two"
                   checked={controllerVersion === 'duet'}
-                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting}
+                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting || isArmMotionRecording}
                   onChange={(event) => handleControllerVersionChange(event.target.checked)}
                   className="h-5 w-5 shrink-0 accent-blue-700"
                 />
@@ -6988,6 +7034,7 @@ export default function App() {
                 code={generatedCode}
                 simulatorState={simulatorState}
                 controllerVersion={controllerVersion}
+                recordedMotionPreview={recordedMotionPreview}
                 obstacles={activeObstacles}
                 waypoints={plannerWaypoints}
                 isWaypointPlacementEnabled={isWaypointPlacementEnabled}

@@ -2,13 +2,14 @@
 #include "FSM/State_Passive.h"
 #include "FSM/State_FixStand.h"
 #include "FSM/State_RLBase.h"
+#include "FSM/State_Handoff.h"
 #include "State_Mimic.h"
 
 std::unique_ptr<LowCmd_t> FSMState::lowcmd = nullptr;
 std::shared_ptr<LowState_t> FSMState::lowstate = nullptr;
 std::shared_ptr<Keyboard> FSMState::keyboard = nullptr;
 
-void init_fsm_state()
+bool init_fsm_state()
 {
     auto lowcmd_sub = std::make_shared<unitree::robot::g1::subscription::LowCmd>();
     usleep(0.2 * 1e6);
@@ -16,13 +17,14 @@ void init_fsm_state()
     {
         spdlog::critical("The other process is using the lowcmd channel, please close it first.");
         unitree::robot::go2::shutdown();
-        // exit(0);
+        return false;
     }
     FSMState::lowcmd = std::make_unique<LowCmd_t>();
     FSMState::lowstate = std::make_shared<LowState_t>();
     spdlog::info("Waiting for connection to robot...");
     FSMState::lowstate->wait_for_connection();
     spdlog::info("Connected to robot.");
+    return true;
 }
 
 int main(int argc, char** argv)
@@ -36,7 +38,10 @@ int main(int argc, char** argv)
     // Unitree DDS Config
     unitree::robot::ChannelFactory::Instance()->Init(0, vm["network"].as<std::string>());
 
-    init_fsm_state();
+    if(!init_fsm_state())
+    {
+        return 1;
+    }
 
     FSMState::lowcmd->msg_.mode_machine() = 4; // 23dof
     if(!FSMState::lowcmd->check_mode_machine(FSMState::lowstate)) {
