@@ -1,5 +1,7 @@
 FSM:
   _: # enabled fsms
+    Handoff:
+      id: 4
     Passive:
       id: 1
     FixStand:
@@ -11,6 +13,11 @@ FSM:
     # Mimic_Dance1_subject2:   # disabled: requires dance1_subject2.npz (not present)
     #   id: 5
     #   type: Mimic
+
+  Handoff:
+    transitions:
+      FixStand: "(LT + up.on_pressed) | F1.on_pressed"
+      # Same deliberate on-robot handoff as Passive; no command is published before it.
 
   Passive:
     transitions: 
@@ -73,10 +80,13 @@ FSM:
       # 9.5 Nm total standing at 0.73 m, versus 24.4 Nm hanging with the legs
       # folded), so any automatic cut-out would risk freezing the legs mid-stride.
       # Instead this is an explicit operator action, on the same key that means
-      # "go to FixStand" everywhere else. FixStand interpolates from wherever the
-      # legs are over 3 s (see ts/qs above), so it eases in rather than snapping,
-      # and then holds a fixed stance under PD -- the right state to be lifted in.
-      # Press 1 BEFORE lifting; press 2 to hand back to the policy afterwards.
+      # "go to FixStand" in other states. Use it only when the operator has
+      # verified the current FSM is Velocity and the robot is upright and stable.
+      # It is not a generic Ready/Connect action; do not use it when the state is
+      # unknown (for example, in Handoff). FixStand interpolates the legs over
+      # 3 s (see ts/qs above), then holds a fixed stance under PD for lifting.
+      # Press 1 only when intentionally entering fixed stance; press 2 to return
+      # to the policy afterwards.
       FixStand: "(LT + up.on_pressed) | F1.on_pressed"
     policy_dir: config/policy/velocity
 

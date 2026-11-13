@@ -31,6 +31,23 @@ export class DuetRobotConnection {
     });
   }
 
+  async recordings() {
+    return this.request('/api/robot/recordings', { cache: 'no-store' });
+  }
+
+  async saveRecording(recording) {
+    return this.request('/api/robot/recordings', {
+      method: 'POST',
+      body: JSON.stringify(recording),
+    });
+  }
+
+  async deleteRecording(recordingId) {
+    return this.request(`/api/robot/recordings/${encodeURIComponent(recordingId)}`, {
+      method: 'DELETE',
+    });
+  }
+
   async run(code) {
     if (!parseDuetProgram(code).length) {
       throw new Error('DUET program contains no commands.');

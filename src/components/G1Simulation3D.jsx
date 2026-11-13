@@ -8,6 +8,11 @@ import {
 } from 'lucide-react';
 import { buildG1SimulationFrames, G1_EDU_23_ENV } from '../sim/g1Edu23Env';
 import { simulateDuetG1Edu23Program } from '../sim/duetG1Edu23Env';
+import {
+  clampMujocoJointAngle, composeMujocoJointQuaternion, convertMujocoAxisToView, getMujocoJointAngle,
+} from '../sim/g1MeshRigAxes.js';
+import { interpolateSimulationFrame } from '../sim/g1MotionInterpolation.js';
+import { buildG1RecordedArmMotionFrames } from '../sim/g1RecordedArmMotion.js';
 import { getSceneObjectScale } from '../sim/sceneObjects';
 import {
   DEFAULT_CAMERA_DISTANCE, DEFAULT_CAMERA_PITCH, DEFAULT_CAMERA_TARGET_HEIGHT,
@@ -16,8 +21,8 @@ import {
 
 const JOINT_AXES = {
   left_hip_pitch: 'x', right_hip_pitch: 'x', left_knee: 'x', right_knee: 'x', left_knee_pitch: 'x', right_knee_pitch: 'x',
-  left_ankle_pitch: 'x', right_ankle_pitch: 'x', waist_pitch: 'x',
-  left_hip_roll: 'z', right_hip_roll: 'z', left_ankle_roll: 'z', right_ankle_roll: 'z', waist_roll: 'z',
+  left_ankle_pitch: 'x', right_ankle_pitch: 'x',
+  left_hip_roll: 'z', right_hip_roll: 'z', left_ankle_roll: 'z', right_ankle_roll: 'z',
   left_hip_yaw: 'y', right_hip_yaw: 'y', waist_yaw: 'y',
   left_shoulder_pitch: 'x', right_shoulder_pitch: 'x', left_elbow: 'x', right_elbow: 'x',
   left_shoulder_roll: 'z', right_shoulder_roll: 'z', left_shoulder_yaw: 'y', right_shoulder_yaw: 'y',
@@ -182,14 +187,12 @@ function createRobot() {
   addBox(pelvis, [0.48, 0.12, 0.48], [0, 0.26, 0], light, 0);
 
   const waistYaw = register('waist_yaw_joint', pelvis, [0, 0.28, 0]);
-  const waistPitch = new THREE.Group();
-  waistYaw.add(waistPitch);
-  const waistRoll = new THREE.Group();
-  waistPitch.add(waistRoll);
-  addBox(waistRoll, [0.62, 0.72, 0.38], [0, 0.38, 0], dark, 0);
-  addBox(waistRoll, [0.4, 0.3, 0.42], [0, 0.76, 0], light, 0);
+  const torso = new THREE.Group();
+  waistYaw.add(torso);
+  addBox(torso, [0.62, 0.72, 0.38], [0, 0.38, 0], dark, 0);
+  addBox(torso, [0.4, 0.3, 0.42], [0, 0.76, 0], light, 0);
 
-  const head = register('head', waistRoll, [0, 0.95, 0]);
+  const head = register('head', torso, [0, 0.95, 0]);
   addBox(head, [0.4, 0.42, 0.38], [0, 0, 0], dark, 0);
   addBox(head, [0.22, 0.08, 0.04], [0, 0.02, -0.2], accent, 0);
 
@@ -209,14 +212,14 @@ function createRobot() {
   leg('right', 0.24);
 
   const arm = (side, x) => {
-    const shoulderPitch = register(`${side}_shoulder_pitch_joint`, waistRoll, [x, 0.68, 0]);
+    const shoulderPitch = register(`${side}_shoulder_pitch_joint`, torso, [x, 0.68, 0]);
     const shoulderRoll = register(`${side}_shoulder_roll_joint`, shoulderPitch);
     const shoulderYaw = register(`${side}_shoulder_yaw_joint`, shoulderRoll);
     addSegment(shoulderYaw, [0, 0, 0], [0, -0.48, 0], 0.1, light);
     const elbow = register(`${side}_elbow_joint`, shoulderYaw, [0, -0.48, 0]);
     addSegment(elbow, [0, 0, 0], [0, -0.46, 0], 0.085, dark);
-    const wrist = register(`${side}_wrist_roll_joint`, elbow, [0, -0.46, 0]);
-    addBox(wrist, [0.16, 0.2, 0.2], [0, -0.1, 0], light, 0);
+    const wristRoll = register(`${side}_wrist_roll_joint`, elbow, [0, -0.46, 0]);
+    addBox(wristRoll, [0.16, 0.2, 0.2], [0, -0.1, 0], light, 0);
   };
   arm('left', -0.46);
   arm('right', 0.46);
@@ -252,37 +255,6 @@ function convertQuaternion(quaternion) {
   const rotation = new THREE.Matrix4().makeRotationFromQuaternion(quatFromWxyz(quaternion));
   const converted = MUJOCO_TO_VIEW.clone().multiply(rotation).multiply(MUJOCO_TO_VIEW.clone().invert());
   return new THREE.Quaternion().setFromRotationMatrix(converted);
-}
-
-function interpolateAngle(from = 0, to = 0, amount) {
-  const delta = ((to - from + 540) % 360) - 180;
-  return from + delta * amount;
-}
-
-function easeMotion(amount) {
-  return amount * amount * (3 - 2 * amount);
-}
-
-function interpolateSimulationFrame(from, to, amount) {
-  if (!from) return to;
-  if (!to) return from;
-  const eased = easeMotion(amount);
-  const joints = {};
-  const jointNames = new Set([...Object.keys(from.joints || {}), ...Object.keys(to.joints || {})]);
-  jointNames.forEach((name) => {
-    joints[name] = THREE.MathUtils.lerp(Number(from.joints?.[name] ?? 0), Number(to.joints?.[name] ?? 0), eased);
-  });
-  return {
-    ...to,
-    time: THREE.MathUtils.lerp(from.time || 0, to.time || 0, eased),
-    x: THREE.MathUtils.lerp(from.x || 0, to.x || 0, amount),
-    y: THREE.MathUtils.lerp(from.y || 0, to.y || 0, amount),
-    heading: interpolateAngle(from.heading || 0, to.heading || 0, amount),
-    torsoPitch: THREE.MathUtils.lerp(from.torsoPitch || 0, to.torsoPitch || 0, eased),
-    torsoRoll: THREE.MathUtils.lerp(from.torsoRoll || 0, to.torsoRoll || 0, eased),
-    joints,
-    path: from.path || to.path || [],
-  };
 }
 
 function createWaypointLabelTexture(label) {
@@ -466,6 +438,25 @@ async function loadG1MeshRig() {
   const loader = new STLLoader();
   const geometryCache = new Map();
   const materialCache = new Map();
+  const activeJointNames = new Set(G1_EDU_23_ENV.joints);
+  if (activeJointNames.size !== 23) {
+    throw new Error(`Expected 23 active G1 joints, found ${activeJointNames.size}`);
+  }
+  const rigJointNames = new Set([...xml.querySelectorAll('joint[name]')].map((joint) => joint.getAttribute('name')));
+  const missingJointNames = [...activeJointNames].filter((name) => !rigJointNames.has(name));
+  if (missingJointNames.length) {
+    throw new Error(`G1 mesh rig is missing active joints: ${missingJointNames.join(', ')}`);
+  }
+  const jointClassAxes = new Map([...xml.querySelectorAll('default')].flatMap((element) => {
+    const className = element.getAttribute('class');
+    const axis = element.querySelector(':scope > joint')?.getAttribute('axis');
+    return className && axis ? [[className, axis]] : [];
+  }));
+  const jointClassRanges = new Map([...xml.querySelectorAll('default')].flatMap((element) => {
+    const className = element.getAttribute('class');
+    const range = element.querySelector(':scope > joint')?.getAttribute('range');
+    return className && range ? [[className, range]] : [];
+  }));
   const rootBody = xml.querySelector('worldbody > body');
   const robot = new THREE.Group();
   robot.name = 'G1-34Link-MeshRig';
@@ -501,10 +492,17 @@ async function loadG1MeshRig() {
     body.name = bodyElement.getAttribute('name') || 'g1-link';
     body.position.copy(convertPosition(bodyElement.getAttribute('pos')));
     body.quaternion.copy(convertQuaternion(bodyElement.getAttribute('quat')));
+    body.userData.baseQuaternion = body.quaternion.clone();
     parent.add(body);
 
     const joint = bodyElement.querySelector(':scope > joint');
-    if (joint?.getAttribute('name')) joints[joint.getAttribute('name')] = body;
+    if (activeJointNames.has(joint?.getAttribute('name'))) {
+      const jointName = joint.getAttribute('name');
+      const axis = joint.getAttribute('axis') || jointClassAxes.get(joint.getAttribute('class'));
+      joints[jointName] = body;
+      body.userData.rotationAxis = convertMujocoAxisToView(axis);
+      body.userData.jointRange = joint.getAttribute('range') || jointClassRanges.get(joint.getAttribute('class'));
+    }
 
     const geomElements = [...bodyElement.querySelectorAll(':scope > geom[mesh]')];
     await Promise.all(geomElements.map(async (geom) => {
@@ -529,7 +527,7 @@ async function loadG1MeshRig() {
   return { robot, joints };
 }
 
-export default function G1Simulation3D({ code, simulatorState, controllerVersion = 'legacy', obstacles = [], waypoints = [], onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange, workspacePanelRef }) {
+export default function G1Simulation3D({ code, simulatorState, controllerVersion = 'legacy', recordedMotionPreview = null, obstacles = [], waypoints = [], onObstacleChange, onObstacleSelect, onWaypointChange, isWaypointPlacementEnabled = false, onWaypointPlace, isPlaying = false, playbackSpeed = 1, playbackProgress = 0, gridSize = 20, onPlaybackProgress, onPlaybackToggle, onPlaybackReset, onPlaybackSpeedChange, workspacePanelRef }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const rendererRef = useRef(null);
@@ -727,13 +725,15 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
   }, [waypoints]);
 
   useEffect(() => {
-    framesRef.current = controllerVersion === 'duet'
-      ? simulateDuetG1Edu23Program(code)
-      : buildG1SimulationFrames(code, {
-        obstacles,
-        challenge: simulatorState?.goal ? { goal: simulatorState.goal } : null,
-      });
-  }, [code, controllerVersion, obstacles, simulatorState?.goal]);
+    framesRef.current = recordedMotionPreview
+      ? buildG1RecordedArmMotionFrames(recordedMotionPreview)
+      : controllerVersion === 'duet'
+        ? simulateDuetG1Edu23Program(code)
+        : buildG1SimulationFrames(code, {
+          obstacles,
+          challenge: simulatorState?.goal ? { goal: simulatorState.goal } : null,
+        });
+  }, [code, controllerVersion, obstacles, recordedMotionPreview, simulatorState?.goal]);
 
   useEffect(() => {
     const group = obstacleGroupRef.current;
@@ -1155,10 +1155,21 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
         robotRef.current.rotation.y = THREE.MathUtils.degToRad((frame.heading || 0) + robotHeadingOffsetRef.current);
         Object.entries(jointRefs.current).forEach(([name, group]) => {
           const normalizedName = name.replace('_joint', '');
-          const stateName = normalizedName.endsWith('_knee') ? `${normalizedName}_pitch` : normalizedName;
-          const value = Number(frame.joints?.[normalizedName] ?? frame.joints?.[stateName] ?? frame.joints?.[name] ?? 0);
-          const axis = JOINT_AXES[normalizedName] || (normalizedName.includes('pitch') ? 'x' : 'y');
-          group.rotation[axis] = THREE.MathUtils.degToRad(value);
+          const value = clampMujocoJointAngle(
+            getMujocoJointAngle(frame.joints, name),
+            group.userData.jointRange,
+          );
+          const meshAxis = group.userData.rotationAxis;
+          if (meshAxis) {
+            group.quaternion.copy(composeMujocoJointQuaternion(
+              group.userData.baseQuaternion,
+              meshAxis,
+              THREE.MathUtils.degToRad(value),
+            ));
+          } else {
+            const axis = JOINT_AXES[normalizedName] || (normalizedName.includes('pitch') ? 'x' : 'y');
+            group.rotation[axis] = THREE.MathUtils.degToRad(value);
+          }
         });
         const path = frame.path || [];
         pathLine.geometry.setFromPoints(path.map((point) => new THREE.Vector3(point.x, 0.035, -point.y)));

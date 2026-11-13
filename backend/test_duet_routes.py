@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -261,6 +262,231 @@ class DuetRouteTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(duplicate.status_code, 409)
 
+    def test_duet_arm_recordings_are_teacher_owned_and_persist_measured_samples(self):
+        samples = [
+            {"time": 0.0, "joints": [0.0] * 10},
+            {"time": 0.1, "joints": [0.1] * 10},
+            {"time": 0.2, "joints": [0.2] * 10},
+        ]
+        forbidden = self.client.post(
+            "/api/duet/recordings",
+            headers=self.student,
+            json={"name": "Wave", "frames": samples},
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        created = self.client.post(
+            "/api/duet/recordings",
+            headers=self.teacher,
+            json={"name": "Wave", "frames": samples},
+        )
+        self.assertEqual(created.status_code, 200)
+        recording = created.json()["recording"]
+        self.assertEqual(recording["name"], "Wave")
+        self.assertRegex(recording["id"], r"^capture_[a-f0-9]{12}$")
+        self.assertEqual(recording["frames"], samples)
+        listed = self.client.get("/api/duet/recordings", headers=self.teacher)
+        self.assertEqual(listed.json()["recordings"], [recording])
+        self.assertEqual(
+            self.client.get("/api/duet/recordings", headers=self.student).status_code,
+            403,
+        )
+
+        duplicated = self.client.post(
+            "/api/duet/recordings",
+            headers=self.teacher,
+            json={"name": " wave ", "frames": samples},
+        )
+        self.assertEqual(duplicated.status_code, 409)
+
+        forbidden_delete = self.client.delete(
+            f"/api/duet/recordings/{recording['id']}",
+            headers=self.student,
+        )
+        self.assertEqual(forbidden_delete.status_code, 403)
+        deleted = self.client.delete(
+            f"/api/duet/recordings/{recording['id']}",
+            headers=self.teacher,
+        )
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/duet/recordings", headers=self.teacher).json()["recordings"],
+            [],
+        )
+
+    def test_duet_arm_recordings_reject_invalid_sample_shapes_and_times(self):
+        cases = (
+            [{"time": 0.0, "joints": [0.0] * 9}, {"time": 0.1, "joints": [0.0] * 10}],
+            [{"time": 0.0, "joints": [0.0] * 10}, {"time": 0.0, "joints": [0.0] * 10}],
+            [{"time": 0.1, "joints": [0.0] * 10}, {"time": 0.2, "joints": [0.0] * 10}],
+            [{"time": 0.0, "joints": [0.0] * 10}, {"time": 31.0, "joints": [0.0] * 10}],
+        )
+        for frames in cases:
+            response = self.client.post(
+                "/api/duet/recordings",
+                headers=self.teacher,
+                json={"name": "Invalid", "frames": frames},
+            )
+            self.assertEqual(response.status_code, 400)
+
+    def test_generic_recording_routes_store_duet_and_legacy_joint_layouts(self):
+        duet_frames = [
+            {"time": 0.0, "joints": [0.0] * 10},
+            {"time": 0.1, "joints": [0.1] * 10},
+        ]
+        legacy_frames = [
+            {"time": 0.0, "joints": [0.0] * 23},
+            {"time": 0.1, "joints": [0.1] * 23},
+        ]
+        legacy_joint_names = list(server.G1_JOINT_NAMES)
+        duet_joint_names = list(server.DUET_ARM_JOINT_NAMES)
+
+        forbidden = self.client.post(
+            "/api/robot/recordings",
+            headers=self.student,
+            json={
+                "name": "Student capture",
+                "controller_version": "legacy",
+                "command": 'robot.arm_action("face wave")',
+                "joint_names": legacy_joint_names,
+                "frames": legacy_frames,
+            },
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        duet = self.client.post(
+            "/api/robot/recordings",
+            headers=self.teacher,
+            json={
+                "name": "DUET wave",
+                "controller_version": "duet",
+                "command": 'duet.wave_right("mid", 1.5)',
+                "joint_names": duet_joint_names,
+                "frames": duet_frames,
+            },
+        )
+        legacy = self.client.post(
+            "/api/robot/recordings",
+            headers=self.teacher,
+            json={
+                "name": "Legacy wave",
+                "controller_version": "legacy",
+                "command": 'robot.arm_action("face wave")',
+                "joint_names": legacy_joint_names,
+                "captured_at": "2026-03-01T10:00:00Z",
+                "frames": legacy_frames,
+            },
+        )
+        self.assertEqual(duet.status_code, 200)
+        self.assertEqual(legacy.status_code, 200)
+        self.assertEqual(duet.json()["recording"]["joint_names"], duet_joint_names)
+        self.assertEqual(legacy.json()["recording"]["joint_names"], legacy_joint_names)
+        self.assertEqual(legacy.json()["recording"]["captured_at"], "2026-03-01T10:00:00Z")
+        self.assertEqual(legacy.json()["recording"]["frames"], legacy_frames)
+        all_recordings = self.client.get("/api/robot/recordings", headers=self.teacher)
+        self.assertEqual(
+            {entry["controller_version"] for entry in all_recordings.json()["recordings"]},
+            {"legacy", "duet"},
+        )
+        self.assertEqual(
+            len(self.client.get("/api/duet/recordings", headers=self.teacher).json()["recordings"]),
+            1,
+        )
+        self.assertEqual(
+            self.client.delete(
+                f"/api/robot/recordings/{legacy.json()['recording']['id']}",
+                headers=self.teacher,
+            ).status_code,
+            200,
+        )
+
+        invalid_layout = self.client.post(
+            "/api/robot/recordings",
+            headers=self.teacher,
+            json={
+                "name": "Bad legacy layout",
+                "controller_version": "legacy",
+                "command": "robot.arm_action('face wave')",
+                "joint_names": duet_joint_names,
+                "frames": duet_frames,
+            },
+        )
+        self.assertEqual(invalid_layout.status_code, 400)
+
+    def test_existing_duet_recordings_migrate_with_joint_names(self):
+        legacy_db_path = os.path.join(self.temp_dir.name, "pre-migration.db")
+        connection = sqlite3.connect(legacy_db_path)
+        connection.execute(
+            """
+            CREATE TABLE duet_arm_recordings (
+                recording_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                name TEXT NOT NULL,
+                frames TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (username, recording_id),
+                UNIQUE (username, name)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO duet_arm_recordings (recording_id, username, name, frames) VALUES (?, ?, ?, ?)",
+            (
+                "capture_existing",
+                "teacher",
+                "Old DUET capture",
+                '[{"time":0,"joints":[0,0,0,0,0,0,0,0,0,0]},{"time":0.1,"joints":[0,0,0,0,0,0,0,0,0,0]}]',
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        with patch.object(server, "DB_PATH", legacy_db_path):
+            server.init_db()
+            migrated = server.list_duet_arm_recordings_for_user("teacher")
+
+        self.assertEqual(migrated[0]["id"], "capture_existing")
+        self.assertEqual(migrated[0]["controller_version"], "duet")
+        self.assertEqual(migrated[0]["joint_names"], list(server.DUET_ARM_JOINT_NAMES))
+
+    def test_legacy_joint_state_proxy_is_teacher_only_fresh_and_no_store(self):
+        positions = [index / 100 for index in range(23)]
+        payload = {
+            "joint_names": list(server.G1_JOINT_NAMES),
+            "positions_rad": positions,
+            "received_at": "2026-03-01T10:00:00+00:00",
+            "age_ms": 40,
+        }
+        provider_response = unittest.mock.Mock(status_code=200)
+        provider_response.json.return_value = payload
+        with patch.dict(os.environ, {
+            "G1_DISTANCE_PROVIDER_URL": "http://127.0.0.1:8181/distance/front",
+            "G1_DISTANCE_PROVIDER_TOKEN": "provider-secret",
+        }), patch.object(server.httpx, "get", return_value=provider_response) as provider_get:
+            response = self.client.get("/api/robot/joint-state", headers=self.teacher)
+            forbidden = self.client.get("/api/robot/joint-state", headers=self.student)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["joint_names"], list(server.G1_JOINT_NAMES))
+        self.assertEqual(response.json()["positions_rad"], positions)
+        self.assertEqual(response.headers["cache-control"], "no-store, no-cache, max-age=0")
+        self.assertEqual(forbidden.status_code, 403)
+        provider_get.assert_called_once_with(
+            "http://127.0.0.1:8181/joint_state",
+            headers={"Authorization": "Bearer provider-secret", "Accept": "application/json"},
+            timeout=0.5,
+            follow_redirects=False,
+        )
+
+        stale_response = unittest.mock.Mock(status_code=200)
+        stale_response.json.return_value = {**payload, "age_ms": 250.1}
+        with patch.dict(os.environ, {
+            "G1_DISTANCE_PROVIDER_URL": "http://127.0.0.1:8181/distance/front",
+            "G1_DISTANCE_PROVIDER_TOKEN": "provider-secret",
+        }), patch.object(server.httpx, "get", return_value=stale_response):
+            stale = self.client.get("/api/robot/joint-state", headers=self.teacher)
+        self.assertEqual(stale.status_code, 502)
+
     def test_duet_run_expands_saved_motion_before_controller_execution(self):
         saved = self.client.post(
             "/api/duet/motions",
@@ -287,7 +513,7 @@ class DuetRouteTests(unittest.TestCase):
             safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
         )
 
-    def test_duet_connect_reports_missing_gateway_and_does_not_use_sdk(self):
+    def test_duet_connect_reports_missing_controller_unit_and_does_not_use_sdk(self):
         with patch.dict(os.environ, {
             "DUET_CONTROL_DIR": os.path.join(self.temp_dir.name, "duet-control"),
             "DUET_PHYSICAL_ENABLED": "",
@@ -299,22 +525,23 @@ class DuetRouteTests(unittest.TestCase):
             response = self.client.post("/api/duet/connect", headers=self.teacher)
 
         self.assertEqual(response.status_code, 503)
-        self.assertIn("gateway is unreachable", response.json()["detail"])
+        self.assertIn("manual DUET controller unit is not installed", response.json()["detail"])
         connect_sdk.assert_not_called()
 
     def test_duet_status_explains_when_the_local_gateway_is_not_running(self):
         with patch.dict(os.environ, {
             "DUET_CONTROL_DIR": os.path.join(self.temp_dir.name, "duet-control"),
-        }):
+        }), patch.object(server.Path, "home", return_value=server.Path(self.temp_dir.name)):
             response = self.client.get("/api/duet/status", headers=self.teacher)
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["connected"])
         self.assertEqual(response.json()["motionOwner"], "none")
+        self.assertFalse(response.json()["controllerServiceActive"])
         self.assertIn("DUET_GATEWAY_ENABLED=true", response.json()["error"])
         self.assertIn("DUET_CONTROL_DIR", response.json()["error"])
 
-    def test_duet_connect_is_available_before_motion_acceptance_without_using_sdk(self):
+    def test_duet_connect_attaches_to_already_active_controller_without_starting_it(self):
         connected = {
             "status": "connected",
             "connected": True,
@@ -325,9 +552,15 @@ class DuetRouteTests(unittest.TestCase):
         with patch.dict(os.environ, {"DUET_PHYSICAL_ENABLED": ""}), patch.object(
             server, "active_navigation_operation", return_value=None
         ), patch.object(server, "active_lidar_scan", return_value=None), patch.object(
-            server, "robot_status", return_value={"running": False}
+            server, "robot_status", return_value={"sdkAvailable": False, "running": False}
         ), patch.object(
-            server, "duet_controller_status", return_value={"motionOwner": "none", "controlLease": False}
+            server, "duet_controller_status",
+            side_effect=[
+                {"motionOwner": "none", "controlLease": False},
+                connected,
+            ],
+        ), patch.object(
+            server, "duet_controller_service_state", return_value="active"
         ), patch.object(
             server, "connect_duet_controller", return_value=connected
         ) as connect_duet, patch.object(server, "connect_robot") as connect_sdk:

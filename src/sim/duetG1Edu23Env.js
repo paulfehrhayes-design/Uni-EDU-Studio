@@ -3,8 +3,10 @@ import {
   getDuetCommand,
   parseDuetProgram,
 } from './duetCommands.js';
+import { G1_NOMINAL_STEP_METERS } from './g1Commands.js';
 import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
 import { G1_MODEL_INFO } from './g1ModelRuntime.js';
+import { getG1GaitEnvelope, getG1GaitJointTargets } from './g1Gait.js';
 
 const FRAME_RATE = 30;
 const RADIANS_TO_DEGREES = 180 / Math.PI;
@@ -26,9 +28,16 @@ function appendFrame(frames, state, joints, actions, timeline, elapsed, mode = '
   frames.push(snapshot);
 }
 
+function getGaitPhaseIncrement(vx, vy, yawRate, duration) {
+  const translationPhase = Math.hypot(vx, vy) * duration / (2 * G1_NOMINAL_STEP_METERS);
+  const turnPhase = Math.abs(yawRate) * duration / (Math.PI / 2);
+  return Math.max(translationPhase, turnPhase);
+}
+
 function simulateMove(command, frames, state, joints, actions, timeline, elapsed) {
   const [vx, vy, yawRate, duration] = command.values;
   const frameCount = Math.max(1, Math.ceil(duration * FRAME_RATE));
+  let gaitPhase = 0;
   actions.push({
     label: 'DUET velocity',
     summary: `vx ${vx.toFixed(2)} m/s, vy ${vy.toFixed(2)} m/s, yaw ${yawRate.toFixed(2)} rad/s for ${duration.toFixed(1)} s`,
@@ -44,15 +53,25 @@ function simulateMove(command, frames, state, joints, actions, timeline, elapsed
     state.torsoRoll = vy * 12;
     state.path.push({ x: Number(state.x.toFixed(3)), y: Number(state.y.toFixed(3)) });
     elapsed.value += dt;
-    const phase = (frame / frameCount) * Math.PI * 2;
-    joints.left_hip_pitch_joint = Number((Math.sin(phase) * 12).toFixed(2));
-    joints.right_hip_pitch_joint = Number((-Math.sin(phase) * 12).toFixed(2));
-    joints.left_knee_pitch_joint = Number((Math.max(0, Math.sin(phase)) * 18).toFixed(2));
-    joints.right_knee_pitch_joint = Number((Math.max(0, -Math.sin(phase)) * 18).toFixed(2));
+    gaitPhase += getGaitPhaseIncrement(vx, vy, yawRate, dt);
+    const progress = (frame + 1) / frameCount;
+    Object.assign(
+      joints,
+      getG1GaitJointTargets(
+        gaitPhase * Math.PI * 2,
+        Math.hypot(vx, vy) > 0 || Math.abs(yawRate) > 0
+          ? getG1GaitEnvelope(progress)
+          : 0,
+        state.torsoPitch,
+        state.torsoRoll,
+      ),
+    );
     appendFrame(frames, state, joints, actions, timeline, elapsed.value);
   }
   state.torsoPitch = 0;
   state.torsoRoll = 0;
+  Object.assign(joints, getG1GaitJointTargets(gaitPhase * Math.PI * 2, 0));
+  appendFrame(frames, state, joints, actions, timeline, elapsed.value);
 }
 
 function simulateArmTarget(target, duration, label, frames, state, joints, actions, timeline, elapsed) {
@@ -107,6 +126,7 @@ function simulateConcurrent(movement, gesture, frames, state, joints, actions, t
   let taskElapsed = 0;
   let armIndex = 0;
   let armSegmentStart = 0;
+  let gaitPhase = 0;
   let armInitial = ARM_JOINT_NAMES.map((name) => joints[name] || 0);
   while (taskElapsed < totalDuration) {
     const dt = Math.min(1 / FRAME_RATE, totalDuration - taskElapsed);
@@ -119,11 +139,7 @@ function simulateConcurrent(movement, gesture, frames, state, joints, actions, t
       state.torsoPitch = vx * 12;
       state.torsoRoll = vy * 12;
       state.path.push({ x: Number(state.x.toFixed(3)), y: Number(state.y.toFixed(3)) });
-      const phase = (taskElapsed / Math.max(moveDuration, 0.001)) * Math.PI * 2;
-      joints.left_hip_pitch_joint = Number((Math.sin(phase) * 12).toFixed(2));
-      joints.right_hip_pitch_joint = Number((-Math.sin(phase) * 12).toFixed(2));
-      joints.left_knee_pitch_joint = Number((Math.max(0, Math.sin(phase)) * 18).toFixed(2));
-      joints.right_knee_pitch_joint = Number((Math.max(0, -Math.sin(phase)) * 18).toFixed(2));
+      gaitPhase += getGaitPhaseIncrement(vx, vy, yawRate, moveDt);
     } else {
       state.torsoPitch = 0;
       state.torsoRoll = 0;
@@ -139,6 +155,18 @@ function simulateConcurrent(movement, gesture, frames, state, joints, actions, t
     const currentArm = armSequence[armIndex];
     const targetDegrees = currentArm.target.map((radians) => radians * RADIANS_TO_DEGREES);
     const armProgress = Math.min(1, (taskElapsed + dt - armSegmentStart) / currentArm.duration);
+    const moveProgress = Math.min(1, (taskElapsed + dt) / Math.max(moveDuration, 0.001));
+    Object.assign(
+      joints,
+      getG1GaitJointTargets(
+        gaitPhase * Math.PI * 2,
+        taskElapsed + dt < moveDuration && (Math.hypot(vx, vy) > 0 || Math.abs(yawRate) > 0)
+          ? getG1GaitEnvelope(moveProgress)
+          : 0,
+        state.torsoPitch,
+        state.torsoRoll,
+      ),
+    );
     ARM_JOINT_NAMES.forEach((name, index) => {
       joints[name] = Number((armInitial[index] + (targetDegrees[index] - armInitial[index]) * armProgress).toFixed(2));
     });
@@ -148,6 +176,11 @@ function simulateConcurrent(movement, gesture, frames, state, joints, actions, t
   }
   state.torsoPitch = 0;
   state.torsoRoll = 0;
+  const settledGait = getG1GaitJointTargets(gaitPhase * Math.PI * 2, 0);
+  Object.entries(settledGait).forEach(([name, value]) => {
+    if (!ARM_JOINT_NAMES.includes(name)) joints[name] = value;
+  });
+  appendFrame(frames, state, joints, actions, timeline, elapsed.value);
   if (isPoseHold && gesture.method === 'hold_pose_until_reset') {
     heldPose.name = gesture.poseName;
   } else if (isPoseHold && gesture.method === 'hold_pose') {

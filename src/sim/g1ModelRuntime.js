@@ -2,14 +2,15 @@ const URDF_SOURCE_FILE = 'g1_23dof.urdf.txt';
 
 async function getDefaultUrdfText() {
   if (typeof process !== 'undefined' && process.versions && process.versions.node) {
-    try {
-      const { readFileSync } = await import('node:fs');
-      return readFileSync(new URL('../../g1_23dof.urdf.txt', import.meta.url), 'utf8');
-    } catch {
-      return '';
-    }
+    const { readFileSync } = await import('node:fs');
+    return readFileSync(new URL('../../g1_23dof.urdf.txt', import.meta.url), 'utf8');
   }
-  return '';
+
+  const response = await fetch(new URL('../../g1_23dof.urdf.txt', import.meta.url));
+  if (!response.ok) {
+    throw new Error(`G1 URDF unavailable (${response.status})`);
+  }
+  return response.text();
 }
 
 const G1_URDF_SOURCE = await getDefaultUrdfText();
@@ -68,8 +69,9 @@ export function parseG1Urdf(urdfText) {
       const child = block.match(/<child\s+link="([^"]+)"/)?.[1] ?? null;
       const axis = block.match(/<axis\s+xyz="([^"]+)"/)?.[1] ?? '0 0 0';
       const origin = block.match(/<origin\s+xyz="([^"]+)"(?:\s+rpy="([^"]+)")?/)?.[1] ?? '0 0 0';
+      const originRpy = block.match(/<origin\s+xyz="[^"]+"(?:\s+rpy="([^"]+)")?/)?.[1] ?? '0 0 0';
       const limit = block.match(/<limit\s+([^>]*)>/)?.[1] ?? '';
-      return name ? { name, type, parent, child, axis, origin, limit } : null;
+      return name ? { name, type, parent, child, axis, origin, originRpy, limit } : null;
     })
     .filter(Boolean);
 

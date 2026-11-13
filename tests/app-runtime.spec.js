@@ -6,6 +6,47 @@ async function openConnectionPanel(page) {
   await page.getByRole('button', { name: 'Open robot connection' }).click();
 }
 
+test('login starts blank and determines role from the account', async ({ page }) => {
+  let loginPayload;
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/login') {
+      loginPayload = request.postDataJSON();
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/login'
+        ? { token: 'student-login-token', user: { role: 'student', username: 'student-login-test' } }
+        : {}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('input[type="text"]')).toHaveValue('');
+  const passwordInput = page.locator('input[autocomplete="current-password"]');
+  await expect(passwordInput).toHaveAttribute('type', 'password');
+  await expect(passwordInput).toHaveValue('');
+  await expect(page.getByLabel('Role')).toHaveCount(0);
+  await expect(page.getByText('Teacher demo: teacher / teacher')).toHaveCount(0);
+  await expect(page.getByText('Student demo: student1 / student1')).toHaveCount(0);
+
+  await page.locator('input[type="text"]').fill('student-login-test');
+  await passwordInput.fill('classroom-password');
+  await page.getByRole('button', { name: 'Show password' }).click();
+  await expect(passwordInput).toHaveAttribute('type', 'text');
+  await expect(page.getByRole('button', { name: 'Hide password' })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: 'Hide password' }).click();
+  await expect(passwordInput).toHaveAttribute('type', 'password');
+  await page.getByRole('button', { name: 'Log In' }).click();
+  await expect.poll(() => loginPayload).toEqual({
+    username: 'student-login-test',
+    password: 'classroom-password',
+  });
+  await expect(page.getByRole('button', { name: 'Open queue' })).toHaveCount(0);
+});
+
 test('legacy and DUET expose the same approximate in-place 180-degree turn name', () => {
   const legacy = parseG1Program('robot.turn_around_180()');
   const duet = parseDuetProgram('duet.turn_around_180()');
@@ -91,6 +132,174 @@ test('simulation preview controls are in app Settings, not the G1 simulator', as
   await expect(objectArea.getByText('Box', { exact: true })).toBeVisible();
   await expect(objectArea.getByRole('button', { name: 'Delete' })).toBeVisible();
   await expect(objectArea.getByRole('heading', { name: /Internal Simulator/ })).toHaveCount(0);
+});
+
+test('teacher records measured DUET arm samples and saves them for simulator playback', async ({ page }) => {
+  test.setTimeout(60000);
+  const savedPayloads = [];
+  const apiRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-arm-recording-token',
+      user: { role: 'teacher', username: 'teacher-arm-recording-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    apiRequests.push(`${request.method()} ${path}`);
+    let body = {};
+    if (path === '/api/duet/status') {
+      body = {
+        status: 'connected',
+        connected: true,
+        ready: true,
+        controlLease: true,
+        motionOwner: 'duet',
+        motionActive: false,
+        programActive: false,
+        robotModel: 'Unitree G1 EDU 23-DOF',
+        capabilities: ['base_velocity', 'arm_targets', 'arm_feedback'],
+        measuredJoints: Array(10).fill(0),
+      };
+    } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
+      body = { recordings: [] };
+    } else if (path === '/api/robot/recordings' && request.method() === 'POST') {
+      const payload = request.postDataJSON();
+      savedPayloads.push(payload);
+      body = {
+        recording: {
+          id: 'capture_test123456',
+          name: payload.name,
+          controller_version: payload.controller_version,
+          command: payload.command,
+          joint_names: payload.joint_names,
+          frames: payload.frames,
+          created_at: '2026-11-12 00:00:00',
+        },
+      };
+    } else if (path === '/api/duet/run') {
+      body = { status: 'completed', commandsExecuted: 1, armTelemetry: [] };
+    } else if (path === '/api/classroom/safe-mode') {
+      body = { enabled: false };
+    } else if (path === '/api/classroom/simulation-visibility') {
+      body = { show_simulation: true };
+    } else if (path === '/api/classroom/sidebar-settings') {
+      body = { locked_panels: [], configured: true };
+    } else if (path === '/api/classroom/me') {
+      body = { data_revision: 0 };
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
+  await expect(page.getByText('DUET v2 and fresh measured arm feedback are ready.')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Recorded motion name' }).fill('Measured wave');
+  await page.getByRole('checkbox', { name: 'Confirm robot arm workspace is clear' }).check();
+  await page.getByRole('button', { name: 'Run & record on robot' }).click();
+  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(1);
+  await expect(page.getByText('Measured wave', { exact: true })).toBeVisible();
+  expect(apiRequests).toContain('POST /api/duet/run');
+  expect(savedPayloads).toHaveLength(1);
+  expect(savedPayloads[0].name).toBe('Measured wave');
+  expect(savedPayloads[0].controller_version).toBe('duet');
+  expect(savedPayloads[0].frames.length).toBeGreaterThanOrEqual(2);
+  expect(savedPayloads[0].joint_names).toHaveLength(10);
+  expect(savedPayloads[0].frames[0]).toEqual({ time: 0, joints: Array(10).fill(0) });
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toHaveCount(0);
+});
+
+test('teacher records full measured legacy SDK joint samples and exports them', async ({ page }) => {
+  test.setTimeout(60000);
+  const savedPayloads = [];
+  const apiRequests = [];
+  const jointNames = [
+    'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
+    'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint',
+    'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint',
+    'right_knee_joint', 'right_ankle_pitch_joint', 'right_ankle_roll_joint',
+    'waist_yaw_joint', 'left_shoulder_pitch_joint', 'left_shoulder_roll_joint',
+    'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint',
+    'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
+    'right_elbow_joint', 'right_wrist_roll_joint',
+  ];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-legacy-recording-token',
+      user: { role: 'teacher', username: 'teacher-legacy-recording-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    apiRequests.push(`${request.method()} ${path}`);
+    let body = {};
+    if (path === '/api/robot/status') {
+      body = { sdkAvailable: true, running: false, status: 'connected' };
+    } else if (path === '/api/robot/joint-state') {
+      body = {
+        joint_names: jointNames,
+        positions_rad: Array(23).fill(0),
+        received_at: '2026-11-12T00:00:00Z',
+        age_ms: 10,
+      };
+    } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
+      body = { recordings: [] };
+    } else if (path === '/api/robot/recordings' && request.method() === 'POST') {
+      const payload = request.postDataJSON();
+      savedPayloads.push(payload);
+      body = {
+        recording: {
+          id: 'capture_legacytest1',
+          ...payload,
+          created_at: '2026-11-12T00:00:00Z',
+        },
+      };
+    } else if (path === '/api/run') {
+      body = { status: 'completed', commandsExecuted: 1 };
+    } else if (path === '/api/classroom/safe-mode') {
+      body = { enabled: false };
+    } else if (path === '/api/classroom/simulation-visibility') {
+      body = { show_simulation: true };
+    } else if (path === '/api/classroom/sidebar-settings') {
+      body = { locked_panels: [], configured: true };
+    } else if (path === '/api/classroom/me') {
+      body = { data_revision: 0 };
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await expect(page.getByText('Legacy SDK and fresh 23-joint ROS telemetry are ready.')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Recorded motion name' }).fill('Legacy face wave');
+  await page.getByRole('checkbox', { name: 'Confirm robot arm workspace is clear' }).check();
+  await page.getByRole('button', { name: 'Run & record on robot' }).click();
+  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(1);
+  expect(apiRequests).toContain('POST /api/run');
+  expect(savedPayloads[0].controller_version).toBe('legacy');
+  expect(savedPayloads[0].command).toBe('robot.arm_action("face wave")');
+  expect(savedPayloads[0].joint_names).toEqual(jointNames);
+  expect(savedPayloads[0].frames.length).toBeGreaterThanOrEqual(2);
+  expect(savedPayloads[0].frames[0].joints).toHaveLength(23);
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export all JSON' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe('g1-recorded-motions.json');
+  await page.getByRole('button', { name: 'Preview', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toHaveCount(0);
 });
 
 test('only teachers can hide the simulation from Settings', async ({ page }) => {
@@ -3281,6 +3490,7 @@ test('teacher DUET commissioning supports retry, review, failure, and copyable e
   await openConnectionPanel(page);
   const connectionPanel = page.getByRole('dialog', { name: 'Robot connection panel' });
   await expect(connectionPanel.getByText('Teacher-only DUET commissioning')).toBeVisible();
+  page.on('dialog', (dialog) => dialog.accept());
   await connectionPanel.getByRole('button', { name: 'Connect', exact: true }).click();
   await connectionPanel.getByRole('button', { name: 'Start full test sequence' }).click();
   await connectionPanel.getByRole('button', { name: 'Run test 1' }).click();
@@ -3375,6 +3585,7 @@ test('teacher commissioning controls stay disabled when the backend feature gate
   await page.getByRole('button', { name: 'Close', exact: true }).click();
   await openConnectionPanel(page);
   const robotSettings = page.getByTestId('teacher-robot-settings');
+  page.on('dialog', (dialog) => dialog.accept());
   await robotSettings.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(robotSettings.getByText('Guided commissioning is disabled.')).toBeVisible();
   const startButton = robotSettings.getByRole('button', { name: 'Start full test sequence' });

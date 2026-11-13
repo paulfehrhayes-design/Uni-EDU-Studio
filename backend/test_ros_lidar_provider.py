@@ -11,6 +11,7 @@ try:
     from . import ros_lidar_provider
     from .ros_lidar_provider import (
         SampleCache,
+        JointStateCache,
         PointCloudClockNormalizer,
         compose_transforms,
         footprint_clear_range_m,
@@ -27,6 +28,7 @@ except ImportError:
     import ros_lidar_provider
     from ros_lidar_provider import (
         SampleCache,
+        JointStateCache,
         PointCloudClockNormalizer,
         compose_transforms,
         footprint_clear_range_m,
@@ -191,6 +193,56 @@ class RosLidarProviderTests(unittest.TestCase):
             self.assertEqual(response.headers["Cache-Control"], "no-store, max-age=0")
         self.assertEqual(payload["topic"], topic)
         self.assertEqual(base64.b64decode(payload["data_base64"]), b"rgb")
+
+    def test_joint_state_cache_orders_names_validates_values_and_rejects_stale_samples(self):
+        names = [name for name, _ in ros_lidar_provider.JOINT_MOTOR_INDICES]
+        cache = JointStateCache()
+        cache.update(list(reversed(names)), list(reversed(range(23))))
+        sample = cache.current_sample()
+        self.assertEqual(sample["joint_names"], names)
+        self.assertEqual(sample["positions_rad"], list(map(float, range(23))))
+        self.assertLessEqual(sample["age_ms"], 250)
+
+        with self.assertRaisesRegex(ValueError, "exactly once"):
+            cache.update(names[:-1], list(range(22)))
+        with self.assertRaisesRegex(ValueError, "finite"):
+            cache.update(names, [float("nan")] + list(range(22)))
+
+        stale_cache = JointStateCache()
+        with patch.object(ros_lidar_provider.time, "monotonic", side_effect=[10.0, 10.251]):
+            stale_cache.update(names, list(range(23)))
+            with self.assertRaisesRegex(LookupError, "stale"):
+                stale_cache.current_sample()
+
+    def test_joint_state_http_endpoint_requires_token_and_disables_caching(self):
+        from threading import Thread
+
+        names = [name for name, _ in ros_lidar_provider.JOINT_MOTOR_INDICES]
+        joint_state_cache = JointStateCache()
+        joint_state_cache.update(names, [0.1] * 23)
+        server = ros_lidar_provider.serve_http(
+            SampleCache("mid360-front", "pelvis"),
+            "127.0.0.1",
+            0,
+            "provider-secret",
+            joint_state_cache=joint_state_cache,
+        )
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/joint_state"
+        with self.assertRaises(HTTPError) as unauthorized:
+            urlopen(url, timeout=2)
+        self.assertEqual(unauthorized.exception.code, 401)
+        unauthorized.exception.close()
+
+        request = Request(url, headers={"Authorization": "Bearer provider-secret"})
+        with urlopen(request, timeout=2) as response:
+            payload = json.load(response)
+            self.assertEqual(response.headers["Cache-Control"], "no-store, max-age=0")
+        self.assertEqual(payload["joint_names"], names)
+        self.assertEqual(payload["positions_rad"], [0.1] * 23)
 
     def test_supplemental_pointcloud_configuration_is_explicit_and_model_safe(self):
         sources = ros_lidar_provider.parse_pointcloud_source_specs(

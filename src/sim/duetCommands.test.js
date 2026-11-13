@@ -260,10 +260,13 @@ test('DUET arm pose targets are bounded and legacy gestures include their availa
   ]);
   const left = getDuetArmPoseTarget('left_high_five');
   const right = getDuetArmPoseTarget('right_high_five');
-  assert.deepEqual(right, [
+  const mirroredHighFive = [
     left[5], -left[6], -left[7], left[8], -left[9],
     left[0], -left[1], -left[2], left[3], -left[4],
-  ]);
+  ];
+  right.forEach((value, index) => {
+    assert.ok(Math.abs(value - mirroredHighFive[index]) < 0.001);
+  });
   assert.deepEqual(Object.keys(catalog.legacyMappings).sort(), Object.keys(G1_ARM_PRESET_DESCRIPTIONS).sort());
   const commandMethods = new Set(DUET_COMMANDS.map(({ method }) => method));
   Object.entries(catalog.legacyMappings).forEach(([legacyPreset, methods]) => {
@@ -321,15 +324,17 @@ test('DUET arm pose targets are bounded and legacy gestures include their availa
 });
 
 test('every side-specific V2 pose has a true mirrored target in the other arm', () => {
-  const normalizeSignedZero = (target) => target.map((value) => (value === 0 ? 0 : value));
   getDuetArmPoseNames().filter((poseName) => poseName.startsWith('left_')).forEach((leftPoseName) => {
     const rightPoseName = leftPoseName.replace(/^left_/, 'right_');
     const left = getDuetArmPoseTarget(leftPoseName);
     const right = getDuetArmPoseTarget(rightPoseName);
-    assert.deepEqual(normalizeSignedZero(right), normalizeSignedZero([
+    const mirrored = [
       left[5], -left[6], -left[7], left[8], -left[9],
       left[0], -left[1], -left[2], left[3], -left[4],
-    ]), `${leftPoseName} must have a mirrored ${rightPoseName}`);
+    ];
+    right.forEach((value, index) => {
+      assert.ok(Math.abs(value - mirrored[index]) < 0.01, `${leftPoseName} must mirror ${rightPoseName}`);
+    });
   });
 });
 

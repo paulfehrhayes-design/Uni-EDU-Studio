@@ -15,7 +15,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
 from urllib.parse import parse_qs, urlsplit
 
+try:
+    from .ros.g1_joint_state import JOINT_MOTOR_INDICES
+except ImportError:
+    from ros.g1_joint_state import JOINT_MOTOR_INDICES
+
 MAX_SAMPLE_AGE_SECONDS = 0.5
+MAX_JOINT_STATE_AGE_SECONDS = 0.25
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
 TF_WARNING_INTERVAL_SECONDS = 5.0
@@ -265,6 +271,61 @@ class CameraFrameCache:
             "height": frame["height"],
             "step": frame["step"],
             "data_base64": base64.b64encode(frame["data"]).decode("ascii"),
+        }
+
+
+class JointStateCache:
+    def __init__(self, maximum_age_seconds: float = MAX_JOINT_STATE_AGE_SECONDS):
+        self._joint_names = tuple(name for name, _ in JOINT_MOTOR_INDICES)
+        self._maximum_age_seconds = maximum_age_seconds
+        self._sample: dict[str, object] | None = None
+        self._lock = threading.Lock()
+
+    def update(self, names: list[str], positions: list[float]) -> None:
+        if (
+            not isinstance(names, (list, tuple))
+            or not isinstance(positions, (list, tuple))
+            or len(names) != len(self._joint_names)
+            or len(positions) != len(self._joint_names)
+            or any(not isinstance(name, str) for name in names)
+            or len(set(names)) != len(names)
+            or set(names) != set(self._joint_names)
+        ):
+            raise ValueError("Joint state must contain each supported G1 23-DOF joint exactly once.")
+        values_by_name = {}
+        for name, position in zip(names, positions):
+            if isinstance(position, bool):
+                raise ValueError(f"Joint state position for {name} must be finite.")
+            try:
+                value = float(position)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Joint state position for {name} must be finite.") from error
+            if not math.isfinite(value):
+                raise ValueError(f"Joint state position for {name} must be finite.")
+            values_by_name[name] = value
+
+        with self._lock:
+            self._sample = {
+                "positions_rad": [values_by_name[name] for name in self._joint_names],
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "received_monotonic": time.monotonic(),
+            }
+
+    def current_sample(self) -> dict[str, object]:
+        with self._lock:
+            sample = dict(self._sample) if self._sample is not None else None
+        if sample is None:
+            raise LookupError("No G1 joint-state sample has been received.")
+        age_seconds = time.monotonic() - float(sample["received_monotonic"])
+        if age_seconds < 0:
+            raise ValueError("G1 joint-state sample receipt time is invalid.")
+        if age_seconds > self._maximum_age_seconds:
+            raise LookupError("G1 joint-state sample is stale.")
+        return {
+            "joint_names": list(self._joint_names),
+            "positions_rad": list(sample["positions_rad"]),
+            "received_at": sample["received_at"],
+            "age_ms": round(age_seconds * 1000, 1),
         }
 
 
@@ -1039,6 +1100,7 @@ def serve_http(
     port: int,
     token: str,
     camera_cache: CameraFrameCache | None = None,
+    joint_state_cache: JointStateCache | None = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -1049,6 +1111,7 @@ def serve_http(
                 "/healthz",
                 "/calibration",
                 "/camera/frame",
+                "/joint_state",
             }:
                 self.send_error(404)
                 return
@@ -1073,6 +1136,24 @@ def serve_http(
                 except LookupError as error:
                     body = json.dumps({"error": str(error)}, separators=(",", ":")).encode("utf-8")
                     self.send_response(503, "Camera frame unavailable")
+                else:
+                    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed_path.path == "/joint_state":
+                if joint_state_cache is None:
+                    self.send_error(503, "Joint state relay is unavailable")
+                    return
+                try:
+                    payload = joint_state_cache.current_sample()
+                except (LookupError, ValueError) as error:
+                    body = json.dumps({"error": str(error)}, separators=(",", ":")).encode("utf-8")
+                    self.send_response(503, "Joint state unavailable")
                 else:
                     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                     self.send_response(200)
@@ -1127,7 +1208,7 @@ def main() -> None:
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs_py import point_cloud2
-    from sensor_msgs.msg import Image, PointCloud2
+    from sensor_msgs.msg import Image, JointState, PointCloud2
     from rclpy.duration import Duration
     from rclpy.time import Time
     from tf2_ros import Buffer, TransformException, TransformListener
@@ -1198,6 +1279,7 @@ def main() -> None:
                 source_specs=source_specs,
             )
             self.camera_cache = CameraFrameCache(camera_source_specs)
+            self.joint_state_cache = JointStateCache()
             self.cache.update_calibration_status(
                 {
                     "ready": False,
@@ -1248,6 +1330,18 @@ def main() -> None:
                     ),
                     qos_profile_sensor_data,
                 )
+            self.create_subscription(
+                JointState,
+                os.environ.get("G1_JOINT_STATE_TOPIC", "/joint_states"),
+                self.on_joint_state,
+                qos_profile_sensor_data,
+            )
+
+        def on_joint_state(self, message: JointState) -> None:
+            try:
+                self.joint_state_cache.update(list(message.name), list(message.position))
+            except (TypeError, ValueError) as error:
+                self.get_logger().warning(f"Ignoring invalid G1 joint-state sample: {error}")
 
         def on_cloud(
             self,
@@ -1583,7 +1677,14 @@ def main() -> None:
 
     rclpy.init()
     node = LidarNode()
-    server = serve_http(node.cache, host, port, token, node.camera_cache)
+    server = serve_http(
+        node.cache,
+        host,
+        port,
+        token,
+        node.camera_cache,
+        node.joint_state_cache,
+    )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     node.get_logger().info(f"Listening to {topic}; read-only sample endpoint bound to {host}:{port}.")

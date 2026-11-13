@@ -46,7 +46,7 @@ robot.turn("left", 90)
 robot.backwardtime(1)
 ```
 
-Programs can also use bounded `for` loops. The legacy G1 arm presets are available with `robot.arm_action("hands up")` and the other names listed below. A preset does not automatically release the arms; add `robot.arm_action("release arm")` explicitly when you want that motion. For a timed static-pose sequence, use `robot.hold_arm("hands up", 3)`; the available poses are the stationary arm presets shown in the Blocks toolbox, excluding moving gestures such as clapping and waving. This command starts the preset and keeps the program on that pose for at least the requested 0.1–10 seconds. It does not send continuous joint targets: the physical SDK confirms request acceptance but does not report that the pose was reached or actively hold it, so actual pose duration depends on the G1 preset/controller behavior. Simulation shows approximate poses, not SDK trajectories. Allow a preset to finish before asking the robot to walk. Walking is sent only when the locomotion FSM reports ready state 500; if it is in another state, the program stops with an instruction to run `robot.stand()` and wait for that transition. The teacher's `Stop robot` button stops locomotion but cannot cancel an accepted arm preset, so keep the robot area clear and use direct teacher supervision.
+Programs can also use bounded `for` loops. The legacy G1 arm presets are available with `robot.arm_action("hands up")` and the other names listed below. A preset does not automatically release the arms; add `robot.arm_action("release arm")` explicitly when you want that motion. For a timed static-pose sequence, use `robot.hold_arm("hands up", 3)`; the available poses are the stationary arm presets shown in the Blocks toolbox, excluding moving gestures such as clapping and waving. This command starts the preset and keeps the program on that pose for at least the requested 0.1–10 seconds. It does not send continuous joint targets: the physical SDK confirms request acceptance but does not report that the pose was reached or actively hold it, so actual pose duration depends on the G1 preset/controller behavior. The simulator uses the project's 23-DOF model (five actuated joints per arm); its poses and gesture sequences are approximate, not the SDK's firmware trajectories. Allow a preset to finish before asking the robot to walk. Walking is sent only when the locomotion FSM reports ready state 500; if it is in another state, the program stops with an instruction to run `robot.stand()` and wait for that transition. The teacher's `Stop robot` button stops locomotion but cannot cancel an accepted arm preset, so keep the robot area clear and use direct teacher supervision.
 
 `robot.wait(2)` pauses the program for 2 seconds. Wait durations are whole seconds from 1 to 10 in both Blocks and the IDE. Timed walking and arm holds can still use fractional seconds.
 
@@ -109,7 +109,7 @@ Arm presets:
 - Heart and right heart: make a heart gesture.
 - Reject: raise a hand to signal “no.”
 - X-ray: make the X-ray pose.
-- Face wave and high wave: wave near the face or overhead.
+- Face wave and high wave: wave near the face or overhead with the right hand.
 - Shake hand: offer the right hand.
 
 Simulator poses are approximate; the real robot runs its built-in preset.
@@ -127,6 +127,7 @@ robot.getvolume()
 ## 5. Test first in the simulator
 Before sending code to the robot, use the simulation preview.
 - Check if the robot path looks correct.
+- Walking uses an approximate articulated gait; it is not a recording of the robot controller's joint trajectories.
 - Look for obstacles or bad turns.
 - Fix the code before submitting.
 - Have a teacher check the motion before starting the physical robot.

@@ -99,6 +99,37 @@ test('SDK status request can test LiDAR without running a robot command', async 
   assert.deepEqual(requests[0][1], { cache: 'no-store' });
 });
 
+test('SDK connection exposes no-store telemetry and shared recording endpoints', async () => {
+  const requests = [];
+  const connection = new SdkRobotConnection(async (...args) => {
+    requests.push(args);
+    return { recordings: [] };
+  });
+  const recording = {
+    name: 'Face wave',
+    controller_version: 'legacy',
+    command: 'robot.arm_action("face wave")',
+    joint_names: ['left_hip_pitch_joint'],
+    frames: [],
+  };
+
+  await connection.jointState();
+  await connection.recordings();
+  await connection.saveRecording(recording);
+  await connection.deleteRecording('capture-1');
+
+  assert.deepEqual(requests.map(([url]) => url), [
+    '/api/robot/joint-state',
+    '/api/robot/recordings',
+    '/api/robot/recordings',
+    '/api/robot/recordings/capture-1',
+  ]);
+  assert.deepEqual(requests[0][1], { cache: 'no-store' });
+  assert.deepEqual(requests[1][1], { cache: 'no-store' });
+  assert.deepEqual(JSON.parse(requests[2][1].body), recording);
+  assert.deepEqual(requests[3][1], { method: 'DELETE' });
+});
+
 test('WebRTC adapter does not infer command support from an encoder alone', async () => {
   const sentCommands = [];
   const transport = {
