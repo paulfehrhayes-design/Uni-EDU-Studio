@@ -1,10 +1,68 @@
 import { test, expect } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
+import { runInNewContext } from 'node:vm';
 import { getG1BlocklyCommandBlocks, parseG1Program } from '../src/sim/g1Commands.js';
 import { getDuetBlocklyCommandBlocks, parseDuetProgram } from '../src/sim/duetCommands.js';
 
 async function openConnectionPanel(page) {
   await page.getByRole('button', { name: 'Open robot connection' }).click();
 }
+
+function harryBotterPreviewConfig() {
+  return {
+    agents: [
+      {
+        agent_id: 'general',
+        display_name: 'General conversation',
+        purpose: 'Answer learner questions with clear, age-appropriate explanations.',
+        instructions: 'Explain ideas clearly, check understanding, and invite a follow-up question when helpful.',
+        generation_temperature: 0.4,
+        generation_max_tokens: 500,
+        is_builtin: true,
+      },
+      {
+        agent_id: 'debate',
+        display_name: 'Debate assistant',
+        purpose: 'Help learners examine arguments, evidence, and respectful counterpoints.',
+        instructions: 'Present balanced arguments and encourage respectful disagreement.',
+        generation_temperature: 0.4,
+        generation_max_tokens: 500,
+        is_builtin: true,
+      },
+    ],
+    knowledge: [],
+    shared_across_teacher_accounts: true,
+    supported_knowledge_formats: ['.txt', '.md'],
+    maximum_knowledge_bytes: 100_000,
+  };
+}
+
+test('Harry Botter audio worklet emits 20 ms of little-endian 16 kHz PCM', async () => {
+  const source = await readFile(new URL('../public/harry-botter-pcm-worklet.js', import.meta.url), 'utf8');
+  const frames = [];
+  let Processor;
+  runInNewContext(source, {
+    AudioWorkletProcessor: class {
+      constructor() {
+        this.port = { postMessage: (message) => frames.push(message) };
+      }
+    },
+    sampleRate: 48_000,
+    registerProcessor: (_name, processor) => {
+      Processor = processor;
+    },
+  });
+  const processor = new Processor();
+  for (let index = 0; index < 8; index += 1) {
+    processor.process(
+      [[new Float32Array(128).fill(0.5)]],
+      [[new Float32Array(128)]],
+    );
+  }
+  expect(frames).toHaveLength(1);
+  expect(frames[0].frame.byteLength).toBe(640);
+  expect(new DataView(frames[0].frame).getInt16(0, true)).toBe(16384);
+});
 
 test('login starts blank and determines role from the account', async ({ page }) => {
   let loginPayload;
@@ -45,6 +103,984 @@ test('login starts blank and determines role from the account', async ({ page })
     password: 'classroom-password',
   });
   await expect(page.getByRole('button', { name: 'Open queue' })).toHaveCount(0);
+});
+
+test('sign-in page links to the Harry Botter browser preview', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('link', { name: 'Try Harry Botter AI' }))
+    .toHaveAttribute('href', '/?try=harry-botter');
+});
+
+test('Harry Botter preview uses teacher login, tests browser audio, and returns to Uni-EDU', async ({ page }) => {
+  const loginRequests = [];
+  const apiCalls = [];
+  await page.addInitScript(() => {
+    const fakeTrack = { stopCount: 0, stop() { this.stopCount += 1; } };
+    window.testAudioTrack = fakeTrack;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({ getTracks: () => [fakeTrack] }),
+        enumerateDevices: async () => [
+          { kind: 'audioinput', deviceId: 'test-microphone', label: 'Test microphone' },
+          { kind: 'audiooutput', deviceId: 'test-speaker', label: 'Test speaker' },
+        ],
+      },
+    });
+    window.MediaRecorder = class FakeMediaRecorder {
+      constructor() {
+        this.state = 'inactive';
+        this.mimeType = 'audio/webm';
+        this.ondataavailable = null;
+        this.onstop = null;
+      }
+
+      start() {
+        this.state = 'recording';
+      }
+
+      stop() {
+        this.state = 'inactive';
+        window.setTimeout(() => {
+          this.ondataavailable?.({ data: new Blob(['local test audio'], { type: this.mimeType }) });
+          this.onstop?.();
+        }, 0);
+      }
+    };
+    HTMLMediaElement.prototype.setSinkId = async function setSinkId(deviceId) {
+      this.testSinkId = deviceId;
+    };
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    apiCalls.push(`${request.method()} ${path}`);
+    if (path === '/api/classroom/login') {
+      const payload = request.postDataJSON();
+      loginRequests.push(payload);
+      const role = payload.username === 'student-preview-test' ? 'student' : 'teacher';
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          token: `${role}-preview-token`,
+          user: { role, username: payload.username },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/model-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'not_configured', configured: false }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/speech-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          transcription: { available: true, model: 'test-whisper', device: 'cpu' },
+          speech_generation: { available: true, voice: 'test-generic' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/transcribe') {
+      expect(request.postDataBuffer()).toEqual(Buffer.from('local test audio'));
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ transcript: 'Question recorded from the microphone.', model: 'test-whisper' }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/config') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(harryBotterPreviewConfig()),
+      });
+      return;
+    }
+    if (path === '/api/classroom/me') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ data_revision: 0 }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await expect(page.getByRole('heading', { name: 'Try Harry Botter AI' })).toBeVisible();
+  await page.getByLabel('Username').fill('student-preview-test');
+  await page.getByLabel('Password').fill('student-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await expect(page.getByRole('alert')).toHaveText('Use a teacher account to open the Harry Botter preview.');
+  await expect(page.getByRole('heading', { name: 'Microphone and speaker test' })).toHaveCount(0);
+  expect(await page.evaluate(() => localStorage.getItem('edu-classroom-session'))).toBeNull();
+
+  await page.getByLabel('Username').fill('teacher-preview-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await expect(page.getByText(/No local model is configured/)).toBeVisible();
+  await page.getByRole('button', { name: 'Microphone test' }).click();
+  await expect(page.getByRole('heading', { name: 'Microphone and speaker test' })).toBeVisible();
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  await expect(page.getByRole('heading', { name: 'Microphone and speaker test' })).toBeInViewport();
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('edu-classroom-session')).user.role)).toBe('teacher');
+  expect(loginRequests).toHaveLength(2);
+
+  await page.getByRole('button', { name: 'Record microphone sample' }).click();
+  await expect(page.getByRole('button', { name: 'Stop recording' })).toBeVisible();
+  await expect(page.getByLabel('Microphone')).toContainText('Test microphone');
+  await page.getByRole('button', { name: 'Stop recording' }).click();
+  await expect(page.locator('audio')).toBeVisible();
+  await expect(page.getByText('Microphone test saved temporarily in this browser. Play it to check your speaker.')).toBeVisible();
+  await page.getByLabel('Speaker').selectOption('test-speaker');
+  await expect(page.locator('audio')).toHaveJSProperty('testSinkId', 'test-speaker');
+  await page.getByRole('button', { name: 'Record microphone sample' }).click();
+  await expect(page.getByRole('button', { name: 'Stop recording' })).toBeVisible();
+  await page.getByRole('button', { name: 'Stop recording' }).click();
+  await page.getByRole('button', { name: 'Transcribe locally and review' }).click();
+  await expect(page.getByRole('heading', { name: 'Local AI draft chat' })).toBeVisible();
+  await expect(page.getByLabel('Message')).toHaveValue('Question recorded from the microphone.');
+  await expect.poll(() => page.evaluate(() => window.testAudioTrack.stopCount)).toBe(2);
+  expect(loginRequests).toHaveLength(2);
+  expect(apiCalls).toEqual([
+    'POST /api/classroom/login',
+    'POST /api/classroom/login',
+    'GET /api/harry-botter/model-status',
+    'GET /api/harry-botter/speech-status',
+    'GET /api/harry-botter/config',
+    'POST /api/harry-botter/transcribe',
+  ]);
+
+  await page.getByRole('link', { name: 'Uni-EDU Studio' }).click();
+  await expect(page).toHaveURL(/\/$/);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('edu-classroom-session')).user.role)).toBe('teacher');
+  await expect(page.getByRole('link', { name: 'Try Harry Botter AI' })).toHaveCount(0);
+});
+
+test('Harry Botter streams a teacher voice turn locally and keeps speech playback explicit', async ({ page }) => {
+  const requests = [];
+  await page.addInitScript(() => {
+    const track = { stopCount: 0, stop() { this.stopCount += 1; } };
+    window.testVoiceTrack = track;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({ getTracks: () => [track] }),
+        enumerateDevices: async () => [
+          { kind: 'audioinput', deviceId: 'live-mic', label: 'Live microphone' },
+        ],
+      },
+    });
+    window.AudioContext = class FakeAudioContext {
+      constructor() {
+        this.state = 'running';
+        this.destination = {};
+        this.audioWorklet = { addModule: async () => {} };
+      }
+
+      createMediaStreamSource() {
+        return { connect() {}, disconnect() {} };
+      }
+
+      async resume() {}
+      async close() { this.state = 'closed'; }
+    };
+    window.AudioWorkletNode = class FakeAudioWorkletNode {
+      constructor() {
+        this.port = { onmessage: null };
+        this.connect = () => {};
+        this.disconnect = () => {};
+        window.testVoiceWorklet = this;
+      }
+    };
+    HTMLMediaElement.prototype.pause = function mockPause() {
+      this.testPauseCount = (this.testPauseCount || 0) + 1;
+    };
+    window.WebSocket = class FakeWebSocket {
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+
+      constructor(url, protocols) {
+        this.url = url;
+        this.protocols = protocols;
+        this.readyState = 0;
+        this.listeners = {};
+        this.sent = [];
+        window.testVoiceSocket = this;
+        window.setTimeout(() => {
+          this.readyState = window.WebSocket.OPEN;
+          this.dispatch('open');
+        }, 0);
+      }
+
+      addEventListener(name, callback) {
+        this.listeners[name] = callback;
+      }
+
+      dispatch(name, event = {}) {
+        this.listeners[name]?.(event);
+        this[`on${name}`]?.(event);
+      }
+
+      send(data) {
+        this.sent.push(data);
+        if (typeof data !== 'string') return;
+        const message = JSON.parse(data);
+        const replies = message.type === 'start'
+          ? [{
+            type: 'ready',
+            session_id: message.session_id,
+            sample_rate: 16000,
+            frame_samples: 320,
+          }]
+          : message.type === 'stop'
+            ? [
+              ...(window.testNextStopTranscript ? [{
+                type: 'transcript_final',
+                session_id: message.session_id,
+                sequence: 1,
+                text: 'Late transcript after sign-out.',
+              }] : []),
+              { type: 'stopped', session_id: message.session_id },
+            ]
+            : [];
+        if (message.type === 'stop') window.testNextStopTranscript = false;
+        if (replies.length > 0) {
+          window.setTimeout(() => {
+            replies.forEach((reply) => {
+              this.dispatch('message', { data: JSON.stringify(reply) });
+            });
+          }, 0);
+        }
+      }
+
+      close() {
+        this.readyState = window.WebSocket.CLOSED;
+        this.dispatch('close');
+      }
+    };
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    requests.push(`${request.method()} ${path}`);
+    if (path === '/api/classroom/login') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          token: 'voice-preview-token',
+          user: { role: 'teacher', username: 'teacher-voice-test' },
+        }),
+      });
+    } else if (path === '/api/harry-botter/model-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'ready', configured: true, model: 'test-local-model' }),
+      });
+    } else if (path === '/api/harry-botter/speech-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          transcription: { available: true, model: 'test-whisper', device: 'cpu' },
+          streaming_transcription: { available: true, sample_rate: 16000 },
+          speech_generation: { available: true, voice: 'test-generic' },
+        }),
+      });
+    } else if (path === '/api/harry-botter/config') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(harryBotterPreviewConfig()),
+      });
+    } else if (path === '/api/harry-botter/draft') {
+      expect(request.postDataJSON().text).toBe('What is evaporation?');
+      expect(request.postDataJSON().learning_level).toBe('MYP 2');
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          draft: { text: 'Evaporation is when liquid water changes into water vapour.', model: 'test-local-model' },
+        }),
+      });
+    } else if (path === '/api/harry-botter/speech') {
+      expect(request.postDataJSON().speed).toBe(1.15);
+      await route.fulfill({
+        status: 200,
+        contentType: 'audio/wav',
+        body: Buffer.from('RIFF-test-wave'),
+      });
+    } else {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+    }
+  });
+
+  await page.goto('/?try=harry-botter');
+  await page.getByLabel('Username').fill('teacher-voice-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await page.getByRole('button', { name: 'Voice conversation' }).click();
+  await page.getByLabel('Learning stage').selectOption('MYP 2');
+  await page.getByLabel('Spoken reply pace').selectOption('1.15');
+  await page.getByRole('button', { name: 'Start voice conversation' }).click();
+  await expect(page.getByText(/Listening locally/)).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.testVoiceSocket?.sent.length)).toBe(1);
+  const streamDetails = await page.evaluate(() => ({
+    url: window.testVoiceSocket.url,
+    protocols: window.testVoiceSocket.protocols,
+    start: JSON.parse(window.testVoiceSocket.sent[0]),
+  }));
+  expect(streamDetails.url).toMatch(/^ws:\/\/.*\/api\/harry-botter\/stream$/);
+  expect(streamDetails.protocols).toEqual(['edu-auth.voice-preview-token']);
+  expect(streamDetails.start).toMatchObject({
+    type: 'start',
+    sample_rate: 16000,
+    format: 'pcm_s16le_mono',
+  });
+  await page.evaluate(() => {
+    window.testVoiceWorklet.port.onmessage({
+      data: { type: 'audio', frame: new ArrayBuffer(640) },
+    });
+    window.testVoiceSocket.onmessage({
+      data: JSON.stringify({
+        type: 'transcript_final',
+        session_id: window.testVoiceSocket.sent[0]
+          ? JSON.parse(window.testVoiceSocket.sent[0]).session_id
+          : 'missing-session',
+        sequence: 1,
+        text: 'What is evaporation?',
+      }),
+    });
+  });
+  await expect(page.getByText('Evaporation is when liquid water changes into water vapour.')).toBeVisible();
+  await expect(page.getByText(/Draft returned in [\d.]+ s after transcript receipt/)).toBeVisible();
+  const forwardedAudioBytes = await page.evaluate(
+    () => window.testVoiceSocket.sent.filter((message) => message instanceof ArrayBuffer).map((message) => message.byteLength),
+  );
+  expect(forwardedAudioBytes).toEqual([640]);
+  await page.getByRole('button', { name: 'Prepare spoken reply' }).click();
+  const spokenReply = page.getByLabel('Spoken draft 2');
+  await expect(spokenReply).toBeVisible();
+  await expect(spokenReply).toHaveJSProperty('paused', true);
+  await page.evaluate(() => {
+    const audio = document.querySelector('audio');
+    Object.defineProperty(audio, 'paused', { configurable: true, value: false });
+    audio.dispatchEvent(new Event('play'));
+    const sessionId = JSON.parse(window.testVoiceSocket.sent[0]).session_id;
+    window.testVoiceSocket.onmessage({
+      data: JSON.stringify({ type: 'speech_started', session_id: sessionId, sequence: 2 }),
+    });
+  });
+  await expect.poll(() => spokenReply.evaluate((audio) => audio.testPauseCount)).toBe(1);
+  await page.getByRole('button', { name: 'Stop voice conversation' }).click();
+  await expect(page.getByRole('button', { name: 'Start voice conversation' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.testVoiceTrack.stopCount)).toBe(1);
+  expect(requests).toContain('POST /api/harry-botter/draft');
+  expect(requests).toContain('POST /api/harry-botter/speech');
+  await page.getByRole('button', { name: 'Start voice conversation' }).click();
+  await expect(page.getByText(/Listening locally/)).toBeVisible();
+  await page.evaluate(() => {
+    window.testNextStopTranscript = true;
+  });
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await expect(page.getByRole('heading', { name: 'Try Harry Botter AI' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.testVoiceTrack.stopCount)).toBe(2);
+  expect(requests.filter((request) => request === 'POST /api/harry-botter/draft')).toHaveLength(1);
+});
+
+test('Harry Botter preview explains and recovers from blocked microphone permission', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: async () => {
+          throw new DOMException('Permission denied', 'NotAllowedError');
+        },
+        enumerateDevices: async () => [],
+      },
+    });
+  });
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(path === '/api/classroom/login'
+        ? { token: 'teacher-mic-denied-token', user: { role: 'teacher', username: 'teacher-mic-denied-test' } }
+        : path === '/api/harry-botter/model-status'
+          ? { status: 'not_configured', configured: false }
+          : path === '/api/harry-botter/config'
+            ? harryBotterPreviewConfig()
+          : {}),
+    });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await page.getByLabel('Username').fill('teacher-mic-denied-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await expect(page.getByRole('heading', { name: 'Voice conversations run locally with explicit review' })).toBeVisible();
+  await page.getByRole('button', { name: 'Microphone test' }).click();
+  const openInBrowserLink = page.getByRole('link', { name: 'Open this preview in a full browser tab' });
+  await expect(openInBrowserLink).toHaveAttribute('target', '_blank');
+  await expect(openInBrowserLink).toHaveAttribute('href', /try=harry-botter/);
+  await expect(page.getByRole('button', { name: 'Record microphone sample' })).toBeVisible();
+  await page.getByRole('button', { name: 'Record microphone sample' }).click();
+  await expect(page.getByRole('alert')).toContainText('open it in a full browser tab');
+  await expect(page.getByText('Allow microphone access in the browser tab')).toBeVisible();
+  await expect(page.getByText(/A webpage cannot open or change browser permission settings/)).toBeVisible();
+  const popupPromise = page.waitForEvent('popup');
+  await openInBrowserLink.click();
+  const standalonePage = await popupPromise;
+  await expect(standalonePage).toHaveURL(/try=harry-botter/);
+  expect(await standalonePage.evaluate(() => window.top === window.self)).toBe(true);
+  await standalonePage.close();
+});
+
+test('Harry Botter preview sends text only to the teacher-authenticated local draft endpoint', async ({ page }) => {
+  const draftRequests = [];
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/login') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          token: 'teacher-chat-preview-token',
+          user: { role: 'teacher', username: 'teacher-chat-preview-test' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/model-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'ready', configured: true, model: 'local-preview-model' }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/speech-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          transcription: { available: true, model: 'test-whisper', device: 'cpu' },
+          speech_generation: { available: true, voice: 'test-generic' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/config') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(harryBotterPreviewConfig()),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/draft') {
+      draftRequests.push({
+        body: request.postDataJSON(),
+        authorization: request.headers().authorization,
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          draft: { text: 'A teacher-reviewable local draft.', model: 'local-preview-model' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/speech') {
+      expect(request.postDataJSON()).toEqual({ text: 'A teacher-reviewable local draft.', speed: 1 });
+      await route.fulfill({ status: 200, contentType: 'audio/wav', body: 'RIFF-test-wave' });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await page.getByLabel('Username').fill('teacher-chat-preview-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await expect(page.getByText(/Local model ready: local-preview-model/)).toBeVisible();
+  await page.getByLabel('Programme / year').selectOption('MYP 2');
+  await page.getByLabel('Tone').selectOption('Lightly humorous');
+  await page.getByLabel('Message').fill('Explain evaporation.');
+  await page.getByRole('button', { name: 'Generate local draft' }).click();
+
+  await expect(page.getByText('A teacher-reviewable local draft.')).toBeVisible();
+  await page.getByRole('button', { name: 'Prepare spoken reply' }).click();
+  await expect(page.getByLabel('Spoken draft 2')).toBeVisible();
+  await page.getByLabel('Spoken draft 2').evaluate((audio) => {
+    audio.dispatchEvent(new Event('play'));
+  });
+  await page.getByRole('button', { name: 'Stop spoken reply' }).click();
+  await expect(page.getByRole('button', { name: 'Stop spoken reply' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Microphone test' }).click();
+  await expect(page.getByRole('heading', { name: 'Microphone and speaker test' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Local AI draft chat' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Typing chat' }).click();
+  await expect(page.getByText('Explain evaporation.')).toBeVisible();
+  await expect(page.getByText('A teacher-reviewable local draft.')).toBeVisible();
+  expect(draftRequests).toEqual([{
+    body: {
+      text: 'Explain evaporation.',
+      learning_level: 'MYP 2',
+      tone: 'Lightly humorous',
+      agent_id: 'general',
+      history: [],
+    },
+    authorization: 'Bearer teacher-chat-preview-token',
+  }]);
+  await page.getByLabel('Message').fill('Can you give another example?');
+  await page.getByRole('button', { name: 'Generate local draft' }).click();
+  await expect(page.getByText('A teacher-reviewable local draft.').last()).toBeVisible();
+  expect(draftRequests[1].body.history).toEqual([
+    { role: 'user', content: 'Explain evaporation.' },
+    { role: 'assistant', content: 'A teacher-reviewable local draft.' },
+  ]);
+  for (let turn = 3; turn <= 7; turn += 1) {
+    await page.getByLabel('Message').fill(`Question ${turn}`);
+    await page.getByRole('button', { name: 'Generate local draft' }).click();
+    await expect(page.getByText('A teacher-reviewable local draft.')).toHaveCount(Math.min(turn, 6));
+  }
+  await expect(page.getByText('Your message', { exact: true })).toHaveCount(6);
+  await expect(page.getByText('AI draft · local-preview-model', { exact: true })).toHaveCount(6);
+  await page.getByRole('button', { name: 'Clear chat' }).click();
+  await expect(page.getByText(/Type a message or record a voice turn/)).toBeVisible();
+  await page.getByLabel('Message').fill('Start a fresh conversation.');
+  await page.getByRole('button', { name: 'Generate local draft' }).click();
+  await expect(page.getByText('A teacher-reviewable local draft.')).toHaveCount(1);
+  expect(draftRequests[7].body.history).toEqual([]);
+  await expect(page.getByText(/Audio playback is always prepared on request/)).toBeVisible();
+});
+
+test('Harry Botter keeps browser output default and sends a selected draft to connected G1 only on click', async ({ page }) => {
+  let g1AudioConnected = false;
+  const speakerRequests = [];
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/login') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          token: 'teacher-g1-speaker-token',
+          user: { role: 'teacher', username: 'teacher-g1-speaker-test' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/robot/status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ capabilities: { audio: g1AudioConnected } }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/model-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'ready', configured: true, model: 'local-preview-model' }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/config') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(harryBotterPreviewConfig()),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/draft') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          draft: { text: 'A short teacher-reviewed reply.', model: 'local-preview-model' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/g1-speak') {
+      speakerRequests.push({
+        body: request.postDataJSON(),
+        authorization: request.headers().authorization,
+      });
+      await route.fulfill(speakerRequests.length === 1
+        ? {
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ status: 'accepted' }),
+        }
+        : {
+          status: 502,
+          contentType: 'application/json',
+          body: JSON.stringify({ detail: 'G1 TTS request failed.' }),
+        });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await page.getByLabel('Username').fill('teacher-g1-speaker-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  const outputSelect = page.getByLabel('Draft audio output');
+  await expect(outputSelect).toHaveValue('browser');
+  await expect(outputSelect.locator('option[value="g1"]')).toHaveCount(0);
+
+  g1AudioConnected = true;
+  await page.getByRole('button', { name: 'Refresh G1 audio status' }).click();
+  await expect(outputSelect.locator('option[value="g1"]')).toHaveCount(1);
+  await outputSelect.selectOption('g1');
+  await page.getByLabel('G1 speaker ID').selectOption('0');
+  await page.getByLabel('Programme / year').selectOption('MYP 2');
+  await page.getByLabel('Message').fill('Write a short response.');
+  await page.getByRole('button', { name: 'Generate local draft' }).click();
+  await expect(page.getByText('A short teacher-reviewed reply.')).toBeVisible();
+  const speakButton = page.getByRole('button', { name: 'Speak this draft on G1' });
+  await expect(speakButton).toBeVisible();
+  expect(speakerRequests).toEqual([]);
+
+  await speakButton.click();
+  await expect(page.getByText(/G1 SDK accepted the TTS request/)).toBeVisible();
+  expect(speakerRequests[0]).toEqual({
+    body: { text: 'A short teacher-reviewed reply.', speaker_id: 0 },
+    authorization: 'Bearer teacher-g1-speaker-token',
+  });
+
+  await speakButton.click();
+  await expect(page.getByRole('alert')).toHaveText('G1 TTS request failed.');
+});
+
+test('Harry Botter asks for a stage without requiring or calling a model', async ({ page }) => {
+  const draftRequests = [];
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/login') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          token: 'teacher-stage-preview-token',
+          user: { role: 'teacher', username: 'teacher-stage-preview-test' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/model-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'not_configured', configured: false }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/config') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(harryBotterPreviewConfig()),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/draft') {
+      draftRequests.push(request.postDataJSON());
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          draft: {
+            text: "Hi, I'm Harry Botter, an AI-powered robot. Before I help with that, which IB programme and year should I use? Choose the programme and year above, then send your question again.",
+            source: 'stage_policy',
+            model: null,
+          },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await page.getByLabel('Username').fill('teacher-stage-preview-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await expect(page.getByText(/No local model is configured/)).toBeVisible();
+
+  await page.getByLabel('Message').fill('Explain evaporation.');
+  const generateButton = page.getByRole('button', { name: 'Generate local draft' });
+  await expect(generateButton).toBeEnabled();
+  await generateButton.click();
+
+  await expect(page.getByText('Stage required', { exact: true })).toBeVisible();
+  await expect(page.getByText(/which IB programme and year should I use/)).toBeVisible();
+  expect(draftRequests).toEqual([{
+    text: 'Explain evaporation.',
+    learning_level: '',
+    tone: 'Formal',
+    agent_id: 'general',
+    history: [],
+  }]);
+
+  await page.getByLabel('Programme / year').selectOption('MYP 2');
+  await expect(generateButton).toBeDisabled();
+});
+
+test('Harry Botter preview saves shared agent settings and scoped teacher-approved references', async ({ page }) => {
+  const config = harryBotterPreviewConfig();
+  let savedAgentPayload;
+  let savedKnowledgePayload;
+  let savedKnowledgeDocument;
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/login') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          token: 'teacher-library-token',
+          user: { role: 'teacher', username: 'teacher-library-test' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/model-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'ready', configured: true, model: 'local-preview-model' }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/config') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(config),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/agents/debate' && request.method() === 'PUT') {
+      savedAgentPayload = request.postDataJSON();
+      const agent = { ...config.agents.find((item) => item.agent_id === 'debate'), ...savedAgentPayload };
+      config.agents = config.agents.map((item) => (item.agent_id === 'debate' ? agent : item));
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ agent }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/knowledge' && request.method() === 'POST') {
+      savedKnowledgePayload = request.postDataJSON();
+      const document = {
+        document_id: 'debate-reference-1',
+        filename: savedKnowledgePayload.filename,
+        title: savedKnowledgePayload.title,
+        source: savedKnowledgePayload.source,
+        owner: savedKnowledgePayload.owner,
+        learning_level: savedKnowledgePayload.learning_level,
+        agent_id: savedKnowledgePayload.agent_id,
+        review_date: savedKnowledgePayload.review_date,
+      };
+      savedKnowledgeDocument = document;
+      config.knowledge = [document];
+      await route.fulfill({
+        status: 201,
+        contentType: 'application/json',
+        body: JSON.stringify({ document }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/knowledge/debate-reference-1' && request.method() === 'GET') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          document: {
+            ...savedKnowledgeDocument,
+            text: savedKnowledgePayload.text,
+            permission_confirmed: true,
+          },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/knowledge/debate-reference-1' && request.method() === 'PUT') {
+      savedKnowledgePayload = request.postDataJSON();
+      savedKnowledgeDocument = {
+        ...savedKnowledgeDocument,
+        ...savedKnowledgePayload,
+      };
+      config.knowledge = [savedKnowledgeDocument];
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ document: savedKnowledgeDocument }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/knowledge/debate-reference-1' && request.method() === 'DELETE') {
+      config.knowledge = [];
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ deleted: true }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await page.getByLabel('Username').fill('teacher-library-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await page.getByLabel('Agent for this chat').selectOption('debate');
+  await page.getByLabel('Additional role instructions').fill('Help learners compare claims with evidence.');
+  await page.getByRole('button', { name: 'Save agent' }).click();
+  await expect(page.getByText('Debate assistant saved for all teacher accounts.')).toBeVisible();
+  expect(savedAgentPayload.instructions).toBe('Help learners compare claims with evidence.');
+
+  await page.locator('input[name="knowledgeFile"]').setInputFiles({
+    name: 'debate-guide.md',
+    mimeType: 'text/markdown',
+    buffer: Buffer.from('Use evidence to support respectful counterarguments.'),
+  });
+  await page.getByLabel('Document title').fill('Debate guide');
+  await page.getByLabel('Source / citation').fill('Teacher-approved debate handout');
+  await page.getByLabel('Source owner').fill('Humanities team');
+  await page.getByLabel('Review date').fill('2027-10-01');
+  await page.getByLabel('Stage scope').selectOption('MYP 2');
+  await page.getByLabel('Agent scope').selectOption('debate');
+  await page.getByRole('checkbox').check();
+  await page.getByRole('button', { name: 'Add to knowledge library' }).click();
+  await expect(page.getByText('Debate guide', { exact: true })).toBeVisible();
+  expect(savedKnowledgePayload).toMatchObject({
+    filename: 'debate-guide.md',
+    title: 'Debate guide',
+    source: 'Teacher-approved debate handout',
+    owner: 'Humanities team',
+    permission_confirmed: true,
+    learning_level: 'MYP 2',
+    agent_id: 'debate',
+    review_date: '2027-10-01',
+    text: 'Use evidence to support respectful counterarguments.',
+  });
+
+  await page.getByRole('button', { name: 'Edit', exact: true }).click();
+  await expect(page.getByLabel('Reference content (up to 100 KB)')).toHaveValue(
+    'Use evidence to support respectful counterarguments.',
+  );
+  await page.getByLabel('Source / citation').fill('Revised teacher-approved debate handout');
+  await page.getByLabel('Reference content (up to 100 KB)').fill('Support each counterargument with evidence and respectful language.');
+  await page.getByRole('button', { name: 'Update reference' }).click();
+  await expect(page.getByText('Updated “Debate guide” in the shared local knowledge library.')).toBeVisible();
+  expect(savedKnowledgePayload).toMatchObject({
+    source: 'Revised teacher-approved debate handout',
+    text: 'Support each counterargument with evidence and respectful language.',
+  });
+
+  page.on('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(page.getByText('Debate guide', { exact: true })).toHaveCount(0);
+});
+
+test('Harry Botter drafts can be edited, regenerated, and dismissed without automatic speech', async ({ page }) => {
+  const draftRequests = [];
+  let version = 0;
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/classroom/login') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          token: 'teacher-review-token',
+          user: { role: 'teacher', username: 'teacher-review-test' },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/model-status') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'ready', configured: true, model: 'local-preview-model' }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/config') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(harryBotterPreviewConfig()),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/draft') {
+      draftRequests.push(request.postDataJSON());
+      version += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          draft: { text: `Local draft version ${version}.`, model: 'local-preview-model' },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await page.getByLabel('Username').fill('teacher-review-test');
+  await page.getByLabel('Password').fill('teacher-password');
+  await page.getByRole('button', { name: 'Sign in as teacher' }).click();
+  await page.getByLabel('Programme / year').selectOption('MYP 2');
+  await page.getByLabel('Message').fill('Explain evaporation.');
+  await page.getByRole('button', { name: 'Generate local draft' }).click();
+  await expect(page.getByText('Local draft version 1.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Edit draft' }).click();
+  await page.getByLabel('Edit AI draft').fill('Teacher-edited draft.');
+  await page.getByRole('button', { name: 'Save edited draft' }).click();
+  await expect(page.getByText('Teacher-edited draft.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Regenerate' }).click();
+  await expect(page.getByText('Local draft version 2.')).toBeVisible();
+  expect(draftRequests[1].history).toEqual([]);
+  await page.getByRole('button', { name: 'Dismiss draft' }).click();
+  await expect(page.getByText('Local draft version 2.')).toHaveCount(0);
+  await expect(page.getByText('Explain evaporation.')).toBeVisible();
+  await expect(page.getByText(/press Play only when you approve it/)).toBeVisible();
 });
 
 test('legacy and DUET expose the same approximate in-place 180-degree turn name', () => {

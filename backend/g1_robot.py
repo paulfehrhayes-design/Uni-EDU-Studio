@@ -43,6 +43,7 @@ _run_lock = threading.Lock()
 _stop_requested = threading.Event()
 _MAX_EXPANDED_COMMANDS = 400
 _ARM_ACTION_REQUEST_SPACING_SECONDS = 2.0
+_MAX_G1_SPEECH_PREVIEW_CHARS = 120
 _DURABLE_LOG_EVENTS = {
     "connection_attempt",
     "connection_failed",
@@ -602,6 +603,32 @@ def robot_status() -> dict[str, Any]:
         },
         "running": _run_lock.locked(),
     }
+
+
+def speak_robot_text(text: str, speaker_id: int) -> dict[str, str]:
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="G1 speech text must not be empty.")
+    if (
+        len(text) > _MAX_G1_SPEECH_PREVIEW_CHARS
+        or any(ord(character) < 32 or ord(character) == 127 for character in text)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"G1 speech text must contain at most {_MAX_G1_SPEECH_PREVIEW_CHARS} printable characters.",
+        )
+    if isinstance(speaker_id, bool) or not isinstance(speaker_id, int) or speaker_id not in (0, 1):
+        raise HTTPException(status_code=400, detail="G1 speaker ID must be 0 or 1.")
+    if _audio_client is None:
+        raise HTTPException(status_code=409, detail="Connect the G1 audio client before using the G1 speaker.")
+    if not _run_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Wait for the active G1 program to finish before sending preview audio.")
+    try:
+        _sdk_result(_audio_client.TtsMaker(text, speaker_id), "TtsMaker")
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Could not send the speech request to the G1: {error}") from error
+    finally:
+        _run_lock.release()
+    return {"status": "accepted"}
 
 
 def _sdk_result(result: Any, operation: str) -> None:

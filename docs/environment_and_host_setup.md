@@ -20,6 +20,66 @@ Important: the backend now resolves the frontend directory using an absolute pat
 
 If you start only the Python backend without building the frontend, the page may look blank or fail to load.
 
+## Recommended: start the complete AI application
+
+Use the one-command startup when you want Harry Botter chat and voice ready.
+It builds the UI, starts the backend and loopback voice service, starts local
+Ollama if needed, and checks for the free local models. On first run it creates
+the ignored audio environment and downloads the small local models. No API key
+or paid service is required.
+
+Prerequisites: Node.js/npm, Python 3.10–3.13 (Python 3.12 is recommended),
+Ollama, and the backend Python dependencies. The startup command installs the
+voice dependencies into the ignored `.venv-audio312` environment when absent.
+
+```bash
+npm install
+npm start
+```
+
+Open `http://localhost:5179/?try=harry-botter` and sign in as a teacher.
+Use **Ctrl+C** to stop the backend, voice service, and any Ollama server this
+command started. An Ollama server that was already running is left alone.
+`npm run dev` remains the frontend-only development server; it does not start
+the AI services.
+
+The local model is Qwen3 0.6B. Speech recognition and speech generation use
+the locally cached Whisper tiny.en and Kokoro models. Model files are stored
+under the Git-ignored `ai-agent/voice-service/models/` folder. The first run
+needs internet access to obtain free model weights; after setup, speech
+processing stays local. A model download may be several hundred megabytes.
+
+### Optional larger Ollama model on private Wi-Fi
+
+The app does not discover or scan the network. On the separate computer
+running Ollama, bind its API only to that computer's private Wi-Fi address,
+install a model there, and restrict its firewall to the app host's IP:
+
+```bash
+OLLAMA_HOST=192.168.1.50:11434 OLLAMA_NO_CLOUD=1 ollama serve
+OLLAMA_HOST=192.168.1.50:11434 ollama pull qwen3:14b
+```
+
+Replace the example address and model with the actual private IP and a model
+installed on that Ollama host. The Ollama local API has no authentication by
+default. Do not expose it to the public internet or an untrusted network;
+binding to a private IP is not a substitute for firewall restrictions.
+
+Copy `.env.harry-botter.example` to `.env.harry-botter.local`, then edit the
+private IP and model name:
+
+```dotenv
+HARRY_BOTTER_NETWORK_MODEL_URL=http://192.168.1.50:11434/v1
+HARRY_BOTTER_NETWORK_MODEL=qwen3:14b
+```
+
+On the next `npm start`, the app prefers this explicitly configured Wi-Fi
+model and falls back to local Qwen3 0.6B if it is unavailable. The active route
+is shown in the teacher preview. Only private numeric IP addresses are
+accepted; no DNS lookup, LAN scan, cloud provider, or automatic data upload is
+used. Model requests sent to the configured Wi-Fi host leave the app computer
+and go only to that host. `HF_HUB_OFFLINE=1` keeps speech models local.
+
 ---
 
 ## Option A: Local development mode

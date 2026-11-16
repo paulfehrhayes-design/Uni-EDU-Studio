@@ -666,6 +666,52 @@ class G1RobotProgramTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(CommandValidationError):
                 parse_robot_program(code)
 
+    def test_explicit_g1_speech_preview_uses_only_tts_and_bounds_inputs(self):
+        class FakeAudioClient:
+            def __init__(self):
+                self.calls = []
+
+            def TtsMaker(self, text, speaker_id):
+                self.calls.append((text, speaker_id))
+                return 0
+
+        original_audio_client = g1_robot._audio_client
+        audio_client = FakeAudioClient()
+        g1_robot._audio_client = audio_client
+        try:
+            result = g1_robot.speak_robot_text("Teacher-approved draft.", 0)
+            self.assertEqual(result, {"status": "accepted"})
+            self.assertEqual(audio_client.calls, [("Teacher-approved draft.", 0)])
+            for text, speaker_id in (
+                (" ", 0),
+                ("x" * 121, 0),
+                ("line\nbreak", 0),
+                ("valid text", True),
+                ("valid text", 2),
+            ):
+                with self.subTest(text=text, speaker_id=speaker_id), self.assertRaises(HTTPException):
+                    g1_robot.speak_robot_text(text, speaker_id)
+            self.assertEqual(audio_client.calls, [("Teacher-approved draft.", 0)])
+
+            self.assertTrue(g1_robot._run_lock.acquire(blocking=False))
+            try:
+                with self.assertRaisesRegex(HTTPException, "active G1 program"):
+                    g1_robot.speak_robot_text("Another draft.", 0)
+            finally:
+                g1_robot._run_lock.release()
+            self.assertEqual(audio_client.calls, [("Teacher-approved draft.", 0)])
+        finally:
+            g1_robot._audio_client = original_audio_client
+
+    def test_g1_speech_preview_requires_audio_client(self):
+        original_audio_client = g1_robot._audio_client
+        g1_robot._audio_client = None
+        try:
+            with self.assertRaisesRegex(HTTPException, "Connect the G1 audio client"):
+                g1_robot.speak_robot_text("Teacher-approved draft.", 0)
+        finally:
+            g1_robot._audio_client = original_audio_client
+
     def test_tts_program_can_exceed_thirty_seconds(self):
         long_phrase = "h" * 100
         commands = parse_robot_program(

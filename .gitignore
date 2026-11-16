@@ -29,6 +29,10 @@ unitree_sdk2_python
 __pycache__/
 *.py[cod]
 .venv/
+.venv-audio312/
+ai-agent/voice-service/models/
+ai-agent/voice-service/build/
+ai-agent/voice-service/src/*.egg-info/
 
 # Generated test artifacts
 test-results/

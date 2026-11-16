@@ -77,6 +77,20 @@ html, body, #root {
   background: #020817;
 }
 
+html.harry-botter-preview,
+body.harry-botter-preview {
+  height: auto;
+  min-height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+body.harry-botter-preview #root {
+  height: auto;
+  min-height: 100vh;
+  overflow: visible;
+}
+
 .scene-shell {
   background:
     radial-gradient(circle at 50% 22%, rgba(59, 130, 246, 0.22), transparent 28%),

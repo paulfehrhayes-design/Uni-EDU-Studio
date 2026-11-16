@@ -1,0 +1,42 @@
+---
+title: Cloud
+sidebarTitle: Overview
+---
+
+Run larger models in Ollama's cloud without requiring a powerful GPU. Inference runs on Ollama's cloud service.
+
+[System One](/capabilities/decision#use-a-cloud-model) is also available in the cloud for classification, yes/no questions, and scoring. Supported capabilities vary by model. Cloud models currently do not support [structured outputs](/capabilities/structured-outputs).
+
+## Choose how to connect
+
+<CardGroup cols={2}>
+  <Card title="Creating an API key" icon="key" href="/cloud/api">
+    Call `https://ollama.com/api` directly without installing Ollama.
+  </Card>
+
+  <Card title="Models" icon="cloud" href="/cloud/models">
+    Run cloud models from the Ollama app, CLI, local API, or official libraries.
+  </Card>
+
+  <Card title="Usage" icon="chart-line" href="/cloud/usage">
+    Review usage, balances, plans, and API reporting.
+  </Card>
+
+  <Card title="FAQ" icon="circle-question" href="/cloud/faq">
+    Find answers about accounts, authentication, privacy, and requests.
+  </Card>
+</CardGroup>
+
+Both connection methods require an Ollama account. Browse the available models in the [cloud model library](https://ollama.com/search?c=cloud).
+
+## Use only local models
+
+To keep inference on your own hardware, follow [Run a model locally](/quickstart#run-a-model-locally). You can also [disable cloud features](/faq#how-do-i-disable-ollama-cloud-features).
+
+## Retirements
+
+Cloud models may be deprecated as newer models become available. See [Cloud model lifecycle](/cloud/model-lifecycle) for upcoming and past retirements.
+
+## Data handling
+
+Ollama processes cloud prompts and responses to answer your requests. We do not use them to train models. Read the [Privacy Policy](https://ollama.com/privacy) for details or see the [Cloud FAQ](/cloud/faq).

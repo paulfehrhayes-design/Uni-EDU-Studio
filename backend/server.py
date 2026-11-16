@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import base64
+import hashlib
 import json
 import math
 import os
@@ -17,18 +18,21 @@ import uuid
 import zlib
 import logging
 import subprocess
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Literal
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, WebSocket, WebSocketDisconnect
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.exceptions import WebSocketException
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.websockets import WebSocketState
 try:
     from .g1_robot import (
         CommandValidationError,
@@ -37,6 +41,7 @@ try:
         execute_robot_program,
         parse_robot_program,
         robot_status,
+        speak_robot_text,
         stop_robot,
     )
     from .duet_robot import (
@@ -92,6 +97,7 @@ except ImportError:
         execute_robot_program,
         parse_robot_program,
         robot_status,
+        speak_robot_text,
         stop_robot,
     )
     from duet_robot import (
@@ -241,6 +247,80 @@ class LoginRequest(BaseModel):
     password: str
     role: Optional[str] = None
 
+
+class HarryBotterChatMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=2_000)
+
+
+HarryBotterLearningLevel = Literal[
+    "",
+    "Early Years",
+    "PYP 1",
+    "PYP 2",
+    "PYP 3",
+    "PYP 4",
+    "PYP 5",
+    "MYP 1",
+    "MYP 2",
+    "MYP 3",
+    "MYP 4",
+    "MYP 5",
+    "DP 1",
+    "DP 2",
+]
+
+
+class HarryBotterDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=2_000)
+    learning_level: HarryBotterLearningLevel = ""
+    tone: Literal["Formal", "Lightly humorous"] = "Formal"
+    history: List[HarryBotterChatMessage] = Field(default_factory=list, max_length=12)
+    agent_id: str = Field(default="general", min_length=1, max_length=80)
+
+
+class HarryBotterSpeechRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=2_000)
+    speed: float = Field(default=1.0, ge=0.75, le=1.25)
+
+
+class HarryBotterG1SpeakRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=120)
+    speaker_id: Literal[0, 1] = 0
+
+
+class HarryBotterAgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str = Field(min_length=1, max_length=80)
+    purpose: str = Field(min_length=1, max_length=500)
+    instructions: str = Field(min_length=1, max_length=5_000)
+    generation_temperature: float = Field(ge=0, le=1)
+    generation_max_tokens: int = Field(ge=64, le=1_000)
+
+
+class HarryBotterKnowledgeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=160)
+    source: str = Field(min_length=1, max_length=500)
+    owner: str = Field(min_length=1, max_length=120)
+    permission_confirmed: bool
+    learning_level: HarryBotterLearningLevel = ""
+    agent_id: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    review_date: date
+    text: str = Field(min_length=1, max_length=128_000)
+
+
 class SaveCodeRequest(BaseModel):
     name: str
     code: str
@@ -359,11 +439,39 @@ class ClassroomGroupRenameRequest(BaseModel):
 
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "classroom.db")
+DEFAULT_HARRY_BOTTER_AGENTS = (
+    {
+        "agent_id": "general",
+        "display_name": "General conversation",
+        "purpose": "Answer learner questions with clear, age-appropriate explanations.",
+        "instructions": "Explain ideas clearly, check understanding, and invite a follow-up question when helpful.",
+        "generation_temperature": 0.4,
+        "generation_max_tokens": 500,
+        "is_builtin": 1,
+    },
+    {
+        "agent_id": "debate",
+        "display_name": "Debate assistant",
+        "purpose": "Help learners examine arguments, evidence, and respectful counterpoints.",
+        "instructions": "Present balanced arguments, distinguish claims from evidence, and encourage respectful disagreement without deciding the debate for learners.",
+        "generation_temperature": 0.4,
+        "generation_max_tokens": 500,
+        "is_builtin": 1,
+    },
+)
+MAX_HARRY_BOTTER_AGENTS = 20
+MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS = 100
+MAX_HARRY_BOTTER_KNOWLEDGE_BYTES = 100_000
+MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES = 10_000_000
+MAX_HARRY_BOTTER_AUDIO_BYTES = 8_000_000
+HARRY_BOTTER_AUDIO_TYPES = {"audio/webm", "audio/ogg", "audio/mp4", "audio/wav", "audio/x-wav"}
+HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS = 2_500
 DEFAULT_USERS: Dict[str, Dict[str, str]] = {
     "teacher": {"username": "teacher", "password": "teacher", "role": "teacher"},
     "student1": {"username": "student1", "password": "student1", "role": "student"},
     "student2": {"username": "student2", "password": "student2", "role": "student"},
 }
+HARRY_BOTTER_STREAM_FRAME_BYTES = 640
 SESSION_TOKENS: Dict[str, str] = {}
 _QUEUE_RUN_LOCK = threading.Lock()
 _MOTION_START_LOCK = threading.Lock()
@@ -1067,6 +1175,45 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS harry_botter_agents (
+            agent_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            purpose TEXT NOT NULL,
+            instructions TEXT NOT NULL,
+            generation_temperature REAL NOT NULL CHECK (generation_temperature BETWEEN 0 AND 1),
+            generation_max_tokens INTEGER NOT NULL CHECK (generation_max_tokens BETWEEN 64 AND 1000),
+            is_builtin INTEGER NOT NULL DEFAULT 0 CHECK (is_builtin IN (0, 1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harry_botter_knowledge (
+            document_id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            permission_confirmed INTEGER NOT NULL CHECK (permission_confirmed = 1),
+            learning_level TEXT NOT NULL DEFAULT '',
+            agent_id TEXT,
+            review_date TEXT,
+            text_content TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_harry_botter_knowledge_scope "
+        "ON harry_botter_knowledge (agent_id, learning_level, updated_at)"
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS navigation_map_versions (
             map_id TEXT NOT NULL,
             version TEXT NOT NULL,
@@ -1378,6 +1525,24 @@ def init_db():
         conn.execute(
             "INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
             (user["username"], user["password"], user["role"]),
+        )
+    for agent in DEFAULT_HARRY_BOTTER_AGENTS:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO harry_botter_agents (
+                agent_id, display_name, purpose, instructions,
+                generation_temperature, generation_max_tokens, is_builtin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                agent["agent_id"],
+                agent["display_name"],
+                agent["purpose"],
+                agent["instructions"],
+                agent["generation_temperature"],
+                agent["generation_max_tokens"],
+                agent["is_builtin"],
+            ),
         )
     conn.commit()
     conn.close()
@@ -2532,6 +2697,757 @@ def auth_required(authorization: Optional[str] = Header(default=None)):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
     return user
+
+
+def _require_harry_botter_teacher(user: dict) -> None:
+    if user.get("role") != "teacher":
+        raise HTTPException(status_code=403, detail="A teacher account is required.")
+
+
+def _harry_botter_agent_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "agent_id": row["agent_id"],
+        "display_name": row["display_name"],
+        "purpose": row["purpose"],
+        "instructions": row["instructions"],
+        "generation_temperature": row["generation_temperature"],
+        "generation_max_tokens": row["generation_max_tokens"],
+        "is_builtin": bool(row["is_builtin"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _harry_botter_knowledge_from_row(row: sqlite3.Row) -> dict:
+    return {
+        "document_id": row["document_id"],
+        "filename": row["filename"],
+        "title": row["title"],
+        "source": row["source"],
+        "owner": row["owner"],
+        "learning_level": row["learning_level"],
+        "agent_id": row["agent_id"],
+        "review_date": row["review_date"],
+        "content_sha256": row["content_sha256"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _harry_botter_knowledge_for_draft(
+    text: str,
+    learning_level: str,
+    agent_id: str,
+) -> list[dict]:
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT title, source, owner, review_date, text_content, updated_at
+            FROM harry_botter_knowledge
+            WHERE (agent_id IS NULL OR agent_id = ?)
+              AND (learning_level = '' OR learning_level = ?)
+            """,
+            (agent_id, learning_level),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    ignored = {
+        "about", "after", "again", "also", "and", "are", "because", "before",
+        "between", "could", "does", "from", "have", "into", "that", "their",
+        "there", "these", "this", "those", "what", "when", "where", "which",
+        "will", "with", "would", "your",
+    }
+    terms = {
+        term
+        for term in re.findall(r"[a-z0-9]{3,}", text.casefold())
+        if term not in ignored
+    }
+    ranked = []
+    for row in rows:
+        if row["review_date"] < date.today().isoformat():
+            continue
+        combined = f"{row['title']} {row['text_content']}".casefold()
+        score = sum(combined.count(term) for term in terms)
+        if score:
+            ranked.append((score, row))
+    ranked.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
+
+    selected = []
+    for _, row in ranked[:3]:
+        content = row["text_content"]
+        if len(content) > HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS:
+            matching_offset = next(
+                (content.casefold().find(term) for term in terms if term in content.casefold()),
+                0,
+            )
+            start = max(0, matching_offset - HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS // 3)
+            content = content[start : start + HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS]
+        selected.append(
+            {
+                "title": row["title"],
+                "source": row["source"],
+                "owner": row["owner"],
+                "review_date": row["review_date"],
+                "excerpt": content,
+            }
+        )
+    return selected
+
+
+@app.get("/api/harry-botter/config")
+def harry_botter_config(user: dict = Depends(auth_required)):
+    _require_harry_botter_teacher(user)
+    conn = get_db_connection()
+    try:
+        agents = conn.execute(
+            "SELECT * FROM harry_botter_agents ORDER BY is_builtin DESC, display_name COLLATE NOCASE"
+        ).fetchall()
+        knowledge = conn.execute(
+            "SELECT * FROM harry_botter_knowledge ORDER BY updated_at DESC, title COLLATE NOCASE"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {
+        "agents": [_harry_botter_agent_from_row(row) for row in agents],
+        "knowledge": [_harry_botter_knowledge_from_row(row) for row in knowledge],
+        "shared_across_teacher_accounts": True,
+        "supported_knowledge_formats": [".txt", ".md"],
+        "maximum_knowledge_bytes": MAX_HARRY_BOTTER_KNOWLEDGE_BYTES,
+        "maximum_knowledge_documents": MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS,
+        "maximum_knowledge_total_bytes": MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES,
+    }
+
+
+@app.post("/api/harry-botter/agents", status_code=201)
+def harry_botter_create_agent(
+    request: HarryBotterAgentRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    display_name = request.display_name.strip()
+    purpose = request.purpose.strip()
+    instructions = request.instructions.strip()
+    if not display_name or not purpose or not instructions:
+        raise HTTPException(status_code=400, detail="Agent name, purpose, and instructions are required.")
+
+    agent_id = f"custom-{uuid.uuid4()}"
+    conn = get_db_connection()
+    try:
+        count = conn.execute("SELECT COUNT(*) AS count FROM harry_botter_agents").fetchone()["count"]
+        if count >= MAX_HARRY_BOTTER_AGENTS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A maximum of {MAX_HARRY_BOTTER_AGENTS} shared agents is supported.",
+            )
+        conn.execute(
+            """
+            INSERT INTO harry_botter_agents (
+                agent_id, display_name, purpose, instructions,
+                generation_temperature, generation_max_tokens, is_builtin
+            ) VALUES (?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                agent_id,
+                display_name,
+                purpose,
+                instructions,
+                request.generation_temperature,
+                request.generation_max_tokens,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="An agent with that name already exists.") from exc
+    finally:
+        conn.close()
+    return {"agent": _harry_botter_agent_from_row(row)}
+
+
+@app.put("/api/harry-botter/agents/{agent_id}")
+def harry_botter_update_agent(
+    agent_id: str,
+    request: HarryBotterAgentRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    display_name = request.display_name.strip()
+    purpose = request.purpose.strip()
+    instructions = request.instructions.strip()
+    if not display_name or not purpose or not instructions:
+        raise HTTPException(status_code=400, detail="Agent name, purpose, and instructions are required.")
+
+    conn = get_db_connection()
+    try:
+        existing = conn.execute(
+            "SELECT agent_id FROM harry_botter_agents WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="The agent does not exist.")
+        conn.execute(
+            """
+            UPDATE harry_botter_agents
+            SET display_name = ?, purpose = ?, instructions = ?,
+                generation_temperature = ?, generation_max_tokens = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE agent_id = ?
+            """,
+            (
+                display_name,
+                purpose,
+                instructions,
+                request.generation_temperature,
+                request.generation_max_tokens,
+                agent_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="An agent with that name already exists.") from exc
+    finally:
+        conn.close()
+    return {"agent": _harry_botter_agent_from_row(row)}
+
+
+@app.delete("/api/harry-botter/agents/{agent_id}")
+def harry_botter_delete_agent(
+    agent_id: str,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    conn = get_db_connection()
+    try:
+        existing = conn.execute(
+            "SELECT is_builtin FROM harry_botter_agents WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="The agent does not exist.")
+        if existing["is_builtin"]:
+            raise HTTPException(status_code=409, detail="Built-in agents cannot be deleted.")
+        conn.execute("DELETE FROM harry_botter_knowledge WHERE agent_id = ?", (agent_id,))
+        conn.execute("DELETE FROM harry_botter_agents WHERE agent_id = ?", (agent_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"deleted": True}
+
+
+@app.post("/api/harry-botter/knowledge", status_code=201)
+def harry_botter_add_knowledge(
+    request: HarryBotterKnowledgeRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    filename, encoded_text = _validate_harry_botter_knowledge(request)
+
+    document_id = str(uuid.uuid4())
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        usage = conn.execute(
+            """
+            SELECT COUNT(*) AS document_count,
+                   COALESCE(SUM(length(CAST(text_content AS BLOB))), 0) AS total_bytes
+            FROM harry_botter_knowledge
+            """
+        ).fetchone()
+        if usage["document_count"] >= MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS:
+            raise HTTPException(
+                status_code=409,
+                detail=f"The shared knowledge library is limited to {MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS} documents.",
+            )
+        if usage["total_bytes"] + len(encoded_text) > MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="The shared knowledge library has reached its 10 MB storage limit.",
+            )
+        conn.execute(
+            """
+            INSERT INTO harry_botter_knowledge (
+                document_id, filename, title, source, owner, permission_confirmed,
+                learning_level, agent_id, review_date, text_content, content_sha256, created_by
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document_id,
+                filename,
+                request.title.strip(),
+                request.source.strip(),
+                request.owner.strip(),
+                request.learning_level,
+                request.agent_id,
+                request.review_date.isoformat(),
+                request.text,
+                hashlib.sha256(encoded_text).hexdigest(),
+                user["username"],
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM harry_botter_knowledge WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return {"document": _harry_botter_knowledge_from_row(row)}
+
+
+def _validate_harry_botter_knowledge(request: HarryBotterKnowledgeRequest) -> tuple[str, bytes]:
+    filename = re.split(r"[\\/]", request.filename.strip())[-1]
+    if Path(filename).suffix.casefold() not in {".txt", ".md"}:
+        raise HTTPException(status_code=415, detail="Only plain-text .txt and .md knowledge files are supported.")
+    if not request.permission_confirmed:
+        raise HTTPException(status_code=400, detail="Confirm that you have permission to upload this material.")
+    if not request.title.strip() or not request.source.strip() or not request.owner.strip():
+        raise HTTPException(status_code=400, detail="Title, source, and owner are required.")
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Knowledge files must contain readable text.")
+    encoded_text = request.text.encode("utf-8")
+    if len(encoded_text) > MAX_HARRY_BOTTER_KNOWLEDGE_BYTES:
+        raise HTTPException(status_code=413, detail="Knowledge files must be 100 KB or smaller.")
+    if request.agent_id:
+        conn = get_db_connection()
+        try:
+            agent = conn.execute(
+                "SELECT agent_id FROM harry_botter_agents WHERE agent_id = ?",
+                (request.agent_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if agent is None:
+            raise HTTPException(status_code=404, detail="The selected agent does not exist.")
+    return filename, encoded_text
+
+
+@app.get("/api/harry-botter/knowledge/{document_id}")
+def harry_botter_get_knowledge(
+    document_id: str,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM harry_botter_knowledge WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="The knowledge document does not exist.")
+    return {"document": {**_harry_botter_knowledge_from_row(row), "text": row["text_content"]}}
+
+
+@app.put("/api/harry-botter/knowledge/{document_id}")
+def harry_botter_update_knowledge(
+    document_id: str,
+    request: HarryBotterKnowledgeRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    filename, encoded_text = _validate_harry_botter_knowledge(request)
+    conn = get_db_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT length(CAST(text_content AS BLOB)) AS byte_count "
+            "FROM harry_botter_knowledge WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="The knowledge document does not exist.")
+        usage = conn.execute(
+            """
+            SELECT COALESCE(SUM(length(CAST(text_content AS BLOB))), 0) AS total_bytes
+            FROM harry_botter_knowledge
+            """
+        ).fetchone()
+        if usage["total_bytes"] - existing["byte_count"] + len(encoded_text) > MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="The shared knowledge library has reached its 10 MB storage limit.",
+            )
+        conn.execute(
+            """
+            UPDATE harry_botter_knowledge
+            SET filename = ?, title = ?, source = ?, owner = ?, permission_confirmed = 1,
+                learning_level = ?, agent_id = ?, review_date = ?, text_content = ?,
+                content_sha256 = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE document_id = ?
+            """,
+            (
+                filename,
+                request.title.strip(),
+                request.source.strip(),
+                request.owner.strip(),
+                request.learning_level,
+                request.agent_id,
+                request.review_date.isoformat(),
+                request.text,
+                hashlib.sha256(encoded_text).hexdigest(),
+                document_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM harry_botter_knowledge WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return {"document": _harry_botter_knowledge_from_row(row)}
+
+
+@app.delete("/api/harry-botter/knowledge/{document_id}")
+def harry_botter_delete_knowledge(
+    document_id: str,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM harry_botter_knowledge WHERE document_id = ?",
+            (document_id,),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="The knowledge document does not exist.")
+    finally:
+        conn.close()
+    return {"deleted": True}
+
+
+@app.get("/api/harry-botter/model-status")
+async def harry_botter_model_status(user: dict = Depends(auth_required)):
+    _require_harry_botter_teacher(user)
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            response = await client.get("http://127.0.0.1:8765/api/v1/model/status")
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="The local Harry Botter service timed out.") from exc
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Could not check the local model service.") from exc
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="The local model service returned invalid JSON.") from exc
+    if response.status_code >= 400:
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        detail = error.get("message") if isinstance(error, dict) else None
+        raise HTTPException(status_code=502, detail=detail or "Could not check the local model service.")
+    return body
+
+
+@app.get("/api/harry-botter/speech-status")
+async def harry_botter_speech_status(user: dict = Depends(auth_required)):
+    _require_harry_botter_teacher(user)
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            response = await client.get("http://127.0.0.1:8765/api/v1/speech/status")
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="The local speech service timed out.") from exc
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Could not check the local speech service.") from exc
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="The local speech service returned invalid JSON.") from exc
+    if response.status_code >= 400:
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        detail = error.get("message") if isinstance(error, dict) else None
+        raise HTTPException(status_code=502, detail=detail or "Could not check the local speech service.")
+    return body
+
+
+@app.post("/api/harry-botter/transcribe")
+async def harry_botter_transcribe_audio(
+    request: Request,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type not in HARRY_BOTTER_AUDIO_TYPES:
+        raise HTTPException(status_code=415, detail="Send WebM, Ogg, MP4, or WAV audio.")
+    try:
+        content_length = int(request.headers.get("content-length", "0"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Content-Length must be an integer.") from exc
+    if content_length > MAX_HARRY_BOTTER_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Audio recordings must be 8 MB or smaller.")
+
+    chunks = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > MAX_HARRY_BOTTER_AUDIO_BYTES:
+            raise HTTPException(status_code=413, detail="Audio recordings must be 8 MB or smaller.")
+        chunks.append(chunk)
+    audio = b"".join(chunks)
+    if not audio:
+        raise HTTPException(status_code=400, detail="A non-empty audio recording is required.")
+
+    try:
+        async with httpx.AsyncClient(timeout=180.0, trust_env=False) as client:
+            response = await client.post(
+                "http://127.0.0.1:8765/api/v1/transcribe",
+                content=audio,
+                headers={"Content-Type": content_type},
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="Local transcription timed out.") from exc
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Could not reach the local speech service.") from exc
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="The local speech service returned invalid JSON.") from exc
+    if response.status_code >= 400:
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        detail = error.get("message") if isinstance(error, dict) else None
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=detail or "The local speech service could not transcribe this recording.",
+        )
+    return body
+
+
+@app.post("/api/harry-botter/speech")
+async def harry_botter_synthesize_speech(
+    request: HarryBotterSpeechRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    try:
+        async with httpx.AsyncClient(timeout=180.0, trust_env=False) as client:
+            response = await client.post(
+                "http://127.0.0.1:8765/api/v1/speech",
+                json={"text": request.text, "speed": request.speed},
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="Local speech generation timed out.") from exc
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Could not reach the local speech service.") from exc
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="The local speech service returned invalid JSON.") from exc
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        detail = error.get("message") if isinstance(error, dict) else None
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=detail or "The local speech service could not generate audio.",
+        )
+    media_type = response.headers.get("content-type", "").split(";", 1)[0]
+    if media_type != "audio/wav":
+        raise HTTPException(status_code=502, detail="The local speech service returned an unsupported audio type.")
+    return Response(
+        content=response.content,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/harry-botter/g1-speak")
+def harry_botter_speak_on_g1(
+    request: HarryBotterG1SpeakRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    audio_capability = robot_status().get("capabilities", {}).get("audio")
+    if audio_capability is not True:
+        raise HTTPException(
+            status_code=409,
+            detail="Connect the G1 audio client before using the G1 speaker.",
+        )
+    if not request.text.strip() or any(
+        ord(character) < 32 or ord(character) == 127 for character in request.text
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="G1 speech text must contain printable characters.",
+        )
+    return speak_robot_text(request.text, request.speaker_id)
+
+
+@app.websocket("/api/harry-botter/stream")
+async def harry_botter_audio_stream(websocket: WebSocket):
+    protocol = next(
+        (
+            value.strip()
+            for value in websocket.headers.get("sec-websocket-protocol", "").split(",")
+            if value.strip().startswith("edu-auth.")
+        ),
+        None,
+    )
+    token = protocol[len("edu-auth."):] if protocol else None
+    user = get_user_from_token(token) if token else None
+    if not user or user.get("role") != "teacher":
+        await websocket.close(code=1008, reason="Authenticated teacher session required.")
+        return
+    await websocket.accept(subprotocol=protocol)
+
+    async def forward_audio_to_service(service_socket) -> None:
+        try:
+            while True:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+                binary = message.get("bytes")
+                text = message.get("text")
+                if binary is not None:
+                    if len(binary) != HARRY_BOTTER_STREAM_FRAME_BYTES:
+                        await websocket.send_json({
+                            "type": "error",
+                            "code": "invalid_audio_frame",
+                            "message": "Audio frames must contain 20 ms of PCM.",
+                        })
+                        await websocket.close(code=1003, reason="Invalid audio frame.")
+                        return
+                    await service_socket.send(binary)
+                elif text is not None and len(text) <= 1024:
+                    await service_socket.send(text)
+                else:
+                    await websocket.close(code=1009, reason="Audio control message is too large.")
+                    return
+        except WebSocketDisconnect:
+            return
+
+    async def forward_service_events(service_socket) -> None:
+        async for message in service_socket:
+            if isinstance(message, bytes):
+                await websocket.send_bytes(message)
+            else:
+                await websocket.send_text(message)
+
+    try:
+        async with websocket_connect(
+            "ws://127.0.0.1:8766/api/v1/audio-stream",
+            subprotocols=["harry-botter-audio-v1"],
+            proxy=None,
+            max_size=16_000,
+            max_queue=8,
+        ) as service_socket:
+            forwarders = {
+                asyncio.create_task(forward_audio_to_service(service_socket)),
+                asyncio.create_task(forward_service_events(service_socket)),
+            }
+            done, pending = await asyncio.wait(
+                forwarders,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            results = await asyncio.gather(*done, *pending, return_exceptions=True)
+            unexpected = next(
+                (
+                    result
+                    for result in results
+                    if isinstance(result, Exception)
+                    and not isinstance(result, (WebSocketDisconnect, WebSocketException, OSError))
+                ),
+                None,
+            )
+            if unexpected:
+                raise unexpected
+        if (
+            websocket.client_state == WebSocketState.CONNECTED
+            and websocket.application_state == WebSocketState.CONNECTED
+        ):
+            await websocket.close(code=1000)
+    except (OSError, WebSocketException, TimeoutError) as exc:
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "code": "stream_unavailable",
+                "message": "The local voice stream is unavailable. Check that the voice service is running.",
+            })
+        except WebSocketDisconnect:
+            return
+        await websocket.close(code=1011, reason="Local voice stream unavailable.")
+
+
+@app.post("/api/harry-botter/draft")
+async def harry_botter_create_draft(
+    request: HarryBotterDraftRequest,
+    user: dict = Depends(auth_required),
+):
+    _require_harry_botter_teacher(user)
+    conn = get_db_connection()
+    try:
+        agent_row = conn.execute(
+            "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
+            (request.agent_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if agent_row is None:
+        raise HTTPException(status_code=404, detail="The selected agent does not exist.")
+
+    agent = _harry_botter_agent_from_row(agent_row)
+    knowledge = _harry_botter_knowledge_for_draft(
+        request.text,
+        request.learning_level,
+        request.agent_id,
+    ) if request.learning_level else []
+    service_payload = request.model_dump(exclude={"agent_id"})
+    service_payload["agent"] = {
+        "agent_id": agent["agent_id"],
+        "display_name": agent["display_name"],
+        "purpose": agent["purpose"],
+        "instructions": agent["instructions"],
+        "generation_temperature": agent["generation_temperature"],
+        "generation_max_tokens": agent["generation_max_tokens"],
+    }
+    service_payload["knowledge"] = knowledge
+
+    try:
+        async with httpx.AsyncClient(timeout=65.0, trust_env=False) as client:
+            response = await client.post(
+                "http://127.0.0.1:8765/api/v1/drafts",
+                json=service_payload,
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="The local model request timed out.") from exc
+    except httpx.ConnectError as exc:
+        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Could not reach the local model service.") from exc
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="The local model service returned invalid JSON.") from exc
+    if response.status_code >= 400:
+        error = body.get("error", {}) if isinstance(body, dict) else {}
+        detail = error.get("message") if isinstance(error, dict) else None
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=detail or "The local model service could not create a draft.",
+        )
+    return body
 
 
 @app.get("/api/github-proxy")

@@ -5649,6 +5649,12 @@ export default function App() {
                   ? <p>Student accounts only. Username: 3–32 letters, numbers, _ or -. Password: 8–128 characters.</p>
                   : <>
                     <p>Sign in with your classroom account or create a student account to join.</p>
+                    <a
+                      href="/?try=harry-botter"
+                      className="block rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-center text-sm font-semibold text-blue-800 hover:bg-blue-100"
+                    >
+                      Try Harry Botter AI
+                    </a>
                   </>}
               </div>
           </form>

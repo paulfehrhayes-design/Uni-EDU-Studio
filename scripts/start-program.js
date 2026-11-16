@@ -1,0 +1,339 @@
+import { spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:net';
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const voiceDir = path.join(root, 'ai-agent', 'voice-service');
+const modelsDir = path.join(voiceDir, 'models');
+const port = Number(process.env.UNI_EDU_PORT || 5179);
+const voicePort = 8765;
+const ollamaUrl = 'http://127.0.0.1:11434';
+const localModel = 'qwen3:0.6b';
+const pythonPackages = ['faster_whisper', 'kokoro', 'webrtcvad'];
+const configFile = path.join(root, '.env.harry-botter.local');
+const children = [];
+let shuttingDown = false;
+
+function log(message) {
+  console.log(`[Harry Botter] ${message}`);
+}
+
+function loadLocalConfig() {
+  if (!existsSync(configFile)) return {};
+  const allowed = new Set([
+    'HARRY_BOTTER_NETWORK_MODEL_URL',
+    'HARRY_BOTTER_NETWORK_MODEL',
+    'HARRY_BOTTER_LOCAL_MODEL',
+  ]);
+  const values = {};
+  for (const [index, rawLine] of readFileSync(configFile, 'utf8').split(/\r?\n/).entries()) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^([A-Z0-9_]+)\s*=\s*(.*)$/);
+    if (!match || !allowed.has(match[1])) {
+      throw new Error(`Invalid setting on line ${index + 1} of ${configFile}.`);
+    }
+    let value = match[2].trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    values[match[1]] = value;
+  }
+  return values;
+}
+
+function run(binary, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binary, args, {
+      cwd: options.cwd || root,
+      env: options.env || process.env,
+      stdio: 'inherit',
+      shell: false,
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${binary} ${args.join(' ')} failed (${signal || code}).`));
+    });
+  });
+}
+
+function startProcess(binary, args, options = {}) {
+  const child = spawn(binary, args, {
+    cwd: options.cwd || root,
+    env: options.env || process.env,
+    stdio: 'inherit',
+    shell: false,
+  });
+  child.once('error', (error) => {
+    if (!shuttingDown) console.error(`[Harry Botter] ${error.message}`);
+  });
+  children.push(child);
+  return child;
+}
+
+function fetchJson(url, timeoutMs = 1500) {
+  return Promise.race([
+    fetch(url).then(async (response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    }),
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Request timed out.')), timeoutMs).unref();
+    }),
+  ]);
+}
+
+async function waitForService(url, child, label, timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = 'not responding';
+  while (Date.now() < deadline) {
+    if (child?.exitCode !== null && child?.exitCode !== undefined) {
+      throw new Error(`${label} exited before becoming ready.`);
+    }
+    try {
+      await fetchJson(url);
+      return;
+    } catch (error) {
+      lastError = error.message;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  throw new Error(`${label} did not become ready: ${lastError}`);
+}
+
+function canBind(portNumber) {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.once('error', () => resolve(false));
+    server.listen(portNumber, '127.0.0.1', () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
+
+function findPython() {
+  const windows = process.platform === 'win32';
+  const venvPaths = [
+    path.join(root, '.venv-audio312', windows ? 'Scripts/python.exe' : 'bin/python'),
+    path.join(voiceDir, '.venv', windows ? 'Scripts/python.exe' : 'bin/python'),
+  ];
+  for (const candidate of venvPaths) {
+    if (existsSync(candidate)) return { binary: candidate, isVenv: true };
+  }
+
+  const candidates = windows ? ['python'] : ['python3.12', 'python3', 'python'];
+  for (const binary of candidates) {
+    const result = spawnSync(binary, ['-c', 'import sys; print(sys.version_info[:2])'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (result.status !== 0) continue;
+    const [major, minor] = result.stdout.match(/\d+/g).map(Number);
+    if (major === 3 && minor >= 10 && minor <= 13) return { binary, isVenv: false };
+  }
+  throw new Error('Python 3.10–3.13 is required. Install Python 3.12 and run npm start again.');
+}
+
+function npmCommand(args) {
+  if (process.env.npm_execpath) {
+    return run(process.execPath, [process.env.npm_execpath, ...args]);
+  }
+  return run('npm', args);
+}
+
+async function ensureVoicePython() {
+  const windows = process.platform === 'win32';
+  const existing = findPython();
+  let python = existing.binary;
+  if (!existing.isVenv) {
+    const venv = path.join(root, '.venv-audio312');
+    await run(python, ['-m', 'venv', venv]);
+    python = path.join(venv, windows ? 'Scripts/python.exe' : 'bin/python');
+  }
+  const packages = spawnSync(
+    python,
+    ['-c', `import ${pythonPackages.join(', ')}`],
+    { stdio: 'ignore' },
+  );
+  if (packages.status !== 0) {
+    log('Installing the free local voice-service dependencies (first run only)...');
+    await run(python, [
+      '-m', 'pip', 'install', '--index-url', 'https://download.pytorch.org/whl/cpu',
+      'torch==2.7.1',
+    ], { cwd: voiceDir });
+    await run(python, ['-m', 'pip', 'install', '-e', '.[audio]'], { cwd: voiceDir });
+  }
+  return python;
+}
+
+async function ensureOllama(env) {
+  const version = spawnSync('ollama', ['--version'], { stdio: 'ignore' });
+  if (version.status !== 0) {
+    throw new Error('Ollama is not installed. Install the free Ollama app, then run npm start again.');
+  }
+
+  let server = null;
+  try {
+    server = await fetchJson(`${ollamaUrl}/api/tags`);
+  } catch {
+    log('Starting the local Ollama server...');
+    const child = startProcess('ollama', ['serve'], {
+      env: {
+        ...env,
+        OLLAMA_HOST: '127.0.0.1:11434',
+        OLLAMA_NO_CLOUD: '1',
+      },
+    });
+    await waitForService(`${ollamaUrl}/api/tags`, child, 'Ollama');
+    server = await fetchJson(`${ollamaUrl}/api/tags`);
+  }
+
+  const selectedModel = env.HARRY_BOTTER_LOCAL_MODEL || localModel;
+  const installed = Array.isArray(server.models)
+    && server.models.some((model) => model.name === selectedModel || model.name.startsWith(`${selectedModel}-`));
+  if (!installed) {
+    log(`Downloading the free local fallback model ${selectedModel} (first run only)...`);
+    await run('ollama', ['pull', selectedModel], {
+      env: {
+        ...env,
+        OLLAMA_HOST: '127.0.0.1:11434',
+        OLLAMA_NO_CLOUD: '1',
+      },
+    });
+  }
+}
+
+function speechModelsCached() {
+  const hub = path.join(modelsDir, 'huggingface', 'hub');
+  return [
+    'models--Systran--faster-whisper-tiny.en',
+    'models--hexgrad--Kokoro-82M',
+  ].every((model) => {
+    const modelDirectory = path.join(hub, model);
+    const snapshots = path.join(modelDirectory, 'snapshots');
+    const ref = path.join(modelDirectory, 'refs', 'main');
+    return existsSync(snapshots)
+      && existsSync(ref)
+      && readFileSync(ref, 'utf8').trim().length > 0;
+  });
+}
+
+function serviceEnvironment(config) {
+  return {
+    ...process.env,
+    ...config,
+    HF_HOME: path.join(modelsDir, 'huggingface'),
+    OLLAMA_MODELS: path.join(modelsDir, 'ollama'),
+    HARRY_BOTTER_LOCAL_MODEL: config.HARRY_BOTTER_LOCAL_MODEL || localModel,
+    HARRY_BOTTER_LOCAL_MODEL_URL: `${ollamaUrl}/v1`,
+    HARRY_BOTTER_WHISPER_MODEL: 'Systran/faster-whisper-tiny.en',
+    HARRY_BOTTER_STT_DEVICE: 'cpu',
+    HARRY_BOTTER_STT_COMPUTE_TYPE: 'int8',
+    HARRY_BOTTER_STT_CPU_THREADS: '2',
+  };
+}
+
+async function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const child of children) {
+    if (child.exitCode === null) child.kill('SIGTERM');
+  }
+  await Promise.all(children.map((child) => new Promise((resolve) => {
+    if (child.exitCode !== null) return resolve();
+    child.once('exit', resolve);
+    setTimeout(() => {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      resolve();
+    }, 5000).unref();
+  })));
+  process.exit(exitCode);
+}
+
+async function ensureBackendPython() {
+  const candidates = [
+    process.env.UNI_EDU_PYTHON,
+    process.platform === 'win32' ? 'python' : 'python3',
+    process.platform === 'win32' ? null : 'python',
+  ].filter(Boolean);
+  for (const binary of candidates) {
+    const check = spawnSync(
+      binary,
+      ['-c', 'import fastapi, httpx, pydantic, uvicorn'],
+      { stdio: 'ignore' },
+    );
+    if (check.status === 0) return binary;
+  }
+
+  const basePython = findPython().binary;
+  const venv = path.join(root, '.venv-backend');
+  await run(basePython, ['-m', 'venv', venv]);
+  const python = path.join(
+    venv,
+    process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python',
+  );
+  log('Installing the Uni-EDU backend dependencies (first run only)...');
+  await run(python, ['-m', 'pip', 'install', '-r', path.join(root, 'backend', 'requirements.txt')]);
+  return python;
+}
+
+process.on('SIGINT', () => shutdown());
+process.on('SIGTERM', () => shutdown());
+
+try {
+  const config = { ...loadLocalConfig(), ...process.env };
+  const env = serviceEnvironment(config);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error('UNI_EDU_PORT must be an integer between 1024 and 65535.');
+  }
+  if (!(await canBind(port))) {
+    throw new Error(`Port ${port} is already in use. Set UNI_EDU_PORT to another available port.`);
+  }
+  if (!(await canBind(voicePort))) throw new Error(`Port ${voicePort} is already in use.`);
+
+  await ensureOllama(env);
+  const python = await ensureVoicePython();
+  const backendPython = await ensureBackendPython();
+  if (!speechModelsCached()) {
+    log('Downloading and warming the free local speech models (first run only)...');
+    await run(python, ['-m', 'harry_botter_voice.setup_models'], {
+      cwd: voiceDir,
+      env: {
+        ...env,
+        HF_HUB_OFFLINE: '0',
+        PYTHONPATH: path.join(voiceDir, 'src'),
+      },
+    });
+  }
+
+  log('Building the app...');
+  await npmCommand(['run', 'build']);
+
+  const voice = startProcess(python, ['-m', 'harry_botter_voice', '--port', String(voicePort)], {
+    cwd: voiceDir,
+    env: {
+      ...env,
+      HF_HUB_OFFLINE: '1',
+      PYTHONPATH: path.join(voiceDir, 'src'),
+    },
+  });
+  await waitForService(`http://127.0.0.1:${voicePort}/api/v1/health`, voice, 'Voice service');
+
+  const backend = startProcess(backendPython, [path.join(root, 'backend', 'server.py')], {
+    cwd: root,
+    env: { ...env, UNI_EDU_PORT: String(port) },
+  });
+  await waitForService(`http://127.0.0.1:${port}/api/status`, backend, 'Uni-EDU backend');
+
+  log(`Ready. Open http://localhost:${port}/?try=harry-botter and sign in as a teacher.`);
+  log('Press Ctrl+C to stop the backend, voice service, and any Ollama server started here.');
+} catch (error) {
+  console.error(`[Harry Botter] Startup failed: ${error.message}`);
+  await shutdown(1);
+}
