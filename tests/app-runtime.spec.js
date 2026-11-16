@@ -397,6 +397,40 @@ test('student accounts follow the teacher saved simulation visibility', async ({
   await expect(page.getByRole('checkbox', { name: 'Show 3D simulation in the workspace' })).toHaveCount(0);
 });
 
+test('student accounts follow teacher sidebar tab visibility changes', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'student-sidebar-visibility-token',
+      user: { role: 'student', username: 'student-sidebar-visibility-test' },
+    }));
+  });
+  let lockedPanels = [];
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/classroom/sidebar-settings') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ locked_panels: lockedPanels, configured: true }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toBeVisible();
+  lockedPanels = ['blocks'];
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toHaveCount(0, { timeout: 10000 });
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
+  lockedPanels = [];
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toBeVisible({ timeout: 10000 });
+});
+
 test('App loads without runtime initialization errors', async ({ page }) => {
   const pageErrors = [];
   const consoleErrors = [];
@@ -1089,7 +1123,7 @@ test('teacher can hide locked sidebar panels and restore them from settings', as
   await expect(page.getByRole('checkbox', { name: 'Enable Safe Mode spatial guards' })).toBeChecked();
 });
 
-test('teacher queue review overlays the workspace and shows the complete submitted project', async ({ page }) => {
+test('teacher can review and rerun a completed queued request', async ({ page }) => {
   const runRequests = [];
   const queuedItem = {
     id: 'queued-project-review',
@@ -1126,7 +1160,16 @@ test('teacher queue review overlays the workspace and shows the complete submitt
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    if (path === '/api/classroom/run-next') runRequests.push(request.postDataJSON());
+    if (path === '/api/classroom/run-next') {
+      runRequests.push(request.postDataJSON());
+      queuedItem.status = 'completed';
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'completed', item: queuedItem, process: { status: 'completed' } }),
+      });
+      return;
+    }
     const responses = {
       '/api/classroom/codes': { codes: [] },
       '/api/classroom/queue': { items: [queuedItem] },
@@ -1156,9 +1199,14 @@ test('teacher queue review overlays the workspace and shows the complete submitt
   await expect(dialog.getByRole('button', { name: 'Approve & run queued request' })).toBeEnabled();
   expect(runRequests).toEqual([]);
 
-  await dialog.getByRole('button', { name: 'Close request review' }).click();
-  await expect(page.getByRole('dialog')).toHaveCount(0);
-  expect(runRequests).toEqual([]);
+  await dialog.getByRole('button', { name: 'Approve & run queued request' }).click();
+  await expect(dialog.getByRole('button', { name: 'Run request again' })).toBeEnabled();
+  await dialog.getByRole('button', { name: 'Run request again' }).click();
+  await expect.poll(() => runRequests).toEqual([
+    { item_id: queuedItem.id },
+    { item_id: queuedItem.id },
+  ]);
+  await expect(dialog.getByText('Request completed. Physical movement is not independently verified.')).toBeVisible();
 });
 
 test('teacher can save a completed queued DUET program as a named command', async ({ page }) => {

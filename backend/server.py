@@ -1148,6 +1148,24 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS classroom_sidebar_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            locked_panels TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO classroom_sidebar_settings (id, locked_panels, updated_at)
+        SELECT 1, locked_panels, updated_at
+        FROM teacher_sidebar_settings
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS teacher_safe_mode_settings (
             username TEXT PRIMARY KEY,
             enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
@@ -3159,8 +3177,11 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
     try:
         queue = list_queue_items()
         item = next((queued for queued in queue if queued["id"] == request.item_id), None)
-        if not item or item["status"] != "queued":
-            raise HTTPException(status_code=404, detail="The approved queue item is no longer queued.")
+        if not item or item["status"] not in {"queued", "completed"}:
+            raise HTTPException(
+                status_code=404,
+                detail="The approved queue item is neither queued nor previously completed.",
+            )
         planner_request = item.get("planner_request") or {}
         if planner_request.get("planner_mode") == "sensor_corrected":
             if item["controller_version"] != "legacy":
@@ -5072,29 +5093,29 @@ def update_simulation_visibility(
 
 
 @app.get("/api/classroom/sidebar-settings")
-def get_teacher_sidebar_settings(user: dict = Depends(auth_required)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher role required")
+def get_classroom_sidebar_settings(response: Response, user: dict = Depends(auth_required)):
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     conn = get_db_connection()
-    row = conn.execute(
-        "SELECT locked_panels FROM teacher_sidebar_settings WHERE username = ?",
-        (user["username"],),
-    ).fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            "SELECT locked_panels FROM classroom_sidebar_settings WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
     if row is None:
         return {"locked_panels": [], "configured": False}
     try:
         locked_panels = json.loads(row["locked_panels"])
     except (TypeError, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.") from error
+        raise HTTPException(status_code=503, detail="Classroom sidebar settings are invalid.") from error
     valid_panels = {"blocks", "ide", "planner", "prompt", "camera"}
     if not isinstance(locked_panels, list) or any(panel not in valid_panels for panel in locked_panels):
-        raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.")
+        raise HTTPException(status_code=503, detail="Classroom sidebar settings are invalid.")
     return {"locked_panels": locked_panels, "configured": True}
 
 
 @app.put("/api/classroom/sidebar-settings")
-def update_teacher_sidebar_settings(
+def update_classroom_sidebar_settings(
     request: SidebarSettingsRequest,
     user: dict = Depends(auth_required),
 ):
@@ -5102,18 +5123,20 @@ def update_teacher_sidebar_settings(
         raise HTTPException(status_code=403, detail="Teacher role required")
     locked_panels = list(dict.fromkeys(request.locked_panels))
     conn = get_db_connection()
-    conn.execute(
-        """
-        INSERT INTO teacher_sidebar_settings (username, locked_panels, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(username) DO UPDATE SET
-            locked_panels = excluded.locked_panels,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (user["username"], json.dumps(locked_panels)),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO classroom_sidebar_settings (id, locked_panels, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                locked_panels = excluded.locked_panels,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (json.dumps(locked_panels),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"locked_panels": locked_panels, "configured": True}
 
 

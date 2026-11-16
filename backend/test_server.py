@@ -414,7 +414,7 @@ class ServerClassroomTests(unittest.TestCase):
                 200,
             )
 
-    def test_sidebar_settings_are_saved_per_teacher_account(self):
+    def test_sidebar_settings_are_shared_with_students_and_teacher_only_writable(self):
         client = TestClient(app)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
@@ -438,11 +438,16 @@ class ServerClassroomTests(unittest.TestCase):
                 json={"locked_panels": ["blocks", "ide", "planner", "camera", "planner"]},
             )
             restored = client.get("/api/classroom/sidebar-settings", headers=teacher_headers)
-            student_denied = client.get("/api/classroom/sidebar-settings", headers=student_headers)
+            student_setting = client.get("/api/classroom/sidebar-settings", headers=student_headers)
             invalid = client.put(
                 "/api/classroom/sidebar-settings",
                 headers=teacher_headers,
                 json={"locked_panels": ["settings"]},
+            )
+            student_write = client.put(
+                "/api/classroom/sidebar-settings",
+                headers=student_headers,
+                json={"locked_panels": []},
             )
 
         self.assertEqual(initial.status_code, 200)
@@ -450,8 +455,42 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(saved.status_code, 200)
         self.assertEqual(saved.json(), {"locked_panels": ["blocks", "ide", "planner", "camera"], "configured": True})
         self.assertEqual(restored.json(), saved.json())
-        self.assertEqual(student_denied.status_code, 403)
+        self.assertEqual(student_setting.status_code, 200)
+        self.assertEqual(student_setting.json(), saved.json())
         self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(student_write.status_code, 403)
+
+    def test_sidebar_settings_migrate_from_existing_teacher_preferences(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            conn = server.get_db_connection()
+            conn.execute(
+                """
+                INSERT INTO teacher_sidebar_settings (username, locked_panels, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                ("teacher", json.dumps(["blocks", "camera"]), "2026-01-01 00:00:00"),
+            )
+            conn.commit()
+            conn.close()
+            server.init_db()
+
+            teacher = TestClient(app).post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            settings = TestClient(app).get(
+                "/api/classroom/sidebar-settings",
+                headers={"Authorization": f"Bearer {teacher['token']}"},
+            )
+
+        self.assertEqual(settings.status_code, 200)
+        self.assertEqual(
+            settings.json(),
+            {"locked_panels": ["blocks", "camera"], "configured": True},
+        )
 
     def test_simulation_visibility_is_shared_with_students_and_teacher_only_writable(self):
         client = TestClient(app)
@@ -1422,6 +1461,50 @@ class ServerClassroomTests(unittest.TestCase):
                 safe_mode=False,
                 safe_mode_stop_margin_m=server.SAFE_MODE_STOP_MARGIN_METERS,
             )
+
+    def test_run_next_allows_teacher_to_repeat_completed_queue_item(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            client = TestClient(app)
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1", "role": "student"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            submission = client.post(
+                "/api/classroom/submit-code",
+                headers=student_headers,
+                json={"name": "repeatable-command", "code": "robot.stand()"},
+            ).json()["item"]
+
+            with patch.object(server, "ensure_sdk_motion_available"), patch.object(
+                server,
+                "execute_robot_program",
+                return_value={"status": "completed", "commandsExecuted": 1},
+            ) as execute:
+                first_run = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": submission["id"]},
+                )
+                second_run = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": submission["id"]},
+                )
+
+        self.assertEqual(first_run.status_code, 200)
+        self.assertEqual(second_run.status_code, 200)
+        self.assertEqual(first_run.json()["item"]["status"], "completed")
+        self.assertEqual(second_run.json()["item"]["status"], "completed")
+        self.assertEqual(execute.call_count, 2)
 
     def test_run_next_dispatches_each_project_planner_mode_to_its_executor(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(

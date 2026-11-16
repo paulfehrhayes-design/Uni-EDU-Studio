@@ -1284,7 +1284,7 @@ export default function App() {
   }, [apiFetch, duetArmMotionsKey, sceneObjectsKey, session?.token, session?.user?.username]);
 
   useEffect(() => {
-    if (currentUser.role !== 'teacher' || !session?.token) {
+    if (!session?.token) {
       setLockedSidebarPanels([]);
       setIsSidebarSettingsLoading(false);
       return undefined;
@@ -1295,9 +1295,9 @@ export default function App() {
       try {
         let settings = await apiFetch('/api/classroom/sidebar-settings');
         if (!Array.isArray(settings.locked_panels)) {
-          throw new Error('Teacher sidebar settings response is invalid.');
+          throw new Error('Classroom sidebar settings response is invalid.');
         }
-        if (!settings.configured) {
+        if (currentUser.role === 'teacher' && !settings.configured) {
           const legacyValue = localStorage.getItem(`edu-locked-sidebar-panels:${currentUser.username}`);
           const legacyPanels = legacyValue ? JSON.parse(legacyValue) : [];
           const validLegacyPanels = Array.isArray(legacyPanels)
@@ -1321,21 +1321,27 @@ export default function App() {
         });
         setLockedSidebarPanelsError('');
         setIsSidebarSettingsLoading(false);
-        try {
-          localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
-        } catch (error) {
-          console.warn('Unable to cache teacher sidebar settings locally.', error);
+        if (currentUser.role === 'teacher') {
+          try {
+            localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
+          } catch (error) {
+            console.warn('Unable to cache classroom sidebar settings locally.', error);
+          }
         }
       } catch (error) {
         if (!active) return;
-        console.error('Unable to load teacher sidebar settings.', error);
-        setLockedSidebarPanelsError(`Teacher sidebar settings could not be loaded: ${error.message}`);
+        console.error('Unable to load classroom sidebar settings.', error);
+        setLockedSidebarPanelsError(`Classroom sidebar settings could not be loaded: ${error.message}`);
         setIsSidebarSettingsLoading(false);
       }
     };
-    loadSidebarSettings();
+    void loadSidebarSettings();
+    const refreshInterval = currentUser.role === 'student'
+      ? window.setInterval(() => void loadSidebarSettings(), 5000)
+      : null;
     return () => {
       active = false;
+      if (refreshInterval !== null) window.clearInterval(refreshInterval);
     };
   }, [apiFetch, currentUser.role, currentUser.username, session?.token]);
 
@@ -1470,8 +1476,8 @@ export default function App() {
       }
     } catch (error) {
       setLockedSidebarPanels(previousPanels);
-      console.error('Unable to save teacher sidebar settings.', error);
-      setLockedSidebarPanelsError(`Teacher sidebar settings could not be saved: ${error.message}`);
+      console.error('Unable to save classroom sidebar settings.', error);
+      setLockedSidebarPanelsError(`Classroom sidebar settings could not be saved: ${error.message}`);
     } finally {
       setIsSidebarSettingsSaving(false);
     }
@@ -2202,7 +2208,7 @@ export default function App() {
   };
 
   const handleApproveQueuedExecution = async () => {
-    if (!queueReviewItem || queueReviewItem.status !== 'queued') return;
+    if (!queueReviewItem || !['queued', 'completed'].includes(queueReviewItem.status)) return;
     if (queueReviewItem.planner_request?.planner_mode === PLANNER_PATH_MODES.autonomous
       && !queueReviewNavigationPreview) {
       setQueueReviewError('Preview the autonomous route before approving movement.');
@@ -8631,10 +8637,14 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleApproveQueuedExecution}
-                disabled={isQueueReviewRunning || queueReviewItem.status !== 'queued' || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
+                disabled={isQueueReviewRunning || !['queued', 'completed'].includes(queueReviewItem.status) || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
                 className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isQueueReviewRunning ? 'Starting…' : 'Approve & run queued request'}
+                {isQueueReviewRunning
+                  ? 'Starting…'
+                  : queueReviewItem.status === 'completed'
+                    ? 'Run request again'
+                    : 'Approve & run queued request'}
               </button>
             </footer>
           </section>
