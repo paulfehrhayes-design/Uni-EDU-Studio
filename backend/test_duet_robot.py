@@ -10,6 +10,34 @@ import duet_robot
 
 
 class DuetProgramValidationTests(unittest.TestCase):
+    def test_navigation_uses_only_the_existing_leased_move_and_stop_protocol(self):
+        moving = {
+            "ready": True,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "motion_active": True,
+            "capabilities": [],
+        }
+        stopped = {**moving, "motion_active": False}
+        with patch.object(duet_robot, "_run_lock") as run_lock, \
+                patch.object(duet_robot, "_require_hardware_acceptance") as acceptance, \
+                patch.object(duet_robot, "_gateway_request", return_value=moving) as gateway, \
+                patch.object(duet_robot, "_validate_controller_status", side_effect=lambda value: value):
+            run_lock.locked.return_value = False
+            result = duet_robot.navigation_move(0.1, -0.2)
+        self.assertEqual(result, {"status": "accepted", "lease_ms": duet_robot.COMMAND_LEASE_MS})
+        acceptance.assert_called_once_with()
+        gateway.assert_called_once_with("MOVE 0.100000 0 -0.200000 250")
+
+        with patch.object(duet_robot, "_gateway_request", return_value=stopped) as gateway, \
+                patch.object(duet_robot, "_validate_controller_status", side_effect=lambda value: value):
+            result = duet_robot.stop_navigation_motion()
+        self.assertEqual(result, {"status": "stopped", "zero_velocity_confirmed": True})
+        gateway.assert_called_once_with("STOP")
+
+        with self.assertRaisesRegex(duet_robot.DuetControllerError, "bounded"):
+            duet_robot.navigation_move(0.21, 0.0)
+
     def test_parser_accepts_bounded_front_and_rear_distance_conditions(self):
         for sensor, operator in (
             ("front", "<"),

@@ -14,9 +14,13 @@ function validateRecording(recording) {
   const jointNames = getRecordingJointNames(recording);
   const knownJoints = new Set(G1_MODEL_INFO.joints);
   const controllerVersion = recording?.controller_version ?? 'duet';
+  const captureType = recording?.capture_type ?? 'motion';
   const duetJointNames = getDuetArmCatalog().jointOrder;
   if (!['legacy', 'duet'].includes(controllerVersion)) {
     throw new Error('Recorded motion controller version is unsupported.');
+  }
+  if (!['motion', 'position_calibration'].includes(captureType)) {
+    throw new Error('Recorded motion capture type is unsupported.');
   }
   if (!Array.isArray(jointNames)) {
     throw new Error('Recorded motion joint names do not match the supported G1 model.');
@@ -26,26 +30,33 @@ function validateRecording(recording) {
     && jointNames.every((name) => knownJoints.has(name));
   const hasDuetLayout = jointNames.length === duetJointNames.length
     && jointNames.every((name, index) => name === duetJointNames[index]);
+  const isValidJointLayout = captureType === 'position_calibration'
+    ? hasLegacyLayout || (controllerVersion === 'duet' && hasDuetLayout)
+    : controllerVersion === 'legacy' ? hasLegacyLayout : hasDuetLayout;
   if (
     new Set(jointNames).size !== jointNames.length
-    || !(controllerVersion === 'legacy' ? hasLegacyLayout : hasDuetLayout)
+    || !isValidJointLayout
   ) {
     throw new Error('Recorded motion joint names do not match the supported G1 model.');
   }
   const frames = recording?.frames;
-  if (!Array.isArray(frames) || frames.length < 2 || frames.length > 601) {
-    throw new Error('Recorded motion must contain 2 to 601 samples.');
+  const maximumSamples = captureType === 'position_calibration' ? 30001 : 601;
+  const maximumDuration = captureType === 'position_calibration' ? 300 : 30;
+  if (!Array.isArray(frames) || frames.length < 2 || frames.length > maximumSamples) {
+    throw new Error(`Recorded motion must contain 2 to ${maximumSamples} samples.`);
   }
   let previousTime = -1;
   frames.forEach((frame, index) => {
     if (
       !Number.isFinite(frame?.time)
       || frame.time < 0
-      || frame.time > 30
+      || frame.time > maximumDuration
       || frame.time <= previousTime
       || !Array.isArray(frame.joints)
       || frame.joints.length !== jointNames.length
       || frame.joints.some((position) => !Number.isFinite(position))
+      || (captureType === 'position_calibration' && !isValidBasePose(frame.pose))
+      || (frame.pose !== undefined && frame.pose !== null && !isValidBasePose(frame.pose))
     ) {
       throw new Error(`Recorded motion sample ${index + 1} is invalid.`);
     }
@@ -57,9 +68,23 @@ function validateRecording(recording) {
   return jointNames;
 }
 
+function isValidBasePose(pose) {
+  return typeof pose?.frame_id === 'string'
+    && pose.frame_id.length > 0
+    && typeof pose?.base_frame === 'string'
+    && pose.base_frame.length > 0
+    && ['x', 'y', 'z', 'yaw_rad', 'age_ms'].every((key) => Number.isFinite(pose[key]))
+    && pose.age_ms >= 0
+    && pose.age_ms <= 1000
+    && typeof pose.timestamp === 'string'
+    && Number.isFinite(new Date(pose.timestamp).getTime())
+    && pose.source === 'tf2';
+}
+
 export function buildG1MotionRecordingExport(recording) {
   const jointNames = validateRecording(recording);
   const controllerVersion = recording.controller_version ?? 'duet';
+  const captureType = recording.capture_type ?? 'motion';
   return {
     format: G1_RECORDING_FORMAT,
     version: G1_RECORDING_SCHEMA_VERSION,
@@ -68,17 +93,39 @@ export function buildG1MotionRecordingExport(recording) {
     recorded_dof: jointNames.length,
     controller: controllerVersion === 'legacy' ? 'legacy_sdk' : 'duet_v2',
     controller_version: controllerVersion,
+    capture_type: captureType,
     measurement_source: controllerVersion === 'legacy'
+      || (captureType === 'position_calibration' && jointNames.length === 23)
       ? 'ros:/joint_states'
       : 'duet_status:measuredJoints',
     name: recording.name,
     command: recording.command || '',
     joint_names: [...jointNames],
-    units: { time: 'seconds', joint_position: 'radians' },
+    units: captureType === 'position_calibration'
+      ? {
+        time: 'seconds',
+        joint_position: 'radians',
+        base_position: 'meters',
+        base_yaw: 'radians',
+      }
+      : { time: 'seconds', joint_position: 'radians' },
     captured_at: normalizeCaptureTime(recording.captured_at || recording.created_at),
     frames: recording.frames.map((frame) => ({
       time_s: frame.time,
       positions_rad: [...frame.joints],
+      ...(frame.pose ? {
+        base_pose: {
+          frame_id: frame.pose.frame_id,
+          base_frame: frame.pose.base_frame,
+          x_m: frame.pose.x,
+          y_m: frame.pose.y,
+          z_m: frame.pose.z,
+          yaw_rad: frame.pose.yaw_rad,
+          timestamp: normalizeCaptureTime(frame.pose.timestamp),
+          age_ms: frame.pose.age_ms,
+          source: frame.pose.source,
+        },
+      } : {}),
     })),
   };
 }

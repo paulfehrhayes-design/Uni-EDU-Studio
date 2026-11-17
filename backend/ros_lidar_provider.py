@@ -22,6 +22,8 @@ except ImportError:
 
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_JOINT_STATE_AGE_SECONDS = 0.25
+MAX_POSE_AGE_SECONDS = 1.0
+POSE_CAPTURE_UPDATE_INTERVAL_SECONDS = 0.01
 MAX_FUTURE_SKEW_SECONDS = 0.1
 MAX_DISTANCE_METERS = 40.0
 TF_WARNING_INTERVAL_SECONDS = 5.0
@@ -326,6 +328,100 @@ class JointStateCache:
             "positions_rad": list(sample["positions_rad"]),
             "received_at": sample["received_at"],
             "age_ms": round(age_seconds * 1000, 1),
+        }
+
+
+class PoseCaptureCache:
+    def __init__(self, frame_ids: list[str], base_frame_id: str):
+        if (
+            not frame_ids
+            or len(frame_ids) > 4
+            or len(set(frame_ids)) != len(frame_ids)
+            or any(not ROS_FRAME_PATTERN.fullmatch(frame_id) for frame_id in frame_ids)
+            or not ROS_FRAME_PATTERN.fullmatch(base_frame_id)
+        ):
+            raise ValueError("Pose capture frames must be unique valid ROS frame IDs.")
+        self._frame_ids = tuple(frame_ids)
+        self._base_frame_id = base_frame_id
+        self._samples: dict[str, dict[str, object]] = {}
+        self._errors: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def update(
+        self,
+        frame_id: str,
+        x: float,
+        y: float,
+        z: float,
+        yaw_rad: float,
+        timestamp: datetime,
+        age_ms: float,
+    ) -> None:
+        if frame_id not in self._frame_ids:
+            raise ValueError("Pose capture frame is not configured.")
+        if timestamp.tzinfo is None:
+            raise ValueError("Pose capture timestamp must include a timezone.")
+        values = (x, y, z, yaw_rad, age_ms)
+        if not all(math.isfinite(value) for value in values) or not 0 <= age_ms <= MAX_POSE_AGE_SECONDS * 1000:
+            raise ValueError("Pose capture values must be finite and fresh.")
+        with self._lock:
+            self._samples[frame_id] = {
+                "frame_id": frame_id,
+                "base_frame": self._base_frame_id,
+                "x": x,
+                "y": y,
+                "z": z,
+                "yaw_rad": yaw_rad,
+                "timestamp": timestamp.astimezone(timezone.utc).isoformat(),
+                "age_ms": age_ms,
+                "source": "tf2",
+                "received_monotonic": time.monotonic(),
+            }
+            self._errors.pop(frame_id, None)
+
+    def mark_unavailable(self, frame_id: str, reason: str) -> None:
+        if frame_id not in self._frame_ids:
+            raise ValueError("Pose capture frame is not configured.")
+        with self._lock:
+            self._samples.pop(frame_id, None)
+            self._errors[frame_id] = reason
+
+    def current_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            samples = {frame_id: dict(sample) for frame_id, sample in self._samples.items()}
+            errors = dict(self._errors)
+        poses = []
+        for frame_id in self._frame_ids:
+            sample = samples.get(frame_id)
+            if sample is None:
+                poses.append({
+                    "ready": False,
+                    "frame_id": frame_id,
+                    "base_frame": self._base_frame_id,
+                    "error": errors.get(frame_id, "Waiting for a fresh TF transform."),
+                })
+                continue
+            received_age = time.monotonic() - float(sample.pop("received_monotonic"))
+            age_ms = float(sample["age_ms"]) + max(0.0, received_age) * 1000
+            if received_age < 0 or age_ms > MAX_POSE_AGE_SECONDS * 1000:
+                poses.append({
+                    "ready": False,
+                    "frame_id": frame_id,
+                    "base_frame": self._base_frame_id,
+                    "error": "TF pose is stale.",
+                })
+                continue
+            poses.append({"ready": True, **sample, "age_ms": round(age_ms, 1)})
+        ready_poses = [pose for pose in poses if pose["ready"] is True]
+        preferred_frame = next(
+            (pose["frame_id"] for pose in ready_poses if pose["frame_id"] == "odom"),
+            ready_poses[0]["frame_id"] if ready_poses else None,
+        )
+        return {
+            "ready": bool(ready_poses),
+            "preferred_frame": preferred_frame,
+            "poses": poses,
+            "error": None if ready_poses else "No fresh odometry or localization TF is available.",
         }
 
 
@@ -1101,6 +1197,7 @@ def serve_http(
     token: str,
     camera_cache: CameraFrameCache | None = None,
     joint_state_cache: JointStateCache | None = None,
+    pose_capture_cache: PoseCaptureCache | None = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -1112,6 +1209,7 @@ def serve_http(
                 "/calibration",
                 "/camera/frame",
                 "/joint_state",
+                "/pose",
             }:
                 self.send_error(404)
                 return
@@ -1157,6 +1255,19 @@ def serve_http(
                 else:
                     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                     self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed_path.path == "/pose":
+                if pose_capture_cache is None:
+                    self.send_error(503, "Pose capture relay is unavailable")
+                    return
+                payload = pose_capture_cache.current_snapshot()
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store, max-age=0")
@@ -1238,6 +1349,11 @@ def main() -> None:
         camera_source_specs = []
         camera_configuration_error = str(error)
     base_frame_id = os.environ.get("G1_DISTANCE_BASE_FRAME", "").strip()
+    pose_frame_ids = [
+        frame_id.strip()
+        for frame_id in os.environ.get("G1_POSE_CAPTURE_FRAMES", "odom,map").split(",")
+        if frame_id.strip()
+    ]
     token = os.environ["G1_DISTANCE_PROVIDER_TOKEN"]
     host = os.environ.get("G1_DISTANCE_PROVIDER_BIND_HOST", "127.0.0.1")
     port = int(os.environ.get("G1_DISTANCE_PROVIDER_PORT", "8181"))
@@ -1268,6 +1384,13 @@ def main() -> None:
         calibration_error = "G1_DISTANCE_BASE_FRAME is required for automatic distance calibration."
     if not sensor_frame_id:
         calibration_error = "G1_DISTANCE_FRAME_ID is required for automatic distance calibration."
+    if (
+        not pose_frame_ids
+        or len(pose_frame_ids) > 4
+        or len(set(pose_frame_ids)) != len(pose_frame_ids)
+        or any(not ROS_FRAME_PATTERN.fullmatch(frame_id) for frame_id in pose_frame_ids)
+    ):
+        raise ValueError("G1_POSE_CAPTURE_FRAMES must list up to four unique valid ROS frame IDs.")
     if not 1 <= half_angle <= 45 or minimum_height >= maximum_height:
         raise ValueError("Invalid LiDAR forward-sector or height configuration.")
     class LidarNode(Node):
@@ -1280,6 +1403,10 @@ def main() -> None:
             )
             self.camera_cache = CameraFrameCache(camera_source_specs)
             self.joint_state_cache = JointStateCache()
+            self.pose_capture_cache = PoseCaptureCache(
+                pose_frame_ids,
+                base_frame_id or "unconfigured_base_frame",
+            )
             self.cache.update_calibration_status(
                 {
                     "ready": False,
@@ -1295,6 +1422,10 @@ def main() -> None:
             )
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
+            self.create_timer(
+                POSE_CAPTURE_UPDATE_INTERVAL_SECONDS,
+                self.update_pose_samples,
+            )
             self.received_first_cloud: set[str] = set()
             self.processed_clouds = 0
             self.last_diagnostic_cloud_count = 0
@@ -1336,6 +1467,72 @@ def main() -> None:
                 self.on_joint_state,
                 qos_profile_sensor_data,
             )
+
+        def update_pose_samples(self) -> None:
+            for frame_id in pose_frame_ids:
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        frame_id, base_frame_id, Time()
+                    )
+                except TransformException as error:
+                    self.pose_capture_cache.mark_unavailable(
+                        frame_id,
+                        f"TF pose unavailable for {frame_id} -> {base_frame_id}: {error}",
+                    )
+                    continue
+                header_frame = str(transform.header.frame_id).strip()
+                child_frame = str(transform.child_frame_id).strip()
+                if header_frame != frame_id or child_frame != base_frame_id:
+                    self.pose_capture_cache.mark_unavailable(
+                        frame_id,
+                        "TF returned frames different from the requested pose frames.",
+                    )
+                    continue
+                stamp = transform.header.stamp
+                transform_timestamp = float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000
+                age_seconds = time.time() - transform_timestamp
+                if (
+                    transform_timestamp <= 0
+                    or age_seconds < -MAX_FUTURE_SKEW_SECONDS
+                    or age_seconds > MAX_POSE_AGE_SECONDS
+                ):
+                    self.pose_capture_cache.mark_unavailable(
+                        frame_id,
+                        f"TF pose is stale or has an invalid timestamp ({age_seconds:.3f} s old).",
+                    )
+                    continue
+                translation = transform.transform.translation
+                rotation = transform.transform.rotation
+                quaternion_values = (
+                    float(rotation.x),
+                    float(rotation.y),
+                    float(rotation.z),
+                    float(rotation.w),
+                )
+                norm = math.sqrt(sum(value * value for value in quaternion_values))
+                if not math.isfinite(norm) or norm <= 1e-9:
+                    self.pose_capture_cache.mark_unavailable(
+                        frame_id,
+                        "TF pose has an invalid orientation quaternion.",
+                    )
+                    continue
+                qx, qy, qz, qw = (value / norm for value in quaternion_values)
+                yaw_rad = math.atan2(
+                    2 * (qw * qz + qx * qy),
+                    1 - 2 * (qy * qy + qz * qz),
+                )
+                try:
+                    self.pose_capture_cache.update(
+                        frame_id,
+                        float(translation.x),
+                        float(translation.y),
+                        float(translation.z),
+                        yaw_rad,
+                        datetime.fromtimestamp(transform_timestamp, timezone.utc),
+                        max(0.0, age_seconds) * 1000,
+                    )
+                except (TypeError, ValueError) as error:
+                    self.pose_capture_cache.mark_unavailable(frame_id, str(error))
 
         def on_joint_state(self, message: JointState) -> None:
             try:
@@ -1684,6 +1881,7 @@ def main() -> None:
         token,
         node.camera_cache,
         node.joint_state_cache,
+        node.pose_capture_cache,
     )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()

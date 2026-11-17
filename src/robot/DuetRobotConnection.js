@@ -20,6 +20,14 @@ export class DuetRobotConnection {
     return this.request('/api/duet/status', { cache: 'no-store' });
   }
 
+  async pose() {
+    return this.request('/api/robot/pose', { cache: 'no-store' });
+  }
+
+  async jointState() {
+    return this.request('/api/robot/joint-state', { cache: 'no-store' });
+  }
+
   async motions() {
     return this.request('/api/duet/motions', { cache: 'no-store' });
   }

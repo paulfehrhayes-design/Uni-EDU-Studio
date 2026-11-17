@@ -28,15 +28,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictFloat
 try:
     from .g1_robot import (
         CommandValidationError,
         clear_robot_stop_request,
         connect_robot,
         execute_robot_program,
+        navigation_set_velocity,
         parse_robot_program,
         robot_status,
+        stop_navigation_velocity,
         stop_robot,
     )
     from .duet_robot import (
@@ -50,6 +52,9 @@ try:
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        navigation_move as duet_navigation_move,
+        stop_navigation_motion as stop_duet_navigation_motion,
+        _require_hardware_acceptance as _require_duet_hardware_acceptance,
         parse_duet_program,
         review_commissioning_step as review_duet_commissioning_step,
         run_commissioning_step as run_duet_commissioning_step,
@@ -90,8 +95,10 @@ except ImportError:
         clear_robot_stop_request,
         connect_robot,
         execute_robot_program,
+        navigation_set_velocity,
         parse_robot_program,
         robot_status,
+        stop_navigation_velocity,
         stop_robot,
     )
     from duet_robot import (
@@ -105,6 +112,9 @@ except ImportError:
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        navigation_move as duet_navigation_move,
+        stop_navigation_motion as stop_duet_navigation_motion,
+        _require_hardware_acceptance as _require_duet_hardware_acceptance,
         parse_duet_program,
         review_commissioning_step as review_duet_commissioning_step,
         run_commissioning_step as run_duet_commissioning_step,
@@ -199,9 +209,22 @@ class DuetMotionSaveRequest(BaseModel):
     code: str
 
 
+class RobotPoseSample(BaseModel):
+    frame_id: str = Field(min_length=1, max_length=128)
+    base_frame: str = Field(min_length=1, max_length=128)
+    x: float
+    y: float
+    z: float
+    yaw_rad: float
+    timestamp: datetime
+    age_ms: float
+    source: Literal["tf2"]
+
+
 class DuetArmRecordingFrame(BaseModel):
     time: float
     joints: List[float]
+    pose: Optional[RobotPoseSample] = None
 
 
 class DuetArmRecordingSaveRequest(BaseModel):
@@ -212,10 +235,11 @@ class DuetArmRecordingSaveRequest(BaseModel):
 class RobotMotionRecordingSaveRequest(BaseModel):
     name: str
     controller_version: Literal["legacy", "duet"]
+    capture_type: Literal["motion", "position_calibration"] = "motion"
     command: str = Field(max_length=20_000)
     joint_names: List[str]
     captured_at: Optional[datetime] = None
-    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=601)
+    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=30001)
 
 
 class DuetCommissioningReviewRequest(BaseModel):
@@ -319,6 +343,17 @@ class LidarScanStartRequest(BaseModel):
     confirm_rotation: bool
 
 
+class NavigationVelocityRequest(BaseModel):
+    vx: StrictFloat
+    vy: StrictFloat = 0.0
+    vyaw: StrictFloat
+
+
+class NavigationStopRequest(BaseModel):
+    terminal: bool = False
+    reason: str = "gateway_stop"
+
+
 class SharedLidarSettingsRequest(BaseModel):
     show_shared_overlay: bool
 
@@ -367,6 +402,8 @@ DEFAULT_USERS: Dict[str, Dict[str, str]] = {
 SESSION_TOKENS: Dict[str, str] = {}
 _QUEUE_RUN_LOCK = threading.Lock()
 _MOTION_START_LOCK = threading.Lock()
+_NAVIGATION_MOTION_LOCK = threading.RLock()
+_NAVIGATION_COMMAND_LOCK = threading.Lock()
 _NAVIGATION_ACTIVE_STATES = ("accepted", "starting", "running", "cancel_requested", "uncertain")
 _WEBSOCKET_TICKETS: Dict[str, tuple[str, float]] = {}
 _WEBSOCKET_TICKET_LOCK = threading.Lock()
@@ -786,7 +823,235 @@ def active_lidar_scan():
     return dict(row) if row else None
 
 
+def _navigation_motion_pin() -> dict:
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT operation_id, operation_kind, controller_mode, state, error "
+        "FROM navigation_motion_pin WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else {
+        "operation_id": None, "operation_kind": None, "controller_mode": None,
+        "state": "idle", "error": None,
+    }
+
+
+def _navigation_operation_is_terminal(operation_id: str, operation_kind: str) -> bool:
+    conn = get_db_connection()
+    if operation_kind == "scan":
+        row = conn.execute(
+            "SELECT status FROM lidar_scans WHERE job_id = ?", (operation_id,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT status FROM navigation_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+    conn.close()
+    return bool(row and row["status"] in {"completed", "canceled", "failed", "rejected"})
+
+
+def _reserve_navigation_motion(operation_id: str, operation_kind: str, mode: str) -> None:
+    if mode not in {"legacy", "duet"} or operation_kind not in {"route", "scan"}:
+        raise HTTPException(status_code=409, detail="Navigation motion reservation is invalid.")
+    with _NAVIGATION_MOTION_LOCK:
+        pin = _navigation_motion_pin()
+        if pin["state"] == "latched":
+            raise HTTPException(
+                status_code=503,
+                detail="Navigation motion is latched after an unconfirmed stop; onsite inspection/reset is required.",
+            )
+        if pin["state"] == "stopped" and pin["operation_id"] and _navigation_operation_is_terminal(
+            pin["operation_id"], pin["operation_kind"]
+        ):
+            conn = get_db_connection()
+            conn.execute(
+                "UPDATE navigation_motion_pin SET operation_id=NULL, operation_kind=NULL, "
+                "controller_mode=NULL, state='idle', error=NULL, updated_at=? WHERE id=1",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            conn.commit()
+            conn.close()
+            pin = _navigation_motion_pin()
+        if pin["state"] != "idle":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Navigation motion is still reserved by operation {pin['operation_id']} "
+                    f"(state {pin['state']})."
+                ),
+            )
+        conn = get_db_connection()
+        conn.execute(
+            "UPDATE navigation_motion_pin SET operation_id=?, operation_kind=?, controller_mode=?, "
+            "state='active', error=NULL, updated_at=? WHERE id=1",
+            (operation_id, operation_kind, mode, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+
+def _set_navigation_motion_state(operation_id: str, state: str, error: str | None = None) -> None:
+    if state not in {"active", "stopped", "latched"}:
+        raise ValueError("Invalid navigation motion state.")
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE navigation_motion_pin SET state=?, error=?, updated_at=? "
+        "WHERE id=1 AND operation_id=?",
+        (state, error, datetime.now(timezone.utc).isoformat(), operation_id),
+    )
+    changed = conn.execute("SELECT changes()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    if not changed:
+        raise HTTPException(status_code=409, detail="Navigation operation does not own the motion reservation.")
+
+
 DUET_CONTROLLER_UNIT = "duet-g1-controller.service"
+
+
+def _navigation_motion_gate() -> None:
+    if os.getenv("G1_NAV_EXECUTION_ENABLED", "").strip() != "1":
+        raise HTTPException(status_code=503, detail="Physical navigation is disabled.")
+    if os.getenv("G1_NAV_CMD_VEL_BRIDGE_VERIFIED", "0").strip() != "1":
+        raise HTTPException(status_code=503, detail="The Nav2 velocity bridge is not commissioned.")
+    if os.getenv("G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED", "0").strip() != "1":
+        raise HTTPException(status_code=503, detail="Navigation controller ownership is not confirmed.")
+    if os.getenv("G1_NAV_LOCOMOTION_OWNER", "").strip() != "nav2_via_active_backend_controller":
+        raise HTTPException(
+            status_code=503,
+            detail="Set the commissioned navigation owner to nav2_via_active_backend_controller.",
+        )
+
+
+def _select_navigation_controller_mode() -> str:
+    _navigation_motion_gate()
+    sdk = robot_status()
+    duet = duet_controller_status()
+    try:
+        service_state = duet_controller_service_state()
+    except DuetControllerError as error:
+        raise HTTPException(
+            status_code=409,
+            detail=f"DUET service/ownership cannot be verified; refusing navigation: {error}",
+        ) from error
+    if sdk.get("running") or duet.get("programActive"):
+        raise HTTPException(status_code=409, detail="A robot program already owns locomotion.")
+    duet_owns = (
+        service_state == "active"
+        and duet.get("connected") is True
+        and duet.get("ready") is True
+        and duet.get("controlLease") is True
+        and duet.get("motionOwner") == "duet"
+    )
+    if duet_owns:
+        try:
+            _require_duet_hardware_acceptance()
+        except DuetControllerError as error:
+            raise HTTPException(
+                status_code=409,
+                detail=f"DUET navigation requires supervised hardware acceptance: {error}",
+            ) from error
+        return "duet"
+    sdk_owns = (
+        sdk.get("sdkAvailable") is True
+        and service_state in {"inactive", "dead"}
+        and duet.get("motionOwner") == "none"
+        and duet.get("controlLease") is not True
+        and duet.get("motionActive") is not True
+    )
+    if sdk_owns:
+        return "legacy"
+    raise HTTPException(
+        status_code=409,
+        detail="Neither exactly one verified SDK or DUET locomotion mode is ready; navigation was not started.",
+    )
+
+
+def _verify_pinned_navigation_mode(mode: str) -> None:
+    sdk = robot_status()
+    duet = duet_controller_status()
+    try:
+        service_state = duet_controller_service_state()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=f"Controller ownership became unverifiable: {error}") from error
+    if sdk.get("running") or duet.get("programActive"):
+        raise HTTPException(status_code=409, detail="A robot program conflicts with the pinned navigation owner.")
+    if mode == "legacy":
+        ready = (
+            sdk.get("sdkAvailable") is True
+            and service_state in {"inactive", "dead"}
+            and duet.get("motionOwner") == "none"
+            and duet.get("controlLease") is not True
+        )
+    else:
+        ready = (
+            service_state == "active"
+            and duet.get("connected") is True
+            and duet.get("ready") is True
+            and duet.get("controlLease") is True
+            and duet.get("motionOwner") == "duet"
+        )
+    if not ready:
+        raise HTTPException(
+            status_code=409,
+            detail=f"The pinned {mode} locomotion owner is no longer uniquely verified.",
+        )
+
+
+def _verify_navigation_stop_owner(mode: str) -> None:
+    sdk = robot_status()
+    duet = duet_controller_status()
+    try:
+        service_state = duet_controller_service_state()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=f"Controller ownership became unverifiable: {error}") from error
+    if sdk.get("running") or duet.get("programActive"):
+        raise HTTPException(status_code=409, detail="A robot program conflicts with navigation stop ownership.")
+    if mode == "legacy":
+        ready = (
+            sdk.get("sdkAvailable") is True
+            and service_state in {"inactive", "dead"}
+            and duet.get("motionOwner") == "none"
+        )
+    else:
+        ready = service_state == "active" and duet.get("motionOwner") == "duet"
+    if not ready:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot verify sole {mode} ownership for the navigation stop request.",
+        )
+
+
+def _stop_navigation_controller(mode: str) -> dict:
+    if mode == "legacy":
+        return stop_navigation_velocity()
+    if mode == "duet":
+        return stop_duet_navigation_motion()
+    raise HTTPException(status_code=503, detail="Navigation controller mode is unknown; stop is unconfirmed.")
+
+
+def _stop_navigation_motion(operation_id: str, *, terminal: bool = False, reason: str = "gateway_stop") -> dict:
+    del terminal  # A gateway terminal report does not replace backend operation-state confirmation.
+    pin = _navigation_motion_pin()
+    if pin["operation_id"] != operation_id or pin["state"] == "idle":
+        raise HTTPException(status_code=409, detail="No matching navigation motion reservation exists.")
+    if pin["state"] == "latched":
+        raise HTTPException(status_code=503, detail="Navigation motion is latched after a previous stop failure.")
+    try:
+        with _NAVIGATION_COMMAND_LOCK:
+            _verify_navigation_stop_owner(pin["controller_mode"])
+            result = _stop_navigation_controller(pin["controller_mode"])
+        _set_navigation_motion_state(operation_id, "stopped")
+        return {**result, "operation_id": operation_id, "reason": reason, "confirmed": True}
+    except Exception as error:
+        try:
+            _set_navigation_motion_state(operation_id, "latched", str(error))
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail=f"Navigation stop failed and motion is latched: {error}",
+        ) from error
 
 
 def _validated_duet_controller_unit() -> Path:
@@ -1089,6 +1354,27 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS navigation_motion_pin (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            operation_id TEXT,
+            operation_kind TEXT,
+            controller_mode TEXT,
+            state TEXT NOT NULL DEFAULT 'idle',
+            error TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO navigation_motion_pin
+            (id, operation_id, operation_kind, controller_mode, state, error, updated_at)
+        VALUES (1, NULL, NULL, NULL, 'idle', NULL, ?)
+        """,
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS navigation_home (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             map_id TEXT NOT NULL,
@@ -1353,6 +1639,10 @@ def init_db():
     if "joint_names" not in recording_columns:
         conn.execute(
             "ALTER TABLE duet_arm_recordings ADD COLUMN joint_names TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "capture_type" not in recording_columns:
+        conn.execute(
+            "ALTER TABLE duet_arm_recordings ADD COLUMN capture_type TEXT NOT NULL DEFAULT 'motion'"
         )
     conn.execute(
         "UPDATE duet_arm_recordings SET joint_names = ? WHERE joint_names = '[]'",
@@ -2093,7 +2383,7 @@ def list_robot_motion_recordings_for_user(
     if controller_version:
         rows = conn.execute(
             """
-            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
             FROM duet_arm_recordings
             WHERE username = ? AND controller_version = ?
             ORDER BY name COLLATE NOCASE, recording_id
@@ -2103,7 +2393,7 @@ def list_robot_motion_recordings_for_user(
     else:
         rows = conn.execute(
             """
-            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
             FROM duet_arm_recordings
             WHERE username = ?
             ORDER BY name COLLATE NOCASE, recording_id
@@ -2121,6 +2411,7 @@ def list_robot_motion_recordings_for_user(
             "controller_version": row["controller_version"],
             "command": row["command"],
             "joint_names": json.loads(row["joint_names"]),
+            "capture_type": row["capture_type"],
         }
         for row in rows
     ]
@@ -2138,28 +2429,45 @@ def save_robot_motion_recording_for_user(
     joint_names: list[str],
     frames: list[DuetArmRecordingFrame],
     captured_at: datetime | None = None,
+    capture_type: str = "motion",
 ) -> dict:
     normalized_name = _validate_duet_motion_name(name)
+    if controller_version not in {"legacy", "duet"}:
+        raise HTTPException(status_code=400, detail="Recording controller version is unsupported.")
+    if capture_type not in {"motion", "position_calibration"}:
+        raise HTTPException(status_code=400, detail="Recording capture type is unsupported.")
     expected_joint_names = (
-        G1_JOINT_NAMES if controller_version == "legacy" else DUET_ARM_JOINT_NAMES
+        G1_JOINT_NAMES
+        if capture_type == "position_calibration" or controller_version == "legacy"
+        else DUET_ARM_JOINT_NAMES
     )
-    if controller_version not in {"legacy", "duet"} or joint_names != list(expected_joint_names):
+    if joint_names != list(expected_joint_names):
         raise HTTPException(status_code=400, detail="Recording joint names do not match the selected controller.")
-    if not 2 <= len(frames) <= 601:
-        raise HTTPException(status_code=400, detail="A recording must contain 2 to 601 joint samples.")
+    maximum_samples = 30001 if capture_type == "position_calibration" else 601
+    maximum_duration = 300 if capture_type == "position_calibration" else 30
+    if not 2 <= len(frames) <= maximum_samples:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A {capture_type.replace('_', ' ')} recording must contain 2 to {maximum_samples} joint samples.",
+        )
 
     validated_frames = []
     previous_time = -1.0
+    pose_frame_id = None
+    pose_base_frame = None
     for index, frame in enumerate(frames):
         if (
             not math.isfinite(frame.time)
             or frame.time < 0
-            or frame.time > 30
+            or frame.time > maximum_duration
             or frame.time <= previous_time
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Recording sample times must increase from zero and stay within 30 seconds.",
+                detail=(
+                    "Recording sample times must increase from zero and stay within "
+                    f"{maximum_duration} seconds."
+                ),
             )
         if len(frame.joints) != len(expected_joint_names) or any(
             not math.isfinite(value) for value in frame.joints
@@ -2175,6 +2483,44 @@ def save_robot_motion_recording_for_user(
             "time": frame.time,
             "joints": frame.joints,
         })
+        if capture_type == "position_calibration" and frame.pose is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Position calibration sample {index + 1} is missing its measured base pose.",
+            )
+        if frame.pose is not None:
+            pose = frame.pose
+            if (
+                not all(math.isfinite(value) for value in (pose.x, pose.y, pose.z, pose.yaw_rad, pose.age_ms))
+                or not 0 <= pose.age_ms <= 1000
+                or pose.timestamp.tzinfo is None
+                or pose.timestamp.utcoffset() is None
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", pose.frame_id)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", pose.base_frame)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Recording sample {index + 1} has an invalid or stale base pose.",
+                )
+            if pose_frame_id is None:
+                pose_frame_id = pose.frame_id
+                pose_base_frame = pose.base_frame
+            elif pose.frame_id != pose_frame_id or pose.base_frame != pose_base_frame:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A position calibration recording must use one consistent TF frame pair.",
+                )
+            validated_frames[-1]["pose"] = {
+                "frame_id": pose.frame_id,
+                "base_frame": pose.base_frame,
+                "x": pose.x,
+                "y": pose.y,
+                "z": pose.z,
+                "yaw_rad": pose.yaw_rad,
+                "timestamp": pose.timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "age_ms": pose.age_ms,
+                "source": pose.source,
+            }
         previous_time = frame.time
 
     if validated_frames[0]["time"] != 0:
@@ -2203,8 +2549,8 @@ def save_robot_motion_recording_for_user(
     conn.execute(
         """
         INSERT INTO duet_arm_recordings
-            (recording_id, username, name, frames, controller_version, command, joint_names, captured_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (recording_id, username, name, frames, controller_version, command, joint_names, captured_at, capture_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             recording_id,
@@ -2215,12 +2561,13 @@ def save_robot_motion_recording_for_user(
             command,
             json.dumps(joint_names, separators=(",", ":")),
             captured_at_text,
+            capture_type,
         ),
     )
     conn.commit()
     row = conn.execute(
         """
-        SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+        SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
         FROM duet_arm_recordings
         WHERE username = ? AND recording_id = ?
         """,
@@ -2236,6 +2583,7 @@ def save_robot_motion_recording_for_user(
         "controller_version": row["controller_version"],
         "command": row["command"],
         "joint_names": json.loads(row["joint_names"]),
+        "capture_type": row["capture_type"],
     }
 
 
@@ -4002,6 +4350,152 @@ def get_robot_joint_state(response: Response, user: dict = Depends(auth_required
     }
 
 
+@app.get("/api/robot/pose")
+def get_robot_pose(response: Response, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    response.headers["Cache-Control"] = "no-store, no-cache, max-age=0"
+    provider_url = os.getenv("G1_DISTANCE_PROVIDER_URL", "").strip()
+    provider_token = os.getenv("G1_DISTANCE_PROVIDER_TOKEN", "").strip()
+    parsed_provider = urlsplit(provider_url)
+    if (
+        not provider_url
+        or not provider_token
+        or parsed_provider.scheme not in {"http", "https"}
+        or not parsed_provider.netloc
+    ):
+        raise HTTPException(status_code=503, detail="Authenticated ROS pose provider is not configured.")
+    if (
+        parsed_provider.scheme == "http"
+        and parsed_provider.hostname not in {"127.0.0.1", "::1", "localhost"}
+    ):
+        raise HTTPException(status_code=503, detail="Remote ROS pose providers require HTTPS.")
+    provider_path = parsed_provider.path.rstrip("/")
+    for suffix in ("/distance/front", "/distance/rear"):
+        if provider_path.endswith(suffix):
+            provider_path = provider_path[:-len(suffix)]
+            break
+    else:
+        raise HTTPException(status_code=503, detail="ROS pose provider URL has an unsupported path.")
+    pose_url = urlunsplit(
+        (parsed_provider.scheme, parsed_provider.netloc, f"{provider_path}/pose", "", "")
+    )
+    try:
+        provider_response = httpx.get(
+            pose_url,
+            headers={"Authorization": f"Bearer {provider_token}", "Accept": "application/json"},
+            timeout=0.5,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=503, detail="ROS pose provider could not be reached.") from error
+    try:
+        payload = provider_response.json()
+    except ValueError:
+        payload = {}
+    if provider_response.status_code != 200:
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        raise HTTPException(
+            status_code=503,
+            detail=detail if isinstance(detail, str) else "Fresh ROS pose data is unavailable.",
+        )
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("ready"), bool)
+        or not isinstance(payload.get("poses"), list)
+        or not 1 <= len(payload["poses"]) <= 4
+    ):
+        raise HTTPException(status_code=502, detail="ROS pose provider returned an invalid response.")
+
+    poses = []
+    seen_frames = set()
+    for index, pose in enumerate(payload["poses"]):
+        if not isinstance(pose, dict) or not isinstance(pose.get("ready"), bool):
+            raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} is invalid.")
+        frame_id = pose.get("frame_id")
+        base_frame = pose.get("base_frame")
+        if (
+            not isinstance(frame_id, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", frame_id)
+            or "//" in frame_id
+            or frame_id in seen_frames
+            or not isinstance(base_frame, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", base_frame)
+            or "//" in base_frame
+        ):
+            raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} has invalid frames.")
+        seen_frames.add(frame_id)
+        if not pose["ready"]:
+            error = pose.get("error")
+            if error is not None and (not isinstance(error, str) or len(error) > 512):
+                raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} has an invalid error.")
+            poses.append({
+                "ready": False,
+                "frame_id": frame_id,
+                "base_frame": base_frame,
+                "error": error,
+            })
+            continue
+        timestamp = pose.get("timestamp")
+        if not isinstance(timestamp, str):
+            raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} has no timestamp.")
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ROS pose provider sample {index + 1} has an invalid timestamp.",
+            ) from error
+        age_ms = pose.get("age_ms")
+        values = (pose.get("x"), pose.get("y"), pose.get("z"), pose.get("yaw_rad"), age_ms)
+        if (
+            parsed_timestamp.tzinfo is None
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in values
+            )
+            or not 0 <= age_ms <= 1000
+            or pose.get("source") != "tf2"
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail=f"ROS pose provider sample {index + 1} is invalid or stale.",
+            )
+        poses.append({
+            "ready": True,
+            "frame_id": frame_id,
+            "base_frame": base_frame,
+            "x": float(pose["x"]),
+            "y": float(pose["y"]),
+            "z": float(pose["z"]),
+            "yaw_rad": float(pose["yaw_rad"]),
+            "timestamp": parsed_timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "age_ms": age_ms,
+            "source": "tf2",
+        })
+    ready_frames = {pose["frame_id"] for pose in poses if pose["ready"]}
+    preferred_frame = payload.get("preferred_frame")
+    if (
+        payload["ready"] != bool(ready_frames)
+        or (
+            preferred_frame is not None
+            and (not isinstance(preferred_frame, str) or preferred_frame not in ready_frames)
+        )
+        or (ready_frames and preferred_frame is None)
+    ):
+        raise HTTPException(status_code=502, detail="ROS pose provider readiness metadata is inconsistent.")
+    error = payload.get("error")
+    if error is not None and (not isinstance(error, str) or len(error) > 512):
+        raise HTTPException(status_code=502, detail="ROS pose provider returned an invalid status message.")
+    return {
+        "ready": payload["ready"],
+        "preferred_frame": preferred_frame,
+        "poses": poses,
+        "error": error,
+    }
+
+
 @app.post("/api/duet/connect")
 def duet_connect(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
@@ -4110,10 +4604,19 @@ def duet_connect(user: dict = Depends(auth_required)):
 def duet_disconnect(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
     try:
+        if active_navigation_operation() or active_lidar_scan():
+            raise HTTPException(
+                status_code=409,
+                detail="A navigation route or scan owns locomotion; stop and confirm it before disconnecting DUET.",
+            )
         return disconnect_duet_controller()
     except DuetControllerError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        _MOTION_START_LOCK.release()
 
 
 @app.get("/api/duet/status")
@@ -4212,6 +4715,7 @@ def create_robot_motion_recording(
         request.joint_names,
         request.frames,
         request.captured_at,
+        request.capture_type,
     )
     return {"recording": recording}
 
@@ -4808,25 +5312,38 @@ def start_lidar_scan(
     if not _MOTION_START_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
     try:
-        ensure_sdk_motion_available()
-        if robot_status()["running"]:
-            raise HTTPException(status_code=409, detail="Stop SDK motion before starting a room scan.")
         if active_navigation_operation():
             raise HTTPException(status_code=409, detail="Cannot scan while ROS navigation owns locomotion.")
         if active_lidar_scan():
             raise HTTPException(status_code=409, detail="A LiDAR room scan is already active.")
+        mode = _select_navigation_controller_mode()
+        job_id = str(uuid.uuid4())
+        _reserve_navigation_motion(job_id, "scan", mode)
+        save_lidar_scan(job_id, "scanning", user["username"], rotation_status="submitted")
         try:
-            scan = navigation_start_scan()
+            scan = navigation_start_scan(job_id)
         except NavigationBridgeError as error:
+            try:
+                _stop_navigation_motion(job_id, reason="scan_start_error")
+            except HTTPException:
+                pass
+            save_lidar_scan(
+                job_id,
+                "scanning",
+                user["username"],
+                rotation_status="uncertain",
+                error=str(error),
+            )
             raise HTTPException(status_code=503, detail=str(error)) from error
         save_lidar_scan(
-            scan["job_id"],
+            job_id,
             scan["status"],
             user["username"],
             rotation_status=scan["rotation_status"],
             rotation_radians=scan["rotation_radians"],
             error=scan.get("error"),
         )
+        scan["job_id"] = job_id
         return scan
     finally:
         _MOTION_START_LOCK.release()
@@ -4853,6 +5370,9 @@ def get_lidar_scan_status(job_id: str, user: dict = Depends(auth_required)):
                 rotation_radians=scan["rotation_radians"],
                 error=scan.get("error"),
             )
+            pin = _navigation_motion_pin()
+            if pin.get("operation_id") == job_id and pin.get("state") != "latched":
+                _stop_navigation_motion(job_id, terminal=True, reason="scan_terminal")
         return scan
     return {
         "job_id": stored["job_id"],
@@ -4961,6 +5481,7 @@ def cancel_lidar_scan(job_id: str, user: dict = Depends(auth_required)):
     if not stored or stored["status"] != "scanning":
         raise HTTPException(status_code=409, detail="There is no active LiDAR scan to cancel.")
     try:
+        _stop_navigation_motion(job_id, reason="teacher_scan_cancel")
         scan = navigation_cancel_scan(job_id)
     except NavigationBridgeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
@@ -5266,11 +5787,9 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
     if not _MOTION_START_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
     try:
-        ensure_sdk_motion_available()
         if active_lidar_scan():
             raise HTTPException(status_code=409, detail="Complete or cancel the active LiDAR scan before navigation.")
-        if robot_status()["running"]:
-            raise HTTPException(status_code=409, detail="Stop the active SDK robot program before starting navigation.")
+        mode = _select_navigation_controller_mode()
         operation_id = str(uuid.uuid4())
         route = {
             "map_id": request.map_id,
@@ -5278,6 +5797,7 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
             "frame_id": request.frame_id,
             "waypoints": request.waypoints,
             "planner_mode": request.planner_mode,
+            "controller_mode": mode,
         }
         if request.queue_item_id:
             route["queue_item_id"] = request.queue_item_id
@@ -5291,6 +5811,7 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
 
         def persist_starting_operation():
             nonlocal dispatch_started
+            _reserve_navigation_motion(operation_id, "route", mode)
             save_navigation_operation(
                 {"operation_id": operation_id, "status": "starting"},
                 user["username"],
@@ -5313,6 +5834,14 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
         except NavigationBridgeError as error:
             if dispatch_started:
                 update_navigation_operation(operation_id, "uncertain")
+                try:
+                    navigation_cancel_route(operation_id)
+                except NavigationBridgeError:
+                    pass
+                try:
+                    _stop_navigation_motion(operation_id, reason="route_start_error")
+                except HTTPException:
+                    pass
             raise HTTPException(status_code=503, detail=str(error)) from error
         save_navigation_operation(
             {"operation_id": operation_id, "status": operation.get("status", "accepted")},
@@ -5321,6 +5850,8 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
         )
         operation_status = "completed" if operation["status"] == "succeeded" else operation["status"]
         update_navigation_operation(operation_id, operation_status)
+        if operation_status in {"completed", "canceled", "failed", "rejected"}:
+            _stop_navigation_motion(operation_id, terminal=True, reason="route_terminal")
         return {**operation, "status": operation_status}
     finally:
         _MOTION_START_LOCK.release()
@@ -5328,12 +5859,10 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
 
 @app.post("/api/navigation/plan")
 def preview_navigation_route(request: NavigationStartRequest, user: dict = Depends(auth_required)):
-    ensure_sdk_motion_available()
-    if robot_status()["running"]:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the active SDK robot program before requesting a route preview.",
-        )
+    if active_navigation_operation() or active_lidar_scan():
+        raise HTTPException(status_code=409, detail="A route preview is unavailable while navigation owns locomotion.")
+    if robot_status().get("running") or duet_controller_status().get("programActive"):
+        raise HTTPException(status_code=409, detail="Stop the active robot program before requesting a route preview.")
     try:
         static_map_snapshot = None
         if request.planner_mode == "static":
@@ -5431,9 +5960,13 @@ def get_navigation_operation(operation_id: str, user: dict = Depends(auth_requir
     if status == "succeeded":
         status = "completed"
     update_navigation_operation(operation_id, status)
+    if status in {"completed", "canceled", "failed", "rejected"}:
+        pin = _navigation_motion_pin()
+        if pin.get("operation_id") == operation_id and pin.get("state") != "latched":
+            _stop_navigation_motion(operation_id, terminal=True, reason="route_terminal")
     route = json.loads(row["route"])
     queue_item_id = route.get("queue_item_id")
-    if queue_item_id and status in {"completed", "canceled", "failed"}:
+    if queue_item_id and status in {"completed", "canceled", "failed", "rejected"}:
         queue_status = "completed" if status == "completed" else "paused" if status == "canceled" else "failed"
         set_queue_item_status(queue_item_id, queue_status)
     if (
@@ -5486,6 +6019,7 @@ def stop_navigation(operation_id: str, user: dict = Depends(auth_required)):
     if not active_navigation_operation():
         raise HTTPException(status_code=409, detail="There is no active navigation operation.")
     try:
+        _stop_navigation_motion(operation_id, reason="teacher_cancel")
         operation = navigation_cancel_route(operation_id)
     except NavigationBridgeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
@@ -5494,6 +6028,103 @@ def stop_navigation(operation_id: str, user: dict = Depends(auth_required)):
         operation_status = "completed"
     update_navigation_operation(operation_id, operation_status)
     return {**operation, "status": operation_status}
+
+
+def _validate_navigation_bridge_authorization(authorization: str | None) -> None:
+    expected = os.getenv("G1_NAV_BRIDGE_TOKEN", "").strip()
+    supplied = authorization.removeprefix("Bearer ").strip() if isinstance(authorization, str) else ""
+    if len(expected) < 24 or not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="A valid navigation bridge bearer token is required.")
+
+
+def _navigation_motion_source_active(operation_id: str, operation_kind: str) -> bool:
+    conn = get_db_connection()
+    if operation_kind == "scan":
+        row = conn.execute(
+            "SELECT status FROM lidar_scans WHERE job_id = ?", (operation_id,)
+        ).fetchone()
+        active = bool(row and row["status"] == "scanning")
+    else:
+        row = conn.execute(
+            "SELECT status FROM navigation_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        active = bool(row and row["status"] in _NAVIGATION_ACTIVE_STATES)
+    conn.close()
+    return active
+
+
+@app.post("/api/internal/navigation-motion/{operation_id}/velocity")
+def navigation_motion_velocity(
+    operation_id: str,
+    request: NavigationVelocityRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_navigation_bridge_authorization(authorization)
+    _navigation_motion_gate()
+    try:
+        operation_id = str(uuid.UUID(operation_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise HTTPException(status_code=400, detail="Navigation operation ID must be a UUID.") from error
+    values = (request.vx, request.vy, request.vyaw)
+    if any(isinstance(value, bool) or not math.isfinite(float(value)) for value in values):
+        raise HTTPException(status_code=422, detail="Navigation velocity values must be finite numbers.")
+    if abs(request.vx) > 0.20 or request.vy != 0.0 or abs(request.vyaw) > 0.30:
+        raise HTTPException(
+            status_code=422,
+            detail="Navigation accepts only bounded forward/reverse and yaw velocities; lateral/vertical motion is disabled.",
+        )
+    with _NAVIGATION_COMMAND_LOCK:
+        pin = _navigation_motion_pin()
+        if (
+            pin["operation_id"] != operation_id
+            or pin["state"] != "active"
+            or pin["operation_kind"] not in {"route", "scan"}
+            or not _navigation_motion_source_active(operation_id, pin["operation_kind"])
+        ):
+            raise HTTPException(status_code=409, detail="No matching active navigation operation owns locomotion.")
+        try:
+            _verify_pinned_navigation_mode(pin["controller_mode"])
+            if pin["controller_mode"] == "legacy":
+                result = navigation_set_velocity(request.vx, request.vyaw)
+            elif pin["controller_mode"] == "duet":
+                result = duet_navigation_move(
+                    request.vx,
+                    request.vyaw,
+                    hardware_acceptance_verified=True,
+                )
+            else:
+                raise HTTPException(status_code=503, detail="Pinned navigation controller mode is invalid.")
+            return {**result, "operation_id": operation_id, "controller_mode": pin["controller_mode"]}
+        except Exception as error:
+            try:
+                _verify_navigation_stop_owner(pin["controller_mode"])
+                _stop_navigation_controller(pin["controller_mode"])
+                _set_navigation_motion_state(operation_id, "stopped", str(error))
+            except Exception as stop_error:
+                try:
+                    _set_navigation_motion_state(
+                        operation_id, "latched", f"{error}; stop failed: {stop_error}"
+                    )
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=503,
+                detail=f"Navigation velocity failed; cancellation/stop is required: {error}",
+            ) from error
+
+
+@app.post("/api/internal/navigation-motion/{operation_id}/stop")
+def navigation_motion_stop(
+    operation_id: str,
+    request: NavigationStopRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_navigation_bridge_authorization(authorization)
+    try:
+        operation_id = str(uuid.UUID(operation_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise HTTPException(status_code=400, detail="Navigation operation ID must be a UUID.") from error
+    return _stop_navigation_motion(operation_id, terminal=request.terminal, reason=request.reason)
 
 @app.post("/api/stop")
 def stop_code(user: dict = Depends(auth_required)):

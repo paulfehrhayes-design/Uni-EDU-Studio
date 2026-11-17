@@ -1,12 +1,19 @@
 import { G1_MODEL_INFO } from './g1ModelRuntime.js';
-import { G1_NOMINAL_STEP_METERS, parseG1Program } from './g1Commands.js';
+import { G1_NOMINAL_STEP_METERS, LEGACY_ARM_ACTIONS_THAT_HOLD, parseG1Program } from './g1Commands.js';
 import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
 import { getG1GaitEnvelope, getG1GaitJointTargets } from './g1Gait.js';
+import recordedMotions from '../../g1-recorded-motions.json' with { type: 'json' };
 
 const ARM_CATALOG = getDuetArmCatalog();
 const ARM_JOINTS = ARM_CATALOG.jointOrder;
 const ANIMATED_ARM_JOINTS = ARM_JOINTS;
 const RADIANS_TO_DEGREES = 180 / Math.PI;
+const LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS = 20;
+const LEGACY_RECORDED_MOTIONS_BY_COMMAND = new Map(
+  recordedMotions.recordings
+    .filter((recording) => recording.controller_version === 'legacy')
+    .map((recording) => [recording.command.replace(/\r/g, '').trim(), recording]),
+);
 
 const LEGACY_ARM_GESTURES = {
   'two-hand kiss': ['legacy_kiss_both'],
@@ -16,8 +23,6 @@ const LEGACY_ARM_GESTURES = {
   clap: ['legacy_clap'],
   'high five': ['legacy_high_five_right'],
   hug: ['legacy_hug'],
-  heart: ['legacy_heart_both'],
-  'right heart': ['legacy_heart_right'],
   reject: ['legacy_reject_right'],
   'right hand up': ['legacy_hand_up_right'],
   'x-ray': ['legacy_xray'],
@@ -404,6 +409,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   let gaitPhase = 0;
   let gaitWeight = 0;
   let elapsedSeconds = 0;
+  let heldArmActionDeadline = null;
   const poseTargets = {};
 
   const addFrame = (isInitial = false) => {
@@ -437,6 +443,28 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       mode,
       time: elapsedSeconds,
     });
+  };
+
+  const animateRecordedArmMotion = (recording, holdsFinalPose = false) => {
+    const startTime = elapsedSeconds;
+    const label = recording.name;
+    const summary = `Measured legacy SDK motion · ${recording.frames.length} samples`;
+    actions.push({ label, summary });
+    timeline.push({ label, summary });
+    const armJointIndices = recording.joint_names
+      .map((jointName, index) => ({ jointName, index }))
+      .filter(({ jointName }) => ARM_JOINTS.includes(jointName));
+
+    recording.frames.forEach((sample) => {
+      elapsedSeconds = startTime + sample.time_s;
+      armJointIndices.forEach(({ jointName, index }) => {
+        poseTargets[jointName] = sample.positions_rad[index] * RADIANS_TO_DEGREES;
+      });
+      addFrame();
+    });
+    if (holdsFinalPose) {
+      heldArmActionDeadline = elapsedSeconds + LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS;
+    }
   };
 
   const clearLegPoseTargets = () => {
@@ -888,22 +916,41 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   const booleanVariables = new Map();
 
   const executeNodes = (nodes) => {
-    nodes.forEach((node) => {
+    for (let index = 0; index < nodes.length; index += 1) {
+      const node = nodes[index];
       if (node.type === 'command') {
+        if (node.method === 'arm_action') {
+          const action = node.values[0];
+          if (action === 'release arm') heldArmActionDeadline = null;
+          const nextNode = nodes[index + 1];
+          const pairedRecording = nextNode?.type === 'command' && nextNode.method === 'arm_action'
+            ? LEGACY_RECORDED_MOTIONS_BY_COMMAND.get(`${node.code}\n${nextNode.code}`)
+            : null;
+          if (pairedRecording) {
+            animateRecordedArmMotion(pairedRecording);
+            index += 1;
+            continue;
+          }
+          const recording = LEGACY_RECORDED_MOTIONS_BY_COMMAND.get(node.code);
+          if (recording) {
+            animateRecordedArmMotion(recording, LEGACY_ARM_ACTIONS_THAT_HOLD.has(action));
+            continue;
+          }
+        }
         const openingParenthesis = node.code.indexOf('(');
         executeCommand([node.code, node.method, node.code.slice(openingParenthesis + 1, -1)]);
-        return;
+        continue;
       }
       if (node.type === 'boolean_assignment') {
         booleanVariables.set(node.name, node.value);
         actions.push({ label: 'Set Boolean variable', summary: `${node.name} = ${node.value}` });
         timeline.push({ label: 'Set Boolean variable', summary: `${node.name} = ${node.value}` });
         addFrame();
-        return;
+        continue;
       }
       if (node.type === 'repeat') {
         for (let iteration = 0; iteration < node.times; iteration += 1) executeNodes(node.body);
-        return;
+        continue;
       }
       let selectedThen;
       let summary;
@@ -938,11 +985,16 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       timeline.push({ label, summary });
       addFrame();
       executeNodes(selectedThen ? node.then : node.else);
-    });
+    }
   };
 
   if (programNodes) executeNodes(programNodes);
   else commandMatches.forEach(executeCommand);
+
+  if (heldArmActionDeadline !== null && heldArmActionDeadline > elapsedSeconds) {
+    elapsedSeconds = heldArmActionDeadline;
+    addFrame();
+  }
 
   if (!frames.length) {
     addFrame();

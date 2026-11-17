@@ -61,8 +61,9 @@ class NavigationBridgeTests(unittest.TestCase):
                 },
                 "actions": {"navigation": True, "route_preview": True, "spin": True},
                 "controller": {
-                    "owner": "nav2_via_single_unitree_bridge",
+                    "owner": "nav2_via_legacy_sdk",
                     "ownership_confirmed": True,
+                    "cmd_vel_bridge_verified": True,
                     "ready": True,
                 },
             },
@@ -133,6 +134,7 @@ class NavigationBridgeTests(unittest.TestCase):
         self.assertEqual(len(result["diagnostics"]["pointcloud"]["sources"]), 2)
         self.assertTrue(result["diagnostics"]["actions"]["spin"])
         self.assertTrue(result["diagnostics"]["controller"]["ready"])
+        self.assertTrue(result["diagnostics"]["controller"]["cmd_vel_bridge_verified"])
         self.assertTrue(result["diagnostics"]["execution_enabled"])
 
     def test_live_obstacle_layer_requires_fresh_points_in_the_localization_frame(self):
@@ -184,12 +186,20 @@ class NavigationBridgeTests(unittest.TestCase):
             {
                 "owner": "unverified",
                 "ownership_confirmed": False,
+                "cmd_vel_bridge_verified": False,
                 "ready": False,
             },
             {
                 "owner": "another_controller",
                 "ownership_confirmed": True,
+                "cmd_vel_bridge_verified": True,
                 "ready": True,
+            },
+            {
+                "owner": "nav2_via_duet_controller",
+                "ownership_confirmed": True,
+                "cmd_vel_bridge_verified": False,
+                "ready": False,
             },
         ):
             status = {
@@ -215,7 +225,7 @@ class NavigationBridgeTests(unittest.TestCase):
         with patch.dict(os.environ, {"G1_NAV_EXECUTION_ENABLED": "0"}), self.assertRaisesRegex(
             NavigationBridgeError, "Physical scan execution is disabled"
         ):
-            navigation_bridge.navigation_start_scan()
+            navigation_bridge.navigation_start_scan("12345678-1234-1234-1234-123456789abc")
 
     def test_missing_estop_signal_keeps_preview_ready_but_disables_motion(self):
         status_without_estop = {key: value for key, value in self.status.items() if key != "estop"}
@@ -710,7 +720,7 @@ class NavigationBridgeTests(unittest.TestCase):
                 "preview_points": [],
             },
         ) as start:
-            result = navigation_bridge.navigation_start_scan()
+            result = navigation_bridge.navigation_start_scan(job_id)
         self.assertEqual(result["status"], "scanning")
         self.assertEqual(result["rotation_status"], "submitted")
         start.assert_called_once()

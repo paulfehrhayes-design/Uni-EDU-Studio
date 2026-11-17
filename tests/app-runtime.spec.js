@@ -2,6 +2,45 @@ import { test, expect } from '@playwright/test';
 import { getG1BlocklyCommandBlocks, parseG1Program } from '../src/sim/g1Commands.js';
 import { getDuetBlocklyCommandBlocks, parseDuetProgram } from '../src/sim/duetCommands.js';
 
+const G1_JOINT_NAMES = [
+  'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
+  'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint',
+  'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint',
+  'right_knee_joint', 'right_ankle_pitch_joint', 'right_ankle_roll_joint',
+  'waist_yaw_joint', 'left_shoulder_pitch_joint', 'left_shoulder_roll_joint',
+  'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint',
+  'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
+  'right_elbow_joint', 'right_wrist_roll_joint',
+];
+
+function freshJointState() {
+  return {
+    joint_names: G1_JOINT_NAMES,
+    positions_rad: Array(23).fill(0),
+    received_at: '2026-11-12T00:00:00Z',
+    age_ms: 10,
+  };
+}
+
+function freshPoseSnapshot() {
+  return {
+    ready: true,
+    preferred_frame: 'odom',
+    poses: [{
+      ready: true,
+      frame_id: 'odom',
+      base_frame: 'pelvis',
+      x: 0,
+      y: 0,
+      z: 0,
+      yaw_rad: 0,
+      timestamp: '2026-11-12T00:00:00Z',
+      age_ms: 10,
+      source: 'tf2',
+    }],
+  };
+}
+
 async function openConnectionPanel(page) {
   await page.getByRole('button', { name: 'Open robot connection' }).click();
 }
@@ -134,7 +173,7 @@ test('simulation preview controls are in app Settings, not the G1 simulator', as
   await expect(objectArea.getByRole('heading', { name: /Internal Simulator/ })).toHaveCount(0);
 });
 
-test('teacher records measured DUET arm samples and saves them for simulator playback', async ({ page }) => {
+test('teacher captures DUET command series with full-body pose telemetry', async ({ page }) => {
   test.setTimeout(60000);
   const savedPayloads = [];
   const apiRequests = [];
@@ -162,6 +201,10 @@ test('teacher records measured DUET arm samples and saves them for simulator pla
         capabilities: ['base_velocity', 'arm_targets', 'arm_feedback'],
         measuredJoints: Array(10).fill(0),
       };
+    } else if (path === '/api/robot/pose') {
+      body = freshPoseSnapshot();
+    } else if (path === '/api/robot/joint-state') {
+      body = freshJointState();
     } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
       body = { recordings: [] };
     } else if (path === '/api/robot/recordings' && request.method() === 'POST') {
@@ -173,6 +216,7 @@ test('teacher records measured DUET arm samples and saves them for simulator pla
           name: payload.name,
           controller_version: payload.controller_version,
           command: payload.command,
+          capture_type: payload.capture_type,
           joint_names: payload.joint_names,
           frames: payload.frames,
           created_at: '2026-11-12 00:00:00',
@@ -199,37 +243,30 @@ test('teacher records measured DUET arm samples and saves them for simulator pla
   await page.goto('/');
   await page.getByRole('button', { name: 'Open app settings' }).click();
   await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
-  await expect(page.getByText('DUET v2 and fresh measured arm feedback are ready.')).toBeVisible();
-  await page.getByRole('textbox', { name: 'Recorded motion name' }).fill('Measured wave');
-  await page.getByRole('checkbox', { name: 'Confirm robot arm workspace is clear' }).check();
-  await page.getByRole('button', { name: 'Run & record on robot' }).click();
+  await expect(page.getByText('Ready to capture odom → pelvis pose and all 23 measured joints.')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Position capture name' }).fill('Measured walk and turn');
+  await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
+  await page.getByRole('button', { name: 'Run & capture position' }).click();
   await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(1);
-  await expect(page.getByText('Measured wave', { exact: true })).toBeVisible();
+  await expect(page.getByText('Measured walk and turn', { exact: true })).toBeVisible();
   expect(apiRequests).toContain('POST /api/duet/run');
   expect(savedPayloads).toHaveLength(1);
-  expect(savedPayloads[0].name).toBe('Measured wave');
+  expect(savedPayloads[0].name).toBe('Measured walk and turn');
   expect(savedPayloads[0].controller_version).toBe('duet');
+  expect(savedPayloads[0].capture_type).toBe('position_calibration');
+  expect(savedPayloads[0].command).toBe('duet.walk(1)\nduet.turn_left(1)');
   expect(savedPayloads[0].frames.length).toBeGreaterThanOrEqual(2);
-  expect(savedPayloads[0].joint_names).toHaveLength(10);
-  expect(savedPayloads[0].frames[0]).toEqual({ time: 0, joints: Array(10).fill(0) });
+  expect(savedPayloads[0].joint_names).toEqual(G1_JOINT_NAMES);
+  expect(savedPayloads[0].frames[0].joints).toHaveLength(23);
+  expect(savedPayloads[0].frames[0].pose.frame_id).toBe('odom');
   await page.getByRole('button', { name: 'Preview', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toHaveCount(0);
 });
 
-test('teacher records full measured legacy SDK joint samples and exports them', async ({ page }) => {
+test('teacher captures legacy command series with pose and all 23 joint samples', async ({ page }) => {
   test.setTimeout(60000);
   const savedPayloads = [];
   const apiRequests = [];
-  const jointNames = [
-    'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
-    'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint',
-    'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint',
-    'right_knee_joint', 'right_ankle_pitch_joint', 'right_ankle_roll_joint',
-    'waist_yaw_joint', 'left_shoulder_pitch_joint', 'left_shoulder_roll_joint',
-    'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint',
-    'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
-    'right_elbow_joint', 'right_wrist_roll_joint',
-  ];
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-legacy-recording-token',
@@ -242,14 +279,16 @@ test('teacher records full measured legacy SDK joint samples and exports them', 
     apiRequests.push(`${request.method()} ${path}`);
     let body = {};
     if (path === '/api/robot/status') {
-      body = { sdkAvailable: true, running: false, status: 'connected' };
-    } else if (path === '/api/robot/joint-state') {
       body = {
-        joint_names: jointNames,
-        positions_rad: Array(23).fill(0),
-        received_at: '2026-11-12T00:00:00Z',
-        age_ms: 10,
+        sdkAvailable: true,
+        running: false,
+        status: 'connected',
+        capabilities: { locomotion: true, armActions: true },
       };
+    } else if (path === '/api/robot/joint-state') {
+      body = freshJointState();
+    } else if (path === '/api/robot/pose') {
+      body = freshPoseSnapshot();
     } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
       body = { recordings: [] };
     } else if (path === '/api/robot/recordings' && request.method() === 'POST') {
@@ -282,17 +321,23 @@ test('teacher records full measured legacy SDK joint samples and exports them', 
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Open app settings' }).click();
-  await expect(page.getByText('Legacy SDK and fresh 23-joint ROS telemetry are ready.')).toBeVisible();
-  await page.getByRole('textbox', { name: 'Recorded motion name' }).fill('Legacy face wave');
-  await page.getByRole('checkbox', { name: 'Confirm robot arm workspace is clear' }).check();
-  await page.getByRole('button', { name: 'Run & record on robot' }).click();
+  await expect(page.getByText('Ready to capture odom → pelvis pose and all 23 measured joints.')).toBeVisible();
+  const recordButton = page.getByRole('button', { name: 'Run & capture position' });
+  await expect(recordButton).toBeDisabled();
+  await page.getByRole('textbox', { name: 'Position capture name' }).fill('Legacy walk and turn');
+  await expect(recordButton).toBeDisabled();
+  await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
+  await expect(recordButton).toBeEnabled();
+  await recordButton.click();
   await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(1);
   expect(apiRequests).toContain('POST /api/run');
   expect(savedPayloads[0].controller_version).toBe('legacy');
-  expect(savedPayloads[0].command).toBe('robot.arm_action("face wave")');
-  expect(savedPayloads[0].joint_names).toEqual(jointNames);
+  expect(savedPayloads[0].capture_type).toBe('position_calibration');
+  expect(savedPayloads[0].command).toBe('robot.walktime(1)\nrobot.turn("left", 90)');
+  expect(savedPayloads[0].joint_names).toEqual(G1_JOINT_NAMES);
   expect(savedPayloads[0].frames.length).toBeGreaterThanOrEqual(2);
   expect(savedPayloads[0].frames[0].joints).toHaveLength(23);
+  expect(savedPayloads[0].frames[0].pose.frame_id).toBe('odom');
   const [download] = await Promise.all([
     page.waitForEvent('download'),
     page.getByRole('button', { name: 'Export all JSON' }).click(),
@@ -2100,13 +2145,13 @@ test('Blockly workspace survives collapsing and reopening its side panel', async
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
   await page.locator('textarea').first().fill(
-    'robot.walk(2)\nrobot.stand()\nrobot.arm_action("hands up")\nrobot.hold_arm("hands up", 3)',
+    'robot.walk(2)\nrobot.stand()\nrobot.arm_action("hands up")\nrobot.arm_action("release arm")\nrobot.hold_arm("hands up", 3)',
   );
   await page.getByRole('button', { name: 'Blocks', exact: true }).click();
   await expect(page.locator('.blocklyText').filter({ hasText: 'Walk forward' }).first()).toBeVisible();
   await expect.poll(() => page.evaluate(() => (
     window.Blockly.getMainWorkspace().getAllBlocks().length
-  ))).toBe(4);
+  ))).toBe(5);
   await page.evaluate(() => {
     window.originalBlocklySvg = document.querySelector('.blocklySvg');
   });
@@ -2124,7 +2169,7 @@ test('Blockly workspace survives collapsing and reopening its side panel', async
   }).toEqual({ width: expandedPanelBounds.width, height: expandedPanelBounds.height });
   await expect.poll(() => page.evaluate(() => (
     window.originalBlocklySvg === document.querySelector('.blocklySvg')
-      && window.Blockly.getMainWorkspace().getAllBlocks().length === 4
+      && window.Blockly.getMainWorkspace().getAllBlocks().length === 5
   ))).toBe(true);
 });
 
@@ -2174,7 +2219,7 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   await expect(page.locator('canvas')).toBeVisible();
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
   await page.locator('textarea').first().fill(
-    'robot.walk(2)\nrobot.stand()\nrobot.arm_action("hands up")\nrobot.hold_arm("hands up", 3)',
+    'robot.walk(2)\nrobot.stand()\nrobot.arm_action("hands up")\nrobot.arm_action("release arm")\nrobot.hold_arm("hands up", 3)',
   );
   await page.getByRole('button', { name: 'Blocks', exact: true }).click();
 
@@ -2207,7 +2252,7 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   });
   await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).toContainText('robot.arm_action("hands up")');
   await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).toContainText('robot.hold_arm("hands up", 3)');
-  await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).not.toContainText('robot.arm_action("release arm")');
+  await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).toContainText('robot.arm_action("release arm")');
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
   await expect(page.locator('code').filter({ hasText: 'robot.arm_action("hands up")' })).toBeVisible();
   await expect(page.locator('code').filter({ hasText: 'robot.arm_action("shake hand")' })).toBeVisible();
@@ -3312,6 +3357,28 @@ test('simulation playback speed follows estimated SDK command duration', async (
   const playbackPercent = Number((await page.getByText(/^\d+%$/).textContent()).replace('%', ''));
   expect(playbackPercent).toBeGreaterThan(0);
   expect(playbackPercent).toBeLessThan(60);
+});
+
+test('simulation blocks another arm action before release with an error 7401 popup', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'test-token',
+      user: { role: 'student', username: 'student-arm-release-warning-test' },
+    }));
+  });
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await page.locator('textarea').first().fill(
+    'robot.arm_action("hands up")\nrobot.arm_action("reject")',
+  );
+  const dialogPromise = page.waitForEvent('dialog');
+  await page.getByRole('button', { name: 'Run simulation' }).first().click();
+  const dialog = await dialogPromise;
+  expect(dialog.type()).toBe('alert');
+  expect(dialog.message()).toContain('error 7401');
+  expect(dialog.message()).toContain('robot.arm_action("release arm")');
+  await dialog.accept();
 });
 
 test('compiling a planner path preserves its waypoint coordinates', async ({ page }) => {

@@ -18,6 +18,38 @@ except ImportError:
 
 
 class G1RobotProgramTests(unittest.TestCase):
+    def test_navigation_sdk_velocity_uses_a_short_bounded_lease_and_stopmove(self):
+        class FakeLoco:
+            def __init__(self):
+                self.commands = []
+
+            def GetFsmId(self):
+                return 0, 500
+
+            def SetVelocity(self, *args):
+                self.commands.append(("SetVelocity", args))
+                return 0
+
+            def StopMove(self):
+                self.commands.append(("StopMove",))
+                return 0
+
+        fake = FakeLoco()
+        with patch.object(g1_robot, "_client", fake), patch.object(g1_robot, "_run_lock") as run_lock:
+            run_lock.locked.return_value = False
+            result = g1_robot.navigation_set_velocity(0.15, -0.2)
+            stopped = g1_robot.stop_navigation_velocity()
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(fake.commands[0], ("SetVelocity", (0.15, 0.0, -0.2, 0.25)))
+        self.assertEqual(fake.commands[1], ("StopMove",))
+        self.assertTrue(stopped["stop_request_accepted"])
+        self.assertFalse(stopped["physical_stop_verified"])
+
+        with patch.object(g1_robot, "_client", fake), patch.object(g1_robot, "_run_lock") as run_lock:
+            run_lock.locked.return_value = False
+            with self.assertRaisesRegex(HTTPException, "bounded SDK limits"):
+                g1_robot.navigation_set_velocity(0.21, 0.0)
+
     def test_connection_log_creates_private_session_file(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
             os.environ,
@@ -541,8 +573,6 @@ class G1RobotProgramTests(unittest.TestCase):
             "clap": 17,
             "high five": 18,
             "hug": 19,
-            "heart": 20,
-            "right heart": 21,
             "reject": 22,
             "right hand up": 23,
             "x-ray": 24,
@@ -564,25 +594,74 @@ class G1RobotProgramTests(unittest.TestCase):
                 'for _ in range(2):\n'
                 '    robot.arm_action("hands up")\n'
                 '    robot.arm_action("release arm")\n'
-                '    robot.arm_action("right heart")'
+                '    robot.arm_action("face wave")'
             ),
             [
                 {"method": "arm_action", "action": "hands up", "action_id": 15},
                 {"method": "arm_action", "action": "release arm", "action_id": 99},
-                {"method": "arm_action", "action": "right heart", "action_id": 21},
+                {"method": "arm_action", "action": "face wave", "action_id": 25},
                 {"method": "arm_action", "action": "hands up", "action_id": 15},
                 {"method": "arm_action", "action": "release arm", "action_id": 99},
-                {"method": "arm_action", "action": "right heart", "action_id": 21},
+                {"method": "arm_action", "action": "face wave", "action_id": 25},
             ],
         )
 
         for code in (
+            'robot.arm_action("heart")',
+            'robot.arm_action("right heart")',
             'robot.arm_action(15)',
             'robot.arm_action("taught action")',
             'robot.arm_action("hands up", 15)',
         ):
             with self.subTest(code=code), self.assertRaises(CommandValidationError):
                 parse_robot_program(code)
+
+    def test_held_arm_presets_require_release_before_another_arm_block(self):
+        with self.assertRaisesRegex(CommandValidationError, "may still be holding.*error 7401.*Locomotion blocks may remain"):
+            parse_robot_program(
+                'robot.arm_action("hands up")\n'
+                'robot.walk(2)\n'
+                'robot.arm_action("reject")'
+            )
+
+        self.assertEqual(
+            [command["action"] for command in parse_robot_program(
+                'robot.arm_action("hands up")\n'
+                'robot.walk(2)\n'
+                'robot.arm_action("release arm")\n'
+                'robot.arm_action("reject")'
+            ) if command["method"] == "arm_action"],
+            ["hands up", "release arm", "reject"],
+        )
+        self.assertEqual(
+            [command["action"] for command in parse_robot_program(
+                'robot.arm_action("clap")\n'
+                'robot.arm_action("hands up")'
+            )],
+            ["clap", "hands up"],
+        )
+
+    def test_arm_release_flow_checks_all_conditional_paths(self):
+        with self.assertRaisesRegex(CommandValidationError, "error 7401"):
+            parse_robot_program(
+                'robot.arm_action("hands up")\n'
+                'if robot.front_distance_m() < 1:\n'
+                '    robot.arm_action("release arm")\n'
+                'else:\n'
+                '    robot.walk(1)\n'
+                'robot.arm_action("reject")'
+            )
+        self.assertEqual(
+            parse_robot_program(
+                'robot.arm_action("hands up")\n'
+                'if robot.front_distance_m() < 1:\n'
+                '    robot.arm_action("release arm")\n'
+                'else:\n'
+                '    robot.arm_action("release arm")\n'
+                'robot.arm_action("reject")'
+            )[-1]["action"],
+            "reject",
+        )
 
     def test_timed_arm_pose_uses_only_static_presets_and_is_bounded(self):
         self.assertEqual(
@@ -697,7 +776,7 @@ class G1RobotProgramTests(unittest.TestCase):
             4,
         )
         self.assertEqual(
-            len(parse_robot_program('robot.arm_action("hands up")\n' * 16)),
+            len(parse_robot_program('robot.arm_action("clap")\n' * 16)),
             16,
         )
         self.assertEqual(

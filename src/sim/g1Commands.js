@@ -77,8 +77,6 @@ export const G1_ARM_PRESET_DESCRIPTIONS = Object.freeze({
   clap: 'Clap both hands together.',
   'high five': 'Raise the right hand for a high five.',
   hug: 'Open both arms for a hug.',
-  heart: 'Make a heart shape with both hands.',
-  'right heart': 'Make a heart gesture with the right hand.',
   reject: 'Raise the hand in a “no” gesture.',
   'right hand up': 'Raise the right hand.',
   'x-ray': 'Make the X-ray pose.',
@@ -126,8 +124,6 @@ const ARM_PRESETS = [
   ['Clap (17)', 'clap'],
   ['High Five (18)', 'high five'],
   ['Hug (19)', 'hug'],
-  ['Heart (20)', 'heart'],
-  ['Right Heart (21)', 'right heart'],
   ['Reject (22)', 'reject'],
   ['Right Hand Up (23)', 'right hand up'],
   ['X-ray (24)', 'x-ray'],
@@ -170,7 +166,7 @@ const commandGroups = [
       'arm_action',
       'Run arm preset',
       'Gestures',
-      'Run the selected arm preset. Stop cannot cancel an arm preset; keep the area clear.',
+      'Run the selected arm preset. Some gestures hold the final pose; use Release Arm before another arm block. Locomotion may continue while held. Stop cannot cancel an arm preset; keep the area clear.',
       [choiceArgument('ACTION', 'arm preset', ARM_PRESETS, 'hands up')],
     ),
     command(
@@ -334,6 +330,63 @@ function normalizeCommand(method, rawArgs) {
 
 const MIN_DISTANCE_METERS = 0.1;
 const MAX_DISTANCE_METERS = 40;
+export const LEGACY_ARM_ACTIONS_THAT_HOLD = new Set([
+  'hands up',
+  'high five',
+  'hug',
+  'reject',
+  'right hand up',
+  'shake hand',
+  'x-ray',
+]);
+
+function advanceArmActionFlow(nodes, initialHeldActions = new Set([null])) {
+  let heldActions = initialHeldActions;
+  for (const node of nodes) {
+    if (node.type === 'command') {
+      if (!['arm_action', 'hold_arm'].includes(node.method)) continue;
+      const preset = node.values[0];
+      if (node.method === 'arm_action' && preset === 'release arm') {
+        heldActions = new Set([null]);
+        continue;
+      }
+      const previousAction = [...heldActions].find(Boolean);
+      if (previousAction) {
+        return { heldActions, conflict: { previousAction, nextAction: preset } };
+      }
+      heldActions = new Set([
+        node.method === 'hold_arm' || LEGACY_ARM_ACTIONS_THAT_HOLD.has(preset) ? preset : null,
+      ]);
+      continue;
+    }
+    if (node.type === 'repeat') {
+      for (let iteration = 0; iteration < node.times; iteration += 1) {
+        const result = advanceArmActionFlow(node.body, heldActions);
+        if (result.conflict) return result;
+        heldActions = result.heldActions;
+      }
+      continue;
+    }
+    if (node.type === 'condition') {
+      const branches = typeof node.value === 'boolean'
+        ? [node.value ? node.then : node.else]
+        : [node.then, node.else];
+      const branchResults = branches.map((branch) => advanceArmActionFlow(branch, new Set(heldActions)));
+      const conflict = branchResults.find((result) => result.conflict)?.conflict;
+      if (conflict) return { heldActions, conflict };
+      heldActions = new Set(branchResults.flatMap((result) => [...result.heldActions]));
+    }
+  }
+  return { heldActions, conflict: null };
+}
+
+function validateLegacyArmActionFlow(nodes) {
+  const { conflict } = advanceArmActionFlow(nodes);
+  if (!conflict) return;
+  throw new Error(
+    `The ${conflict.previousAction} preset may still be holding the arms. Add robot.arm_action("release arm") before the next arm block (${conflict.nextAction}); otherwise the G1 SDK may return error 7401. Locomotion blocks may remain between the arm action and release.`,
+  );
+}
 
 function nextProgramLine(lines, index) {
   while (index < lines.length && (!lines[index].text || lines[index].text.startsWith('#'))) index += 1;
@@ -475,6 +528,7 @@ export function parseG1Program(code = '') {
   if (commandCount(normalized) > 400) {
     throw new Error('Programs may contain at most 400 expanded commands per execution path.');
   }
+  validateLegacyArmActionFlow(normalized);
   return normalized;
 }
 

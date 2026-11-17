@@ -34,12 +34,11 @@ if [[ "${INSTALL_G1_LIDAR:-0}" == "1" ]]; then
   if bash "$PROJECT_DIR/backend/install_g1_lidar.sh"; then
     LIDAR_CONFIGURED=1
   else
+    echo "ERROR: requested LiDAR/ROS setup did not complete; stopping before reporting app setup success." >&2
     if [[ "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then
-      echo "WARNING: LiDAR setup retry did not complete; preserving the existing LiDAR installation and configuration." >&2
-    else
-      echo "WARNING: LiDAR setup did not complete; continuing with the G1 SDK backend and ordinary supported SDK commands." >&2
-      echo "Distance-condition programs will remain fail-closed until LiDAR setup succeeds." >&2
+      echo "The previous LiDAR installation/configuration may still be present; inspect its services and logs." >&2
     fi
+    exit 1
   fi
 elif [[ -f "$LIDAR_CONFIG_DIR/lidar-installed" ]]; then
   LIDAR_CONFIGURED=1

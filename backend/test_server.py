@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -692,9 +692,11 @@ class ServerClassroomTests(unittest.TestCase):
             with patch.object(
                 server, "robot_status", return_value={"running": False}
             ), patch.object(
+                server, "_select_navigation_controller_mode", return_value="legacy"
+            ), patch.object(
                 server, "navigation_start_scan",
-                return_value={
-                    "job_id": job_id,
+                side_effect=lambda requested_id: {
+                    "job_id": requested_id,
                     "status": "scanning",
                     "rotation_status": "submitted",
                     "rotation_radians": 0.0,
@@ -703,8 +705,8 @@ class ServerClassroomTests(unittest.TestCase):
                 },
             ), patch.object(
                 server, "navigation_scan_status",
-                return_value={
-                    "job_id": job_id,
+                side_effect=lambda requested_id: {
+                    "job_id": requested_id,
                     "status": "scanning",
                     "rotation_status": "completed",
                     "rotation_radians": 6.283185307179586,
@@ -713,8 +715,8 @@ class ServerClassroomTests(unittest.TestCase):
                 },
             ), patch.object(
                 server, "navigation_complete_scan",
-                return_value={
-                    "job_id": job_id, "status": "completed",
+                side_effect=lambda requested_id: {
+                    "job_id": requested_id, "status": "completed",
                     "map_id": "classroom", "map_version": "v-room-1",
                     "frame_id": "map",
                 },
@@ -733,6 +735,7 @@ class ServerClassroomTests(unittest.TestCase):
                     headers=teacher_headers,
                     json={"confirm_rotation": True},
                 )
+                job_id = started.json()["job_id"]
                 status = client.get(f"/api/lidar/scan/{job_id}", headers=teacher_headers)
                 blocked_sdk = client.post(
                     "/api/run",
@@ -1001,8 +1004,14 @@ class ServerClassroomTests(unittest.TestCase):
                 "operation_id": "12345678-1234-1234-1234-123456789abc",
                 "status": "accepted",
             }
+            def start_route(*args, **kwargs):
+                kwargs["on_dispatch"]()
+                return operation
+
             with patch.object(server, "robot_status", return_value={"running": False}), patch.object(
-                server, "navigation_start_route", return_value=operation
+                server, "_select_navigation_controller_mode", return_value="legacy"
+            ), patch.object(
+                server, "navigation_start_route", side_effect=start_route
             ) as start_route:
                 response = client.post(
                     "/api/navigation/start",
@@ -1020,10 +1029,12 @@ class ServerClassroomTests(unittest.TestCase):
                 headers=teacher_headers,
                 json={"code": "robot.walk(1)"},
             )
+            pinned_motion = server._navigation_motion_pin()
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["operation_id"], operation["operation_id"])
         self.assertEqual(start_route.call_args.kwargs["planner_mode"], "static")
+        self.assertEqual(pinned_motion["controller_mode"], "legacy")
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(blocked_sdk.status_code, 409)
         self.assertIn("owns locomotion", blocked_sdk.json()["detail"])
@@ -1145,6 +1156,157 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn('distanceSensor', response.json())
         sensor_status.assert_not_called()
+
+    def test_robot_pose_is_teacher_only_and_validates_fresh_tf_samples(self):
+        client = TestClient(app)
+        teacher = client.post(
+            '/api/classroom/login',
+            json={'username': 'teacher', 'password': 'teacher'},
+        ).json()
+        student = client.post(
+            '/api/classroom/login',
+            json={'username': 'student1', 'password': 'student1'},
+        ).json()
+        teacher_headers = {'Authorization': f"Bearer {teacher['token']}"}
+        student_headers = {'Authorization': f"Bearer {student['token']}"}
+        provider_payload = {
+            'ready': True,
+            'preferred_frame': 'odom',
+            'poses': [
+                {
+                    'ready': True,
+                    'frame_id': 'odom',
+                    'base_frame': 'pelvis',
+                    'x': 0.4,
+                    'y': -0.2,
+                    'z': 0.0,
+                    'yaw_rad': 1.25,
+                    'timestamp': '2026-03-01T10:00:00Z',
+                    'age_ms': 20.0,
+                    'source': 'tf2',
+                },
+                {
+                    'ready': False,
+                    'frame_id': 'map',
+                    'base_frame': 'pelvis',
+                    'error': 'No map transform.',
+                },
+            ],
+            'error': None,
+        }
+        provider_response = Mock(status_code=200)
+        provider_response.json.return_value = provider_payload
+        with patch.dict(
+            os.environ,
+            {
+                'G1_DISTANCE_PROVIDER_URL': 'http://127.0.0.1:8181/distance/front',
+                'G1_DISTANCE_PROVIDER_TOKEN': 'provider-token',
+            },
+        ), patch.object(server.httpx, 'get', return_value=provider_response) as provider_get:
+            response = client.get('/api/robot/pose', headers=teacher_headers)
+            denied = client.get('/api/robot/pose', headers=student_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['ready'])
+        self.assertEqual(response.json()['preferred_frame'], 'odom')
+        self.assertEqual(response.json()['poses'][0]['yaw_rad'], 1.25)
+        self.assertEqual(response.headers['cache-control'], 'no-store, no-cache, max-age=0')
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(provider_get.call_args.args[0], 'http://127.0.0.1:8181/pose')
+
+        provider_payload['poses'][0]['age_ms'] = 1001
+        provider_response.json.return_value = provider_payload
+        with patch.dict(
+            os.environ,
+            {
+                'G1_DISTANCE_PROVIDER_URL': 'http://127.0.0.1:8181/distance/front',
+                'G1_DISTANCE_PROVIDER_TOKEN': 'provider-token',
+            },
+        ), patch.object(server.httpx, 'get', return_value=provider_response):
+            stale = client.get('/api/robot/pose', headers=teacher_headers)
+        self.assertEqual(stale.status_code, 502)
+
+    def test_position_calibration_recording_persists_pose_and_requires_every_sample(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, 'DB_PATH', os.path.join(temp_dir, 'classroom.db')
+        ):
+            server.init_db()
+            captured_at = server.datetime.now(server.timezone.utc)
+            pose = server.RobotPoseSample(
+                frame_id='odom',
+                base_frame='pelvis',
+                x=0.1,
+                y=0.2,
+                z=0.0,
+                yaw_rad=0.4,
+                timestamp=captured_at,
+                age_ms=20,
+                source='tf2',
+            )
+            frames = [
+                server.DuetArmRecordingFrame(time=0, joints=[0.0] * 23, pose=pose),
+                server.DuetArmRecordingFrame(
+                    time=0.1,
+                    joints=[0.1] * 23,
+                    pose=pose.model_copy(update={'x': 0.2}),
+                ),
+            ]
+            saved = server.save_robot_motion_recording_for_user(
+                'teacher',
+                '90 degree left turn',
+                'legacy',
+                '90 degree left turn',
+                list(server.G1_JOINT_NAMES),
+                frames,
+                captured_at,
+                'position_calibration',
+            )
+
+            self.assertEqual(saved['capture_type'], 'position_calibration')
+            self.assertEqual(saved['frames'][1]['pose']['x'], 0.2)
+            duet_saved = server.save_robot_motion_recording_for_user(
+                'teacher',
+                'DUET position capture',
+                'duet',
+                'supervised movement',
+                list(server.G1_JOINT_NAMES),
+                frames,
+                captured_at,
+                'position_calibration',
+            )
+            self.assertEqual(duet_saved['controller_version'], 'duet')
+            self.assertEqual(len(duet_saved['joint_names']), 23)
+            self.assertEqual(
+                server.list_robot_motion_recordings_for_user('teacher')[0]['capture_type'],
+                'position_calibration',
+            )
+            with self.assertRaises(HTTPException) as raised:
+                server.save_robot_motion_recording_for_user(
+                    'teacher',
+                    'Missing pose',
+                    'legacy',
+                    '',
+                    list(server.G1_JOINT_NAMES),
+                    [
+                        frames[0],
+                        server.DuetArmRecordingFrame(time=0.1, joints=[0.1] * 23),
+                    ],
+                    captured_at,
+                    'position_calibration',
+                )
+            self.assertEqual(raised.exception.status_code, 400)
+            with self.assertRaises(HTTPException) as too_many:
+                server.save_robot_motion_recording_for_user(
+                    'teacher',
+                    'Too many samples',
+                    'legacy',
+                    '',
+                    list(server.G1_JOINT_NAMES),
+                    [frames[0]] * 30002,
+                    captured_at,
+                    'position_calibration',
+                )
+            self.assertEqual(too_many.exception.status_code, 400)
 
     def test_sensor_status_and_discovery_are_teacher_only(self):
         client = TestClient(app)
@@ -1712,6 +1874,136 @@ class ServerClassroomTests(unittest.TestCase):
         execute.assert_not_called()
         self.assertEqual(queued_items[0]["id"], submission["id"])
         self.assertEqual(queued_items[0]["status"], "queued")
+
+
+class NavigationMotionControlTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_patcher = patch.object(
+            server, "DB_PATH", os.path.join(self.temp_dir.name, "classroom.db")
+        )
+        self.db_patcher.start()
+        server.init_db()
+        self.client = TestClient(app)
+        self.gates = patch.dict(
+            os.environ,
+            {
+                "G1_NAV_EXECUTION_ENABLED": "1",
+                "G1_NAV_CMD_VEL_BRIDGE_VERIFIED": "1",
+                "G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED": "1",
+                "G1_NAV_LOCOMOTION_OWNER": "nav2_via_active_backend_controller",
+                "G1_NAV_BRIDGE_TOKEN": "a sufficiently long shared gateway secret",
+            },
+        )
+        self.gates.start()
+
+    def tearDown(self):
+        self.gates.stop()
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_controller_mode_is_selected_from_unique_live_ownership(self):
+        sdk = {"sdkAvailable": True, "running": False}
+        no_duet = {
+            "connected": False, "ready": False, "controlLease": False,
+            "motionOwner": "none", "motionActive": False, "programActive": False,
+        }
+        with patch.object(server, "robot_status", return_value=sdk), \
+                patch.object(server, "duet_controller_status", return_value=no_duet), \
+                patch.object(server, "duet_controller_service_state", return_value="inactive"):
+            self.assertEqual(server._select_navigation_controller_mode(), "legacy")
+
+        duet = {
+            "connected": True, "ready": True, "controlLease": True,
+            "motionOwner": "duet", "motionActive": False, "programActive": False,
+        }
+        with patch.object(server, "robot_status", return_value=sdk), \
+                patch.object(server, "duet_controller_status", return_value=duet), \
+                patch.object(server, "duet_controller_service_state", return_value="active"), \
+                patch.object(server, "_require_duet_hardware_acceptance"):
+            self.assertEqual(server._select_navigation_controller_mode(), "duet")
+
+        unknown = {**no_duet, "motionOwner": "unknown"}
+        with patch.object(server, "robot_status", return_value=sdk), \
+                patch.object(server, "duet_controller_status", return_value=unknown), \
+                patch.object(server, "duet_controller_service_state", return_value="active"), \
+                self.assertRaisesRegex(HTTPException, "Neither exactly one"):
+            server._select_navigation_controller_mode()
+
+    def test_velocity_endpoint_is_operation_bound_authenticated_and_bounded(self):
+        operation_id = str(uuid.uuid4())
+        server.save_navigation_operation(
+            {"operation_id": operation_id, "status": "running"},
+            "teacher",
+            {},
+        )
+        server._reserve_navigation_motion(operation_id, "route", "legacy")
+        headers = {"Authorization": "Bearer a sufficiently long shared gateway secret"}
+        with patch.object(server, "_verify_pinned_navigation_mode") as verify, \
+                patch.object(
+                    server, "navigation_set_velocity",
+                    return_value={"status": "accepted", "lease_seconds": 0.25},
+                ) as sdk_move:
+            response = self.client.post(
+                f"/api/internal/navigation-motion/{operation_id}/velocity",
+                headers=headers,
+                json={"vx": 0.1, "vy": 0.0, "vyaw": -0.2},
+            )
+            unauthenticated = self.client.post(
+                f"/api/internal/navigation-motion/{operation_id}/velocity",
+                json={"vx": 0.1, "vy": 0.0, "vyaw": 0.0},
+            )
+            out_of_bounds = self.client.post(
+                f"/api/internal/navigation-motion/{operation_id}/velocity",
+                headers=headers,
+                json={"vx": 0.21, "vy": 0.0, "vyaw": 0.0},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["controller_mode"], "legacy")
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.assertEqual(out_of_bounds.status_code, 422)
+        verify.assert_called_once_with("legacy")
+        sdk_move.assert_called_once_with(0.1, -0.2)
+
+    def test_failed_stop_latches_motion_and_blocks_future_reservations(self):
+        operation_id = str(uuid.uuid4())
+        server.save_navigation_operation(
+            {"operation_id": operation_id, "status": "running"}, "teacher", {}
+        )
+        server._reserve_navigation_motion(operation_id, "route", "legacy")
+        with patch.object(server, "_verify_navigation_stop_owner"), patch.object(
+            server, "stop_navigation_velocity", side_effect=RuntimeError("stop timeout")
+        ):
+            with self.assertRaisesRegex(HTTPException, "motion is latched"):
+                server._stop_navigation_motion(operation_id, reason="test")
+        self.assertEqual(server._navigation_motion_pin()["state"], "latched")
+        with self.assertRaisesRegex(HTTPException, "latched"):
+            server._reserve_navigation_motion(str(uuid.uuid4()), "route", "legacy")
+
+    def test_rejected_navigation_operation_releases_stopped_motion_reservation(self):
+        operation_id = str(uuid.uuid4())
+        server.save_navigation_operation(
+            {"operation_id": operation_id, "status": "rejected"}, "teacher", {}
+        )
+        server._reserve_navigation_motion(operation_id, "route", "legacy")
+        server._set_navigation_motion_state(operation_id, "stopped")
+
+        next_operation_id = str(uuid.uuid4())
+        server.save_navigation_operation(
+            {"operation_id": next_operation_id, "status": "running"}, "teacher", {}
+        )
+        server._reserve_navigation_motion(next_operation_id, "route", "legacy")
+
+        self.assertEqual(server._navigation_motion_pin()["operation_id"], next_operation_id)
+
+    def test_duet_disconnect_is_blocked_while_navigation_owns_motion(self):
+        operation_id = str(uuid.uuid4())
+        server.save_navigation_operation(
+            {"operation_id": operation_id, "status": "running"}, "teacher", {}
+        )
+        with self.assertRaises(HTTPException) as raised:
+            server.duet_disconnect({"role": "teacher"})
+        self.assertEqual(raised.exception.status_code, 409)
 
 
 class AccountManagementTests(unittest.TestCase):
@@ -2488,6 +2780,8 @@ class NavigationHomeTests(unittest.TestCase):
         with patch.object(server, 'navigation_map_snapshot', return_value=active_snapshot), patch.object(server, 'ensure_sdk_motion_available'), patch.object(
             server, 'active_lidar_scan', return_value=None
         ), patch.object(server, 'robot_status', return_value={'running': False}), patch.object(
+            server, '_select_navigation_controller_mode', return_value='legacy'
+        ), patch.object(
             server,
             'navigation_start_route',
             return_value={'operation_id': 'home-return-operation', 'status': 'accepted'},
@@ -2524,6 +2818,8 @@ class NavigationHomeTests(unittest.TestCase):
             server, 'ensure_sdk_motion_available'
         ), patch.object(server, 'active_lidar_scan', return_value=None), patch.object(
             server, 'robot_status', return_value={'running': False}
+        ), patch.object(
+            server, '_select_navigation_controller_mode', return_value='legacy'
         ), patch.object(
             server,
             'navigation_start_route',

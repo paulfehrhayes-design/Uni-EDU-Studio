@@ -63,6 +63,10 @@ _STEP_METERS = 0.345
 _FORWARD_METERS_PER_SECOND = 0.4
 _TURN_RADIANS_PER_SECOND = 0.6
 _SAFE_MODE_POLL_INTERVAL_SECONDS = 0.1
+_NAVIGATION_VELOCITY_LEASE_SECONDS = 0.25
+_NAVIGATION_MAX_LINEAR_VELOCITY = 0.20
+_NAVIGATION_MAX_YAW_RATE = 0.30
+_navigation_command_lock = threading.Lock()
 _POSTURE_TRANSITION_FSM_IDS = {
     "squat_to_stand": 706,
     "lie_to_stand": 702,
@@ -77,8 +81,6 @@ _ARM_ACTION_IDS = {
     "clap": 17,
     "high five": 18,
     "hug": 19,
-    "heart": 20,
-    "right heart": 21,
     "reject": 22,
     "right hand up": 23,
     "x-ray": 24,
@@ -95,12 +97,19 @@ _ARM_HOLD_ACTION_IDS = {
         "hands up",
         "high five",
         "hug",
-        "heart",
-        "right heart",
         "reject",
         "right hand up",
         "x-ray",
     )
+}
+_ARM_ACTIONS_THAT_MAY_HOLD = {
+    "hands up",
+    "high five",
+    "hug",
+    "reject",
+    "right hand up",
+    "shake hand",
+    "x-ray",
 }
 
 
@@ -335,6 +344,44 @@ def _loop_count(node: ast.For) -> int:
     return int(stop)
 
 
+def _validate_arm_action_release_flow(nodes: list[dict[str, Any]]) -> None:
+    def apply(
+        program_nodes: list[dict[str, Any]],
+        held_actions: set[str | None],
+    ) -> set[str | None]:
+        for node in program_nodes:
+            node_type = node.get("type")
+            if node_type == "repeat":
+                for _ in range(node["times"]):
+                    held_actions = apply(node["body"], held_actions)
+                continue
+            if node_type == "condition":
+                held_actions = (
+                    apply(node["then"], set(held_actions))
+                    | apply(node["else"], set(held_actions))
+                )
+                continue
+            if node_type is not None or node.get("method") not in {"arm_action", "hold_arm"}:
+                continue
+
+            action = node["action"]
+            if node["method"] == "arm_action" and action == "release arm":
+                held_actions = {None}
+                continue
+            if any(held_action is not None for held_action in held_actions):
+                previous = next(held_action for held_action in held_actions if held_action is not None)
+                raise CommandValidationError(
+                    f'The {previous} preset may still be holding the arms. Add robot.arm_action("release arm") before the next arm block ({action}); otherwise the G1 SDK may return error 7401. Locomotion blocks may remain between the arm action and release.'
+                )
+            if node["method"] == "hold_arm" or action in _ARM_ACTIONS_THAT_MAY_HOLD:
+                held_actions = {action}
+            else:
+                held_actions = {None}
+        return held_actions
+
+    apply(nodes, {None})
+
+
 def parse_robot_program(code: str) -> list[dict[str, Any]]:
     try:
         tree = ast.parse(code, mode="exec")
@@ -490,6 +537,7 @@ def parse_robot_program(code: str) -> list[dict[str, Any]]:
         raise CommandValidationError("Program contains no robot commands.")
     if command_count > _MAX_EXPANDED_COMMANDS:
         raise CommandValidationError(f"Programs may contain at most {_MAX_EXPANDED_COMMANDS} expanded commands.")
+    _validate_arm_action_release_flow(nodes)
     return nodes
 
 
@@ -753,6 +801,44 @@ def _require_locomotion_ready() -> None:
                 "Use robot.stand() and wait for that transition to finish before walking."
             ),
         )
+
+
+def navigation_set_velocity(vx: float, vyaw: float) -> dict[str, Any]:
+    """Send one short, bounded SDK velocity lease for an owned Nav2 operation."""
+    if (
+        not math.isfinite(vx)
+        or not math.isfinite(vyaw)
+        or abs(vx) > _NAVIGATION_MAX_LINEAR_VELOCITY
+        or abs(vyaw) > _NAVIGATION_MAX_YAW_RATE
+    ):
+        raise HTTPException(status_code=422, detail="Navigation velocity exceeds the bounded SDK limits.")
+    if _client is None:
+        raise HTTPException(status_code=409, detail="The legacy SDK controller is not connected.")
+    if _run_lock.locked():
+        raise HTTPException(status_code=409, detail="An SDK program owns locomotion.")
+    with _navigation_command_lock:
+        _require_locomotion_ready()
+        try:
+            _sdk_result(
+                _client.SetVelocity(vx, 0.0, vyaw, _NAVIGATION_VELOCITY_LEASE_SECONDS),
+                "SetVelocity",
+            )
+        except Exception as error:
+            raise HTTPException(status_code=502, detail=f"SDK navigation velocity failed: {error}") from error
+    return {"status": "accepted", "lease_seconds": _NAVIGATION_VELOCITY_LEASE_SECONDS}
+
+
+def stop_navigation_velocity() -> dict[str, Any]:
+    """Request the SDK's existing StopMove and require a successful RPC result."""
+    if _client is None:
+        raise HTTPException(status_code=409, detail="The legacy SDK controller is not connected; stop is unconfirmed.")
+    with _navigation_command_lock:
+        try:
+            _sdk_result(_client.StopMove(), "StopMove")
+        except Exception as error:
+            _log_event("safety_stop_failed", error=str(error), source="navigation")
+            raise HTTPException(status_code=502, detail=f"SDK navigation stop was not confirmed: {error}") from error
+    return {"status": "stopped", "stop_request_accepted": True, "physical_stop_verified": False}
 
 
 def _distance_condition_result(sample: dict[str, Any], operator: str, threshold: float) -> bool:

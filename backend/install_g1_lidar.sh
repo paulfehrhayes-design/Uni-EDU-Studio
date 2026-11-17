@@ -363,6 +363,11 @@ else
   sudo apt-get update
   sudo apt-get install -y "ros-${ROS_DISTRO_REQUIRED}-ros-base" \
     "ros-${ROS_DISTRO_REQUIRED}-rmw-cyclonedds-cpp" \
+    "ros-${ROS_DISTRO_REQUIRED}-navigation2" \
+    "ros-${ROS_DISTRO_REQUIRED}-nav2-bringup" \
+    "ros-${ROS_DISTRO_REQUIRED}-nav2-map-server" \
+    "ros-${ROS_DISTRO_REQUIRED}-slam-toolbox" \
+    "ros-${ROS_DISTRO_REQUIRED}-pointcloud-to-laserscan" \
     "ros-${ROS_DISTRO_REQUIRED}-sensor-msgs-py" \
     "ros-${ROS_DISTRO_REQUIRED}-robot-state-publisher" \
     "ros-${ROS_DISTRO_REQUIRED}-rosidl-default-generators" \

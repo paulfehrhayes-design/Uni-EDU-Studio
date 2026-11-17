@@ -13,11 +13,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpcl-dev \
     python3-colcon-common-extensions \
     ros-humble-launch-ros \
+    ros-humble-navigation2 \
+    ros-humble-nav2-bringup \
+    ros-humble-nav2-map-server \
     ros-humble-pcl-conversions \
+    ros-humble-pointcloud-to-laserscan \
     ros-humble-robot-state-publisher \
     ros-humble-rosidl-default-generators \
     ros-humble-rosidl-generator-dds-idl \
     ros-humble-sensor-msgs-py \
+    ros-humble-slam-toolbox \
     ros-humble-std-msgs \
     ros-humble-tf2-ros \
     && rm -rf /var/lib/apt/lists/*

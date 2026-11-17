@@ -25,7 +25,11 @@ MAX_PREVIEW_MAP_CELLS = 250_000
 MAX_NAVIGATION_WAYPOINTS = 20
 MAX_NAVIGATION_PREVIEW_POINTS = 50_000
 MAX_SCAN_POINTS = 300_000
-REQUIRED_LOCOMOTION_OWNER = "nav2_via_single_unitree_bridge"
+REQUIRED_LOCOMOTION_OWNERS = {
+    "nav2_via_legacy_sdk",
+    "nav2_via_duet_controller",
+    "nav2_via_active_backend_controller",
+}
 
 
 class NavigationBridgeError(RuntimeError):
@@ -227,11 +231,13 @@ def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float | No
         raise NavigationBridgeError("Navigation bridge diagnostic occupancy threshold is invalid.")
     owner = optional_text(controller.get("owner"), "controller owner") or "unverified"
     ownership_confirmed = controller.get("ownership_confirmed") is True
+    cmd_vel_bridge_verified = controller.get("cmd_vel_bridge_verified") is True
     execution_enabled = os.getenv("G1_NAV_EXECUTION_ENABLED", "").strip() == "1"
     ownership_ready = (
         controller.get("ready") is True
         and ownership_confirmed
-        and owner == REQUIRED_LOCOMOTION_OWNER
+        and cmd_vel_bridge_verified
+        and owner in REQUIRED_LOCOMOTION_OWNERS
     )
     localization = payload.get("localization")
     localization_age_ms = None
@@ -306,9 +312,10 @@ def _validate_diagnostics(payload: dict[str, Any], pointcloud_age_ms: float | No
         "controller": {
             "owner": owner,
             "ownership_confirmed": ownership_confirmed,
+            "cmd_vel_bridge_verified": cmd_vel_bridge_verified,
             "ready": ownership_ready,
             "error": None if ownership_ready else (
-                f"Locomotion ownership is not commissioned ({owner}); motion remains disabled."
+                f"Controller mode or /cmd_vel bridge is not commissioned ({owner}); motion remains disabled."
             ),
         },
         "execution_enabled": execution_enabled,
@@ -871,17 +878,25 @@ def navigation_cancel_route(operation_id: str) -> dict[str, Any]:
     return result
 
 
-def navigation_start_scan() -> dict[str, Any]:
+def navigation_start_scan(job_id: str) -> dict[str, Any]:
     if os.getenv("G1_NAV_EXECUTION_ENABLED", "").strip() != "1":
         raise NavigationBridgeError(
             "Physical scan execution is disabled; set G1_NAV_EXECUTION_ENABLED=1 after commissioning the ROS/Nav2 gateway."
         )
     base_url, token = _bridge_credentials()
-    result = _post_json(base_url, token, "/api/v1/scans/start", {})
-    job_id = _scan_job_id(result.get("job_id"))
+    requested_job_id = _scan_job_id(job_id)
+    result = _post_json(
+        base_url,
+        token,
+        "/api/v1/scans/start",
+        {"job_id": requested_job_id},
+    )
+    returned_job_id = _scan_job_id(result.get("job_id"))
+    if returned_job_id != requested_job_id:
+        raise NavigationBridgeError("Navigation gateway returned a different scan job ID.")
     if result.get("status") != "scanning":
         raise NavigationBridgeError("LiDAR gateway did not confirm that scan capture started.")
-    return _validated_scan_status(result, job_id)
+    return _validated_scan_status(result, returned_job_id)
 
 
 def _validated_scan_status(result: dict[str, Any], job_id: str) -> dict[str, Any]:

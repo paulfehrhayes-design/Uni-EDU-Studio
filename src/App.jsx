@@ -44,7 +44,7 @@ import { buildG1RecordedMotionFrames } from './sim/g1RecordedArmMotion.js';
 import { analyzeDuetVideo, captureDuetLiveMotion } from './sim/duetVisionMotion.js';
 import { createRobotConnection } from './robot/RobotConnection';
 import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
-import TeacherArmMotionRecorder from './components/TeacherArmMotionRecorder.jsx';
+import TeacherPositionRecorder from './components/TeacherPositionRecorder.jsx';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -881,7 +881,7 @@ export default function App() {
   const [projectMenuPosition, setProjectMenuPosition] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
-  const [isArmMotionRecording, setIsArmMotionRecording] = useState(false);
+  const [isPositionCaptureRecording, setIsPositionCaptureRecording] = useState(false);
   const [recordedMotionPreview, setRecordedMotionPreview] = useState(null);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
@@ -2208,11 +2208,29 @@ export default function App() {
   };
 
   const handleApproveQueuedExecution = async () => {
+    if (isPositionCaptureRecording) {
+      setQueueReviewError('Finish the active position capture before starting another robot operation.');
+      return;
+    }
     if (!queueReviewItem || !['queued', 'completed'].includes(queueReviewItem.status)) return;
     if (queueReviewItem.planner_request?.planner_mode === PLANNER_PATH_MODES.autonomous
       && !queueReviewNavigationPreview) {
       setQueueReviewError('Preview the autonomous route before approving movement.');
       return;
+    }
+    if (
+      queueReviewItem.controller_version === 'legacy'
+      && typeof queueReviewItem.code === 'string'
+      && queueReviewItem.code.trim()
+    ) {
+      try {
+        parseG1Program(queueReviewItem.code);
+      } catch (error) {
+        const message = `Execution was not started • ${error.message}`;
+        setQueueReviewError(message);
+        alert(message);
+        return;
+      }
     }
     setIsQueueReviewRunning(true);
     if (queueReviewItem.controller_version === 'duet') {
@@ -2478,6 +2496,10 @@ export default function App() {
   };
 
   const handleConnectRobot = async () => {
+    if (isPositionCaptureRecording) {
+      alert('Finish the active position capture before reconnecting or changing the robot connection.');
+      return;
+    }
     if (!session || session.user.role !== 'teacher') {
       alert('Teacher login is required to connect the robot.');
       return;
@@ -2551,6 +2573,10 @@ export default function App() {
   };
 
   const handleTestRobotMotion = async () => {
+    if (isPositionCaptureRecording) {
+      alert('Finish the active position capture before starting another robot motion.');
+      return;
+    }
     if (!isRobotConnected) {
       alert(`Connect the ${controllerVersion === 'duet' ? 'DUET controller' : 'G1 SDK'} before testing motion.`);
       return;
@@ -2591,6 +2617,10 @@ export default function App() {
   };
 
   const handleStartDuetCommissioning = async () => {
+    if (isPositionCaptureRecording) {
+      setRobotConnectionStatus('Finish the active position capture before starting DUET commissioning.');
+      return;
+    }
     if (!isRobotConnected || currentUser.role !== 'teacher') {
       setRobotConnectionStatus('Connect DUET and sign in as a teacher before commissioning.');
       return;
@@ -2618,6 +2648,10 @@ export default function App() {
   };
 
   const handleRunDuetCommissioningStep = async (retry = false) => {
+    if (isPositionCaptureRecording) {
+      setRobotConnectionStatus('Finish the active position capture before running a DUET commissioning step.');
+      return;
+    }
     const stepIndex = duetCommissioning?.current_step;
     const step = duetCommissioning?.steps?.[stepIndex];
     if (!step || !isRobotConnected || currentUser.role !== 'teacher') return;
@@ -3649,6 +3683,10 @@ export default function App() {
   };
 
   const handleStartNavigation = async () => {
+    if (isPositionCaptureRecording) {
+      setNavigationExecutionStatus('Finish the active position capture before starting Nav2.');
+      return;
+    }
     if (!session || session.user.role !== 'teacher') {
       setNavigationExecutionStatus('Teacher login is required to start navigation.');
       return;
@@ -4410,6 +4448,10 @@ export default function App() {
   };
 
   const handleRunCheckpointedPlanner = async () => {
+    if (isPositionCaptureRecording) {
+      setNavigationExecutionStatus('Finish the active position capture before starting another robot operation.');
+      return;
+    }
     if (session?.user?.role !== 'teacher') {
       setNavigationExecutionStatus('Teacher login is required to run checkpointed SDK paths.');
       return;
@@ -4473,6 +4515,10 @@ export default function App() {
   };
 
   const handleRunCode = async () => {
+    if (isPositionCaptureRecording && !isRunning) {
+      alert('Finish the active position capture before starting another robot program.');
+      return;
+    }
     if (isRunning) {
       try {
         const result = await activeRobotConnection.stop();
@@ -4566,6 +4612,15 @@ export default function App() {
   const activeObstacles = useMemo(() => sceneObjects, [sceneObjects]);
   const queueReviewSnapshot = queueReviewItem?.project_snapshot || {};
   const queueReviewPlannerRequest = queueReviewItem?.planner_request;
+  const isOtherRobotOperationActive = isRunning
+    || isRobotConnecting
+    || isDuetCommissioningBusy
+    || isDuetCommissioningAborting
+    || isNavigationStarting
+    || isQueueReviewRunning
+    || lidarScanJob?.status === 'scanning'
+    || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))
+    || Boolean(queueReviewNavigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(queueReviewNavigationOperation.status));
   const queueReviewWaypoints = queueReviewPlannerRequest?.planner_waypoints
     || queueReviewSnapshot.plannerWaypoints
     || [];
@@ -4648,6 +4703,14 @@ export default function App() {
       alert('Add some robot commands before starting the simulation preview.');
       return;
     }
+    if (!recordedMotionPreview && controllerVersion === 'legacy') {
+      try {
+        parseG1Program(generatedCode);
+      } catch (error) {
+        alert(`Simulation cannot run: ${error.message}`);
+        return;
+      }
+    }
     setPlaybackProgress((progress) => progress >= 1 ? 0 : progress);
     setIsPreviewPlaying(true);
     if (!recordedMotionPreview) previewPreviewState();
@@ -4666,6 +4729,14 @@ export default function App() {
     if (!generatedCode.trim()) {
       alert('Add code or blocks before running the simulation.');
       return;
+    }
+    if (controllerVersion === 'legacy') {
+      try {
+        parseG1Program(generatedCode);
+      } catch (error) {
+        alert(`Simulation cannot run: ${error.message}`);
+        return;
+      }
     }
     setRecordedMotionPreview(null);
     setPlaybackProgress(0);
@@ -5758,10 +5829,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowAppSettings(false)}
-                disabled={isArmMotionRecording}
+                disabled={isPositionCaptureRecording}
                 className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
               >
-                {isArmMotionRecording ? 'Recording…' : 'Close'}
+                {isPositionCaptureRecording ? 'Recording…' : 'Close'}
               </button>
             </div>
             <div className="space-y-3 overflow-y-auto p-5">
@@ -5847,11 +5918,12 @@ export default function App() {
               </fieldset>
               {currentUser.role === 'teacher' && (
                 <>
-              <TeacherArmMotionRecorder
+              <TeacherPositionRecorder
                 connection={activeRobotConnection}
                 controllerVersion={controllerVersion}
-                onBusyChange={setIsArmMotionRecording}
+                onBusyChange={setIsPositionCaptureRecording}
                 onPreview={previewRecordedArmMotion}
+                blockedByOtherMotion={isOtherRobotOperationActive}
               />
               {recordedMotionPreview && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-white px-3 py-2">
@@ -6192,7 +6264,7 @@ export default function App() {
                   type="checkbox"
                   aria-label="Enable DUET version two"
                   checked={controllerVersion === 'duet'}
-                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting || isArmMotionRecording}
+                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting || isPositionCaptureRecording}
                   onChange={(event) => handleControllerVersionChange(event.target.checked)}
                   className="h-5 w-5 shrink-0 accent-blue-700"
                 />
@@ -6449,7 +6521,7 @@ export default function App() {
                   <div className="mt-2 flex gap-2">
                     <button
                       onClick={handleConnectRobot}
-                      disabled={isRobotConnecting || isRunning || isDuetCommissioningBusy}
+                      disabled={isRobotConnecting || isRunning || isDuetCommissioningBusy || isPositionCaptureRecording}
                       className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
                     >
                       {isRobotConnecting
@@ -6462,7 +6534,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={handleTestRobotMotion}
-                        disabled={isRunning || isRobotConnecting}
+                        disabled={isRunning || isRobotConnecting || isPositionCaptureRecording}
                         className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
                       >
                         {isRunning ? 'Motion test running…' : 'Test motion'}
@@ -6568,7 +6640,7 @@ export default function App() {
                             <button
                               type="button"
                               onClick={() => handleRunDuetCommissioningStep(step.status === 'awaiting_review')}
-                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
+                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting || isPositionCaptureRecording || duetCommissioning?.commissioning_enabled !== true}
                               className="mt-2 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                             >
                               {isDuetCommissioningBusy
@@ -6663,7 +6735,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={handleStartDuetCommissioning}
-                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
+                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting || isPositionCaptureRecording || duetCommissioning?.commissioning_enabled !== true}
                           className="rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                         >
                           {duetCommissioning?.status === 'not_started' ? 'Start full test sequence' : 'Start a new full test'}
@@ -7140,7 +7212,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleRunCode}
-                    disabled={lidarScanJob?.status === 'scanning' && !isRunning}
+                    disabled={(lidarScanJob?.status === 'scanning' && !isRunning) || (isPositionCaptureRecording && !isRunning)}
                     className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
                     title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}
                   >
@@ -7800,7 +7872,7 @@ export default function App() {
                               type="button"
                               aria-label="Start Nav2"
                               onClick={handleStartNavigation}
-                              disabled={isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                              disabled={isPositionCaptureRecording || isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
                               className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
                             >
                               {isNavigationStarting ? 'Starting…' : 'Approve & start Nav2'}
@@ -7892,7 +7964,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={handleRunCheckpointedPlanner}
-                        disabled={isRunning || !plannerRouteVariants.initial}
+                        disabled={isRunning || isPositionCaptureRecording || !plannerRouteVariants.initial}
                         className="w-full rounded-md bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 disabled:opacity-50"
                       >
                         {isRunning ? 'Running SDK path and checking waypoints…' : 'Run SDK path • checkpoint and correct'}
@@ -8637,7 +8709,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleApproveQueuedExecution}
-                disabled={isQueueReviewRunning || !['queued', 'completed'].includes(queueReviewItem.status) || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
+                disabled={isPositionCaptureRecording || isQueueReviewRunning || !['queued', 'completed'].includes(queueReviewItem.status) || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
                 className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isQueueReviewRunning

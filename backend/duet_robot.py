@@ -2393,3 +2393,46 @@ def disconnect_controller() -> dict:
             "Stop the DUET controller process before using the legacy SDK."
         ),
     }
+
+
+def navigation_move(
+    vx: float,
+    yaw_rate: float,
+    *,
+    hardware_acceptance_verified: bool = False,
+) -> dict:
+    """Refresh a short DUET base-velocity lease for an owned Nav2 operation."""
+    if (
+        not math.isfinite(vx)
+        or not math.isfinite(yaw_rate)
+        or abs(vx) > 0.20
+        or abs(yaw_rate) > 0.30
+    ):
+        raise DuetControllerError("Navigation velocity exceeds the bounded DUET limits.")
+    if not hardware_acceptance_verified:
+        _require_hardware_acceptance()
+    if _run_lock.locked():
+        raise DuetControllerError("A DUET program owns locomotion.")
+    status = _validate_controller_status(
+        _gateway_request(f"MOVE {vx:.6f} 0 {yaw_rate:.6f} {COMMAND_LEASE_MS}")
+    )
+    expected_motion = abs(vx) > 0.001 or abs(yaw_rate) > 0.001
+    if (
+        status.get("ready") is not True
+        or status.get("control_lease") is not True
+        or status.get("lowcmd_owner") != "duet"
+        or status.get("motion_active") is not expected_motion
+    ):
+        raise DuetControllerError("DUET did not confirm the requested navigation velocity lease.")
+    return {"status": "accepted", "lease_ms": COMMAND_LEASE_MS}
+
+
+def stop_navigation_motion() -> dict:
+    """Issue DUET's existing STOP and confirm its leased motion is inactive."""
+    status = _stop_gateway_leases()
+    if (
+        status.get("lowcmd_owner") != "duet"
+        or status.get("motion_active") is not False
+    ):
+        raise DuetControllerError("DUET did not confirm stopped navigation motion while it owned lowcmd.")
+    return {"status": "stopped", "zero_velocity_confirmed": True}
