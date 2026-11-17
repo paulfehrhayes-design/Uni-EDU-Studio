@@ -429,10 +429,38 @@ def should_log_tf_warning(last_warning_at: float | None, now: float) -> bool:
     return last_warning_at is None or now - last_warning_at >= TF_WARNING_INTERVAL_SECONDS
 
 
-class PointCloudClockNormalizer:
-    def __init__(self) -> None:
+class SensorClockNormalizer:
+    def __init__(
+        self,
+        sample_label: str,
+        clock_label: str,
+        maximum_age_seconds: float,
+    ) -> None:
+        self.sample_label = sample_label
+        self.clock_label = clock_label
+        self.maximum_age_seconds = maximum_age_seconds
         self._future_offsets: deque[float] = deque(maxlen=15)
         self.offset_seconds: float | None = None
+
+    def _validated_timestamp(
+        self,
+        seconds: int,
+        nanoseconds: int,
+        now_seconds: float,
+    ) -> datetime:
+        timestamp_seconds = seconds + nanoseconds / 1_000_000_000
+        age_seconds = now_seconds - timestamp_seconds
+        if age_seconds < -MAX_FUTURE_SKEW_SECONDS:
+            raise ValueError(f"{self.sample_label} timestamp is still in the future.")
+        if age_seconds > self.maximum_age_seconds:
+            raise ValueError(
+                "{} is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
+                    self.sample_label,
+                    age_seconds * 1000,
+                    self.maximum_age_seconds * 1000,
+                )
+            )
+        return datetime.fromtimestamp(timestamp_seconds, timezone.utc)
 
     def normalize(
         self,
@@ -448,20 +476,21 @@ class PointCloudClockNormalizer:
             or seconds < 0
             or not 0 <= nanoseconds < 1_000_000_000
         ):
-            raise ValueError("LiDAR point-cloud timestamp is invalid.")
+            raise ValueError(f"{self.sample_label} timestamp is invalid.")
         raw_timestamp = seconds + nanoseconds / 1_000_000_000
         if raw_timestamp <= 0:
-            raise ValueError("LiDAR point-cloud timestamp is missing.")
+            raise ValueError(f"{self.sample_label} timestamp is missing.")
         raw_age = now_seconds - raw_timestamp
-        if -MAX_FUTURE_SKEW_SECONDS <= raw_age <= MAX_SAMPLE_AGE_SECONDS:
+        if -MAX_FUTURE_SKEW_SECONDS <= raw_age <= self.maximum_age_seconds:
             self._future_offsets.clear()
             self.offset_seconds = None
-            return validate_pointcloud_timestamp(seconds, nanoseconds, now_seconds)
-        if raw_age > MAX_SAMPLE_AGE_SECONDS:
+            return self._validated_timestamp(seconds, nanoseconds, now_seconds)
+        if raw_age > self.maximum_age_seconds:
             raise ValueError(
-                "LiDAR point cloud is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
+                "{} is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
+                    self.sample_label,
                     raw_age * 1000,
-                    MAX_SAMPLE_AGE_SECONDS * 1000,
+                    self.maximum_age_seconds * 1000,
                 )
             )
 
@@ -470,8 +499,10 @@ class PointCloudClockNormalizer:
             self._future_offsets.clear()
             self.offset_seconds = None
             raise ValueError(
-                "LiDAR point-cloud clock is {:.0f} ms ahead of ROS system time, "
-                "beyond the supported offset.".format(offset * 1000)
+                "{} clock is {:.0f} ms ahead of ROS system time, beyond the supported offset.".format(
+                    self.sample_label,
+                    offset * 1000,
+                )
             )
         if self._future_offsets and abs(offset - statistics.median(self._future_offsets)) > (
             SENSOR_CLOCK_MAX_JITTER_SECONDS
@@ -481,7 +512,8 @@ class PointCloudClockNormalizer:
         self._future_offsets.append(offset)
         if len(self._future_offsets) < SENSOR_CLOCK_STABLE_SAMPLES:
             raise ValueError(
-                "Waiting for a stable LiDAR-to-ROS clock offset ({}/{} samples).".format(
+                "Waiting for a stable {} clock offset ({}/{} samples).".format(
+                    self.clock_label,
                     len(self._future_offsets),
                     SENSOR_CLOCK_STABLE_SAMPLES,
                 )
@@ -490,8 +522,11 @@ class PointCloudClockNormalizer:
         offset_spread = max(self._future_offsets) - min(self._future_offsets)
         if offset_spread > SENSOR_CLOCK_MAX_JITTER_SECONDS:
             raise ValueError(
-                "LiDAR-to-ROS clock offset is unstable ({:.0f} ms spread); "
-                "clock synchronization cannot be verified.".format(offset_spread * 1000)
+                "{} clock offset is unstable ({:.0f} ms spread); "
+                "clock synchronization cannot be verified.".format(
+                    self.clock_label,
+                    offset_spread * 1000,
+                )
             )
         self.offset_seconds = offset_median
         corrected_timestamp = raw_timestamp - offset_median
@@ -502,10 +537,28 @@ class PointCloudClockNormalizer:
         if corrected_nanoseconds >= 1_000_000_000:
             corrected_seconds += 1
             corrected_nanoseconds -= 1_000_000_000
-        return validate_pointcloud_timestamp(
+        return self._validated_timestamp(
             corrected_seconds,
             corrected_nanoseconds,
             now_seconds,
+        )
+
+
+class PointCloudClockNormalizer(SensorClockNormalizer):
+    def __init__(self) -> None:
+        super().__init__(
+            "LiDAR point cloud",
+            "LiDAR-to-ROS",
+            MAX_SAMPLE_AGE_SECONDS,
+        )
+
+
+class PoseClockNormalizer(SensorClockNormalizer):
+    def __init__(self) -> None:
+        super().__init__(
+            "TF pose",
+            "TF-to-ROS",
+            MAX_POSE_AGE_SECONDS,
         )
 
 
@@ -1435,6 +1488,10 @@ def main() -> None:
                 str(source["id"]): PointCloudClockNormalizer()
                 for source in source_specs
             }
+            self.pose_clock_normalizers = {
+                frame_id: PoseClockNormalizer()
+                for frame_id in pose_frame_ids
+            }
             self.reported_clock_offsets: set[str] = set()
             if camera_configuration_error:
                 self.get_logger().warning(
@@ -1489,18 +1546,22 @@ def main() -> None:
                     )
                     continue
                 stamp = transform.header.stamp
-                transform_timestamp = float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000
-                age_seconds = time.time() - transform_timestamp
-                if (
-                    transform_timestamp <= 0
-                    or age_seconds < -MAX_FUTURE_SKEW_SECONDS
-                    or age_seconds > MAX_POSE_AGE_SECONDS
-                ):
+                now_seconds = time.time()
+                try:
+                    normalized_timestamp = self.pose_clock_normalizers[
+                        frame_id
+                    ].normalize(
+                        int(stamp.sec),
+                        int(stamp.nanosec),
+                        now_seconds,
+                    )
+                except (TypeError, ValueError) as error:
                     self.pose_capture_cache.mark_unavailable(
                         frame_id,
-                        f"TF pose is stale or has an invalid timestamp ({age_seconds:.3f} s old).",
+                        str(error),
                     )
                     continue
+                age_seconds = now_seconds - normalized_timestamp.timestamp()
                 translation = transform.transform.translation
                 rotation = transform.transform.rotation
                 quaternion_values = (
@@ -1528,7 +1589,7 @@ def main() -> None:
                         float(translation.y),
                         float(translation.z),
                         yaw_rad,
-                        datetime.fromtimestamp(transform_timestamp, timezone.utc),
+                        normalized_timestamp,
                         max(0.0, age_seconds) * 1000,
                     )
                 except (TypeError, ValueError) as error:

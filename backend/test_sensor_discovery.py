@@ -270,6 +270,80 @@ class SensorDiscoveryTests(unittest.TestCase):
             " ".join(report["diagnostics"]),
         )
 
+    def test_supported_future_pointcloud_clock_offset_is_configured_unverified(self):
+        report = self.run_discovery(
+            {
+                "topics": "/utlidar/cloud_livox_mid360 [sensor_msgs/msg/PointCloud2]\n",
+                "headers": {
+                    "/utlidar/cloud_livox_mid360": (
+                        "stamp:\n"
+                        "  sec: 1800000004\n"
+                        "  nanosec: 245000000\n"
+                        "frame_id: livox_frame\n"
+                    )
+                },
+            }
+        )
+
+        self.assertEqual(
+            report["connection"]["method"],
+            "existing_ros_pointcloud_unverified",
+        )
+        self.assertFalse(report["connection"]["ready"])
+        self.assertTrue(report["connection"]["clock_offset_pending"])
+        self.assertEqual(report["connection"]["clock_offset_ms"], 4245)
+        self.assertEqual(
+            report["connection"]["topic"],
+            "/utlidar/cloud_livox_mid360",
+        )
+        self.assertEqual(report["connection"]["frame_id"], "livox_frame")
+
+    def test_pointcloud_clock_offset_beyond_provider_limit_is_not_configured(self):
+        report = self.run_discovery(
+            {
+                "topics": "/utlidar/cloud_livox_mid360 [sensor_msgs/msg/PointCloud2]\n",
+                "headers": {
+                    "/utlidar/cloud_livox_mid360": (
+                        "stamp:\n"
+                        "  sec: 1800000031\n"
+                        "  nanosec: 0\n"
+                        "frame_id: livox_frame\n"
+                    )
+                },
+            }
+        )
+
+        self.assertEqual(
+            report["connection"]["method"],
+            "unsupported_existing_sensor_topic",
+        )
+        self.assertFalse(report["connection"]["ready"])
+        self.assertIn("beyond the supported", " ".join(report["diagnostics"]))
+
+    def test_joint_state_discovery_allows_empty_optional_frame_id(self):
+        report = self.run_discovery(
+            {
+                "topics": "/joint_states [sensor_msgs/msg/JointState]\n",
+                "headers": {
+                    "/joint_states": (
+                        "header:\n"
+                        "  stamp:\n"
+                        "    sec: 1800000000\n"
+                        "    nanosec: 0\n"
+                        "  frame_id: ''\n"
+                    )
+                },
+            }
+        )
+
+        joint_state = next(
+            source for source in report["ros"]["sources"]
+            if source["name"] == "/joint_states"
+        )
+        self.assertTrue(joint_state["fresh"])
+        self.assertIsNone(joint_state["error"])
+        self.assertIsNone(joint_state["frame_id"])
+
     def test_invalid_pointcloud_header_is_not_reported_as_ready(self):
         report = self.run_discovery(
             {

@@ -14,6 +14,7 @@ try:
         JointStateCache,
         PoseCaptureCache,
         PointCloudClockNormalizer,
+        PoseClockNormalizer,
         compose_transforms,
         footprint_clear_range_m,
         footprint_clearance_m,
@@ -32,6 +33,7 @@ except ImportError:
         JointStateCache,
         PoseCaptureCache,
         PointCloudClockNormalizer,
+        PoseClockNormalizer,
         compose_transforms,
         footprint_clear_range_m,
         footprint_clearance_m,
@@ -400,6 +402,31 @@ class RosLidarProviderTests(unittest.TestCase):
                     round((raw_timestamp % 1) * 1_000_000_000),
                     now,
                 )
+
+    def test_pose_clock_normalizer_corrects_a_stable_future_tf_offset(self):
+        normalizer = PoseClockNormalizer()
+        now = 1_800_000_000.0
+
+        for sample_index in range(4):
+            current_time = now + sample_index * 0.02
+            raw_timestamp = current_time + 10.8
+            with self.assertRaisesRegex(ValueError, "stable TF-to-ROS clock offset"):
+                normalizer.normalize(
+                    int(raw_timestamp),
+                    round((raw_timestamp % 1) * 1_000_000_000),
+                    current_time,
+                )
+
+        current_time = now + 0.08
+        raw_timestamp = current_time + 10.8
+        corrected = normalizer.normalize(
+            int(raw_timestamp),
+            round((raw_timestamp % 1) * 1_000_000_000),
+            current_time,
+        )
+
+        self.assertAlmostEqual(normalizer.offset_seconds, 10.8, places=5)
+        self.assertAlmostEqual(corrected.timestamp(), current_time, places=5)
 
     def test_missing_live_tf_error_identifies_required_frames_and_safe_action(self):
         message = format_tf_calibration_error(

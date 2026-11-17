@@ -108,9 +108,18 @@ DRIVER_REQUIRED="$(discovery_value connection.driver_required)"
 DISCOVERED_TOPIC="$(discovery_value connection.topic)"
 DISCOVERED_FRAME="$(discovery_value connection.frame_id)"
 DISCOVERED_SENSOR_ID="$(discovery_value connection.sensor_id)"
+DISCOVERED_READY="$(discovery_value connection.ready)"
+DISCOVERED_METHOD="$(discovery_value connection.method)"
 G1_LIDAR_HOST_IP="${G1_LIDAR_HOST_IP:-${SAVED_HOST_IP:-$(discovery_value network.host_ip)}}"
 G1_LIDAR_DEVICE_IP="${G1_LIDAR_DEVICE_IP:-${SAVED_DEVICE_IP:-$(discovery_value network.device_ip)}}"
-G1_LIDAR_TOPIC="${G1_LIDAR_TOPIC:-${SAVED_LIDAR_TOPIC:-$DISCOVERED_TOPIC}}"
+if [[ -z "${G1_LIDAR_TOPIC:-}" ]]; then
+  if [[ ( "$DISCOVERED_READY" == "1" || "$DISCOVERED_METHOD" == "existing_ros_pointcloud_unverified" ) &&
+        -n "$DISCOVERED_TOPIC" ]]; then
+    G1_LIDAR_TOPIC="$DISCOVERED_TOPIC"
+  else
+    G1_LIDAR_TOPIC="${SAVED_LIDAR_TOPIC:-$DISCOVERED_TOPIC}"
+  fi
+fi
 G1_DISTANCE_SENSOR_ID="${G1_DISTANCE_SENSOR_ID:-${DISCOVERED_SENSOR_ID:-${SAVED_SENSOR_ID:-mid360-front}}}"
 G1_LIDAR_LOWSTATE_TOPIC="${G1_LIDAR_LOWSTATE_TOPIC:-/lowstate}"
 G1_LIDAR_MOUNT_CONFIRMED="${G1_LIDAR_MOUNT_CONFIRMED:-${SAVED_MOUNT_CONFIRMED:-0}}"

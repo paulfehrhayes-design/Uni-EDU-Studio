@@ -13,6 +13,7 @@ import time
 
 MAX_SAMPLE_AGE_SECONDS = 0.5
 MAX_FUTURE_SKEW_SECONDS = 0.1
+MAX_SENSOR_CLOCK_OFFSET_SECONDS = 30.0
 MAX_TOPIC_SAMPLE_BYTES = 65536
 MAX_AUXILIARY_TOPIC_SAMPLES = 32
 ROS_TOPIC_LIST_TIMEOUT_SECONDS = 10.0
@@ -218,21 +219,21 @@ def _parse_topic_list(text):
     return topics
 
 
-def _parse_message_header(text, now_seconds, message_name):
+def _parse_message_header(text, now_seconds, message_name, require_frame=True):
     frame_match = re.search(r"^\s*frame_id:\s*(.*?)\s*$", text, re.MULTILINE)
     seconds_match = re.search(r"^\s*sec:\s*(-?\d+)\s*$", text, re.MULTILINE)
     nanoseconds_match = re.search(r"^\s*nanosec:\s*(-?\d+)\s*$", text, re.MULTILINE)
-    if not frame_match or not seconds_match or not nanoseconds_match:
+    if (require_frame and not frame_match) or not seconds_match or not nanoseconds_match:
         return {
             "frame_id": None,
             "fresh": False,
             "age_ms": None,
             "error": "Could not read frame and acquisition timestamp from the {} header.".format(message_name),
         }
-    frame_id = frame_match.group(1).strip().strip("\"'")
+    frame_id = frame_match.group(1).strip().strip("\"'") if frame_match else ""
     seconds = int(seconds_match.group(1))
     nanoseconds = int(nanoseconds_match.group(1))
-    if not frame_id or seconds < 0 or not 0 <= nanoseconds < 1_000_000_000:
+    if (require_frame and not frame_id) or seconds < 0 or not 0 <= nanoseconds < 1_000_000_000:
         return {
             "frame_id": frame_id or None,
             "fresh": False,
@@ -249,22 +250,42 @@ def _parse_message_header(text, now_seconds, message_name):
         }
     age = now_seconds - timestamp
     if age < -MAX_FUTURE_SKEW_SECONDS:
-        error = (
-            "{} acquisition timestamp is more than {:.0f} ms ahead of the "
-            "host wall clock; verify G1, ROS, and LiDAR time synchronization."
-        ).format(message_name, -age * 1000)
+        clock_offset_seconds = -age
+        if clock_offset_seconds <= MAX_SENSOR_CLOCK_OFFSET_SECONDS:
+            error = (
+                "{} acquisition timestamp is {:.0f} ms ahead of the host wall "
+                "clock; the provider must confirm a stable clock offset before use. "
+                "verify G1, ROS, and LiDAR time synchronization."
+            ).format(message_name, clock_offset_seconds * 1000)
+        else:
+            error = (
+                "{} acquisition timestamp is {:.0f} ms ahead of the host wall "
+                "clock, beyond the supported {:.0f} s offset; verify G1, ROS, "
+                "and LiDAR time synchronization."
+            ).format(
+                message_name,
+                clock_offset_seconds * 1000,
+                MAX_SENSOR_CLOCK_OFFSET_SECONDS,
+            )
     elif age > MAX_SAMPLE_AGE_SECONDS:
+        clock_offset_seconds = 0.0
         error = "{} sample is stale ({:.0f} ms old; maximum is {:.0f} ms).".format(
             message_name,
             age * 1000,
             MAX_SAMPLE_AGE_SECONDS * 1000,
         )
     else:
+        clock_offset_seconds = 0.0
         error = None
     return {
-        "frame_id": frame_id,
+        "frame_id": frame_id or None,
         "fresh": error is None,
         "age_ms": max(0, round(age * 1000)),
+        "clock_offset_candidate": (
+            age < -MAX_FUTURE_SKEW_SECONDS
+            and clock_offset_seconds <= MAX_SENSOR_CLOCK_OFFSET_SECONDS
+        ),
+        "clock_offset_ms": round(clock_offset_seconds * 1000),
         "error": error,
     }
 
@@ -481,7 +502,12 @@ def discover_sensors(
                     timeout=ROS_TOPIC_SAMPLE_TIMEOUT_SECONDS,
                 )
                 sample = (
-                    _parse_message_header(header_output, current_time, topic["type"].rsplit("/", 1)[-1])
+                    _parse_message_header(
+                        header_output,
+                        current_time,
+                        topic["type"].rsplit("/", 1)[-1],
+                        require_frame=role != "joint_state",
+                    )
                     if not header_error
                     else {
                         "frame_id": None,
@@ -504,6 +530,11 @@ def discover_sensors(
         sample for sample in pointclouds if LIDAR_NAME_PATTERN.search(sample["name"])
     ]
     fresh_pointclouds = [sample for sample in matching_pointclouds if sample["fresh"]]
+    candidate_pointclouds = [
+        sample
+        for sample in matching_pointclouds
+        if sample["fresh"] or sample.get("clock_offset_candidate") is True
+    ]
     sensor_named_topics = [
         topic for topic in topics if LIDAR_NAME_PATTERN.search(topic["name"])
     ]
@@ -521,44 +552,63 @@ def discover_sensors(
         ),
         None,
     )
-    saved_fresh_pointcloud = next(
+    saved_candidate_pointcloud = next(
         (
-            source
-            for source in fresh_pointclouds
+            source for source in candidate_pointclouds
             if source["name"] == saved_topic_name
             and (not saved_sensor_frame or source["frame_id"] == saved_sensor_frame)
         ),
         None,
     )
-    selected_pointcloud = saved_fresh_pointcloud or (
-        fresh_pointclouds[0] if len(fresh_pointclouds) == 1 else None
+    selected_pointcloud = saved_candidate_pointcloud or (
+        candidate_pointclouds[0] if len(candidate_pointclouds) == 1 else None
     )
 
     if selected_pointcloud:
         selected = selected_pointcloud
         unitree_name = re.search(r"unitree|utlidar", selected["name"], re.IGNORECASE)
         method = "unitree_ros_pointcloud" if unitree_name else "existing_ros_pointcloud"
-        connection = {
-            "method": method,
-            "ready": True,
-            "driver_required": False,
-            "sensor_id": environment.get("G1_DISTANCE_SENSOR_ID", "").strip()
-            or saved.get("G1_DISTANCE_SENSOR_ID", "unitree-lidar" if unitree_name else "ros-pointcloud"),
-            "topic": selected["name"],
-            "message_type": selected["type"],
-            "frame_id": selected["frame_id"],
-            "reason": (
-                "The previously selected PointCloud2 source is fresh; other discovered sources remain listed for diagnostics."
-                if saved_fresh_pointcloud and len(fresh_pointclouds) > 1
-                else "A fresh ROS 2 PointCloud2 stream was detected; no Livox driver will be started."
-            ),
-        }
-    elif len(fresh_pointclouds) > 1:
+        sensor_id = environment.get("G1_DISTANCE_SENSOR_ID", "").strip() or saved.get(
+            "G1_DISTANCE_SENSOR_ID",
+            "unitree-lidar" if unitree_name else "ros-pointcloud",
+        )
+        if selected["fresh"]:
+            connection = {
+                "method": method,
+                "ready": True,
+                "driver_required": False,
+                "sensor_id": sensor_id,
+                "topic": selected["name"],
+                "message_type": selected["type"],
+                "frame_id": selected["frame_id"],
+                "reason": (
+                    "The previously selected PointCloud2 source is fresh; other discovered sources remain listed for diagnostics."
+                    if saved_candidate_pointcloud and len(fresh_pointclouds) > 1
+                    else "A fresh ROS 2 PointCloud2 stream was detected; no Livox driver will be started."
+                ),
+            }
+        else:
+            connection = {
+                "method": "existing_ros_pointcloud_unverified",
+                "ready": False,
+                "driver_required": False,
+                "sensor_id": sensor_id,
+                "topic": selected["name"],
+                "message_type": selected["type"],
+                "frame_id": selected["frame_id"],
+                "clock_offset_pending": True,
+                "clock_offset_ms": selected["clock_offset_ms"],
+                "reason": (
+                    "A live ROS 2 PointCloud2 stream was detected, but its clock is ahead of the host. "
+                    "The provider must confirm a stable offset before sensor distances are enabled."
+                ),
+            }
+    elif len(candidate_pointclouds) > 1:
         connection = {
             "method": "ambiguous",
             "ready": False,
             "driver_required": False,
-            "reason": "Multiple fresh LiDAR PointCloud2 streams were detected; select the intended source explicitly.",
+            "reason": "Multiple fresh or clock-offset LiDAR PointCloud2 streams were detected; select the intended source explicitly.",
         }
     elif saved_pointcloud and saved_sensor_frame:
         connection = {
