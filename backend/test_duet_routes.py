@@ -39,6 +39,72 @@ class DuetRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_duet_legacy_handoff_requires_teacher_operator_confirmation(self):
+        forbidden = self.client.post(
+            "/api/duet/handoff-to-legacy",
+            headers=self.student,
+            json={"operator_confirmed_passive": True},
+        )
+        self.assertEqual(forbidden.status_code, 403)
+
+        with patch.object(server, "stop_duet_controller_service") as stop_service:
+            unconfirmed = self.client.post(
+                "/api/duet/handoff-to-legacy",
+                headers=self.teacher,
+                json={"operator_confirmed_passive": False},
+            )
+
+        self.assertEqual(unconfirmed.status_code, 409)
+        self.assertIn("cannot verify physical stability or Passive state", unconfirmed.json()["detail"])
+        stop_service.assert_not_called()
+
+    def test_duet_legacy_handoff_stops_and_verifies_before_success(self):
+        with patch.object(server, "robot_status", return_value={"running": False}), \
+                patch.object(
+                    server,
+                    "duet_controller_status",
+                    return_value={"programActive": False, "motionActive": False},
+                ), patch.object(server, "active_navigation_operation", return_value=None), \
+                patch.object(server, "active_lidar_scan", return_value=None), \
+                patch.object(
+                    server,
+                    "stop_duet_controller_service",
+                    return_value={
+                        "controllerServiceActive": False,
+                        "motionOwner": "none",
+                        "motionActive": False,
+                    },
+                ) as stop_service:
+            response = self.client.post(
+                "/api/duet/handoff-to-legacy",
+                headers=self.teacher,
+                json={"operator_confirmed_passive": True},
+            )
+
+        self.assertEqual(response.status_code, 200, response.json())
+        self.assertEqual(response.json()["status"], "handoff_complete")
+        self.assertFalse(response.json()["controllerServiceActive"])
+        self.assertEqual(response.json()["motionOwner"], "none")
+        self.assertFalse(response.json()["physicalPassiveVerified"])
+        stop_service.assert_called_once_with()
+
+    def test_duet_legacy_handoff_refuses_while_duet_reports_motion(self):
+        with patch.object(server, "robot_status", return_value={"running": False}), \
+                patch.object(
+                    server,
+                    "duet_controller_status",
+                    return_value={"programActive": False, "motionActive": True},
+                ), patch.object(server, "stop_duet_controller_service") as stop_service:
+            response = self.client.post(
+                "/api/duet/handoff-to-legacy",
+                headers=self.teacher,
+                json={"operator_confirmed_passive": True},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("active program or motion", response.json()["detail"])
+        stop_service.assert_not_called()
+
     def test_safe_mode_setting_is_teacher_only_and_persists_per_teacher(self):
         default = self.client.get("/api/classroom/safe-mode", headers=self.teacher)
         student = self.client.get("/api/classroom/safe-mode", headers=self.student)

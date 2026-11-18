@@ -126,6 +126,78 @@ test('teacher robot connection opens from the top bar beside Settings', async ({
   await expect(page.getByRole('heading', { name: /Internal Simulator/ })).toHaveCount(0);
 });
 
+test('teacher confirms Passive before the app stops DUET and switches to legacy', async ({ page }) => {
+  const requests = [];
+  let handoffConfirmation = '';
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-duet-legacy-handoff-token',
+      user: { role: 'teacher', username: 'teacher-handoff' },
+    }));
+  });
+  page.on('dialog', async (dialog) => {
+    handoffConfirmation = dialog.message();
+    await dialog.accept();
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    requests.push(`${request.method()} ${path}`);
+    let body = {};
+    if (path === '/api/duet/status') {
+      body = {
+        connected: false,
+        ready: false,
+        controlLease: false,
+        motionOwner: 'none',
+        motionActive: false,
+        programActive: false,
+        controllerServiceActive: false,
+      };
+    } else if (path === '/api/duet/handoff-to-legacy') {
+      expect(request.postDataJSON()).toEqual({ operator_confirmed_passive: true });
+      body = {
+        status: 'handoff_complete',
+        controllerServiceActive: false,
+        motionOwner: 'none',
+        motionActive: false,
+        operatorConfirmedPassive: true,
+        physicalPassiveVerified: false,
+      };
+    } else if (path === '/api/robot/status') {
+      body = { sdkAvailable: false, running: false };
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  const controllerToggle = page.getByRole('checkbox', { name: 'Enable DUET version two' });
+  await controllerToggle.check();
+  await expect(controllerToggle).toBeChecked();
+  await controllerToggle.uncheck();
+
+  await expect(controllerToggle).not.toBeChecked();
+  expect(handoffConfirmation).toContain('press L2+B');
+  expect(handoffConfirmation).toContain('cannot verify the robot’s physical stability or Passive state');
+  expect(requests).toContain('POST /api/duet/handoff-to-legacy');
+  expect(requests).not.toContain('POST /api/duet/disconnect');
+  expect(requests).not.toContain('POST /api/duet/run');
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await page.getByRole('button', { name: 'Open robot connection' }).click();
+  await expect(page.getByRole('status').filter({
+    hasText: 'DUET service inactive and backend ownership released',
+  })).toContainText('Software did not verify physical stability or Passive');
+  await expect(page.getByRole('status').filter({
+    hasText: 'press Connect to initialize and probe the SDK',
+  })).toBeVisible();
+  await expect(page.getByTestId('teacher-robot-settings').getByRole('button', { name: 'Connect' })).toBeVisible();
+});
+
 test('simulation preview controls are in app Settings, not the G1 simulator', async ({ page }) => {
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;

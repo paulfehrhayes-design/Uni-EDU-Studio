@@ -257,6 +257,11 @@ class DuetCommissioningStepRequest(BaseModel):
 class ConnectRobotRequest(BaseModel):
     interface: Optional[str] = None
 
+
+class DuetLegacyHandoffRequest(BaseModel):
+    operator_confirmed_passive: bool
+
+
 class HFTextMotionRequest(BaseModel):
     prompt: str
 
@@ -1155,6 +1160,42 @@ def start_duet_controller_service() -> str:
             f"Inspect: journalctl --user -u {DUET_CONTROLLER_UNIT}"
         )
     return state
+
+
+def stop_duet_controller_service() -> dict:
+    state = duet_controller_service_state()
+    if state == "active":
+        stopped = _duet_systemctl("stop", DUET_CONTROLLER_UNIT)
+        if stopped.returncode != 0:
+            detail = (stopped.stderr or stopped.stdout).strip()
+            raise DuetControllerError(
+                f"Could not stop the DUET controller service: {detail or 'systemctl failed'}"
+            )
+    elif state not in {"inactive", "dead"}:
+        raise DuetControllerError(
+            f"DUET controller service is {state or 'in an unknown state'}; refusing the handoff."
+        )
+
+    state = duet_controller_service_state()
+    if state not in {"inactive", "dead"}:
+        raise DuetControllerError(
+            f"DUET controller service did not become inactive (state: {state or 'unknown'})."
+        )
+    status = duet_controller_status()
+    if (
+        status.get("motionOwner") != "none"
+        or status.get("programActive") is True
+        or status.get("motionActive") is not False
+    ):
+        raise DuetControllerError(
+            "The DUET service is inactive, but the backend cannot confirm released DUET ownership. "
+            "Do not connect or run legacy motion; have an onsite operator inspect the G1 host."
+        )
+    return {
+        "controllerServiceActive": False,
+        "motionOwner": "none",
+        "motionActive": False,
+    }
 
 
 def _validate_duet_handoff_build(controller_dir: Path) -> None:
@@ -4634,6 +4675,58 @@ def duet_disconnect(user: dict = Depends(auth_required)):
         return disconnect_duet_controller()
     except DuetControllerError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.post("/api/duet/handoff-to-legacy")
+def duet_handoff_to_legacy(
+    request: DuetLegacyHandoffRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if request.operator_confirmed_passive is not True:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Before switching, an onsite operator must verify the G1 is stable and press L2+B "
+                "to put DUET in Passive. The backend cannot verify physical stability or Passive state."
+            ),
+        )
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
+    try:
+        sdk_status = robot_status()
+        if sdk_status.get("running"):
+            raise HTTPException(status_code=409, detail="Stop the active legacy SDK program before switching controllers.")
+        duet_status = duet_controller_status()
+        if duet_status.get("programActive") is True or duet_status.get("motionActive") is True:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "DUET still reports an active program or motion. Stop it and have the onsite operator "
+                    "verify the robot is stable and in Passive before retrying."
+                ),
+            )
+        if active_navigation_operation():
+            raise HTTPException(status_code=409, detail="Stop and confirm the active navigation operation before switching controllers.")
+        scan = active_lidar_scan()
+        if scan:
+            raise HTTPException(
+                status_code=409,
+                detail=f"LiDAR scan {scan['job_id']} is active; stop it before switching controllers.",
+            )
+        try:
+            handoff = stop_duet_controller_service()
+        except DuetControllerError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {
+            "status": "handoff_complete",
+            **handoff,
+            "operatorConfirmedPassive": True,
+            "physicalPassiveVerified": False,
+        }
     finally:
         _MOTION_START_LOCK.release()
 

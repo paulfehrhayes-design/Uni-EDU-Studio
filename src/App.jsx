@@ -3067,22 +3067,56 @@ export default function App() {
   const handleControllerVersionChange = async (useDuetVersion) => {
     const nextVersion = useDuetVersion ? 'duet' : 'legacy';
     if (nextVersion === controllerVersion) return;
-    if (isRunning || isRobotConnecting || isDuetProgramActive) {
+    if (
+      isRunning || isRobotConnecting || isDuetProgramActive
+      || isDuetCommissioningBusy || isDuetCommissioningAborting || isPositionCaptureRecording
+    ) {
       alert('Wait for the current robot operation or connection attempt to finish before switching versions.');
       return;
     }
+    let duetHandoffCompleted = false;
     if (controllerVersion === 'duet' && nextVersion === 'legacy') {
+      const operatorConfirmed = window.confirm(
+        'DUET → Legacy SDK handoff\n\n'
+        + 'Before continuing, an onsite operator must stop any active motion, verify the G1 is stable, '
+        + 'and press L2+B on the handheld controller to put DUET in Passive. The app cannot verify '
+        + 'the robot’s physical stability or Passive state and will not command a mode change.\n\n'
+        + 'After you have personally confirmed those steps, choose OK. The app will stop the managed '
+        + 'DUET systemd user service and proceed only if the service is inactive and backend DUET '
+        + 'ownership is reported released. This does not start legacy motion; connect and run remain '
+        + 'separate teacher actions.',
+      );
+      if (!operatorConfirmed) return;
+
       setIsRobotConnecting(true);
+      setRobotConnectionStatus('Stopping the DUET service and checking backend ownership…');
       try {
-        const status = await duetRobotConnection.status();
-        if (status.motionOwner !== 'none' || status.controllerServiceActive !== false) {
-          throw new Error(
-            'The DUET controller service is active or its state cannot be verified. '
-            + 'The app will not stop it; do not switch to legacy until an onsite operator has stopped DUET '
-            + 'and backend status confirms the service is inactive and ownership is released.',
-          );
+        const handoff = await duetRobotConnection.handoffToLegacy();
+        if (
+          handoff.status !== 'handoff_complete'
+          || handoff.controllerServiceActive !== false
+          || handoff.motionOwner !== 'none'
+          || handoff.physicalPassiveVerified !== false
+        ) {
+          throw new Error('Backend did not confirm an inactive DUET service and released DUET ownership.');
         }
+        duetHandoffCompleted = true;
       } catch (error) {
+        try {
+          const status = await duetRobotConnection.status();
+          const connected = status.connected === true
+            && status.ready === true
+            && status.controlLease === true
+            && status.motionOwner === 'duet'
+            && status.controllerServiceActive === true;
+          const motionActive = status.motionActive === true || status.programActive === true;
+          setIsRobotConnected(connected);
+          duetProgramActiveRef.current = motionActive;
+          setIsDuetProgramActive(motionActive);
+          setIsRunning(motionActive);
+        } catch {
+          setIsRobotConnected(false);
+        }
         setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
         alert(`Cannot switch to legacy mode: ${error.message}`);
         return;
@@ -3116,6 +3150,15 @@ export default function App() {
       setRobotConnectionStatus(nextVersion === 'duet'
         ? 'DUET preview selected • teacher login required for physical connection.'
         : 'Legacy version selected.');
+      return;
+    }
+
+    if (duetHandoffCompleted) {
+      setIsRobotConnected(false);
+      setRobotConnectionStatus(
+        'DUET service inactive and backend ownership released. Software did not verify physical stability or Passive. '
+        + 'Legacy selected; press Connect to initialize and probe the SDK. No motion was started.',
+      );
       return;
     }
 
@@ -6371,9 +6414,9 @@ export default function App() {
               </div>
               <div className="flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-5 py-4">
                 <div>
-                  <p className="text-sm font-semibold text-gray-800">DUET version two preview</p>
+                  <p className="text-sm font-semibold text-gray-800">Controller application</p>
                   <p className="text-xs text-gray-600">
-                    Switches Blocks, IDE, simulation, and connection to the separate DUET path. Legacy programs stay unchanged. Teacher-only commissioning unlocks normal physical runs only after every bounded test is physically reviewed.
+                    Switches Blocks, IDE, simulation, and connection between DUET v2 and the legacy SDK. Legacy programs stay unchanged. Switching from DUET requires onsite confirmation that the stable robot is in Passive; the app then stops its managed DUET service and verifies backend ownership release. Software cannot verify physical stability or Passive. DUET physical runs still require teacher-only commissioning.
                   </p>
                 </div>
                 <input
@@ -6709,7 +6752,7 @@ export default function App() {
                   </div>
                   <p className="mt-2 text-[10px] text-slate-600">
                     {controllerVersion === 'duet'
-                      ? 'Connect acquires the DUET command lease without starting movement. Teacher-only commissioning is required before normal physical runs; the legacy SDK path is not used.'
+                      ? 'Connect acquires the DUET command lease without starting movement. Disconnect releases only that lease; to switch to legacy, use the Controller application setting and complete the onsite Passive confirmation. Teacher-only commissioning is required before normal DUET physical runs.'
                       : 'Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.'}
                   </p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>

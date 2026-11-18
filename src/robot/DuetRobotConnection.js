@@ -16,6 +16,13 @@ export class DuetRobotConnection {
     return this.request('/api/duet/disconnect', { method: 'POST' });
   }
 
+  async handoffToLegacy() {
+    return this.request('/api/duet/handoff-to-legacy', {
+      method: 'POST',
+      body: JSON.stringify({ operator_confirmed_passive: true }),
+    });
+  }
+
   async status() {
     return this.request('/api/duet/status', { cache: 'no-store' });
   }

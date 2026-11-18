@@ -192,6 +192,39 @@ class ServerClassroomTests(unittest.TestCase):
 
         systemctl.assert_not_called()
 
+    def test_duet_stop_service_verifies_inactive_state_and_released_ownership(self):
+        with patch.object(
+            server, "duet_controller_service_state", side_effect=["active", "inactive"]
+        ), patch.object(
+            server,
+            "_duet_systemctl",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as systemctl, patch.object(
+            server,
+            "duet_controller_status",
+            return_value={"motionOwner": "none", "motionActive": False, "programActive": False},
+        ):
+            result = server.stop_duet_controller_service()
+
+        self.assertEqual(result["controllerServiceActive"], False)
+        self.assertEqual(result["motionOwner"], "none")
+        systemctl.assert_called_once_with("stop", server.DUET_CONTROLLER_UNIT)
+
+    def test_duet_stop_service_fails_closed_when_ownership_is_not_released(self):
+        with patch.object(
+            server, "duet_controller_service_state", side_effect=["active", "inactive"]
+        ), patch.object(
+            server,
+            "_duet_systemctl",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ), patch.object(
+            server,
+            "duet_controller_status",
+            return_value={"motionOwner": "unknown", "motionActive": None, "programActive": False},
+        ):
+            with self.assertRaisesRegex(server.DuetControllerError, "cannot confirm released DUET ownership"):
+                server.stop_duet_controller_service()
+
     def test_sdk_motion_is_blocked_while_duet_handoff_service_is_active(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             home = server.Path(temp_dir)
