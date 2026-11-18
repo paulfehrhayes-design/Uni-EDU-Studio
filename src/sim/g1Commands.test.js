@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as Blockly from 'blockly';
 import { pythonGenerator } from 'blockly/python';
-import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './g1Commands.js';
+import recordedMotions from '../../g1-recorded-motions.json' with { type: 'json' };
+import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, LEGACY_ARM_ACTIONS_THAT_HOLD, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './g1Commands.js';
 import { compileMotionPrompt } from './textToMotion.js';
 import { buildG1SimulationFrames } from './g1Edu23Env.js';
 import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
@@ -18,6 +19,8 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     [
       ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
         .slice(0, 12).map((command) => command.blockType),
+      'g1_command_turn_left_110',
+      'g1_command_turn_right_110',
       'g1_command_turn_around_180',
       'g1_command_squat_to_stand',
       'g1_command_lie_to_stand',
@@ -30,8 +33,6 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
       'g1_command_arm_action_clap',
       'g1_command_arm_action_high_five',
       'g1_command_arm_action_hug',
-      'g1_command_arm_action_heart',
-      'g1_command_arm_action_right_heart',
       'g1_command_arm_action_reject',
       'g1_command_arm_action_right_hand_up',
       'g1_command_arm_action_x_ray',
@@ -48,8 +49,20 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   );
   assert.ok(blocks.every((block) => G1_EXECUTABLE_COMMANDS.some((command) => (
     command.blockType === block.type
+    || Boolean(block.fixedTurnDirection)
     || (command.method === 'arm_action' && block.armPreset && command.args[0].choices.some(([, preset]) => preset === block.armPreset))
   ))));
+  assert.deepEqual(
+    blocks.filter((block) => block.fixedTurnDirection).map((block) => [
+      block.message0,
+      block.codeTemplate,
+      block.args0,
+    ]),
+    [
+      ['Turn left (110°)', 'robot.turn("left", 110)\n', []],
+      ['Turn right (110°)', 'robot.turn("right", 110)\n', []],
+    ],
+  );
   assert.ok(G1_COMMANDS.some((command) => command.method === 'hold_arm'));
   assert.ok(!G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'hold_arm'));
   assert.ok(getG1BlocklyCommandBlocks(G1_COMMANDS).some((block) => block.type === 'g1_command_hold_arm'));
@@ -98,8 +111,10 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   assert.equal(G1_NOMINAL_STEP_METERS, 0.345);
   const armPreset = G1_COMMANDS.find((entry) => entry.method === 'arm_action');
   assert.equal(armPreset.physicalSupported, true);
-  assert.equal(armPreset.args[0].choices.length, 16);
-  assert.equal(blocks.filter((block) => block.armPreset).length, 16);
+  assert.equal(armPreset.args[0].choices.length, 14);
+  assert.equal(blocks.filter((block) => block.armPreset).length, 14);
+  assert.throws(() => parseG1Program('robot.arm_action("heart")'), /must be one of/);
+  assert.throws(() => parseG1Program('robot.arm_action("right heart")'), /must be one of/);
   assert.ok(!blocks.some((block) => block.type === armPreset.blockType));
   assert.equal(
     blocks.find((block) => block.armPreset === 'hands up').codeTemplate,
@@ -107,6 +122,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   );
   assert.ok(!blocks.some((block) => block.type === G1_COMMANDS.find((entry) => entry.method === 'simulate_arm_action').blockType));
   assert.match(armPreset.description, /Stop cannot cancel an arm preset/);
+  assert.match(armPreset.description, /recorded action runtime plus 20 seconds.*Release Arm/);
   assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'playstop').description, /placeholder app name, not a sound/);
   assert.equal(
     blocks.find((block) => block.type === 'g1_command_arm_action_hands_up').tooltip.startsWith('Raise both hands.'),
@@ -181,13 +197,14 @@ test('wait command is bounded, included in the IDE catalog, and previews its ful
   assert.equal(waitBlock.message0, 'Wait for %1 seconds');
   assert.deepEqual(
     [waitBlock.args0[0].value, waitBlock.args0[0].min, waitBlock.args0[0].max, waitBlock.args0[0].precision],
-    [1, 1, 10, 1],
+    [1, 1, 20, 1],
   );
   assert.throws(() => parseG1Program('robot.wait(0.1)'), /integer/);
   assert.equal(parseG1Program('robot.wait(1)')[0].values[0], 1);
   assert.equal(parseG1Program('robot.wait(2)')[0].code, 'robot.wait(2)');
   assert.equal(parseG1Program('robot.wait(2);')[0].code, 'robot.wait(2)');
-  assert.equal(parseG1Program('robot.wait(99)')[0].code, 'robot.wait(10)');
+  assert.equal(parseG1Program('robot.wait(20)')[0].values[0], 20);
+  assert.equal(parseG1Program('robot.wait(99)')[0].code, 'robot.wait(20)');
   assert.throws(() => parseG1Program('robot.wait(1.1)'), /integer/);
   const frames = buildG1SimulationFrames('robot.wait(2)');
   assert.ok(Math.abs(frames.at(-1).time - 2) < 1e-9);
@@ -508,22 +525,112 @@ test('simulation expands the same bounded IDE loop syntax', () => {
   assert.ok(Math.abs(finalFrame.x - 2 * G1_NOMINAL_STEP_METERS) < 1e-9);
 });
 
-test('legacy arm presets preview differentiated DUET pose sequences', () => {
-  const frames = buildG1SimulationFrames('robot.arm_action("hands up")');
-  const poseFrame = frames.find((frame) => Math.abs(frame.time - 0.8) < 0.001);
-  const finalFrame = frames.at(-1);
-  const catalog = getDuetArmCatalog();
-  const handsUp = getDuetArmPoseTarget('both_hands_up');
+test('legacy held gestures allow other actions but reject overlapping gestures', () => {
+  assert.throws(() => parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'robot.walk(2)\n'
+    + 'robot.arm_action("reject")',
+  ), /gesture is still active/);
+  assert.throws(() => parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'robot.arm_action("release arm")',
+  ), /cannot run during that 20-second hold/);
+  assert.doesNotThrow(() => parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
+    + 'robot.arm_action("reject")',
+  ));
+  assert.doesNotThrow(() => parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
+    + 'robot.arm_action("release arm")\n'
+    + 'robot.arm_action("reject")',
+  ));
+  assert.doesNotThrow(() => parseG1Program(
+    'robot.arm_action("clap")\n'
+    + 'robot.arm_action("hands up")',
+  ));
+  assert.throws(
+    () => parseG1Program(
+      'robot.hold_arm("hands up", 3)\n'
+      + 'robot.arm_action("reject")',
+    ),
+    /intentionally held/,
+  );
+  assert.throws(
+    () => parseG1Program(
+      'robot.hold_arm("hands up", 3)\n'
+      + 'if robot.front_distance_m() < 1:\n'
+      + '    robot.arm_action("release arm")\n'
+      + 'else:\n'
+      + '    robot.walk(1)\n'
+      + 'robot.arm_action("reject")',
+    ),
+    /intentionally held/,
+  );
+  const conflictPreview = buildG1SimulationFrames(
+    'robot.arm_action("hands up")\n'
+    + 'robot.arm_action("reject")',
+  );
+  assert.equal(conflictPreview[0].status, 'Invalid arm sequence');
+  assert.match(conflictPreview[0].actions[0].summary, /gesture is still active/);
+});
 
-  assert.ok(poseFrame, 'the first gesture target should be previewed');
-  assert.equal(finalFrame.actions.at(-1).label, 'Arm preset preview: hands up');
-  catalog.jointOrder.forEach((joint, index) => {
-    assert.ok(Math.abs(
-      Number(poseFrame.joints[joint]) - handsUp[index] * 180 / Math.PI,
-    ) < 0.01, `hands up should target catalog joint ${joint}`);
-    assert.ok(Math.abs(
-      Number(finalFrame.joints[joint]) - handsUp[index] * 180 / Math.PI,
-    ) < 0.01, `hands up should finish at catalog joint ${joint}`);
+test('legacy simulator runs non-gesture actions during the held-pose return delay', () => {
+  const frames = buildG1SimulationFrames(
+    'robot.arm_action("hands up")\n'
+    + 'robot.wait(2)',
+  );
+  const waitFrames = frames.filter((frame) => frame.actions.at(-1)?.label === 'Wait');
+  const releaseFrame = frames.find((frame) => frame.actions.at(-1)?.label === 'Release Arm');
+
+  assert.ok(waitFrames.length > 0, 'the wait should proceed while the arms remain held');
+  assert.ok(releaseFrame, 'the simulator should return the arms after the held-pose delay');
+  assert.ok(waitFrames[0].time < releaseFrame.time, 'the wait should start before the automatic arm return');
+});
+
+test('legacy arm presets replay measured trajectories and explicit release recordings', () => {
+  const frames = buildG1SimulationFrames('robot.arm_action("hands up")');
+  const pairedFrames = buildG1SimulationFrames(
+    'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
+    + 'robot.arm_action("release arm")',
+  );
+  const firstRecordedFrame = pairedFrames[1];
+  const heldPoseFrame = pairedFrames.find((frame) => frame.time >= 3.5);
+  const finalFrame = frames.at(-1);
+  const measuredMotionFrame = frames.find((frame) => (
+    frame.actions.at(-1)?.summary.includes('Measured legacy SDK motion')
+  ));
+  const recordedActionRuntime = recordedMotions.recordings.find((recording) => (
+    recording.command === 'robot.arm_action("hands up")'
+  )).frames.at(-1).time_s;
+  const pairedFinalFrame = pairedFrames.at(-1);
+  const catalog = getDuetArmCatalog();
+
+  assert.equal(finalFrame.actions.at(-1).label, 'Release Arm');
+  assert.match(measuredMotionFrame.actions.at(-1).summary, /46 samples/);
+  assert.ok(
+    finalFrame.time >= recordedActionRuntime + 20,
+    'a held legacy preset should remain posed for 20 seconds after its measured motion',
+  );
+  catalog.jointOrder.forEach((joint) => {
+    assert.equal(finalFrame.joints[joint], 0, `the gesture should finish with ${joint} down`);
+  });
+  assert.ok(heldPoseFrame, 'the paired capture should include the held pose');
+  assert.equal(pairedFinalFrame.actions.at(-1).label, 'Arm preset preview: release arm');
+  assert.ok(
+    pairedFinalFrame.time > recordedActionRuntime,
+    'the paired recording should preserve its measured release interval',
+  );
+  assert.ok(catalog.jointOrder.some((joint) => (
+    Math.abs(Number(heldPoseFrame.joints[joint]) - Number(firstRecordedFrame.joints[joint])) > 20
+  )), 'the paired recording should hold a raised pose before release');
+  catalog.jointOrder.forEach((joint) => {
+    assert.equal(pairedFinalFrame.joints[joint], 0, `the paired recording should return ${joint} to neutral`);
   });
 
   const presets = G1_COMMANDS.find((entry) => entry.method === 'arm_action').args[0].choices;
@@ -532,9 +639,33 @@ test('legacy arm presets preview differentiated DUET pose sequences', () => {
     assert.deepEqual(presetProgram.map(({ values }) => values[0]), [preset]);
 
     const presetFrames = buildG1SimulationFrames(`robot.arm_action(${JSON.stringify(preset)})`);
-    const presetPose = presetFrames
-      .find((frame) => Math.abs(frame.time - 0.8) < 0.001)?.joints;
+    const presetPose = presetFrames.find((frame) => frame.time > 0)?.joints;
     assert.ok(presetPose, `${preset} should preview its first pose`);
+    if (preset === 'release arm') {
+      assert.ok(presetFrames.at(-1).time > 0, 'release arm should retain its simulator transition');
+    } else {
+      assert.ok(
+        presetFrames.at(-1).actions.some(({ summary }) => /Measured legacy SDK motion/.test(summary)),
+        `${preset} should preview its measured legacy action`,
+      );
+      assert.ok(presetFrames.at(-1).time > 2, `${preset} should use the measured recording duration`);
+      if (LEGACY_ARM_ACTIONS_THAT_HOLD.has(preset)) {
+        const releaseFrameIndex = presetFrames.findIndex((frame) => (
+          frame.actions.at(-1)?.label === 'Release Arm'
+        ));
+        const actionRuntime = recordedMotions.recordings.find((recording) => (
+          recording.command === `robot.arm_action(${JSON.stringify(preset)})`
+        )).frames.at(-1).time_s;
+        assert.ok(releaseFrameIndex > 0, `${preset} should animate its return to the down pose`);
+        assert.ok(
+          presetFrames[releaseFrameIndex].time - actionRuntime >= 20,
+          `${preset} should stay in its final pose for 20 seconds after the recorded action`,
+        );
+        G1_MESH_ARM_JOINT_NAMES.forEach((joint) => {
+          assert.equal(presetFrames.at(-1).joints[joint], 0, `${preset} should end with ${joint} down`);
+        });
+      }
+    }
     presetFrames.forEach(({ joints }) => {
       assert.equal(Object.keys(joints).length, 23, `${preset} frame uses exactly 23 joint states`);
       G1_MESH_ARM_JOINT_NAMES.forEach((joint) => {
@@ -569,41 +700,45 @@ test('legacy raise and wave motions animate catalog shoulder, elbow, and wrist t
 });
 
 test('legacy face and high wave presets use the SDK right-arm side', () => {
-  const faceWaveFrame = buildG1SimulationFrames('robot.arm_action("face wave")')
-    .find((frame) => Math.abs(frame.joints.right_wrist_roll_joint) > 20);
-  const faceWave = faceWaveFrame?.joints;
-  const highWave = buildG1SimulationFrames('robot.arm_action("high wave")')
-    .find((frame) => Math.abs(frame.time - 0.8) < 0.001).joints;
-  const rightHighPose = getDuetArmPoseTarget('right_wave_high');
-  const armJointOrder = getDuetArmCatalog().jointOrder;
+  const faceWave = buildG1SimulationFrames('robot.arm_action("face wave")');
+  const highWave = buildG1SimulationFrames('robot.arm_action("high wave")');
+  const assertRightArmIsPrimary = (frames, action) => {
+    const initial = frames[1].joints;
+    const maxDelta = (joint) => Math.max(...frames.map((frame) => (
+      Math.abs(Number(frame.joints[joint]) - Number(initial[joint]))
+    )));
+    assert.ok(maxDelta('right_wrist_roll_joint') > maxDelta('left_wrist_roll_joint'), `${action} moves the right wrist farther`);
+    assert.ok(maxDelta('right_elbow_joint') > maxDelta('left_elbow_joint'), `${action} moves the right elbow farther`);
+  };
 
-  assert.ok(faceWave, 'face wave rotates the active right wrist-roll joint');
-  assert.ok(faceWave.right_shoulder_pitch_joint < 0, 'face wave raises the right arm');
-  assert.ok(faceWave.right_elbow_joint > 30, 'face wave bends the right elbow');
-  assert.equal(faceWave.left_wrist_roll_joint, 0, 'the inactive left wrist stays neutral');
-  armJointOrder.slice(5, 10).forEach((joint, index) => {
-    assert.ok(Math.abs(
-      Number(highWave[joint]) - rightHighPose[index + 5] * 180 / Math.PI,
-    ) < 0.01, `high wave targets right-side catalog joint ${joint}`);
-  });
+  assertRightArmIsPrimary(faceWave, 'face wave');
+  assertRightArmIsPrimary(highWave, 'high wave');
+  assert.equal(faceWave.at(-1).actions.at(-1).label, 'Face Wave Legacy');
+  assert.equal(highWave.at(-1).actions.at(-1).label, 'High Wave Legacy');
 });
 
 test('arm preset parsing preserves only explicitly requested releases', () => {
   const nodes = parseG1Program(
     'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
     + 'robot.arm_action("release arm")\n'
-    + 'robot.arm_action("right heart")',
+    + 'robot.arm_action("face wave")',
   );
-  assert.deepEqual(nodes.map(({ values }) => values[0]), [
-    'hands up',
-    'release arm',
-    'right heart',
-  ]);
+  const armActions = [];
+  const collect = (items) => items.forEach((item) => {
+    if (item.type === 'repeat') collect(Array(item.times).fill(item.body).flat());
+    else if (item.method === 'arm_action') armActions.push(item.values[0]);
+  });
+  collect(nodes);
+  assert.deepEqual(armActions, ['hands up', 'release arm', 'face wave']);
   assert.equal(
     formatG1Program(nodes),
     'robot.arm_action("hands up")\n'
+      + 'for _ in range(2):\n'
+      + '    robot.wait(10)\n'
       + 'robot.arm_action("release arm")\n'
-      + 'robot.arm_action("right heart")',
+      + 'robot.arm_action("face wave")',
   );
 });
 

@@ -122,6 +122,12 @@ body.harry-botter-preview #root {
 .blocklySvg {
   overflow: hidden !important; 
 }
+.blocklyZoom > image {
+  opacity: 0.9 !important;
+}
+.blocklyTrash > image {
+  opacity: 1;
+}
 /* 隐藏滚动条背景，只显示滑块 */
 .blocklyScrollbarBackground {
   fill-opacity: 0 !important;

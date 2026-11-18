@@ -36,6 +36,10 @@ inline std::optional<std::array<float, 3>> velocity_override()
     if (!shared.velocity_active || std::chrono::steady_clock::now() >= shared.velocity_deadline) {
         shared.velocity_active = false;
         shared.velocity = {0.0f, 0.0f, 0.0f};
+        // Acquiring the app lease does not commandeer the handheld controller.
+        // Fall back to the normal joystick mapping until a bounded remote MOVE
+        // is explicitly active.
+        return std::nullopt;
     }
     return shared.velocity;
 }

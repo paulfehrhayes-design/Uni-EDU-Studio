@@ -77,8 +77,6 @@ export const G1_ARM_PRESET_DESCRIPTIONS = Object.freeze({
   clap: 'Clap both hands together.',
   'high five': 'Raise the right hand for a high five.',
   hug: 'Open both arms for a hug.',
-  heart: 'Make a heart shape with both hands.',
-  'right heart': 'Make a heart gesture with the right hand.',
   reject: 'Raise the hand in a “no” gesture.',
   'right hand up': 'Raise the right hand.',
   'x-ray': 'Make the X-ray pose.',
@@ -113,7 +111,7 @@ const command = (method, label, category, description, args = []) => ({
 
 const steps = (value = 2) => integerArgument('STEPS', 'steps', value, 1, 20);
 const seconds = (value = 1) => numberArgument('SECONDS', 'seconds', value, 0.1, 10, 0.001);
-const wholeSeconds = (value = 1) => integerArgument('SECONDS', 'seconds', value, 1, 10);
+const wholeSeconds = (value = 1) => integerArgument('SECONDS', 'seconds', value, 1, 20);
 const degrees = (value = 90) => numberArgument('DEGREES', 'degrees', value, 0, 120);
 const direction = (value = 'left') => choiceArgument('DIRECTION', 'direction', [['Left', 'left'], ['Right', 'right']], value);
 const level = (value = 'mid') => choiceArgument('LEVEL', 'level', [['High', 'high'], ['Mid', 'mid'], ['Low', 'low']], value);
@@ -126,8 +124,6 @@ const ARM_PRESETS = [
   ['Clap (17)', 'clap'],
   ['High Five (18)', 'high five'],
   ['Hug (19)', 'hug'],
-  ['Heart (20)', 'heart'],
-  ['Right Heart (21)', 'right heart'],
   ['Reject (22)', 'reject'],
   ['Right Hand Up (23)', 'right hand up'],
   ['X-ray (24)', 'x-ray'],
@@ -170,7 +166,7 @@ const commandGroups = [
       'arm_action',
       'Run arm preset',
       'Gestures',
-      'Run the selected arm preset. Stop cannot cancel an arm preset; keep the area clear.',
+      'Run the selected arm preset. Presets that finish raised hold for their recorded action runtime plus 20 seconds, then request Release Arm. Locomotion may continue during the preset. Stop cannot cancel an arm preset after acceptance; keep the area clear.',
       [choiceArgument('ACTION', 'arm preset', ARM_PRESETS, 'hands up')],
     ),
     command(
@@ -334,6 +330,138 @@ function normalizeCommand(method, rawArgs) {
 
 const MIN_DISTANCE_METERS = 0.1;
 const MAX_DISTANCE_METERS = 40;
+export const LEGACY_ARM_ACTIONS_THAT_HOLD = new Set([
+  'hands up',
+  'high five',
+  'hug',
+  'reject',
+  'right hand up',
+  'shake hand',
+  'x-ray',
+]);
+
+const LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS = 20;
+
+function estimatedLegacyCommandDuration(node) {
+  if (node.type !== 'command') return 0;
+  const [first, second] = node.values;
+  if (node.method === 'wait') return first;
+  if (node.method.endsWith('time')) return first;
+  if (['walk', 'backward', 'slowwalk', 'fastwalk'].includes(node.method)) {
+    const speed = node.method.startsWith('slow') ? 0.2 : node.method.startsWith('fast') ? 0.8 : 0.4;
+    return first * 0.345 / speed;
+  }
+  if (node.method === 'sidestep') return second * 0.345 / 0.2;
+  if (node.method === 'turn') return (second * Math.PI / 180) / 0.6;
+  if (node.method === 'turn_around_180') return Math.PI / 0.6;
+  if (node.method === 'hold_arm') return Math.max(2, second);
+  if (node.method === 'arm_action') return 2;
+  return 0;
+}
+
+function uniqueArmFlowStates(states) {
+  return [...new Map(states.map((state) => [
+    `${state.explicitHold ?? ''}|${state.autoHoldRemaining.toFixed(3)}|${state.heldGesture ?? ''}`,
+    state,
+  ])).values()];
+}
+
+function advanceArmActionFlow(nodes, initialStates = [{ explicitHold: null, autoHoldRemaining: 0, heldGesture: null }]) {
+  let states = initialStates;
+  for (const node of nodes) {
+    if (node.type === 'repeat') {
+      for (let iteration = 0; iteration < node.times; iteration += 1) {
+        const result = advanceArmActionFlow(node.body, states);
+        if (result.conflict) return result;
+        states = result.states;
+      }
+      continue;
+    }
+    if (node.type === 'condition') {
+      const branches = typeof node.value === 'boolean'
+        ? [node.value ? node.then : node.else]
+        : [node.then, node.else];
+      const results = branches.map((branch) => advanceArmActionFlow(branch, states));
+      const conflict = results.find((result) => result.conflict)?.conflict;
+      if (conflict) return { states, conflict };
+      states = uniqueArmFlowStates(results.flatMap((result) => result.states));
+      continue;
+    }
+    const nextStates = [];
+    for (const state of states) {
+      if (node.type !== 'command' || !['arm_action', 'hold_arm'].includes(node.method)) {
+        const duration = estimatedLegacyCommandDuration(node);
+        nextStates.push({
+          ...state,
+          autoHoldRemaining: Math.max(0, state.autoHoldRemaining - duration),
+          heldGesture: state.autoHoldRemaining > duration ? state.heldGesture : null,
+        });
+        continue;
+      }
+      const preset = node.values[0];
+      if (node.method === 'arm_action' && preset === 'release arm') {
+        if (state.explicitHold) {
+          nextStates.push({ explicitHold: null, autoHoldRemaining: 0, heldGesture: null });
+          continue;
+        }
+        if (state.autoHoldRemaining > 0) {
+          return {
+            states,
+            conflict: {
+              previousAction: state.heldGesture,
+              nextAction: preset,
+              remaining: state.autoHoldRemaining,
+            },
+          };
+        }
+        nextStates.push({ explicitHold: null, autoHoldRemaining: 0, heldGesture: null });
+        continue;
+      }
+      if (state.explicitHold) {
+        return {
+          states,
+          conflict: { previousAction: state.explicitHold, nextAction: preset, explicit: true },
+        };
+      }
+      if (state.autoHoldRemaining > 0) {
+        return {
+          states,
+          conflict: {
+            previousAction: state.heldGesture,
+            nextAction: preset,
+            remaining: state.autoHoldRemaining,
+          },
+        };
+      }
+      if (node.method === 'hold_arm') {
+        nextStates.push({ explicitHold: preset, autoHoldRemaining: 0, heldGesture: null });
+      } else if (LEGACY_ARM_ACTIONS_THAT_HOLD.has(preset)) {
+        nextStates.push({
+          explicitHold: null,
+          autoHoldRemaining: LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS,
+          heldGesture: preset,
+        });
+      } else {
+        nextStates.push({ explicitHold: null, autoHoldRemaining: 0, heldGesture: null });
+      }
+    }
+    states = uniqueArmFlowStates(nextStates);
+  }
+  return { states, conflict: null };
+}
+
+function validateLegacyArmActionFlow(nodes) {
+  const { conflict } = advanceArmActionFlow(nodes);
+  if (!conflict) return;
+  if (!conflict.explicit) {
+    throw new Error(
+      `Cannot submit or run this Legacy sequence: the ${conflict.previousAction} gesture is still active for about ${conflict.remaining.toFixed(1)} more seconds. The arm action "${conflict.nextAction}" cannot run during that 20-second hold. Add a wait until the gesture returns to its default position, or move "${conflict.nextAction}" after it.`,
+    );
+  }
+  throw new Error(
+    `Cannot submit or run this Legacy sequence: the ${conflict.previousAction} pose is intentionally held. The arm action "${conflict.nextAction}" cannot run until robot.arm_action("release arm") is used to release the pose.`,
+  );
+}
 
 function nextProgramLine(lines, index) {
   while (index < lines.length && (!lines[index].text || lines[index].text.startsWith('#'))) index += 1;
@@ -475,6 +603,7 @@ export function parseG1Program(code = '') {
   if (commandCount(normalized) > 400) {
     throw new Error('Programs may contain at most 400 expanded commands per execution path.');
   }
+  validateLegacyArmActionFlow(normalized);
   return normalized;
 }
 
@@ -542,6 +671,25 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
         codeTemplate: `robot.arm_action(${JSON.stringify(preset)})\n`,
         armPreset: preset,
       }))
+      : definition.method === 'turn'
+        ? [
+          {
+            ...definition,
+            type: definition.blockType,
+            message: definition.blockMessage,
+          },
+          ...[
+            ['left', 'Turn left (110°)'],
+            ['right', 'Turn right (110°)'],
+          ].map(([fixedTurnDirection, message]) => ({
+            ...definition,
+            type: `g1_command_turn_${fixedTurnDirection}_110`,
+            message,
+            args: [],
+            codeTemplate: `robot.turn("${fixedTurnDirection}", 110)\n`,
+            fixedTurnDirection,
+          })),
+        ]
       : [{
         ...definition,
         type: definition.blockType,
@@ -552,6 +700,7 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
       type: variant.type,
       category: definition.category,
       armPreset: variant.armPreset,
+      fixedTurnDirection: variant.fixedTurnDirection,
       message0: variant.message,
       args0: variant.args.map((argument) => ['number', 'integer'].includes(argument.kind)
         ? { type: 'field_number', name: argument.name, value: argument.value, min: argument.min, max: argument.max, precision: argument.step }

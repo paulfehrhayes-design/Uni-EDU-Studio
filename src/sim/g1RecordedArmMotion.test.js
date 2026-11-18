@@ -55,6 +55,38 @@ test('recorded legacy samples map all 23 named joint positions into simulator fr
   });
 });
 
+test('DUET position captures preview all 23 joints and measured base travel', () => {
+  const jointNames = [...G1_MODEL_INFO.joints];
+  const pose = {
+    frame_id: 'odom',
+    base_frame: 'pelvis',
+    x: 2,
+    y: 3,
+    yaw_rad: Math.PI / 2,
+  };
+  const frames = buildG1RecordedMotionFrames({
+    name: 'Measured turn',
+    controller_version: 'duet',
+    capture_type: 'position_calibration',
+    joint_names: jointNames,
+    frames: [
+      { time: 0, joints: Array(23).fill(0), pose },
+      {
+        time: 300,
+        joints: Array.from({ length: 23 }, (_, index) => index / 100),
+        pose: { ...pose, x: 2, y: 4, yaw_rad: 0 },
+      },
+    ],
+  });
+
+  assert.equal(Object.keys(frames[1].joints).length, 23);
+  assert.ok(Math.abs(frames[1].x - 1) < 1e-12);
+  assert.ok(Math.abs(frames[1].y) < 1e-12);
+  assert.equal(frames[1].heading, -90);
+  assert.equal(frames[1].path.length, 2);
+  assert.equal(frames[1].time, 300);
+});
+
 test('recorded motion rejects unknown or duplicate joint names', () => {
   const base = [
     { time: 0, joints: Array(10).fill(0) },

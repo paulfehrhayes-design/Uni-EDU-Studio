@@ -10,6 +10,44 @@ import duet_robot
 
 
 class DuetProgramValidationTests(unittest.TestCase):
+    def test_duet_gateway_only_overrides_handheld_velocity_during_an_active_move(self):
+        header = Path(__file__).resolve().parent.parent / "vendor" / "DUET" / "deploy" / "include" / "duet_command_gateway.h"
+        source = header.read_text(encoding="utf-8")
+        override = source.split("inline std::optional<std::array<float, 3>> velocity_override()", 1)[1].split(
+            "inline std::optional<std::array<float, 10>> arm_target_override()", 1
+        )[0]
+        self.assertIn("Acquiring the app lease does not commandeer the handheld controller", override)
+        self.assertIn("if (!shared.velocity_active", override)
+        self.assertIn("return std::nullopt;", override)
+
+    def test_navigation_uses_only_the_existing_leased_move_and_stop_protocol(self):
+        moving = {
+            "ready": True,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "motion_active": True,
+            "capabilities": [],
+        }
+        stopped = {**moving, "motion_active": False}
+        with patch.object(duet_robot, "_run_lock") as run_lock, \
+                patch.object(duet_robot, "_require_hardware_acceptance") as acceptance, \
+                patch.object(duet_robot, "_gateway_request", return_value=moving) as gateway, \
+                patch.object(duet_robot, "_validate_controller_status", side_effect=lambda value: value):
+            run_lock.locked.return_value = False
+            result = duet_robot.navigation_move(0.1, -0.2)
+        self.assertEqual(result, {"status": "accepted", "lease_ms": duet_robot.COMMAND_LEASE_MS})
+        acceptance.assert_called_once_with()
+        gateway.assert_called_once_with("MOVE 0.100000 0 -0.200000 250")
+
+        with patch.object(duet_robot, "_gateway_request", return_value=stopped) as gateway, \
+                patch.object(duet_robot, "_validate_controller_status", side_effect=lambda value: value):
+            result = duet_robot.stop_navigation_motion()
+        self.assertEqual(result, {"status": "stopped", "zero_velocity_confirmed": True})
+        gateway.assert_called_once_with("STOP")
+
+        with self.assertRaisesRegex(duet_robot.DuetControllerError, "bounded"):
+            duet_robot.navigation_move(0.21, 0.0)
+
     def test_parser_accepts_bounded_front_and_rear_distance_conditions(self):
         for sensor, operator in (
             ("front", "<"),
@@ -69,6 +107,13 @@ class DuetProgramValidationTests(unittest.TestCase):
         self.assertEqual(len(commands), 3)
         self.assertEqual(commands[0]["type"], "move")
         self.assertEqual(commands[-1]["type"], "wait")
+
+    def test_wait_allows_up_to_twenty_seconds(self):
+        wait = duet_robot.parse_duet_program("duet.wait(20)")[0]
+        self.assertEqual(wait["type"], "wait")
+        self.assertEqual(wait["duration_s"], 20)
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "0.1 and 20 seconds"):
+            duet_robot.parse_duet_program("duet.wait(20.1)")
 
     def test_parser_accepts_negative_velocity_and_yaw_literals(self):
         command = duet_robot.parse_duet_program("duet.move(-0.1, 0, -0.2, 0.5)")[0]
@@ -190,6 +235,7 @@ class DuetProgramValidationTests(unittest.TestCase):
         gesture = duet_robot.parse_duet_program("duet.gesture_kiss_left(1)")[0]
         self.assertEqual(gesture["type"], "arm_trajectory")
         self.assertEqual(gesture["gesture"], "gesture_kiss_left")
+        self.assertTrue(gesture["return_to_carry"])
         self.assertEqual(len(gesture["arm_commands"]), 2)
 
         held = duet_robot.parse_duet_program(
@@ -234,6 +280,7 @@ class DuetProgramValidationTests(unittest.TestCase):
         left_wave = duet_robot.parse_duet_program('duet.wave_left("mid", 1.5)')
         right_wave = duet_robot.parse_duet_program('duet.wave_right("mid", 1.5)')
         self.assertEqual(left_wave[0]["type"], "arm_trajectory")
+        self.assertTrue(left_wave[0]["return_to_carry"])
         self.assertEqual(
             [command["pose"] for command in left_wave[0]["arm_commands"]],
             ["left_wave_mid", "left_wave_mid_out", "left_wave_mid", "left_wave_mid_out", "carry"],
@@ -293,9 +340,113 @@ class DuetProgramValidationTests(unittest.TestCase):
                 duet_robot.parse_duet_program(code)
         raise_both = duet_robot.parse_duet_program('duet.raise_both_arms("high", 1.5)')[0]
         self.assertEqual(raise_both["type"], "arm_trajectory")
+        self.assertTrue(raise_both["return_to_carry"])
         self.assertEqual(
             [command["pose"] for command in raise_both["arm_commands"]],
             ["both_raise_high", "carry"],
+        )
+
+    def test_other_commands_run_while_held_gesture_waits_to_return(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "arm_targets_active": False,
+            "external_arm_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop", "arm_targets"],
+        }
+        active_status = {**status, "arm_targets_active": True}
+        requests = []
+        wait_durations = []
+        gesture_start_times = []
+        reset_times = []
+        arm_is_active = {"value": False}
+        clock = {"now": 0.0}
+
+        def gateway_response(request):
+            requests.append(request)
+            if request == "STATUS":
+                return active_status if arm_is_active["value"] else status
+            if request == "RESET_ARMS":
+                arm_is_active["value"] = False
+                reset_times.append(clock["now"])
+                return status
+            if request.startswith("ARM_TARGETS "):
+                if not arm_is_active["value"]:
+                    gesture_start_times.append(clock["now"])
+                arm_is_active["value"] = True
+                return active_status
+            if request.startswith("MOVE "):
+                return {
+                    **active_status,
+                    "motion_active": request.split()[1:4] != ["0.000000", "0.000000", "0.000000"],
+                }
+            raise AssertionError(f"Unexpected gateway request: {request}")
+
+        def wait_and_advance(duration):
+            wait_durations.append(duration)
+            clock["now"] += duration
+            return False
+
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", side_effect=gateway_response
+        ), patch.object(
+            duet_robot.time, "monotonic", side_effect=lambda: clock["now"]
+        ), patch.object(
+            duet_robot._stop_requested, "wait", side_effect=wait_and_advance
+        ):
+            result = duet_robot.execute_program(
+                "duet.receive_and_hold(1)\n"
+                "duet.forward(0.2)"
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertGreaterEqual(reset_times[0] - gesture_start_times[0], 22.0)
+        move_index = next(index for index, request in enumerate(requests) if request.startswith("MOVE 0.120000"))
+        reset_index = requests.index("RESET_ARMS")
+        self.assertLess(move_index, reset_index)
+        self.assertTrue(wait_durations)
+
+    def test_overlapping_duet_gestures_are_rejected_before_execution(self):
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "Cannot submit or run this sequence"):
+            duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "duet.gesture_clap(1)"
+            )
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "arm movement"):
+            duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "duet.arm_carry(1)"
+            )
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "reset arms"):
+            duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "duet.reset_arms()"
+            )
+        self.assertEqual(
+            len(duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "for _ in range(7):\n"
+                "    duet.wait(3)\n"
+                "duet.gesture_clap(1)"
+            )),
+            9,
+        )
+        self.assertEqual(
+            len(duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "for _ in range(7):\n"
+                "    duet.wait(3)\n"
+                "duet.arm_carry(1)"
+            )),
+            9,
         )
 
     def test_stop_must_be_final_and_program_has_no_aggregate_duration_cap(self):

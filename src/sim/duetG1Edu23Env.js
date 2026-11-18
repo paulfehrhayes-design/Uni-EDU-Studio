@@ -12,8 +12,30 @@ const FRAME_RATE = 30;
 const RADIANS_TO_DEGREES = 180 / Math.PI;
 const ARM_POSE_CARRY = getDuetArmPoseTarget('carry');
 const ARM_JOINT_NAMES = getDuetArmCatalog().jointOrder;
+const AUTOMATIC_ARM_RETURNS = new WeakMap();
 
 function appendFrame(frames, state, joints, actions, timeline, elapsed, mode = 'duet-preview') {
+  const automaticReturn = AUTOMATIC_ARM_RETURNS.get(state);
+  if (automaticReturn && elapsed >= automaticReturn.deadline) {
+    if (!automaticReturn.started) {
+      const returnAction = {
+        label: 'DUET arm pose',
+        summary: 'Preview the carry preset after the gesture hold.',
+      };
+      actions.push(returnAction);
+      timeline.push(returnAction);
+      automaticReturn.started = true;
+    }
+    const progress = Math.min(1, (elapsed - automaticReturn.deadline) / 1);
+    const carryDegrees = ARM_POSE_CARRY.map((value) => value * RADIANS_TO_DEGREES);
+    ARM_JOINT_NAMES.forEach((name, index) => {
+      joints[name] = Number((
+        automaticReturn.starts[index]
+        + (carryDegrees[index] - automaticReturn.starts[index]) * progress
+      ).toFixed(2));
+    });
+    if (progress === 1) AUTOMATIC_ARM_RETURNS.delete(state);
+  }
   const snapshot = {
     ...state,
     path: [...state.path],
@@ -296,6 +318,13 @@ export function simulateDuetG1Edu23Program(code, { obstacles = G1_EDU_23_ENV.def
           elapsed,
         );
       });
+      if (definition.category === 'Arm gestures' && definition.armPoses.at(-1) !== 'carry') {
+        AUTOMATIC_ARM_RETURNS.set(state, {
+          deadline: elapsed.value + 20,
+          starts: ARM_JOINT_NAMES.map((name) => joints[name] || 0),
+          started: false,
+        });
+      }
     } else if (command.method === 'hold_pose' || command.method === 'hold_pose_until_reset') {
       const target = getDuetArmPoseTarget(command.poseName);
       simulateArmTarget(target, 1, command.poseName, frames, state, joints, actions, timeline, elapsed);
@@ -311,6 +340,7 @@ export function simulateDuetG1Edu23Program(code, { obstacles = G1_EDU_23_ENV.def
         heldPose.name = command.poseName;
       }
     } else if (command.method === 'reset_arms') {
+      AUTOMATIC_ARM_RETURNS.delete(state);
       simulateArmTarget(ARM_POSE_CARRY, 1, 'carry', frames, state, joints, actions, timeline, elapsed);
       heldPose.name = null;
     } else if (command.method === 'wait') {
@@ -336,6 +366,14 @@ export function simulateDuetG1Edu23Program(code, { obstacles = G1_EDU_23_ENV.def
   }
   if (heldPose.name && state.status !== 'Stopped') {
     simulateArmTarget(ARM_POSE_CARRY, 1, 'carry reset on program completion', frames, state, joints, actions, timeline, elapsed);
+  }
+  const automaticReturn = AUTOMATIC_ARM_RETURNS.get(state);
+  if (automaticReturn) {
+    const returnCompletion = automaticReturn.deadline + 1;
+    while (elapsed.value < returnCompletion) {
+      elapsed.value = Math.min(returnCompletion, elapsed.value + 1 / FRAME_RATE);
+      appendFrame(frames, state, joints, actions, timeline, elapsed.value);
+    }
   }
   state.status = state.status === 'Stopped' ? 'Stopped' : 'DUET preview complete';
   return frames;

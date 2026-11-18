@@ -14,11 +14,13 @@ installation. Set
 The HTTP listener binds to 127.0.0.1 by default. Set
 ``G1_NAV_GATEWAY_HOST``/``G1_NAV_GATEWAY_PORT`` only for a deliberately
 configured deployment; non-loopback HTTP should be protected by a trusted
-network and TLS reverse proxy. The gateway sends goals only to Nav2; it does
-not publish ``cmd_vel`` or call a G1 bridge/stop service. A full LiDAR scan
-uses Nav2's Spin action and its existing velocity path; it does not create a
-second command publisher. A cancel request
-remains pending until Nav2 reports a terminal action result.
+network and TLS reverse proxy. The gateway sends goals only to Nav2. When
+explicitly enabled by ``G1_NAV_CMD_VEL_BRIDGE_VERIFIED=1``, it subscribes to
+the configured Twist topic and forwards bounded commands to the authenticated
+app-backend motion endpoint for the matching active operation. It does not
+publish ``cmd_vel`` or use a second Unitree controller. A full LiDAR scan uses
+Nav2's Spin action and the same guarded velocity path. A cancel request remains
+pending until Nav2 reports a terminal action result.
 
 Configuration overrides are ``G1_NAV_ACTION_NAME`` (default
 ``/navigate_through_poses``), ``G1_NAV_PLAN_ACTION_NAME`` (default
@@ -63,6 +65,8 @@ import math
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -196,8 +200,12 @@ def validate_pointcloud_timestamp(
     return max(0.0, age_seconds)
 
 
-def controller_ownership_ready(owner: str, confirmed: bool) -> bool:
-    return owner == "nav2_via_single_unitree_bridge" and confirmed is True
+def controller_ownership_ready(owner: str, confirmed: bool, bridge_verified: bool = False) -> bool:
+    return owner in {
+        "nav2_via_legacy_sdk",
+        "nav2_via_duet_controller",
+        "nav2_via_active_backend_controller",
+    } and confirmed is True and bridge_verified is True
 
 
 def pointcloud_topics_for_runtime(
@@ -255,13 +263,18 @@ def _configuration() -> dict[str, Any]:
     ).strip()
     map_frame = os.getenv("G1_NAV_MAP_FRAME", "map").strip()
     base_frame = os.getenv("G1_NAV_BASE_FRAME", "base_link").strip()
+    cmd_vel_topic = os.getenv("G1_NAV_CMD_VEL_TOPIC", "/cmd_vel").strip()
+    motion_backend_url = os.getenv("G1_NAV_MOTION_BACKEND_URL", "http://127.0.0.1:5179").strip().rstrip("/")
     map_id = os.getenv("G1_NAV_MAP_ID", "nav2-map").strip()
     locomotion_owner = os.getenv("G1_NAV_LOCOMOTION_OWNER", "unverified").strip()
     if not all((
         action_name, spin_action_name, plan_action_name, map_topic,
-        *pointcloud_topics, local_costmap_topic, map_frame, base_frame, map_id, locomotion_owner,
+        *pointcloud_topics, local_costmap_topic, map_frame, base_frame, map_id,
+        locomotion_owner, cmd_vel_topic,
     )):
         raise GatewayConfigurationError("Action, map, frame, and map ID settings cannot be empty.")
+    if not cmd_vel_topic.startswith("/") or "//" in cmd_vel_topic:
+        raise GatewayConfigurationError("G1_NAV_CMD_VEL_TOPIC must be an absolute ROS topic name.")
     if (
         len(pointcloud_topics) > MAX_POINTCLOUD_TOPICS
         or len(set(pointcloud_topics)) != len(pointcloud_topics)
@@ -280,6 +293,30 @@ def _configuration() -> dict[str, Any]:
         raise GatewayConfigurationError("G1_NAV_OCCUPIED_THRESHOLD must be numeric.") from error
     if not math.isfinite(threshold) or not 1 <= threshold <= 100:
         raise GatewayConfigurationError("G1_NAV_OCCUPIED_THRESHOLD must be between 1 and 100.")
+    parsed_backend = urlsplit(motion_backend_url)
+    if (
+        not motion_backend_url
+        or parsed_backend.scheme not in {"http", "https"}
+        or not parsed_backend.hostname
+        or parsed_backend.username
+        or parsed_backend.password
+        or parsed_backend.query
+        or parsed_backend.fragment
+    ):
+        raise GatewayConfigurationError("G1_NAV_MOTION_BACKEND_URL must be a valid HTTP(S) URL.")
+    if parsed_backend.scheme == "http" and parsed_backend.hostname.lower() not in {
+        "localhost", "127.0.0.1", "::1",
+    }:
+        raise GatewayConfigurationError("Remote motion backends require HTTPS.")
+    cmd_vel_bridge_verified = os.getenv(
+        "G1_NAV_CMD_VEL_BRIDGE_VERIFIED", "0"
+    ).strip() == "1"
+    if cmd_vel_bridge_verified and len(token) < 24:
+        raise GatewayConfigurationError("Verified cmd_vel forwarding requires the shared 24-character bearer secret.")
+    if cmd_vel_bridge_verified and locomotion_owner != "nav2_via_active_backend_controller":
+        raise GatewayConfigurationError(
+            "Verified cmd_vel forwarding requires G1_NAV_LOCOMOTION_OWNER=nav2_via_active_backend_controller."
+        )
     return {
         "token": token,
         "host": host,
@@ -301,6 +338,8 @@ def _configuration() -> dict[str, Any]:
         ).strip() == "1",
         "map_frame": map_frame,
         "base_frame": base_frame,
+        "cmd_vel_topic": cmd_vel_topic,
+        "motion_backend_url": motion_backend_url,
         "robot_healthy_topic": os.getenv("G1_NAV_ROBOT_HEALTHY_TOPIC", "").strip(),
         "robot_health_max_age_seconds": _env_int("G1_NAV_ROBOT_HEALTH_MAX_AGE_MS", 1000, 100, 5000) / 1000,
         "estop_healthy_topic": os.getenv("G1_NAV_ESTOP_HEALTHY_TOPIC", "").strip(),
@@ -311,7 +350,18 @@ def _configuration() -> dict[str, Any]:
         "controller_ownership_confirmed": os.getenv(
             "G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED", "0"
         ).strip() == "1",
+        "cmd_vel_bridge_verified": cmd_vel_bridge_verified,
     }
+
+
+def validate_planar_cmd_vel(vx: Any, vy: Any, vz: Any, wx: Any, wy: Any, wz: Any) -> tuple[float, float]:
+    values = (vx, vy, vz, wx, wy, wz)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in values):
+        raise ValueError("Twist values must be finite numbers.")
+    vx, vy, vz, wx, wy, wz = map(float, values)
+    if abs(vx) > 0.20 or vy != 0.0 or vz != 0.0 or wx != 0.0 or wy != 0.0 or abs(wz) > 0.30:
+        raise ValueError("Only bounded forward/reverse and yaw velocities are supported.")
+    return vx, wz
 
 
 def _utc_now() -> str:
@@ -352,7 +402,7 @@ def _make_ros_node(config: dict[str, Any]):
     """Import ROS only on launch, allowing syntax inspection without ROS."""
     import rclpy
     from action_msgs.msg import GoalStatus
-    from geometry_msgs.msg import PoseStamped
+    from geometry_msgs.msg import PoseStamped, Twist
     from nav2_msgs.action import ComputePathThroughPoses, NavigateThroughPoses, Spin
     from nav_msgs.msg import OccupancyGrid
     from rclpy.action import ActionClient
@@ -398,6 +448,15 @@ def _make_ros_node(config: dict[str, Any]):
             }
             self.pointcloud_discovery_truncated = 0
             self.pointcloud_discovery_error: str | None = None
+            self._velocity_condition = threading.Condition()
+            self._velocity_pending: tuple[str, float, float] | None = None
+            self._velocity_stop_pending: tuple[str, bool, str] | None = None
+            self._velocity_operation_id: str | None = None
+            self._velocity_last_received = time.monotonic()
+            self._velocity_seen_command = False
+            self._velocity_stopped_operation: str | None = None
+            self._velocity_fault: tuple[str, str] | None = None
+            self._velocity_cancel_requested: set[str] = set()
             self.pointcloud_received_monotonic: float | None = None
             self.registered_obstacles: dict[
                 tuple[int, int, int], tuple[float, float, float, float, str]
@@ -438,8 +497,18 @@ def _make_ros_node(config: dict[str, Any]):
                 )
                 if config["robot_healthy_topic"] else None
             )
+            self.cmd_vel_subscription = self.create_subscription(
+                Twist, config["cmd_vel_topic"], self._cmd_vel_callback, 10
+            )
             self.scan_health_timer = self.create_timer(0.05, self._scan_health_tick)
             self.navigation_safety_timer = self.create_timer(0.1, self._navigation_safety_tick)
+            self.cmd_vel_watchdog_timer = self.create_timer(0.05, self._cmd_vel_watchdog_tick)
+            self._velocity_worker = threading.Thread(
+                target=self._cmd_vel_worker,
+                name="navigation-cmd-vel-forwarder",
+                daemon=True,
+            )
+            self._velocity_worker.start()
             self.pointcloud_discovery_timer = (
                 self.create_timer(2.0, self._discover_pointcloud_sources)
                 if config["auto_discover_pointcloud_topics"] else None
@@ -454,6 +523,185 @@ def _make_ros_node(config: dict[str, Any]):
                 lambda message, source_topic=topic: self._pointcloud_callback(message, source_topic),
                 10,
             )
+
+        def _activate_cmd_vel_operation(self, operation_id: str) -> None:
+            with self._velocity_condition:
+                self._velocity_operation_id = operation_id
+                self._velocity_last_received = time.monotonic()
+                self._velocity_seen_command = False
+                self._velocity_stopped_operation = None
+                self._velocity_fault = None
+                self._velocity_cancel_requested.discard(operation_id)
+                self._velocity_pending = None
+                self._velocity_condition.notify_all()
+
+        def _active_cmd_vel_operation(self) -> str | None:
+            with self.lock:
+                route_id = self.active_operation_id
+                route = self.operations.get(route_id) if route_id else None
+                if route and route.get("state") not in TERMINAL_STATES:
+                    return route_id
+                scan_id = self.active_scan_id
+                scan = self.scans.get(scan_id) if scan_id else None
+                if scan and scan.get("state") == "scanning":
+                    return scan_id
+            return None
+
+        def _cmd_vel_callback(self, message: Any) -> None:
+            if not self.config["cmd_vel_bridge_verified"]:
+                return
+            operation_id = self._active_cmd_vel_operation()
+            if operation_id is None:
+                return
+            with self._velocity_condition:
+                if self._velocity_operation_id != operation_id:
+                    self._activate_cmd_vel_operation(operation_id)
+                if self._velocity_stopped_operation == operation_id:
+                    return
+                self._velocity_last_received = time.monotonic()
+                self._velocity_seen_command = True
+                try:
+                    vx, yaw_rate = validate_planar_cmd_vel(
+                        message.linear.x,
+                        message.linear.y,
+                        message.linear.z,
+                        message.angular.x,
+                        message.angular.y,
+                        message.angular.z,
+                    )
+                except ValueError as error:
+                    self._velocity_fault = (operation_id, str(error))
+                    self._velocity_stop_pending = (operation_id, False, "invalid_cmd_vel")
+                    self._velocity_pending = None
+                else:
+                    self._velocity_pending = (operation_id, vx, yaw_rate)
+                self._velocity_condition.notify_all()
+
+        def _queue_cmd_vel_stop(self, operation_id: str, *, terminal: bool, reason: str) -> None:
+            if not self.config["cmd_vel_bridge_verified"]:
+                return
+            with self._velocity_condition:
+                self._velocity_pending = None
+                self._velocity_stop_pending = (operation_id, terminal, reason[:120])
+                self._velocity_condition.notify_all()
+
+        def _post_backend_motion(self, operation_id: str, suffix: str, payload: dict[str, Any]) -> dict[str, Any]:
+            url = (
+                f"{self.config['motion_backend_url']}/api/internal/navigation-motion/"
+                f"{operation_id}/{suffix}"
+            )
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {self.config['token']}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=0.35) as response:
+                    result = json.loads(response.read(16_384).decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError(f"Backend motion endpoint failed: {error}") from error
+            if not isinstance(result, dict):
+                raise RuntimeError("Backend motion endpoint returned an invalid response.")
+            if suffix == "velocity" and (
+                result.get("status") != "accepted" or result.get("operation_id") != operation_id
+            ):
+                raise RuntimeError("Backend did not accept the matching velocity lease.")
+            if suffix == "stop" and (
+                result.get("confirmed") is not True or result.get("operation_id") != operation_id
+            ):
+                raise RuntimeError("Backend did not confirm the matching controller stop.")
+            return result
+
+        def _cmd_vel_worker(self) -> None:
+            while True:
+                with self._velocity_condition:
+                    while self._velocity_stop_pending is None and self._velocity_pending is None:
+                        self._velocity_condition.wait()
+                    stop_request = self._velocity_stop_pending
+                    if stop_request is not None:
+                        self._velocity_stop_pending = None
+                        self._velocity_pending = None
+                    else:
+                        velocity = self._velocity_pending
+                        self._velocity_pending = None
+                        velocity = velocity
+                if stop_request is not None:
+                    operation_id, terminal, reason = stop_request
+                    try:
+                        self._post_backend_motion(
+                            operation_id,
+                            "stop",
+                            {"terminal": terminal, "reason": reason},
+                        )
+                    except Exception as error:
+                        self.get_logger().error(
+                            f"Controller stop for navigation operation {operation_id} was not confirmed: {error}"
+                        )
+                        with self._velocity_condition:
+                            self._velocity_fault = (operation_id, "backend stop was not confirmed")
+                    else:
+                        with self._velocity_condition:
+                            self._velocity_stopped_operation = operation_id
+                    continue
+                if velocity is None:
+                    continue
+                operation_id, vx, yaw_rate = velocity
+                try:
+                    self._post_backend_motion(
+                        operation_id,
+                        "velocity",
+                        {"vx": vx, "vy": 0.0, "vyaw": yaw_rate},
+                    )
+                except Exception as error:
+                    self.get_logger().error(
+                        f"Navigation velocity for operation {operation_id} was rejected: {error}"
+                    )
+                    with self._velocity_condition:
+                        self._velocity_fault = (operation_id, "backend rejected or lost velocity forwarding")
+                        self._velocity_stop_pending = (operation_id, False, "velocity_forward_error")
+                        self._velocity_pending = None
+                        self._velocity_condition.notify_all()
+
+        def _cmd_vel_watchdog_tick(self) -> None:
+            if not self.config["cmd_vel_bridge_verified"]:
+                return
+            operation_id = self._active_cmd_vel_operation()
+            if operation_id is None:
+                return
+            now = time.monotonic()
+            with self._velocity_condition:
+                if self._velocity_operation_id != operation_id:
+                    self._activate_cmd_vel_operation(operation_id)
+                timeout = 0.30 if self._velocity_seen_command else 1.0
+                stale = now - self._velocity_last_received > timeout
+                fault = self._velocity_fault
+                if stale and fault is None:
+                    self._velocity_fault = (operation_id, "cmd_vel topic became stale")
+                    fault = self._velocity_fault
+                    self._velocity_stop_pending = (operation_id, False, "stale_cmd_vel")
+                    self._velocity_pending = None
+                    self._velocity_condition.notify_all()
+            if fault and fault[0] == operation_id and operation_id not in self._velocity_cancel_requested:
+                self._velocity_cancel_requested.add(operation_id)
+                self.get_logger().error(
+                    f"{fault[1]}; requesting Nav2 cancellation for {operation_id}."
+                )
+                with self.lock:
+                    operation = self.operations.get(operation_id)
+                    scan = self.scans.get(operation_id)
+                if operation and operation["state"] not in TERMINAL_STATES:
+                    try:
+                        self.cancel_operation(operation_id)
+                    except GatewayHTTPError as error:
+                        self.get_logger().error(f"Nav2 cancellation is unconfirmed: {error}")
+                elif scan and scan["state"] == "scanning":
+                    self._abort_scan(operation_id, fault[1])
 
         def _discover_pointcloud_sources(self) -> None:
             try:
@@ -876,6 +1124,7 @@ def _make_ros_node(config: dict[str, Any]):
                 scan["updated_at"] = _utc_now()
 
         def _abort_scan(self, job_id: str, reason: str) -> None:
+            self._queue_cmd_vel_stop(job_id, terminal=False, reason="scan_cancel_requested")
             with self.lock:
                 scan = self.scans.get(job_id)
                 if not scan or scan["state"] != "scanning":
@@ -904,6 +1153,7 @@ def _make_ros_node(config: dict[str, Any]):
             try:
                 handle = future.result()
             except Exception as error:
+                self._queue_cmd_vel_stop(job_id, terminal=False, reason="scan_goal_unknown")
                 with self.lock:
                     scan = self.scans.get(job_id)
                     if scan and scan["state"] == "scanning":
@@ -951,6 +1201,7 @@ def _make_ros_node(config: dict[str, Any]):
                 message = "Nav2 has not acknowledged cancellation."
             if accepted:
                 return
+            self._queue_cmd_vel_stop(job_id, terminal=False, reason="scan_cancel_unconfirmed")
             with self.lock:
                 scan = self.scans.get(job_id)
                 if scan and scan["state"] == "scanning":
@@ -968,6 +1219,7 @@ def _make_ros_node(config: dict[str, Any]):
                 error_code = int(result.error_code)
                 error_message = str(getattr(result, "error_msg", "") or "")
             except Exception as error:
+                self._queue_cmd_vel_stop(job_id, terminal=False, reason="scan_result_unknown")
                 with self.lock:
                     scan = self.scans.get(job_id)
                     if scan and scan["state"] == "scanning":
@@ -1015,6 +1267,7 @@ def _make_ros_node(config: dict[str, Any]):
             scan["completed_at"] = scan["updated_at"]
             if self.active_scan_id == scan["job_id"]:
                 self.active_scan_id = None
+            self._queue_cmd_vel_stop(scan["job_id"], terminal=True, reason="scan_terminal")
 
         @staticmethod
         def _public_scan(scan: dict[str, Any]) -> dict[str, Any]:
@@ -1043,11 +1296,18 @@ def _make_ros_node(config: dict[str, Any]):
                 ],
             }
 
-        def start_scan(self) -> dict[str, Any]:
+        def start_scan(self, request: Any) -> dict[str, Any]:
+            if not isinstance(request, dict):
+                raise GatewayHTTPError(400, "Scan start request must be a JSON object.")
+            try:
+                requested_job_id = str(uuid.UUID(request.get("job_id")))
+            except (TypeError, ValueError, AttributeError) as error:
+                raise GatewayHTTPError(400, "job_id must be a UUID.") from error
             with self.lock:
                 if not controller_ownership_ready(
                     self.config["locomotion_owner"],
                     self.config["controller_ownership_confirmed"],
+                    self.config["cmd_vel_bridge_verified"],
                 ):
                     raise GatewayHTTPError(
                         503,
@@ -1104,7 +1364,7 @@ def _make_ros_node(config: dict[str, Any]):
                     active = self.scans.get(self.active_scan_id)
                     if active and active["state"] == "scanning":
                         raise GatewayHTTPError(409, "A LiDAR scan is already active.")
-                job_id = str(uuid.uuid4())
+                job_id = requested_job_id
                 now = _utc_now()
                 pose = localization["pose"]
                 self.scans[job_id] = {
@@ -1122,6 +1382,7 @@ def _make_ros_node(config: dict[str, Any]):
                     "_goal_handle": None,
                 }
                 self.active_scan_id = job_id
+                self._activate_cmd_vel_operation(job_id)
                 scan = self.scans[job_id]
                 goal = self._spin_action.Goal()
                 goal.target_yaw = SCAN_ROTATION_RADIANS
@@ -1488,6 +1749,7 @@ def _make_ros_node(config: dict[str, Any]):
             ownership_ready = controller_ownership_ready(
                 self.config["locomotion_owner"],
                 self.config["controller_ownership_confirmed"],
+                self.config["cmd_vel_bridge_verified"],
             )
             motion_ready = bool(ready and motion_health["ready"] and ownership_ready)
             map_metadata = self._metadata(grid) if grid else None
@@ -1519,6 +1781,7 @@ def _make_ros_node(config: dict[str, Any]):
                         "pointcloud_sources": self.config["pointcloud_topics"],
                         "map": self.config["map_topic"],
                         "local_costmap": self.config["local_costmap_topic"],
+                        "cmd_vel": self.config["cmd_vel_topic"],
                     },
                     "frames": {
                         "pointcloud": ", ".join(sorted({
@@ -1559,6 +1822,7 @@ def _make_ros_node(config: dict[str, Any]):
                     "controller": {
                         "owner": self.config["locomotion_owner"],
                         "ownership_confirmed": self.config["controller_ownership_confirmed"],
+                        "cmd_vel_bridge_verified": self.config["cmd_vel_bridge_verified"],
                         "ready": ownership_ready,
                     },
                 },
@@ -1855,6 +2119,7 @@ def _make_ros_node(config: dict[str, Any]):
                 if not controller_ownership_ready(
                     self.config["locomotion_owner"],
                     self.config["controller_ownership_confirmed"],
+                    self.config["cmd_vel_bridge_verified"],
                 ):
                     raise GatewayHTTPError(
                         503,
@@ -1892,6 +2157,7 @@ def _make_ros_node(config: dict[str, Any]):
                 }
                 self.operations[operation_id] = operation
                 self.active_operation_id = operation_id
+                self._activate_cmd_vel_operation(operation_id)
                 self._prune_operations()
                 goal_message = self._navigate_action.Goal()
                 for x, y, yaw in valid_goals:
@@ -1991,6 +2257,7 @@ def _make_ros_node(config: dict[str, Any]):
                 self._request_nav2_cancel(operation_id, handle)
 
         def _request_nav2_cancel(self, operation_id: str, handle: Any) -> None:
+            self._queue_cmd_vel_stop(operation_id, terminal=False, reason="route_cancel_requested")
             try:
                 future = handle.cancel_goal_async()
                 future.add_done_callback(
@@ -2044,6 +2311,7 @@ def _make_ros_node(config: dict[str, Any]):
 
         def _mark_uncertain(self, operation_id: str, state: str, message: str) -> None:
             # Keep the active slot reserved until a terminal Nav2 result is known.
+            self._queue_cmd_vel_stop(operation_id, terminal=False, reason="route_result_unknown")
             with self.lock:
                 operation = self.operations.get(operation_id)
                 if operation is None or operation["state"] in TERMINAL_STATES:
@@ -2064,6 +2332,7 @@ def _make_ros_node(config: dict[str, Any]):
                 operation["_goal_handle"] = None
                 if self.active_operation_id == operation_id:
                     self.active_operation_id = None
+            self._queue_cmd_vel_stop(operation_id, terminal=True, reason="route_terminal")
 
         def operation_snapshot(self, operation_id: str) -> dict[str, Any]:
             with self.lock:
@@ -2177,8 +2446,7 @@ def _make_handler(node: Any, token: str):
                 elif self.command == "GET" and path == "/api/v1/map":
                     self._json(200, node.map_snapshot())
                 elif self.command == "POST" and path == "/api/v1/scans/start":
-                    self._body_optional()
-                    self._json(202, node.start_scan())
+                    self._json(202, node.start_scan(self._body()))
                 elif self.command == "POST" and path == "/api/v1/navigation/goal":
                     operation = node.submit_route(self._body())
                     self._json(202, operation)

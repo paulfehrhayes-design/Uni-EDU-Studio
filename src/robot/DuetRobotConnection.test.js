@@ -52,18 +52,24 @@ test('DUET connection stores and deletes measured motion recordings', async () =
     ],
   };
 
+  await connection.pose();
+  await connection.jointState();
   await connection.recordings();
   await connection.saveRecording(recording);
   await connection.deleteRecording('capture-1');
 
   assert.deepEqual(requests.map(([url]) => url), [
+    '/api/robot/pose',
+    '/api/robot/joint-state',
     '/api/robot/recordings',
     '/api/robot/recordings',
     '/api/robot/recordings/capture-1',
   ]);
   assert.deepEqual(requests[0][1], { cache: 'no-store' });
-  assert.deepEqual(JSON.parse(requests[1][1].body), recording);
-  assert.deepEqual(requests[2][1], { method: 'DELETE' });
+  assert.deepEqual(requests[1][1], { cache: 'no-store' });
+  assert.deepEqual(requests[2][1], { cache: 'no-store' });
+  assert.deepEqual(JSON.parse(requests[3][1].body), recording);
+  assert.deepEqual(requests[4][1], { method: 'DELETE' });
 });
 
 test('DUET commissioning exposes isolated evidence and review endpoints', async () => {

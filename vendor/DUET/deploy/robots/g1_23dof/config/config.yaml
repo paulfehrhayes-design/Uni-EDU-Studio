@@ -16,13 +16,13 @@ FSM:
 
   Handoff:
     transitions:
-      FixStand: "(LT + up.on_pressed) | F1.on_pressed"
+      FixStand: "(LT + A.on_pressed) | F1.on_pressed"
       # Same deliberate on-robot handoff as Passive; no command is published before it.
 
   Passive:
     transitions: 
-      FixStand: "(LT + up.on_pressed) | F1.on_pressed"
-      # F1 = keyboard.py key "1"; LT+up = gamepad L2+Up
+      FixStand: "(LT + A.on_pressed) | F1.on_pressed"
+      # F1 = keyboard.py key "1"; LT+A matches the reported legacy-handheld FixStand control.
     mode: [
       1,1,1,1,1,1,
       1,1,1,1,1,1,
@@ -41,8 +41,9 @@ FSM:
     transitions: 
       Passive: "(LT + B.on_pressed) | start.on_pressed"
       # start = keyboard.py Enter; LT+B = gamepad L2+B
-      # F2 = keyboard.py key "2"; RT+A = gamepad R2+A
-      Velocity: "(RT + A.on_pressed) | F2.on_pressed"
+      # L2+A enters FixStand from Handoff/Passive, then starts the policy from FixStand.
+      # F2 = keyboard.py key "2"; RT+A = gamepad R2+A.
+      Velocity: "(LT + A.on_pressed) | (RT + A.on_pressed) | F2.on_pressed"
     kp: [
       100., 100., 100., 150., 40., 40.,
       100., 100., 100., 150., 40., 40.,
@@ -87,7 +88,7 @@ FSM:
       # 3 s (see ts/qs above), then holds a fixed stance under PD for lifting.
       # Press 1 only when intentionally entering fixed stance; press 2 to return
       # to the policy afterwards.
-      FixStand: "(LT + up.on_pressed) | F1.on_pressed"
+      FixStand: "(LT + A.on_pressed) | F1.on_pressed"
     policy_dir: config/policy/velocity
 
 

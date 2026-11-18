@@ -12,8 +12,11 @@ try:
     from .ros_lidar_provider import (
         SampleCache,
         JointStateCache,
+        PoseCaptureCache,
         PointCloudClockNormalizer,
+        PoseClockNormalizer,
         compose_transforms,
+        merge_odometry_pose_snapshots,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -29,8 +32,11 @@ except ImportError:
     from ros_lidar_provider import (
         SampleCache,
         JointStateCache,
+        PoseCaptureCache,
         PointCloudClockNormalizer,
+        PoseClockNormalizer,
         compose_transforms,
+        merge_odometry_pose_snapshots,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -244,6 +250,98 @@ class RosLidarProviderTests(unittest.TestCase):
         self.assertEqual(payload["joint_names"], names)
         self.assertEqual(payload["positions_rad"], [0.1] * 23)
 
+    def test_pose_capture_cache_prefers_fresh_odometry_and_marks_stale_frames_unavailable(self):
+        cache = PoseCaptureCache(["odom", "map"], "pelvis")
+        timestamp = datetime.now(timezone.utc)
+        cache.update("map", 1.0, 2.0, 0.1, 0.5, timestamp, 10.0)
+        cache.update("odom", 3.0, 4.0, 0.2, 1.0, timestamp, 20.0)
+
+        snapshot = cache.current_snapshot()
+
+        self.assertTrue(snapshot["ready"])
+        self.assertEqual(snapshot["preferred_frame"], "odom")
+        self.assertEqual(snapshot["poses"][0]["x"], 3.0)
+        self.assertEqual(snapshot["poses"][0]["base_frame"], "pelvis")
+        self.assertEqual(snapshot["poses"][0]["source"], "tf2")
+
+        stale_cache = PoseCaptureCache(["odom"], "pelvis")
+        with patch.object(ros_lidar_provider.time, "monotonic", side_effect=[10.0, 11.1]):
+            stale_cache.update("odom", 0.0, 0.0, 0.0, 0.0, timestamp, 0.0)
+            stale = stale_cache.current_snapshot()
+        self.assertFalse(stale["ready"])
+        self.assertIn("stale", stale["poses"][0]["error"])
+
+    def test_pose_snapshot_falls_back_to_direct_odometry_when_tf_is_missing(self):
+        timestamp = datetime.now(timezone.utc)
+        tf_cache = PoseCaptureCache(["odom", "map"], "pelvis")
+        tf_cache.mark_unavailable("odom", "TF pose unavailable.")
+        tf_cache.mark_unavailable("map", "TF pose unavailable.")
+        odometry_cache = PoseCaptureCache(["odom", "map"], "pelvis")
+        odometry_cache.update(
+            "odom",
+            1.25,
+            -0.5,
+            0.0,
+            0.2,
+            timestamp,
+            15.0,
+            base_frame="base",
+            source="odometry",
+        )
+        odometry_cache.mark_unavailable("map", "No map odometry.")
+
+        snapshot = merge_odometry_pose_snapshots(
+            tf_cache.current_snapshot(),
+            [odometry_cache.current_snapshot()],
+        )
+
+        self.assertTrue(snapshot["ready"])
+        self.assertEqual(snapshot["preferred_frame"], "odom")
+        self.assertEqual(snapshot["poses"][0]["source"], "odometry")
+        self.assertEqual(snapshot["poses"][0]["base_frame"], "base")
+        self.assertEqual(snapshot["poses"][0]["x"], 1.25)
+        self.assertFalse(snapshot["poses"][1]["ready"])
+
+    def test_pose_http_endpoint_requires_token_and_reports_timestamped_tf(self):
+        from threading import Thread
+
+        cache = PoseCaptureCache(["odom", "map"], "pelvis")
+        cache.update(
+            "odom",
+            0.4,
+            -0.2,
+            0.0,
+            1.25,
+            datetime.now(timezone.utc),
+            15.0,
+        )
+        cache.mark_unavailable("map", "No map-to-base transform.")
+        server = ros_lidar_provider.serve_http(
+            SampleCache("mid360-front", "pelvis"),
+            "127.0.0.1",
+            0,
+            "provider-secret",
+            pose_capture_cache=cache,
+        )
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/pose"
+        with self.assertRaises(HTTPError) as unauthorized:
+            urlopen(url, timeout=2)
+        self.assertEqual(unauthorized.exception.code, 401)
+        unauthorized.exception.close()
+
+        request = Request(url, headers={"Authorization": "Bearer provider-secret"})
+        with urlopen(request, timeout=2) as response:
+            payload = json.load(response)
+            self.assertEqual(response.headers["Cache-Control"], "no-store, max-age=0")
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["preferred_frame"], "odom")
+        self.assertEqual(payload["poses"][0]["yaw_rad"], 1.25)
+        self.assertEqual(payload["poses"][1]["error"], "No map-to-base transform.")
+
     def test_supplemental_pointcloud_configuration_is_explicit_and_model_safe(self):
         sources = ros_lidar_provider.parse_pointcloud_source_specs(
             "/mid360/livox/lidar",
@@ -337,6 +435,31 @@ class RosLidarProviderTests(unittest.TestCase):
                     round((raw_timestamp % 1) * 1_000_000_000),
                     now,
                 )
+
+    def test_pose_clock_normalizer_corrects_a_stable_future_tf_offset(self):
+        normalizer = PoseClockNormalizer()
+        now = 1_800_000_000.0
+
+        for sample_index in range(4):
+            current_time = now + sample_index * 0.02
+            raw_timestamp = current_time + 10.8
+            with self.assertRaisesRegex(ValueError, "stable TF-to-ROS clock offset"):
+                normalizer.normalize(
+                    int(raw_timestamp),
+                    round((raw_timestamp % 1) * 1_000_000_000),
+                    current_time,
+                )
+
+        current_time = now + 0.08
+        raw_timestamp = current_time + 10.8
+        corrected = normalizer.normalize(
+            int(raw_timestamp),
+            round((raw_timestamp % 1) * 1_000_000_000),
+            current_time,
+        )
+
+        self.assertAlmostEqual(normalizer.offset_seconds, 10.8, places=5)
+        self.assertAlmostEqual(corrected.timestamp(), current_time, places=5)
 
     def test_missing_live_tf_error_identifies_required_frames_and_safe_action(self):
         message = format_tf_calibration_error(

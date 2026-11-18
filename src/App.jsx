@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import * as Blockly from 'blockly/core';
 import { pythonGenerator } from 'blockly/python';
+import blocklySpritesUrl from './assets/blockly-sprites.svg?url';
 pythonGenerator.INDENT = '    ';
 import * as En from 'blockly/msg/en';
 import * as Zh from 'blockly/msg/zh-hans';
@@ -44,7 +45,7 @@ import { buildG1RecordedMotionFrames } from './sim/g1RecordedArmMotion.js';
 import { analyzeDuetVideo, captureDuetLiveMotion } from './sim/duetVisionMotion.js';
 import { createRobotConnection } from './robot/RobotConnection';
 import { DuetRobotConnection } from './robot/DuetRobotConnection.js';
-import TeacherArmMotionRecorder from './components/TeacherArmMotionRecorder.jsx';
+import TeacherPositionRecorder from './components/TeacherPositionRecorder.jsx';
 
 const blocklyRuntime = Object.assign({}, Blockly, { Python: pythonGenerator });
 window.Blockly = blocklyRuntime;
@@ -693,7 +694,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_turn_left',
     message0: 'Turn Left %1°',
-    args0: [{ type: 'field_number', name: 'ANGLE', value: 90, min: 1, max: 360 }],
+    args0: [{ type: 'field_number', name: 'ANGLE', value: 110, min: 1, max: 360 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -702,7 +703,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_turn_right',
     message0: 'Turn Right %1°',
-    args0: [{ type: 'field_number', name: 'ANGLE', value: 90, min: 1, max: 360 }],
+    args0: [{ type: 'field_number', name: 'ANGLE', value: 110, min: 1, max: 360 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -881,7 +882,7 @@ export default function App() {
   const [projectMenuPosition, setProjectMenuPosition] = useState(null);
   const [showConfigEditor, setShowConfigEditor] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
-  const [isArmMotionRecording, setIsArmMotionRecording] = useState(false);
+  const [isPositionCaptureRecording, setIsPositionCaptureRecording] = useState(false);
   const [recordedMotionPreview, setRecordedMotionPreview] = useState(null);
   const [isBlocklyLoaded, setIsBlocklyLoaded] = useState(false);
   
@@ -915,6 +916,10 @@ export default function App() {
   const [isSidebarSettingsLoading, setIsSidebarSettingsLoading] = useState(true);
   const [isSidebarSettingsSaving, setIsSidebarSettingsSaving] = useState(false);
   const [lockedSidebarPanelsError, setLockedSidebarPanelsError] = useState('');
+  const [hiddenCommandTypes, setHiddenCommandTypes] = useState([]);
+  const [isCommandVisibilityLoading, setIsCommandVisibilityLoading] = useState(true);
+  const [isCommandVisibilitySaving, setIsCommandVisibilitySaving] = useState(false);
+  const [commandVisibilityError, setCommandVisibilityError] = useState('');
   const [safeModeEnabled, setSafeModeEnabled] = useState(false);
   const [isSafeModeSettingsLoading, setIsSafeModeSettingsLoading] = useState(true);
   const [isSafeModeSettingsSaving, setIsSafeModeSettingsSaving] = useState(false);
@@ -1023,12 +1028,15 @@ export default function App() {
         category: example.category || 'Commands',
         script: example.code,
         description: example.label,
+        blockTypes: example.blockTypes || [example.blockType],
       }));
     }
     return legacyCommandsForCurrentUser.flatMap((command) => {
       if (command.method === 'arm_action') {
+        const presetBlockTypes = new Map(getG1BlocklyCommandBlocks([command]).map(({ armPreset, type }) => [armPreset, type]));
         return command.args[0].choices.map(([presetLabel, preset]) => ({
           key: `arm_action_${preset}`,
+          blockTypes: [presetBlockTypes.get(preset)],
           category: command.category,
           method: 'arm_action',
           script: `robot.arm_action(${JSON.stringify(preset)})`,
@@ -1045,6 +1053,7 @@ export default function App() {
           : String(argument.value));
       return [{
         key: command.method,
+        blockTypes: [command.blockType],
         category: command.category,
         method: command.method,
         script: `robot.${command.method}(${args.join(', ')})`,
@@ -1055,6 +1064,12 @@ export default function App() {
       }];
     });
   }, [controllerVersion, legacyCommandsForCurrentUser, savedDuetMotions]);
+  const visibleSharedMotions = sharedMotions.filter((motion) => (
+    motion.controller_version === controllerVersion
+    && !hiddenCommandTypes.includes(controllerVersion === 'duet'
+      ? 'duet_command_shared_motion'
+      : `g1_shared_motion_${motion.id}`)
+  ));
   const [savedDuetArmMotions, setSavedDuetArmMotions] = useState([]);
   const [duetArmMotionName, setDuetArmMotionName] = useState('');
   const [duetArmMotionError, setDuetArmMotionError] = useState('');
@@ -1284,7 +1299,7 @@ export default function App() {
   }, [apiFetch, duetArmMotionsKey, sceneObjectsKey, session?.token, session?.user?.username]);
 
   useEffect(() => {
-    if (currentUser.role !== 'teacher' || !session?.token) {
+    if (!session?.token) {
       setLockedSidebarPanels([]);
       setIsSidebarSettingsLoading(false);
       return undefined;
@@ -1295,9 +1310,9 @@ export default function App() {
       try {
         let settings = await apiFetch('/api/classroom/sidebar-settings');
         if (!Array.isArray(settings.locked_panels)) {
-          throw new Error('Teacher sidebar settings response is invalid.');
+          throw new Error('Classroom sidebar settings response is invalid.');
         }
-        if (!settings.configured) {
+        if (currentUser.role === 'teacher' && !settings.configured) {
           const legacyValue = localStorage.getItem(`edu-locked-sidebar-panels:${currentUser.username}`);
           const legacyPanels = legacyValue ? JSON.parse(legacyValue) : [];
           const validLegacyPanels = Array.isArray(legacyPanels)
@@ -1321,23 +1336,65 @@ export default function App() {
         });
         setLockedSidebarPanelsError('');
         setIsSidebarSettingsLoading(false);
-        try {
-          localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
-        } catch (error) {
-          console.warn('Unable to cache teacher sidebar settings locally.', error);
+        if (currentUser.role === 'teacher') {
+          try {
+            localStorage.setItem(`edu-locked-sidebar-panels:${currentUser.username}`, JSON.stringify(nextPanels));
+          } catch (error) {
+            console.warn('Unable to cache classroom sidebar settings locally.', error);
+          }
         }
       } catch (error) {
         if (!active) return;
-        console.error('Unable to load teacher sidebar settings.', error);
-        setLockedSidebarPanelsError(`Teacher sidebar settings could not be loaded: ${error.message}`);
+        console.error('Unable to load classroom sidebar settings.', error);
+        setLockedSidebarPanelsError(`Classroom sidebar settings could not be loaded: ${error.message}`);
         setIsSidebarSettingsLoading(false);
       }
     };
-    loadSidebarSettings();
+    void loadSidebarSettings();
+    const refreshInterval = currentUser.role === 'student'
+      ? window.setInterval(() => void loadSidebarSettings(), 5000)
+      : null;
     return () => {
       active = false;
+      if (refreshInterval !== null) window.clearInterval(refreshInterval);
     };
   }, [apiFetch, currentUser.role, currentUser.username, session?.token]);
+
+  useEffect(() => {
+    if (!session?.token) {
+      setHiddenCommandTypes([]);
+      setIsCommandVisibilityLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setIsCommandVisibilityLoading(true);
+    const loadCommandVisibility = async () => {
+      try {
+        const settings = await apiFetch('/api/classroom/command-visibility');
+        if (!Array.isArray(settings.hidden_command_types)
+          || settings.hidden_command_types.some((type) => typeof type !== 'string')) {
+          throw new Error('Classroom command visibility response is invalid.');
+        }
+        if (!active) return;
+        setHiddenCommandTypes([...new Set(settings.hidden_command_types)]);
+        setCommandVisibilityError('');
+      } catch (error) {
+        if (!active) return;
+        console.error('Unable to load classroom command visibility settings.', error);
+        setCommandVisibilityError(`Command visibility settings could not be loaded: ${error.message}`);
+      } finally {
+        if (active) setIsCommandVisibilityLoading(false);
+      }
+    };
+    void loadCommandVisibility();
+    const refreshInterval = currentUser.role === 'student'
+      ? window.setInterval(() => void loadCommandVisibility(), 5000)
+      : null;
+    return () => {
+      active = false;
+      if (refreshInterval !== null) window.clearInterval(refreshInterval);
+    };
+  }, [apiFetch, currentUser.role, session?.token]);
 
   useEffect(() => {
     if (currentUser.role !== 'teacher' || !session?.token) {
@@ -1470,10 +1527,37 @@ export default function App() {
       }
     } catch (error) {
       setLockedSidebarPanels(previousPanels);
-      console.error('Unable to save teacher sidebar settings.', error);
-      setLockedSidebarPanelsError(`Teacher sidebar settings could not be saved: ${error.message}`);
+      console.error('Unable to save classroom sidebar settings.', error);
+      setLockedSidebarPanelsError(`Classroom sidebar settings could not be saved: ${error.message}`);
     } finally {
       setIsSidebarSettingsSaving(false);
+    }
+  };
+
+  const handleCommandVisibilityChange = async (commandType, isVisible) => {
+    const previousTypes = hiddenCommandTypes;
+    const nextTypes = isVisible
+      ? previousTypes.filter((type) => type !== commandType)
+      : [...new Set([...previousTypes, commandType])];
+    setHiddenCommandTypes(nextTypes);
+    setIsCommandVisibilitySaving(true);
+    try {
+      const settings = await apiFetch('/api/classroom/command-visibility', {
+        method: 'PUT',
+        body: JSON.stringify({ hidden_command_types: nextTypes }),
+      });
+      if (!Array.isArray(settings.hidden_command_types)
+        || settings.hidden_command_types.some((type) => typeof type !== 'string')) {
+        throw new Error('Classroom command visibility response is invalid.');
+      }
+      setHiddenCommandTypes(settings.hidden_command_types);
+      setCommandVisibilityError('');
+    } catch (error) {
+      setHiddenCommandTypes(previousTypes);
+      console.error('Unable to save classroom command visibility settings.', error);
+      setCommandVisibilityError(`Command visibility settings could not be saved: ${error.message}`);
+    } finally {
+      setIsCommandVisibilitySaving(false);
     }
   };
 
@@ -2202,11 +2286,29 @@ export default function App() {
   };
 
   const handleApproveQueuedExecution = async () => {
-    if (!queueReviewItem || queueReviewItem.status !== 'queued') return;
+    if (isPositionCaptureRecording) {
+      setQueueReviewError('Finish the active position capture before starting another robot operation.');
+      return;
+    }
+    if (!queueReviewItem || !['queued', 'completed'].includes(queueReviewItem.status)) return;
     if (queueReviewItem.planner_request?.planner_mode === PLANNER_PATH_MODES.autonomous
       && !queueReviewNavigationPreview) {
       setQueueReviewError('Preview the autonomous route before approving movement.');
       return;
+    }
+    if (
+      queueReviewItem.controller_version === 'legacy'
+      && typeof queueReviewItem.code === 'string'
+      && queueReviewItem.code.trim()
+    ) {
+      try {
+        parseG1Program(queueReviewItem.code);
+      } catch (error) {
+        const message = `Execution was not started • ${error.message}`;
+        setQueueReviewError(message);
+        alert(message);
+        return;
+      }
     }
     setIsQueueReviewRunning(true);
     if (queueReviewItem.controller_version === 'duet') {
@@ -2472,6 +2574,10 @@ export default function App() {
   };
 
   const handleConnectRobot = async () => {
+    if (isPositionCaptureRecording) {
+      alert('Finish the active position capture before reconnecting or changing the robot connection.');
+      return;
+    }
     if (!session || session.user.role !== 'teacher') {
       alert('Teacher login is required to connect the robot.');
       return;
@@ -2545,6 +2651,10 @@ export default function App() {
   };
 
   const handleTestRobotMotion = async () => {
+    if (isPositionCaptureRecording) {
+      alert('Finish the active position capture before starting another robot motion.');
+      return;
+    }
     if (!isRobotConnected) {
       alert(`Connect the ${controllerVersion === 'duet' ? 'DUET controller' : 'G1 SDK'} before testing motion.`);
       return;
@@ -2585,6 +2695,10 @@ export default function App() {
   };
 
   const handleStartDuetCommissioning = async () => {
+    if (isPositionCaptureRecording) {
+      setRobotConnectionStatus('Finish the active position capture before starting DUET commissioning.');
+      return;
+    }
     if (!isRobotConnected || currentUser.role !== 'teacher') {
       setRobotConnectionStatus('Connect DUET and sign in as a teacher before commissioning.');
       return;
@@ -2612,6 +2726,10 @@ export default function App() {
   };
 
   const handleRunDuetCommissioningStep = async (retry = false) => {
+    if (isPositionCaptureRecording) {
+      setRobotConnectionStatus('Finish the active position capture before running a DUET commissioning step.');
+      return;
+    }
     const stepIndex = duetCommissioning?.current_step;
     const step = duetCommissioning?.steps?.[stepIndex];
     if (!step || !isRobotConnected || currentUser.role !== 'teacher') return;
@@ -2949,22 +3067,56 @@ export default function App() {
   const handleControllerVersionChange = async (useDuetVersion) => {
     const nextVersion = useDuetVersion ? 'duet' : 'legacy';
     if (nextVersion === controllerVersion) return;
-    if (isRunning || isRobotConnecting || isDuetProgramActive) {
+    if (
+      isRunning || isRobotConnecting || isDuetProgramActive
+      || isDuetCommissioningBusy || isDuetCommissioningAborting || isPositionCaptureRecording
+    ) {
       alert('Wait for the current robot operation or connection attempt to finish before switching versions.');
       return;
     }
+    let duetHandoffCompleted = false;
     if (controllerVersion === 'duet' && nextVersion === 'legacy') {
+      const operatorConfirmed = window.confirm(
+        'DUET → Legacy SDK handoff\n\n'
+        + 'Before continuing, an onsite operator must stop any active motion, verify the G1 is stable, '
+        + 'and press L2+B on the handheld controller to put DUET in Passive. The app cannot verify '
+        + 'the robot’s physical stability or Passive state and will not command a mode change.\n\n'
+        + 'After you have personally confirmed those steps, choose OK. The app will stop the managed '
+        + 'DUET systemd user service and proceed only if the service is inactive and backend DUET '
+        + 'ownership is reported released. This does not start legacy motion; connect and run remain '
+        + 'separate teacher actions.',
+      );
+      if (!operatorConfirmed) return;
+
       setIsRobotConnecting(true);
+      setRobotConnectionStatus('Stopping the DUET service and checking backend ownership…');
       try {
-        const status = await duetRobotConnection.status();
-        if (status.motionOwner !== 'none' || status.controllerServiceActive !== false) {
-          throw new Error(
-            'The DUET controller service is active or its state cannot be verified. '
-            + 'The app will not stop it; do not switch to legacy until an onsite operator has stopped DUET '
-            + 'and backend status confirms the service is inactive and ownership is released.',
-          );
+        const handoff = await duetRobotConnection.handoffToLegacy();
+        if (
+          handoff.status !== 'handoff_complete'
+          || handoff.controllerServiceActive !== false
+          || handoff.motionOwner !== 'none'
+          || handoff.physicalPassiveVerified !== false
+        ) {
+          throw new Error('Backend did not confirm an inactive DUET service and released DUET ownership.');
         }
+        duetHandoffCompleted = true;
       } catch (error) {
+        try {
+          const status = await duetRobotConnection.status();
+          const connected = status.connected === true
+            && status.ready === true
+            && status.controlLease === true
+            && status.motionOwner === 'duet'
+            && status.controllerServiceActive === true;
+          const motionActive = status.motionActive === true || status.programActive === true;
+          setIsRobotConnected(connected);
+          duetProgramActiveRef.current = motionActive;
+          setIsDuetProgramActive(motionActive);
+          setIsRunning(motionActive);
+        } catch {
+          setIsRobotConnected(false);
+        }
         setRobotConnectionStatus(`Cannot switch to legacy mode: ${error.message}`);
         alert(`Cannot switch to legacy mode: ${error.message}`);
         return;
@@ -2998,6 +3150,15 @@ export default function App() {
       setRobotConnectionStatus(nextVersion === 'duet'
         ? 'DUET preview selected • teacher login required for physical connection.'
         : 'Legacy version selected.');
+      return;
+    }
+
+    if (duetHandoffCompleted) {
+      setIsRobotConnected(false);
+      setRobotConnectionStatus(
+        'DUET service inactive and backend ownership released. Software did not verify physical stability or Passive. '
+        + 'Legacy selected; press Connect to initialize and probe the SDK. No motion was started.',
+      );
       return;
     }
 
@@ -3643,6 +3804,10 @@ export default function App() {
   };
 
   const handleStartNavigation = async () => {
+    if (isPositionCaptureRecording) {
+      setNavigationExecutionStatus('Finish the active position capture before starting Nav2.');
+      return;
+    }
     if (!session || session.user.role !== 'teacher') {
       setNavigationExecutionStatus('Teacher login is required to start navigation.');
       return;
@@ -3872,18 +4037,45 @@ export default function App() {
     [sharedMotions],
   );
 
+  const commandVisibilityGroups = useMemo(() => {
+    const groupDefinitions = (definitions) => {
+      const categories = new Map();
+      definitions.forEach((definition) => {
+        const category = definition.category || 'Commands';
+        if (!categories.has(category)) categories.set(category, []);
+        categories.get(category).push({
+          type: definition.type,
+          label: (definition.message0 || definition.message || definition.type).replace(/%\d+/g, '...'),
+        });
+      });
+      return [...categories.entries()].map(([category, commands]) => ({ category, commands }));
+    };
+    const legacyDefinitions = [
+      ...getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS),
+      ...getG1BlocklyConditionBlocks().map((definition) => ({ ...definition, category: 'Conditions' })),
+      ...legacySharedMotionBlocks,
+    ];
+    const duetDefinitions = getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions());
+    return [
+      { controller: 'Legacy', categories: groupDefinitions(legacyDefinitions) },
+      { controller: 'DUET', categories: groupDefinitions(duetDefinitions) },
+    ];
+  }, [getDuetSharedMotions, legacySharedMotionBlocks, savedDuetMotions]);
+
   const generateToolboxXML = useCallback((language) => {
     const cats = UI_TEXT[language].toolbox;
     const isDuetVersion = controllerVersion === 'duet';
     const commandBlocks = isDuetVersion
       ? getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions())
       : [...getG1BlocklyCommandBlocks(legacyCommandsForCurrentUser), ...legacySharedMotionBlocks];
+    const visibleCommandBlocks = commandBlocks.filter(({ type }) => !hiddenCommandTypes.includes(type));
     const categories = [...new Set(commandBlocks.map((definition) => definition.category))];
     const commandCategoriesXml = categories.map((category) => {
-      const blocks = commandBlocks
+      const blocks = visibleCommandBlocks
         .filter((block) => block.category === category)
         .map((block) => `<block type="${block.type}"></block>`)
         .join('');
+      if (!blocks) return '';
       const colour = category === 'Concurrent actions'
         ? 210
         : category === 'Gestures' || category === 'Arm gestures' || category === 'Arm poses'
@@ -3902,8 +4094,8 @@ export default function App() {
           <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
           <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
           <block type="logic_compare"></block>
-          <block type="duet_front_distance_m"></block>
-          <block type="duet_rear_distance_m"></block>
+          ${hiddenCommandTypes.includes('duet_front_distance_m') ? '' : '<block type="duet_front_distance_m"></block>'}
+          ${hiddenCommandTypes.includes('duet_rear_distance_m') ? '' : '<block type="duet_rear_distance_m"></block>'}
           <block type="math_number"><field name="NUM">1</field></block>
         </category>
       ` : `
@@ -3913,8 +4105,8 @@ export default function App() {
           <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
           <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
           <block type="logic_compare"></block>
-          <block type="g1_front_distance_m"></block>
-          <block type="g1_rear_distance_m"></block>
+          ${hiddenCommandTypes.includes('g1_front_distance_m') ? '' : '<block type="g1_front_distance_m"></block>'}
+          ${hiddenCommandTypes.includes('g1_rear_distance_m') ? '' : '<block type="g1_rear_distance_m"></block>'}
           <block type="math_number"><field name="NUM">1</field></block>
         </category>
       `}
@@ -3929,6 +4121,7 @@ export default function App() {
     getDuetSharedMotions,
     legacyCommandsForCurrentUser,
     legacySharedMotionBlocks,
+    hiddenCommandTypes,
     savedDuetMotions,
   ]);
 
@@ -4063,6 +4256,12 @@ export default function App() {
         zoom: { controls: true, wheel: true, startScale: 0.75, maxScale: 3, minScale: 0.3, scaleSpeed: 1.2 },
         trashcan: true,
       });
+      workspaceRef.current.getParentSvg()
+        .querySelectorAll('.blocklyZoom image, .blocklyTrash image')
+        .forEach((image) => {
+          image.setAttribute('href', blocklySpritesUrl);
+          image.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', blocklySpritesUrl);
+        });
 
       const scheduleResize = () => {
         requestAnimationFrame(() => {
@@ -4404,6 +4603,10 @@ export default function App() {
   };
 
   const handleRunCheckpointedPlanner = async () => {
+    if (isPositionCaptureRecording) {
+      setNavigationExecutionStatus('Finish the active position capture before starting another robot operation.');
+      return;
+    }
     if (session?.user?.role !== 'teacher') {
       setNavigationExecutionStatus('Teacher login is required to run checkpointed SDK paths.');
       return;
@@ -4467,6 +4670,10 @@ export default function App() {
   };
 
   const handleRunCode = async () => {
+    if (isPositionCaptureRecording && !isRunning) {
+      alert('Finish the active position capture before starting another robot program.');
+      return;
+    }
     if (isRunning) {
       try {
         const result = await activeRobotConnection.stop();
@@ -4560,6 +4767,15 @@ export default function App() {
   const activeObstacles = useMemo(() => sceneObjects, [sceneObjects]);
   const queueReviewSnapshot = queueReviewItem?.project_snapshot || {};
   const queueReviewPlannerRequest = queueReviewItem?.planner_request;
+  const isOtherRobotOperationActive = isRunning
+    || isRobotConnecting
+    || isDuetCommissioningBusy
+    || isDuetCommissioningAborting
+    || isNavigationStarting
+    || isQueueReviewRunning
+    || lidarScanJob?.status === 'scanning'
+    || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))
+    || Boolean(queueReviewNavigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(queueReviewNavigationOperation.status));
   const queueReviewWaypoints = queueReviewPlannerRequest?.planner_waypoints
     || queueReviewSnapshot.plannerWaypoints
     || [];
@@ -4642,6 +4858,14 @@ export default function App() {
       alert('Add some robot commands before starting the simulation preview.');
       return;
     }
+    if (!recordedMotionPreview && controllerVersion === 'legacy') {
+      try {
+        parseG1Program(generatedCode);
+      } catch (error) {
+        alert(`Simulation cannot run: ${error.message}`);
+        return;
+      }
+    }
     setPlaybackProgress((progress) => progress >= 1 ? 0 : progress);
     setIsPreviewPlaying(true);
     if (!recordedMotionPreview) previewPreviewState();
@@ -4660,6 +4884,14 @@ export default function App() {
     if (!generatedCode.trim()) {
       alert('Add code or blocks before running the simulation.');
       return;
+    }
+    if (controllerVersion === 'legacy') {
+      try {
+        parseG1Program(generatedCode);
+      } catch (error) {
+        alert(`Simulation cannot run: ${error.message}`);
+        return;
+      }
     }
     setRecordedMotionPreview(null);
     setPlaybackProgress(0);
@@ -4713,7 +4945,11 @@ export default function App() {
                 ? `g1_shared_motion_${node.values[0]}`
                 : node.method === 'arm_action'
                   ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
-                  : `g1_command_${node.method}`);
+                  : node.method === 'turn' && node.values[1] === 110
+                    ? getG1BlocklyCommandBlocks().find((definition) => (
+                      definition.fixedTurnDirection === node.values[0]
+                    ))?.type || `g1_command_${node.method}`
+                    : `g1_command_${node.method}`);
           }
           if (node.type === 'repeat') {
             const repeatCount = workspace.newBlock('math_number');
@@ -5758,10 +5994,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowAppSettings(false)}
-                disabled={isArmMotionRecording}
+                disabled={isPositionCaptureRecording}
                 className="rounded-md px-3 py-1.5 text-sm font-medium text-slate-600 hover:bg-slate-200"
               >
-                {isArmMotionRecording ? 'Recording…' : 'Close'}
+                {isPositionCaptureRecording ? 'Recording…' : 'Close'}
               </button>
             </div>
             <div className="space-y-3 overflow-y-auto p-5">
@@ -5847,11 +6083,12 @@ export default function App() {
               </fieldset>
               {currentUser.role === 'teacher' && (
                 <>
-              <TeacherArmMotionRecorder
+              <TeacherPositionRecorder
                 connection={activeRobotConnection}
                 controllerVersion={controllerVersion}
-                onBusyChange={setIsArmMotionRecording}
+                onBusyChange={setIsPositionCaptureRecording}
                 onPreview={previewRecordedArmMotion}
+                blockedByOtherMotion={isOtherRobotOperationActive}
               />
               {recordedMotionPreview && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-violet-200 bg-white px-3 py-2">
@@ -6183,16 +6420,16 @@ export default function App() {
               </div>
               <div className="flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-5 py-4">
                 <div>
-                  <p className="text-sm font-semibold text-gray-800">DUET version two preview</p>
+                  <p className="text-sm font-semibold text-gray-800">Controller application</p>
                   <p className="text-xs text-gray-600">
-                    Switches Blocks, IDE, simulation, and connection to the separate DUET path. Legacy programs stay unchanged. Teacher-only commissioning unlocks normal physical runs only after every bounded test is physically reviewed.
+                    Switches Blocks, IDE, simulation, and connection between DUET v2 and the legacy SDK. Legacy programs stay unchanged. Switching from DUET requires onsite confirmation that the stable robot is in Passive; the app then stops its managed DUET service and verifies backend ownership release. Software cannot verify physical stability or Passive. DUET physical runs still require teacher-only commissioning.
                   </p>
                 </div>
                 <input
                   type="checkbox"
                   aria-label="Enable DUET version two"
                   checked={controllerVersion === 'duet'}
-                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting || isArmMotionRecording}
+                  disabled={isRunning || isRobotConnecting || isDuetCommissioningBusy || isDuetCommissioningAborting || isPositionCaptureRecording}
                   onChange={(event) => handleControllerVersionChange(event.target.checked)}
                   className="h-5 w-5 shrink-0 accent-blue-700"
                 />
@@ -6226,6 +6463,43 @@ export default function App() {
                   Autonomous mode 3 and Return to Origin keep Nav2 as the fallback when the optional registered layer is unavailable.
                 </p>
                 {safeModeSettingsError && <p role="alert" className="mt-2 text-xs text-red-700">{safeModeSettingsError}</p>}
+              </fieldset>
+              <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
+                <legend className="text-sm font-semibold text-slate-800">Commands shown to students</legend>
+                <p className="mb-3 text-xs text-slate-500">
+                  Choose which commands appear in the Blocks toolbox and IDE command reference for everyone in this classroom.
+                </p>
+                <div className="space-y-2">
+                  {commandVisibilityGroups.map((group) => (
+                    <details key={group.controller} open={group.controller === 'Legacy'} className="rounded-lg border border-slate-200 bg-white p-3">
+                      <summary className="cursor-pointer text-sm font-semibold text-slate-700">{group.controller} commands</summary>
+                      <div className="mt-3 space-y-3">
+                        {group.categories.map(({ category, commands }) => (
+                          <fieldset key={`${group.controller}-${category}`} className="rounded-md border border-slate-100 bg-slate-50 p-2">
+                            <legend className="px-1 text-xs font-semibold text-slate-600">{category}</legend>
+                            <div className="grid gap-x-4 gap-y-2 sm:grid-cols-2">
+                              {commands.map((command) => (
+                                <label key={command.type} className="flex items-start gap-2 text-xs text-slate-700">
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`Show ${group.controller} command ${command.label}`}
+                                    checked={!hiddenCommandTypes.includes(command.type)}
+                                    disabled={isCommandVisibilityLoading || isCommandVisibilitySaving}
+                                    onChange={(event) => handleCommandVisibilityChange(command.type, event.target.checked)}
+                                    className="mt-0.5 h-4 w-4 shrink-0 accent-blue-700"
+                                  />
+                                  <span>{command.label}</span>
+                                </label>
+                              ))}
+                            </div>
+                          </fieldset>
+                        ))}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+                {isCommandVisibilityLoading && <p role="status" className="mt-2 text-xs text-slate-500">Loading classroom command settings…</p>}
+                {commandVisibilityError && <p role="alert" className="mt-2 text-xs text-red-700">{commandVisibilityError}</p>}
               </fieldset>
               <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
                 <legend className="text-sm font-semibold text-gray-800">Hide sidebar tabs for this teacher account</legend>
@@ -6449,7 +6723,7 @@ export default function App() {
                   <div className="mt-2 flex gap-2">
                     <button
                       onClick={handleConnectRobot}
-                      disabled={isRobotConnecting || isRunning || isDuetCommissioningBusy}
+                      disabled={isRobotConnecting || isRunning || isDuetCommissioningBusy || isPositionCaptureRecording}
                       className="flex-1 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
                     >
                       {isRobotConnecting
@@ -6462,7 +6736,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={handleTestRobotMotion}
-                        disabled={isRunning || isRobotConnecting}
+                        disabled={isRunning || isRobotConnecting || isPositionCaptureRecording}
                         className="flex-1 rounded-lg bg-amber-500 text-slate-950 px-2.5 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60"
                       >
                         {isRunning ? 'Motion test running…' : 'Test motion'}
@@ -6484,7 +6758,7 @@ export default function App() {
                   </div>
                   <p className="mt-2 text-[10px] text-slate-600">
                     {controllerVersion === 'duet'
-                      ? 'Connect acquires the DUET command lease without starting movement. Teacher-only commissioning is required before normal physical runs; the legacy SDK path is not used.'
+                      ? 'Connect acquires the DUET command lease without starting movement. Disconnect releases only that lease; to switch to legacy, use the Controller application setting and complete the onsite Passive confirmation. Teacher-only commissioning is required before normal DUET physical runs.'
                       : 'Connect uses the G1 host&apos;s configured Ethernet interface. Test LiDAR reads backend sensor status without robot motion; simulation works while disconnected.'}
                   </p>
                   <p className={`mt-2 text-xs ${isRobotConnected ? 'text-green-700' : 'text-slate-600'}`}>{robotConnectionStatus}</p>
@@ -6568,7 +6842,7 @@ export default function App() {
                             <button
                               type="button"
                               onClick={() => handleRunDuetCommissioningStep(step.status === 'awaiting_review')}
-                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
+                              disabled={!isRobotConnected || isDuetCommissioningBusy || isRobotConnecting || isPositionCaptureRecording || duetCommissioning?.commissioning_enabled !== true}
                               className="mt-2 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                             >
                               {isDuetCommissioningBusy
@@ -6663,7 +6937,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={handleStartDuetCommissioning}
-                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting || duetCommissioning?.commissioning_enabled !== true}
+                          disabled={!isRobotConnected || isDuetCommissioningBusy || isRunning || isRobotConnecting || isPositionCaptureRecording || duetCommissioning?.commissioning_enabled !== true}
                           className="rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
                         >
                           {duetCommissioning?.status === 'not_started' ? 'Start full test sequence' : 'Start a new full test'}
@@ -7140,7 +7414,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleRunCode}
-                    disabled={lidarScanJob?.status === 'scanning' && !isRunning}
+                    disabled={(lidarScanJob?.status === 'scanning' && !isRunning) || (isPositionCaptureRecording && !isRunning)}
                     className="rounded-md bg-amber-500 px-2 py-2 text-[10px] font-bold text-slate-950 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
                     title={lidarScanJob?.status === 'scanning' ? 'SDK motion is locked while the LiDAR room scan is capturing' : isRunning ? 'Stops locomotion; cannot cancel an active arm preset' : 'Run code on connected robot'}
                   >
@@ -7330,10 +7604,14 @@ export default function App() {
                       )}
                     </div>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Generated code</p>
-                      <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-slate-200">
-                        {generatedCode || '# Python code will appear here'}
-                      </pre>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">IDE text</p>
+                      <textarea
+                        aria-label="IDE text preview"
+                        readOnly
+                        value={generatedCode || '# Python code will appear here'}
+                        spellCheck={false}
+                        className="mt-2 h-40 w-full resize-y rounded-md border border-slate-700 bg-slate-950 p-2 font-mono text-[11px] leading-6 text-slate-200"
+                      />
                     </div>
                     {originalPlannerCode && pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && (
                       <details open className="rounded-xl border border-amber-800 bg-amber-950/30 p-3">
@@ -7800,7 +8078,7 @@ export default function App() {
                               type="button"
                               aria-label="Start Nav2"
                               onClick={handleStartNavigation}
-                              disabled={isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
+                              disabled={isPositionCaptureRecording || isNavigationStarting || !isNavigationMotionReady || !navigationRouteWaypoints.length || !navigationRoutePreview || navigationRoutePreview.version !== navigationMapSnapshot.map.version || Boolean(navigationOperation && ['accepted', 'starting', 'running', 'cancel_requested'].includes(navigationOperation.status))}
                               className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50"
                             >
                               {isNavigationStarting ? 'Starting…' : 'Approve & start Nav2'}
@@ -7892,7 +8170,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={handleRunCheckpointedPlanner}
-                        disabled={isRunning || !plannerRouteVariants.initial}
+                        disabled={isRunning || isPositionCaptureRecording || !plannerRouteVariants.initial}
                         className="w-full rounded-md bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 disabled:opacity-50"
                       >
                         {isRunning ? 'Running SDK path and checking waypoints…' : 'Run SDK path • checkpoint and correct'}
@@ -8273,13 +8551,15 @@ export default function App() {
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-xs text-slate-200">
                         {(controllerVersion === 'duet'
-                          ? getDuetCommandExamples(savedDuetMotions).map(({ label, code }) => [label, code])
+                          ? getDuetCommandExamples(savedDuetMotions)
                           : [
-                            ['Stand / Ready', 'robot.stand()'],
-                            ['Walk Forward (3 steps)', 'robot.walk(3)'],
-                            ['Turn Left (90°)', 'robot.turn("left", 90)'],
-                            ['Hands Up arm preset', 'robot.arm_action("hands up")'],
-                          ]).map(([label, code]) => (
+                            { label: 'Stand / Ready', code: 'robot.stand()', blockTypes: ['g1_command_stand'] },
+                            { label: 'Walk Forward (3 steps)', code: 'robot.walk(3)', blockTypes: ['g1_command_walk'] },
+                            { label: 'Turn Left (90°)', code: 'robot.turn("left", 90)', blockTypes: ['g1_command_turn'] },
+                            { label: 'Hands Up arm preset', code: 'robot.arm_action("hands up")', blockTypes: ['g1_command_arm_action_hands_up'] },
+                          ])
+                          .filter(({ blockTypes = [] }) => blockTypes.every((type) => !hiddenCommandTypes.includes(type)))
+                          .map(({ label, code }) => (
                           <button
                             key={code}
                             type="button"
@@ -8315,7 +8595,8 @@ export default function App() {
                         {(() => {
                           const query = ideCommandSearch.trim().toLocaleLowerCase();
                           const visibleEntries = ideCommandEntries.filter((entry) => (
-                            !query || `${entry.label} ${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query)
+                            (entry.blockTypes || []).every((type) => !hiddenCommandTypes.includes(type))
+                            && (!query || `${entry.label} ${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query))
                           ));
                           const categories = [...new Set(visibleEntries.map((entry) => entry.category))];
                           return categories.map((category) => (
@@ -8344,13 +8625,12 @@ export default function App() {
                             </details>
                           ));
                         })()}
-                        <details className="rounded-md border border-cyan-800 bg-slate-800 px-2 py-1.5">
+                        {visibleSharedMotions.length > 0 && <details className="rounded-md border border-cyan-800 bg-slate-800 px-2 py-1.5">
                           <summary className="cursor-pointer font-semibold text-cyan-200">
                             Shared {controllerVersion.toUpperCase()} motions
                           </summary>
                           <div className="mt-2 space-y-2">
-                            {sharedMotions
-                              .filter((motion) => motion.controller_version === controllerVersion)
+                            {visibleSharedMotions
                               .filter((motion) => !ideCommandSearch.trim()
                                 || `${motion.name} ${motion.code}`.toLocaleLowerCase().includes(ideCommandSearch.trim().toLocaleLowerCase()))
                               .map((motion) => (
@@ -8363,11 +8643,8 @@ export default function App() {
                                   <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-slate-300">{motion.code}</pre>
                                 </details>
                               ))}
-                            {sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length === 0 && (
-                              <p className="text-slate-400">No shared motions for this controller yet.</p>
-                            )}
                           </div>
-                        </details>
+                        </details>}
                         <details className="rounded-md bg-slate-800 px-2 py-1.5">
                           <summary className="cursor-pointer font-semibold text-slate-200">Loops</summary>
                           <code className="mt-2 block text-cyan-300">for _ in range(3):</code>
@@ -8377,6 +8654,7 @@ export default function App() {
                       </div>
                     </div>
                     <textarea
+                      aria-label="IDE code editor"
                       value={generatedCode || ''}
                       onChange={(event) => {
                         const nextCode = event.target.value;
@@ -8637,10 +8915,14 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleApproveQueuedExecution}
-                disabled={isQueueReviewRunning || queueReviewItem.status !== 'queued' || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
+                disabled={isPositionCaptureRecording || isQueueReviewRunning || !['queued', 'completed'].includes(queueReviewItem.status) || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
                 className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isQueueReviewRunning ? 'Starting…' : 'Approve & run queued request'}
+                {isQueueReviewRunning
+                  ? 'Starting…'
+                  : queueReviewItem.status === 'completed'
+                    ? 'Run request again'
+                    : 'Approve & run queued request'}
               </button>
             </footer>
           </section>

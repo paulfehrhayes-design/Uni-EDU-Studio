@@ -1,14 +1,21 @@
 # LiDAR navigation gateway and execution contract
 
-The onboard Ubuntu 20.04 LiDAR sensor driver may run in an isolated ROS 2 Humble
-container, but this does not install or run Nav2. The Path Planner gateway below
-still requires a separate, fully configured ROS 2 Humble/Nav2 environment.
+The onboard Ubuntu 20.04 LiDAR runtime runs in the ROS 2 Humble
+`uni-edu-lidar-humble:local` image. The installer includes official Nav2 and
+SLAM Toolbox packages there, but does not choose a map/frame configuration or
+start a SLAM/Nav2 launch. Ubuntu 22.04 installs the same runtime packages on
+the host. A separately commissioned ROS 2 Humble/Nav2 workspace and gateway
+configuration are still required.
 
 The Path Planner can submit ordered map-frame goals to a separate ROS 2 Humble
-Nav2 gateway. Nav2 owns route planning and publishes its controller output to
-the `/cmd_vel` input of the separately installed Unitree G1 bridge. The browser
-does not publish ROS messages or velocity commands. This is a software
-integration path; it has not been commissioned or physically tested on a G1.
+Nav2 gateway. Nav2 owns route planning and publishes controller output to
+`/cmd_vel`. The ROS gateway subscribes to that topic and forwards bounded
+commands to the app backend only while a matching route or scan owns locomotion.
+The backend pins the uniquely verified active mode for the operation: Legacy
+uses the existing SDK `SetVelocity`/`StopMove` path; DUET uses its existing
+leased local-gateway `MOVE`/`STOP` path. The browser does not publish ROS
+messages or velocity commands. This integration has not been commissioned or
+physically tested on a G1.
 Upstream repository, license, ROS-distro, and hardware-assumption notes are
 recorded in [the LiDAR source audit](./lidar_source_audit.md).
 
@@ -19,9 +26,10 @@ Configure the backend service with:
 ```text
 G1_NAV_BRIDGE_URL=https://<trusted-navigation-host>/g1-navigation
 G1_NAV_BRIDGE_TOKEN=<strong random gateway token>
-G1_NAV_EXECUTION_ENABLED=1
-G1_NAV_LOCOMOTION_OWNER=nav2_via_single_unitree_bridge
-G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED=1
+G1_NAV_EXECUTION_ENABLED=0
+G1_NAV_LOCOMOTION_OWNER=nav2_via_active_backend_controller
+G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED=0
+G1_NAV_CMD_VEL_BRIDGE_VERIFIED=0
 ```
 
 HTTP is accepted only for a loopback bridge. Use HTTPS for any remote bridge.
@@ -30,11 +38,37 @@ The token stays on the application backend and is sent as a bearer token. The
 browser uses only teacher-authenticated application API routes and never
 connects directly to ROS or receives the bridge token. `G1_NAV_EXECUTION_ENABLED`
 defaults off; enable it only after commissioning the gateway and Nav2 deployment.
-The two controller-ownership settings are an additional fail-closed motion gate.
-Leave ownership unconfirmed until commissioning verifies that Nav2 sends through
-the single intended Unitree bridge and no competing locomotion controller is
-active. `G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED=1` does not itself detect other
-ROS publishers; it records the deployment owner's commissioning decision.
+`G1_NAV_LOCOMOTION_OWNER` must be
+`nav2_via_active_backend_controller`. The app chooses Legacy only when the SDK
+is connected and the DUET service and ownership are verified inactive; it
+chooses DUET only when DUET reports connected/ready, a valid app control lease,
+and sole `rt/lowcmd` ownership. Neither, ambiguous, or unknown states are
+rejected. The chosen mode is pinned to the operation; app commands and mode
+disconnects/transitions are blocked until the route/scan is terminal and its
+stop is confirmed.
+
+The ROS gateway uses `G1_NAV_CMD_VEL_TOPIC` (default `/cmd_vel`) and
+`G1_NAV_MOTION_BACKEND_URL` (default `http://127.0.0.1:5179`). For a remote
+backend use HTTPS. The gateway's `G1_NAV_GATEWAY_TOKEN` must be the same
+24-character-or-longer secret as backend `G1_NAV_BRIDGE_TOKEN`; it is not sent
+to the browser. The subscriber ignores Twist messages without an active
+operation. The adapter accepts only finite forward/reverse speed up to
+0.20 m/s and yaw rate up to 0.30 rad/s; lateral and non-planar components are
+rejected. SDK SetVelocity and DUET MOVE use 250 ms leases. A 300 ms stale-topic
+timeout after the first command requests stop and Nav2 cancellation (with a
+1 s initial-command timeout).
+
+Keep `G1_NAV_CMD_VEL_BRIDGE_VERIFIED=0` and `G1_NAV_EXECUTION_ENABLED=0` by
+default. Set them to `1` only after independently reviewing this adapter,
+commissioning the exact SDK/DUET stop and lease behavior, and validating the
+network, model, map, frames, e-stop and health signals on the target robot. A
+failed backend stop latches motion in the app database and blocks later
+navigation starts; the latch requires onsite inspection and an explicit
+operator recovery procedure. SDK `StopMove` success confirms the SDK RPC was
+accepted, not physical immobility. DUET STOP confirms its controller reports
+inactive leased velocity while it owns lowcmd, not physical immobility. Physical
+stop behavior remains unverified. Ownership-confirmed settings do not detect
+other publishers or prove hardware safety.
 The backend reports the execution-enable state in navigation diagnostics, and
 both physical route execution and Spin scans remain blocked while that switch
 is off.
@@ -65,7 +99,8 @@ Humble and the SLAM/Nav2 workspace. The host must provide:
   healthy, not merely that the bridge process is alive;
 - a `std_msgs/Bool` heartbeat on `G1_NAV_ROBOT_HEALTHY_TOPIC`; `true` must mean
   the active G1 controller link is established and accepts commands;
-- the specified Unitree `/cmd_vel` bridge connected to the robot.
+- the backend reachable from the ROS gateway using the shared bearer secret,
+  with `G1_NAV_CMD_VEL_BRIDGE_VERIFIED=1` only after commissioning.
 
 The gateway listens on `127.0.0.1:8282` by default. For a separate app server,
 expose it only behind a trusted network and TLS reverse proxy, then set the
@@ -86,14 +121,16 @@ both freshness defaults are 1000). There are no default health topics because
 their meaning and wiring must be verified for the actual bridge and hardware.
 Motion remains disabled if either topic is unset, false, or stale; map viewing
 and route preview remain available.
-The additional motion gate uses `G1_NAV_LOCOMOTION_OWNER` (must be
-`nav2_via_single_unitree_bridge`) and
-`G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED` (must be `1`). The authenticated
+The additional motion gate uses the mode-specific
+`G1_NAV_LOCOMOTION_OWNER`, `G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED`, and
+`G1_NAV_CMD_VEL_BRIDGE_VERIFIED` settings described above. The authenticated
 navigation status reports configured point-cloud/map topics and frames,
 observed point-cloud rate after a five-second measurement window, acquisition
 stamp age, gateway callback duration, map age/resolution/origin/occupancy
 threshold/version, localization freshness, action-server readiness, and
-controller-ownership confirmation. The gateway combines transform-valid clouds
+controller-ownership confirmation. Optional variables also include
+`G1_NAV_CMD_VEL_TOPIC` (default `/cmd_vel`) and
+`G1_NAV_MOTION_BACKEND_URL` (default loopback app server). The gateway combines transform-valid clouds
 for supervised 3D scan capture and source-readiness diagnostics; SLAM and Nav2
 remain responsible for incorporating their configured sensor inputs into
 `/map` and the local costmap. The callback metric is not a DDS packet-drop
@@ -102,10 +139,10 @@ The ROS host also needs the Python ROS packages used by the gateway:
 `rclpy`, `nav2_msgs`, `nav_msgs`, `geometry_msgs`, `action_msgs`, `tf2_ros`,
 `sensor_msgs`, `sensor_msgs_py`, and `std_msgs`.
 
-This gateway is not a replacement for SLAM, Nav2, or the Unitree velocity
-bridge. It does not publish `/cmd_vel`, install sensor drivers, build a 2D
-occupancy map, or configure the G1 bridge. The occupancy map must come from a
-commissioned mapping system; the point cloud is transformed into that map
+This gateway is not a replacement for SLAM, Nav2, or the backend motion
+adapter. It subscribes to `/cmd_vel` but does not publish it, install sensor
+drivers, build a 2D occupancy map, or configure a map. The occupancy map must
+come from a commissioned mapping system; the point cloud is transformed into that map
 frame, voxel-downsampled at 5 cm, and capped at 300,000 points.
 
 A teacher-started 360° scan sends a `Spin` action goal to Nav2, which must use

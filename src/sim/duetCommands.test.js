@@ -132,6 +132,7 @@ test('named DUET motions compile as one validated call and populate the toolbox'
       category: 'Saved motions',
       label: 'Saved motion: Class wave',
       code: 'duet.saved_motion("class_wave_1234abcd")',
+      blockTypes: ['duet_command_saved_motion'],
     },
   );
   assert.throws(() => parseDuetProgram('duet.saved_motion("__import__")'), /ID.*invalid/);
@@ -170,6 +171,15 @@ test('DUET preset commands have one bounded duration and parse as DUET-only synt
   assert.equal(legacyNodes[0].method, 'walk');
   assert.equal(formatDuetProgram(legacyNodes), 'duet.walk(1)');
   assert.equal(getDuetCommand('forward'), getDuetCommand('walk'));
+});
+
+test('DUET wait allows up to 20 seconds without widening movement limits', () => {
+  const wait = getDuetCommand('wait');
+
+  assert.equal(wait.args[0].max, 20);
+  assert.equal(parseDuetProgram('duet.wait(20)')[0].values[0], 20);
+  assert.throws(() => parseDuetProgram('duet.wait(20.1)'), /between 0.1 and 20/);
+  assert.equal(getDuetCommand('walk').args[0].max, 3);
 });
 
 test('DUET concurrent container pairs any supported locomotion command with a separate arm gesture block', () => {
@@ -456,7 +466,7 @@ test('DUET parser rejects unsafe values instead of silently clamping them', () =
   assert.throws(() => parseDuetProgram('duet.move(0.31, 0, 0, 1)'), /between -0.2 and 0.3/);
   assert.throws(() => parseDuetProgram('duet.move(0, 0.16, 0, 1)'), /between -0.15 and 0.15/);
   assert.throws(() => parseDuetProgram('duet.raw_joint(1)'), /Unknown DUET command/);
-  assert.throws(() => parseDuetProgram('duet.wait(3.1)'), /between 0.1 and 3/);
+  assert.throws(() => parseDuetProgram('duet.wait(20.1)'), /between 0.1 and 20/);
 });
 
 test('DUET parser bounds loop depth and expanded command count', () => {

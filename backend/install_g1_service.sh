@@ -34,12 +34,11 @@ if [[ "${INSTALL_G1_LIDAR:-0}" == "1" ]]; then
   if bash "$PROJECT_DIR/backend/install_g1_lidar.sh"; then
     LIDAR_CONFIGURED=1
   else
+    echo "ERROR: requested LiDAR/ROS setup did not complete; stopping before reporting app setup success." >&2
     if [[ "$LIDAR_PREVIOUSLY_INSTALLED" == "1" ]]; then
-      echo "WARNING: LiDAR setup retry did not complete; preserving the existing LiDAR installation and configuration." >&2
-    else
-      echo "WARNING: LiDAR setup did not complete; continuing with the G1 SDK backend and ordinary supported SDK commands." >&2
-      echo "Distance-condition programs will remain fail-closed until LiDAR setup succeeds." >&2
+      echo "The previous LiDAR installation/configuration may still be present; inspect its services and logs." >&2
     fi
+    exit 1
   fi
 elif [[ -f "$LIDAR_CONFIG_DIR/lidar-installed" ]]; then
   LIDAR_CONFIGURED=1
@@ -60,14 +59,52 @@ python3 "$PROJECT_DIR/vendor/DUET/deploy/robots/g1_23dof/install_user_service.py
 echo "Installing backend dependencies"
 "$PYTHON" -m pip install -r "$PROJECT_DIR/backend/requirements.txt"
 
-echo "Preparing hosted frontend dependencies (cached packages are preferred)"
+mkdir -p "$LIDAR_CONFIG_DIR"
+FRONTEND_DEPENDENCIES_SIGNATURE="$(
+  sha256sum "$PROJECT_DIR/package.json" "$PROJECT_DIR/package-lock.json" \
+    | sha256sum | awk '{print $1}'
+)"
+FRONTEND_DEPENDENCIES_MARKER="$LIDAR_CONFIG_DIR/frontend-dependencies.sha256"
 cd "$PROJECT_DIR"
-if ! npm install --prefer-offline --no-audit --no-fund; then
-  echo "Frontend dependency installation failed; see npm output above." >&2
-  exit 1
+if [[ ! -d "$PROJECT_DIR/node_modules" ||
+      ! -f "$FRONTEND_DEPENDENCIES_MARKER" ||
+      "$(cat "$FRONTEND_DEPENDENCIES_MARKER")" != "$FRONTEND_DEPENDENCIES_SIGNATURE" ]]; then
+  echo "Preparing hosted frontend dependencies (cached packages are preferred)"
+  if ! npm install --prefer-offline --no-audit --no-fund; then
+    echo "Frontend dependency installation failed; see npm output above." >&2
+    exit 1
+  fi
+  FRONTEND_DEPENDENCIES_SIGNATURE="$(
+    sha256sum "$PROJECT_DIR/package.json" "$PROJECT_DIR/package-lock.json" \
+      | sha256sum | awk '{print $1}'
+  )"
+  printf '%s\n' "$FRONTEND_DEPENDENCIES_SIGNATURE" > "$FRONTEND_DEPENDENCIES_MARKER"
+else
+  echo "Frontend dependencies are unchanged; reusing node_modules."
 fi
-echo "Building the hosted frontend bundle"
-npm run build
+FRONTEND_BUILD_MARKER="$LIDAR_CONFIG_DIR/frontend-build.sha256"
+FRONTEND_BUILD_SIGNATURE="$(
+  {
+    sha256sum \
+      "$PROJECT_DIR/package.json" \
+      "$PROJECT_DIR/package-lock.json" \
+      "$PROJECT_DIR/index.html" \
+      "$PROJECT_DIR/vite.config.js" \
+      "$PROJECT_DIR/postcss.config.js" \
+      "$PROJECT_DIR/tailwind.config.js"
+    find "$PROJECT_DIR/src" "$PROJECT_DIR/public" -type f -print0 \
+      | sort -z | xargs -0 -r sha256sum
+  } | sha256sum | awk '{print $1}'
+)"
+if [[ ! -f "$PROJECT_DIR/backend/static/index.html" ||
+      ! -f "$FRONTEND_BUILD_MARKER" ||
+      "$(cat "$FRONTEND_BUILD_MARKER")" != "$FRONTEND_BUILD_SIGNATURE" ]]; then
+  echo "Building the hosted frontend bundle"
+  npm run build
+  printf '%s\n' "$FRONTEND_BUILD_SIGNATURE" > "$FRONTEND_BUILD_MARKER"
+else
+  echo "Hosted frontend is unchanged; reusing the existing production bundle."
+fi
 
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"

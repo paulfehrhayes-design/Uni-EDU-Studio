@@ -13,6 +13,7 @@ try:
         pointcloud_topics_for_runtime,
         scan_rotation_complete,
         validate_estop_health,
+        validate_planar_cmd_vel,
         validate_pointcloud_timestamp,
     )
 except ImportError:
@@ -25,11 +26,43 @@ except ImportError:
         pointcloud_topics_for_runtime,
         scan_rotation_complete,
         validate_estop_health,
+        validate_planar_cmd_vel,
         validate_pointcloud_timestamp,
     )
 
 
 class NavigationGatewayScanTests(unittest.TestCase):
+    def test_cmd_vel_defaults_closed_and_accepts_only_bounded_planar_commands(self):
+        with patch.dict(
+            os.environ,
+            {"G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token"},
+            clear=True,
+        ):
+            config = _configuration()
+        self.assertEqual(config["cmd_vel_topic"], "/cmd_vel")
+        self.assertFalse(config["cmd_vel_bridge_verified"])
+        self.assertEqual(validate_planar_cmd_vel(0.2, 0.0, 0.0, 0.0, 0.0, -0.3), (0.2, -0.3))
+        for values in (
+            (0.201, 0.0, 0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.01, 0.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 0.01, 0.0, 0.0),
+            (float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0),
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                validate_planar_cmd_vel(*values)
+
+    def test_remote_motion_backend_requires_https_when_bridge_is_verified(self):
+        with patch.dict(
+            os.environ,
+            {
+                "G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token",
+                "G1_NAV_CMD_VEL_BRIDGE_VERIFIED": "1",
+                "G1_NAV_MOTION_BACKEND_URL": "http://192.0.2.5:5179",
+            },
+            clear=True,
+        ), self.assertRaisesRegex(GatewayConfigurationError, "Remote motion backends require HTTPS"):
+            _configuration()
+
     def test_estop_health_is_fresh_and_true_before_motion_is_ready(self):
         self.assertTrue(validate_estop_health(True, 0.2, 1.0)["ready"])
         for healthy, age, expected in (
@@ -247,26 +280,42 @@ class NavigationGatewayScanTests(unittest.TestCase):
         self.assertEqual(config["robot_healthy_topic"], "/g1/controller_healthy")
         self.assertEqual(config["robot_health_max_age_seconds"], 0.75)
 
-    def test_motion_requires_explicit_single_bridge_ownership_commissioning(self):
+    def test_motion_requires_mode_and_cmd_vel_bridge_commissioning(self):
+        with patch.dict(
+            os.environ,
+            {"G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token"},
+            clear=True,
+        ):
+            defaults = _configuration()
+        self.assertFalse(defaults["cmd_vel_bridge_verified"])
+        self.assertFalse(controller_ownership_ready(
+            "nav2_via_legacy_sdk", True, defaults["cmd_vel_bridge_verified"]
+        ))
+
         with patch.dict(
             os.environ,
             {
                 "G1_NAV_GATEWAY_TOKEN": "a sufficiently long test gateway token",
-                "G1_NAV_LOCOMOTION_OWNER": "nav2_via_single_unitree_bridge",
+                "G1_NAV_LOCOMOTION_OWNER": "nav2_via_active_backend_controller",
                 "G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED": "1",
+                "G1_NAV_CMD_VEL_BRIDGE_VERIFIED": "1",
             },
             clear=True,
         ):
             config = _configuration()
-        self.assertEqual(config["locomotion_owner"], "nav2_via_single_unitree_bridge")
+        self.assertEqual(config["locomotion_owner"], "nav2_via_active_backend_controller")
         self.assertTrue(config["controller_ownership_confirmed"])
+        self.assertTrue(config["cmd_vel_bridge_verified"])
         self.assertTrue(controller_ownership_ready(
             config["locomotion_owner"],
             config["controller_ownership_confirmed"],
+            config["cmd_vel_bridge_verified"],
         ))
-        self.assertFalse(controller_ownership_ready("unverified", True))
-        self.assertFalse(controller_ownership_ready("other_controller", True))
-        self.assertFalse(controller_ownership_ready("nav2_via_single_unitree_bridge", False))
+        self.assertFalse(controller_ownership_ready("unverified", True, True))
+        self.assertFalse(controller_ownership_ready("other_controller", True, True))
+        self.assertFalse(controller_ownership_ready("nav2_via_legacy_sdk", False, True))
+        self.assertFalse(controller_ownership_ready("nav2_via_single_unitree_bridge", True, True))
+        self.assertTrue(controller_ownership_ready("nav2_via_duet_controller", True, True))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import ast
 import base64
-import hashlib
 import json
 import math
 import os
@@ -18,30 +17,28 @@ import uuid
 import zlib
 import logging
 import subprocess
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Literal
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import httpx
-from websockets.asyncio.client import connect as websocket_connect
-from websockets.exceptions import WebSocketException
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
-from starlette.websockets import WebSocketState
+from pydantic import BaseModel, Field, StrictFloat
 try:
     from .g1_robot import (
         CommandValidationError,
         clear_robot_stop_request,
         connect_robot,
         execute_robot_program,
+        navigation_set_velocity,
         parse_robot_program,
         robot_status,
-        speak_robot_text,
+        stop_navigation_velocity,
         stop_robot,
     )
     from .duet_robot import (
@@ -55,6 +52,9 @@ try:
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        navigation_move as duet_navigation_move,
+        stop_navigation_motion as stop_duet_navigation_motion,
+        _require_hardware_acceptance as _require_duet_hardware_acceptance,
         parse_duet_program,
         review_commissioning_step as review_duet_commissioning_step,
         run_commissioning_step as run_duet_commissioning_step,
@@ -95,9 +95,10 @@ except ImportError:
         clear_robot_stop_request,
         connect_robot,
         execute_robot_program,
+        navigation_set_velocity,
         parse_robot_program,
         robot_status,
-        speak_robot_text,
+        stop_navigation_velocity,
         stop_robot,
     )
     from duet_robot import (
@@ -111,6 +112,9 @@ except ImportError:
         controller_status as duet_controller_status,
         disconnect_controller as disconnect_duet_controller,
         execute_program as execute_duet_program,
+        navigation_move as duet_navigation_move,
+        stop_navigation_motion as stop_duet_navigation_motion,
+        _require_hardware_acceptance as _require_duet_hardware_acceptance,
         parse_duet_program,
         review_commissioning_step as review_duet_commissioning_step,
         run_commissioning_step as run_duet_commissioning_step,
@@ -205,9 +209,22 @@ class DuetMotionSaveRequest(BaseModel):
     code: str
 
 
+class RobotPoseSample(BaseModel):
+    frame_id: str = Field(min_length=1, max_length=128)
+    base_frame: str = Field(min_length=1, max_length=128)
+    x: float
+    y: float
+    z: float
+    yaw_rad: float
+    timestamp: datetime
+    age_ms: float
+    source: Literal["tf2", "odometry"]
+
+
 class DuetArmRecordingFrame(BaseModel):
     time: float
     joints: List[float]
+    pose: Optional[RobotPoseSample] = None
 
 
 class DuetArmRecordingSaveRequest(BaseModel):
@@ -218,10 +235,11 @@ class DuetArmRecordingSaveRequest(BaseModel):
 class RobotMotionRecordingSaveRequest(BaseModel):
     name: str
     controller_version: Literal["legacy", "duet"]
+    capture_type: Literal["motion", "position_calibration"] = "motion"
     command: str = Field(max_length=20_000)
     joint_names: List[str]
     captured_at: Optional[datetime] = None
-    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=601)
+    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=30001)
 
 
 class DuetCommissioningReviewRequest(BaseModel):
@@ -239,6 +257,11 @@ class DuetCommissioningStepRequest(BaseModel):
 class ConnectRobotRequest(BaseModel):
     interface: Optional[str] = None
 
+
+class DuetLegacyHandoffRequest(BaseModel):
+    operator_confirmed_passive: bool
+
+
 class HFTextMotionRequest(BaseModel):
     prompt: str
 
@@ -246,80 +269,6 @@ class LoginRequest(BaseModel):
     username: str
     password: str
     role: Optional[str] = None
-
-
-class HarryBotterChatMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=2_000)
-
-
-HarryBotterLearningLevel = Literal[
-    "",
-    "Early Years",
-    "PYP 1",
-    "PYP 2",
-    "PYP 3",
-    "PYP 4",
-    "PYP 5",
-    "MYP 1",
-    "MYP 2",
-    "MYP 3",
-    "MYP 4",
-    "MYP 5",
-    "DP 1",
-    "DP 2",
-]
-
-
-class HarryBotterDraftRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str = Field(min_length=1, max_length=2_000)
-    learning_level: HarryBotterLearningLevel = ""
-    tone: Literal["Formal", "Lightly humorous"] = "Formal"
-    history: List[HarryBotterChatMessage] = Field(default_factory=list, max_length=12)
-    agent_id: str = Field(default="general", min_length=1, max_length=80)
-
-
-class HarryBotterSpeechRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str = Field(min_length=1, max_length=2_000)
-    speed: float = Field(default=1.0, ge=0.75, le=1.25)
-
-
-class HarryBotterG1SpeakRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str = Field(min_length=1, max_length=120)
-    speaker_id: Literal[0, 1] = 0
-
-
-class HarryBotterAgentRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    display_name: str = Field(min_length=1, max_length=80)
-    purpose: str = Field(min_length=1, max_length=500)
-    instructions: str = Field(min_length=1, max_length=5_000)
-    generation_temperature: float = Field(ge=0, le=1)
-    generation_max_tokens: int = Field(ge=64, le=1_000)
-
-
-class HarryBotterKnowledgeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    filename: str = Field(min_length=1, max_length=255)
-    title: str = Field(min_length=1, max_length=160)
-    source: str = Field(min_length=1, max_length=500)
-    owner: str = Field(min_length=1, max_length=120)
-    permission_confirmed: bool
-    learning_level: HarryBotterLearningLevel = ""
-    agent_id: Optional[str] = Field(default=None, min_length=1, max_length=80)
-    review_date: date
-    text: str = Field(min_length=1, max_length=128_000)
-
 
 class SaveCodeRequest(BaseModel):
     name: str
@@ -399,12 +348,27 @@ class LidarScanStartRequest(BaseModel):
     confirm_rotation: bool
 
 
+class NavigationVelocityRequest(BaseModel):
+    vx: StrictFloat
+    vy: StrictFloat = 0.0
+    vyaw: StrictFloat
+
+
+class NavigationStopRequest(BaseModel):
+    terminal: bool = False
+    reason: str = "gateway_stop"
+
+
 class SharedLidarSettingsRequest(BaseModel):
     show_shared_overlay: bool
 
 
 class SidebarSettingsRequest(BaseModel):
     locked_panels: List[Literal["blocks", "ide", "planner", "prompt", "camera"]]
+
+
+class CommandVisibilitySettingsRequest(BaseModel):
+    hidden_command_types: List[str] = Field(max_length=1000)
 
 
 class SafeModeSettingsRequest(BaseModel):
@@ -439,42 +403,16 @@ class ClassroomGroupRenameRequest(BaseModel):
 
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "classroom.db")
-DEFAULT_HARRY_BOTTER_AGENTS = (
-    {
-        "agent_id": "general",
-        "display_name": "General conversation",
-        "purpose": "Answer learner questions with clear, age-appropriate explanations.",
-        "instructions": "Explain ideas clearly, check understanding, and invite a follow-up question when helpful.",
-        "generation_temperature": 0.4,
-        "generation_max_tokens": 500,
-        "is_builtin": 1,
-    },
-    {
-        "agent_id": "debate",
-        "display_name": "Debate assistant",
-        "purpose": "Help learners examine arguments, evidence, and respectful counterpoints.",
-        "instructions": "Present balanced arguments, distinguish claims from evidence, and encourage respectful disagreement without deciding the debate for learners.",
-        "generation_temperature": 0.4,
-        "generation_max_tokens": 500,
-        "is_builtin": 1,
-    },
-)
-MAX_HARRY_BOTTER_AGENTS = 20
-MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS = 100
-MAX_HARRY_BOTTER_KNOWLEDGE_BYTES = 100_000
-MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES = 10_000_000
-MAX_HARRY_BOTTER_AUDIO_BYTES = 8_000_000
-HARRY_BOTTER_AUDIO_TYPES = {"audio/webm", "audio/ogg", "audio/mp4", "audio/wav", "audio/x-wav"}
-HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS = 2_500
 DEFAULT_USERS: Dict[str, Dict[str, str]] = {
     "teacher": {"username": "teacher", "password": "teacher", "role": "teacher"},
     "student1": {"username": "student1", "password": "student1", "role": "student"},
     "student2": {"username": "student2", "password": "student2", "role": "student"},
 }
-HARRY_BOTTER_STREAM_FRAME_BYTES = 640
 SESSION_TOKENS: Dict[str, str] = {}
 _QUEUE_RUN_LOCK = threading.Lock()
 _MOTION_START_LOCK = threading.Lock()
+_NAVIGATION_MOTION_LOCK = threading.RLock()
+_NAVIGATION_COMMAND_LOCK = threading.Lock()
 _NAVIGATION_ACTIVE_STATES = ("accepted", "starting", "running", "cancel_requested", "uncertain")
 _WEBSOCKET_TICKETS: Dict[str, tuple[str, float]] = {}
 _WEBSOCKET_TICKET_LOCK = threading.Lock()
@@ -894,7 +832,235 @@ def active_lidar_scan():
     return dict(row) if row else None
 
 
+def _navigation_motion_pin() -> dict:
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT operation_id, operation_kind, controller_mode, state, error "
+        "FROM navigation_motion_pin WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else {
+        "operation_id": None, "operation_kind": None, "controller_mode": None,
+        "state": "idle", "error": None,
+    }
+
+
+def _navigation_operation_is_terminal(operation_id: str, operation_kind: str) -> bool:
+    conn = get_db_connection()
+    if operation_kind == "scan":
+        row = conn.execute(
+            "SELECT status FROM lidar_scans WHERE job_id = ?", (operation_id,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT status FROM navigation_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+    conn.close()
+    return bool(row and row["status"] in {"completed", "canceled", "failed", "rejected"})
+
+
+def _reserve_navigation_motion(operation_id: str, operation_kind: str, mode: str) -> None:
+    if mode not in {"legacy", "duet"} or operation_kind not in {"route", "scan"}:
+        raise HTTPException(status_code=409, detail="Navigation motion reservation is invalid.")
+    with _NAVIGATION_MOTION_LOCK:
+        pin = _navigation_motion_pin()
+        if pin["state"] == "latched":
+            raise HTTPException(
+                status_code=503,
+                detail="Navigation motion is latched after an unconfirmed stop; onsite inspection/reset is required.",
+            )
+        if pin["state"] == "stopped" and pin["operation_id"] and _navigation_operation_is_terminal(
+            pin["operation_id"], pin["operation_kind"]
+        ):
+            conn = get_db_connection()
+            conn.execute(
+                "UPDATE navigation_motion_pin SET operation_id=NULL, operation_kind=NULL, "
+                "controller_mode=NULL, state='idle', error=NULL, updated_at=? WHERE id=1",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            conn.commit()
+            conn.close()
+            pin = _navigation_motion_pin()
+        if pin["state"] != "idle":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Navigation motion is still reserved by operation {pin['operation_id']} "
+                    f"(state {pin['state']})."
+                ),
+            )
+        conn = get_db_connection()
+        conn.execute(
+            "UPDATE navigation_motion_pin SET operation_id=?, operation_kind=?, controller_mode=?, "
+            "state='active', error=NULL, updated_at=? WHERE id=1",
+            (operation_id, operation_kind, mode, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+
+def _set_navigation_motion_state(operation_id: str, state: str, error: str | None = None) -> None:
+    if state not in {"active", "stopped", "latched"}:
+        raise ValueError("Invalid navigation motion state.")
+    conn = get_db_connection()
+    conn.execute(
+        "UPDATE navigation_motion_pin SET state=?, error=?, updated_at=? "
+        "WHERE id=1 AND operation_id=?",
+        (state, error, datetime.now(timezone.utc).isoformat(), operation_id),
+    )
+    changed = conn.execute("SELECT changes()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    if not changed:
+        raise HTTPException(status_code=409, detail="Navigation operation does not own the motion reservation.")
+
+
 DUET_CONTROLLER_UNIT = "duet-g1-controller.service"
+
+
+def _navigation_motion_gate() -> None:
+    if os.getenv("G1_NAV_EXECUTION_ENABLED", "").strip() != "1":
+        raise HTTPException(status_code=503, detail="Physical navigation is disabled.")
+    if os.getenv("G1_NAV_CMD_VEL_BRIDGE_VERIFIED", "0").strip() != "1":
+        raise HTTPException(status_code=503, detail="The Nav2 velocity bridge is not commissioned.")
+    if os.getenv("G1_NAV_CONTROLLER_OWNERSHIP_CONFIRMED", "0").strip() != "1":
+        raise HTTPException(status_code=503, detail="Navigation controller ownership is not confirmed.")
+    if os.getenv("G1_NAV_LOCOMOTION_OWNER", "").strip() != "nav2_via_active_backend_controller":
+        raise HTTPException(
+            status_code=503,
+            detail="Set the commissioned navigation owner to nav2_via_active_backend_controller.",
+        )
+
+
+def _select_navigation_controller_mode() -> str:
+    _navigation_motion_gate()
+    sdk = robot_status()
+    duet = duet_controller_status()
+    try:
+        service_state = duet_controller_service_state()
+    except DuetControllerError as error:
+        raise HTTPException(
+            status_code=409,
+            detail=f"DUET service/ownership cannot be verified; refusing navigation: {error}",
+        ) from error
+    if sdk.get("running") or duet.get("programActive"):
+        raise HTTPException(status_code=409, detail="A robot program already owns locomotion.")
+    duet_owns = (
+        service_state == "active"
+        and duet.get("connected") is True
+        and duet.get("ready") is True
+        and duet.get("controlLease") is True
+        and duet.get("motionOwner") == "duet"
+    )
+    if duet_owns:
+        try:
+            _require_duet_hardware_acceptance()
+        except DuetControllerError as error:
+            raise HTTPException(
+                status_code=409,
+                detail=f"DUET navigation requires supervised hardware acceptance: {error}",
+            ) from error
+        return "duet"
+    sdk_owns = (
+        sdk.get("sdkAvailable") is True
+        and service_state in {"inactive", "dead"}
+        and duet.get("motionOwner") == "none"
+        and duet.get("controlLease") is not True
+        and duet.get("motionActive") is not True
+    )
+    if sdk_owns:
+        return "legacy"
+    raise HTTPException(
+        status_code=409,
+        detail="Neither exactly one verified SDK or DUET locomotion mode is ready; navigation was not started.",
+    )
+
+
+def _verify_pinned_navigation_mode(mode: str) -> None:
+    sdk = robot_status()
+    duet = duet_controller_status()
+    try:
+        service_state = duet_controller_service_state()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=f"Controller ownership became unverifiable: {error}") from error
+    if sdk.get("running") or duet.get("programActive"):
+        raise HTTPException(status_code=409, detail="A robot program conflicts with the pinned navigation owner.")
+    if mode == "legacy":
+        ready = (
+            sdk.get("sdkAvailable") is True
+            and service_state in {"inactive", "dead"}
+            and duet.get("motionOwner") == "none"
+            and duet.get("controlLease") is not True
+        )
+    else:
+        ready = (
+            service_state == "active"
+            and duet.get("connected") is True
+            and duet.get("ready") is True
+            and duet.get("controlLease") is True
+            and duet.get("motionOwner") == "duet"
+        )
+    if not ready:
+        raise HTTPException(
+            status_code=409,
+            detail=f"The pinned {mode} locomotion owner is no longer uniquely verified.",
+        )
+
+
+def _verify_navigation_stop_owner(mode: str) -> None:
+    sdk = robot_status()
+    duet = duet_controller_status()
+    try:
+        service_state = duet_controller_service_state()
+    except DuetControllerError as error:
+        raise HTTPException(status_code=409, detail=f"Controller ownership became unverifiable: {error}") from error
+    if sdk.get("running") or duet.get("programActive"):
+        raise HTTPException(status_code=409, detail="A robot program conflicts with navigation stop ownership.")
+    if mode == "legacy":
+        ready = (
+            sdk.get("sdkAvailable") is True
+            and service_state in {"inactive", "dead"}
+            and duet.get("motionOwner") == "none"
+        )
+    else:
+        ready = service_state == "active" and duet.get("motionOwner") == "duet"
+    if not ready:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot verify sole {mode} ownership for the navigation stop request.",
+        )
+
+
+def _stop_navigation_controller(mode: str) -> dict:
+    if mode == "legacy":
+        return stop_navigation_velocity()
+    if mode == "duet":
+        return stop_duet_navigation_motion()
+    raise HTTPException(status_code=503, detail="Navigation controller mode is unknown; stop is unconfirmed.")
+
+
+def _stop_navigation_motion(operation_id: str, *, terminal: bool = False, reason: str = "gateway_stop") -> dict:
+    del terminal  # A gateway terminal report does not replace backend operation-state confirmation.
+    pin = _navigation_motion_pin()
+    if pin["operation_id"] != operation_id or pin["state"] == "idle":
+        raise HTTPException(status_code=409, detail="No matching navigation motion reservation exists.")
+    if pin["state"] == "latched":
+        raise HTTPException(status_code=503, detail="Navigation motion is latched after a previous stop failure.")
+    try:
+        with _NAVIGATION_COMMAND_LOCK:
+            _verify_navigation_stop_owner(pin["controller_mode"])
+            result = _stop_navigation_controller(pin["controller_mode"])
+        _set_navigation_motion_state(operation_id, "stopped")
+        return {**result, "operation_id": operation_id, "reason": reason, "confirmed": True}
+    except Exception as error:
+        try:
+            _set_navigation_motion_state(operation_id, "latched", str(error))
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail=f"Navigation stop failed and motion is latched: {error}",
+        ) from error
 
 
 def _validated_duet_controller_unit() -> Path:
@@ -994,6 +1160,42 @@ def start_duet_controller_service() -> str:
             f"Inspect: journalctl --user -u {DUET_CONTROLLER_UNIT}"
         )
     return state
+
+
+def stop_duet_controller_service() -> dict:
+    state = duet_controller_service_state()
+    if state == "active":
+        stopped = _duet_systemctl("stop", DUET_CONTROLLER_UNIT)
+        if stopped.returncode != 0:
+            detail = (stopped.stderr or stopped.stdout).strip()
+            raise DuetControllerError(
+                f"Could not stop the DUET controller service: {detail or 'systemctl failed'}"
+            )
+    elif state not in {"inactive", "dead"}:
+        raise DuetControllerError(
+            f"DUET controller service is {state or 'in an unknown state'}; refusing the handoff."
+        )
+
+    state = duet_controller_service_state()
+    if state not in {"inactive", "dead"}:
+        raise DuetControllerError(
+            f"DUET controller service did not become inactive (state: {state or 'unknown'})."
+        )
+    status = duet_controller_status()
+    if (
+        status.get("motionOwner") != "none"
+        or status.get("programActive") is True
+        or status.get("motionActive") is not False
+    ):
+        raise DuetControllerError(
+            "The DUET service is inactive, but the backend cannot confirm released DUET ownership. "
+            "Do not connect or run legacy motion; have an onsite operator inspect the G1 host."
+        )
+    return {
+        "controllerServiceActive": False,
+        "motionOwner": "none",
+        "motionActive": False,
+    }
 
 
 def _validate_duet_handoff_build(controller_dir: Path) -> None:
@@ -1175,45 +1377,6 @@ def init_db():
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS harry_botter_agents (
-            agent_id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            purpose TEXT NOT NULL,
-            instructions TEXT NOT NULL,
-            generation_temperature REAL NOT NULL CHECK (generation_temperature BETWEEN 0 AND 1),
-            generation_max_tokens INTEGER NOT NULL CHECK (generation_max_tokens BETWEEN 64 AND 1000),
-            is_builtin INTEGER NOT NULL DEFAULT 0 CHECK (is_builtin IN (0, 1)),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS harry_botter_knowledge (
-            document_id TEXT PRIMARY KEY,
-            filename TEXT NOT NULL,
-            title TEXT NOT NULL,
-            source TEXT NOT NULL,
-            owner TEXT NOT NULL,
-            permission_confirmed INTEGER NOT NULL CHECK (permission_confirmed = 1),
-            learning_level TEXT NOT NULL DEFAULT '',
-            agent_id TEXT,
-            review_date TEXT,
-            text_content TEXT NOT NULL,
-            content_sha256 TEXT NOT NULL,
-            created_by TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_harry_botter_knowledge_scope "
-        "ON harry_botter_knowledge (agent_id, learning_level, updated_at)"
-    )
-    conn.execute(
-        """
         CREATE TABLE IF NOT EXISTS navigation_map_versions (
             map_id TEXT NOT NULL,
             version TEXT NOT NULL,
@@ -1233,6 +1396,27 @@ def init_db():
             updated_at TEXT NOT NULL
         )
         """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS navigation_motion_pin (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            operation_id TEXT,
+            operation_kind TEXT,
+            controller_mode TEXT,
+            state TEXT NOT NULL DEFAULT 'idle',
+            error TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO navigation_motion_pin
+            (id, operation_id, operation_kind, controller_mode, state, error, updated_at)
+        VALUES (1, NULL, NULL, NULL, 'idle', NULL, ?)
+        """,
+        (datetime.now(timezone.utc).isoformat(),),
     )
     conn.execute(
         """
@@ -1291,6 +1475,39 @@ def init_db():
             locked_panels TEXT NOT NULL DEFAULT '[]',
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_sidebar_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            locked_panels TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO classroom_sidebar_settings (id, locked_panels, updated_at)
+        SELECT 1, locked_panels, updated_at
+        FROM teacher_sidebar_settings
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_command_visibility_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            hidden_command_types TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO classroom_command_visibility_settings (id, hidden_command_types)
+        VALUES (1, '[]')
         """
     )
     conn.execute(
@@ -1483,6 +1700,10 @@ def init_db():
         conn.execute(
             "ALTER TABLE duet_arm_recordings ADD COLUMN joint_names TEXT NOT NULL DEFAULT '[]'"
         )
+    if "capture_type" not in recording_columns:
+        conn.execute(
+            "ALTER TABLE duet_arm_recordings ADD COLUMN capture_type TEXT NOT NULL DEFAULT 'motion'"
+        )
     conn.execute(
         "UPDATE duet_arm_recordings SET joint_names = ? WHERE joint_names = '[]'",
         (json.dumps(DUET_ARM_JOINT_NAMES, separators=(",", ":")),),
@@ -1525,24 +1746,6 @@ def init_db():
         conn.execute(
             "INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
             (user["username"], user["password"], user["role"]),
-        )
-    for agent in DEFAULT_HARRY_BOTTER_AGENTS:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO harry_botter_agents (
-                agent_id, display_name, purpose, instructions,
-                generation_temperature, generation_max_tokens, is_builtin
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                agent["agent_id"],
-                agent["display_name"],
-                agent["purpose"],
-                agent["instructions"],
-                agent["generation_temperature"],
-                agent["generation_max_tokens"],
-                agent["is_builtin"],
-            ),
         )
     conn.commit()
     conn.close()
@@ -2240,7 +2443,7 @@ def list_robot_motion_recordings_for_user(
     if controller_version:
         rows = conn.execute(
             """
-            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
             FROM duet_arm_recordings
             WHERE username = ? AND controller_version = ?
             ORDER BY name COLLATE NOCASE, recording_id
@@ -2250,7 +2453,7 @@ def list_robot_motion_recordings_for_user(
     else:
         rows = conn.execute(
             """
-            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
             FROM duet_arm_recordings
             WHERE username = ?
             ORDER BY name COLLATE NOCASE, recording_id
@@ -2268,6 +2471,7 @@ def list_robot_motion_recordings_for_user(
             "controller_version": row["controller_version"],
             "command": row["command"],
             "joint_names": json.loads(row["joint_names"]),
+            "capture_type": row["capture_type"],
         }
         for row in rows
     ]
@@ -2285,28 +2489,45 @@ def save_robot_motion_recording_for_user(
     joint_names: list[str],
     frames: list[DuetArmRecordingFrame],
     captured_at: datetime | None = None,
+    capture_type: str = "motion",
 ) -> dict:
     normalized_name = _validate_duet_motion_name(name)
+    if controller_version not in {"legacy", "duet"}:
+        raise HTTPException(status_code=400, detail="Recording controller version is unsupported.")
+    if capture_type not in {"motion", "position_calibration"}:
+        raise HTTPException(status_code=400, detail="Recording capture type is unsupported.")
     expected_joint_names = (
-        G1_JOINT_NAMES if controller_version == "legacy" else DUET_ARM_JOINT_NAMES
+        G1_JOINT_NAMES
+        if capture_type == "position_calibration" or controller_version == "legacy"
+        else DUET_ARM_JOINT_NAMES
     )
-    if controller_version not in {"legacy", "duet"} or joint_names != list(expected_joint_names):
+    if joint_names != list(expected_joint_names):
         raise HTTPException(status_code=400, detail="Recording joint names do not match the selected controller.")
-    if not 2 <= len(frames) <= 601:
-        raise HTTPException(status_code=400, detail="A recording must contain 2 to 601 joint samples.")
+    maximum_samples = 30001 if capture_type == "position_calibration" else 601
+    maximum_duration = 300 if capture_type == "position_calibration" else 30
+    if not 2 <= len(frames) <= maximum_samples:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A {capture_type.replace('_', ' ')} recording must contain 2 to {maximum_samples} joint samples.",
+        )
 
     validated_frames = []
     previous_time = -1.0
+    pose_frame_id = None
+    pose_base_frame = None
     for index, frame in enumerate(frames):
         if (
             not math.isfinite(frame.time)
             or frame.time < 0
-            or frame.time > 30
+            or frame.time > maximum_duration
             or frame.time <= previous_time
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Recording sample times must increase from zero and stay within 30 seconds.",
+                detail=(
+                    "Recording sample times must increase from zero and stay within "
+                    f"{maximum_duration} seconds."
+                ),
             )
         if len(frame.joints) != len(expected_joint_names) or any(
             not math.isfinite(value) for value in frame.joints
@@ -2322,6 +2543,44 @@ def save_robot_motion_recording_for_user(
             "time": frame.time,
             "joints": frame.joints,
         })
+        if capture_type == "position_calibration" and frame.pose is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Position calibration sample {index + 1} is missing its measured base pose.",
+            )
+        if frame.pose is not None:
+            pose = frame.pose
+            if (
+                not all(math.isfinite(value) for value in (pose.x, pose.y, pose.z, pose.yaw_rad, pose.age_ms))
+                or not 0 <= pose.age_ms <= 1000
+                or pose.timestamp.tzinfo is None
+                or pose.timestamp.utcoffset() is None
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", pose.frame_id)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", pose.base_frame)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Recording sample {index + 1} has an invalid or stale base pose.",
+                )
+            if pose_frame_id is None:
+                pose_frame_id = pose.frame_id
+                pose_base_frame = pose.base_frame
+            elif pose.frame_id != pose_frame_id or pose.base_frame != pose_base_frame:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A position calibration recording must use one consistent TF frame pair.",
+                )
+            validated_frames[-1]["pose"] = {
+                "frame_id": pose.frame_id,
+                "base_frame": pose.base_frame,
+                "x": pose.x,
+                "y": pose.y,
+                "z": pose.z,
+                "yaw_rad": pose.yaw_rad,
+                "timestamp": pose.timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "age_ms": pose.age_ms,
+                "source": pose.source,
+            }
         previous_time = frame.time
 
     if validated_frames[0]["time"] != 0:
@@ -2350,8 +2609,8 @@ def save_robot_motion_recording_for_user(
     conn.execute(
         """
         INSERT INTO duet_arm_recordings
-            (recording_id, username, name, frames, controller_version, command, joint_names, captured_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (recording_id, username, name, frames, controller_version, command, joint_names, captured_at, capture_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             recording_id,
@@ -2362,12 +2621,13 @@ def save_robot_motion_recording_for_user(
             command,
             json.dumps(joint_names, separators=(",", ":")),
             captured_at_text,
+            capture_type,
         ),
     )
     conn.commit()
     row = conn.execute(
         """
-        SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names
+        SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
         FROM duet_arm_recordings
         WHERE username = ? AND recording_id = ?
         """,
@@ -2383,6 +2643,7 @@ def save_robot_motion_recording_for_user(
         "controller_version": row["controller_version"],
         "command": row["command"],
         "joint_names": json.loads(row["joint_names"]),
+        "capture_type": row["capture_type"],
     }
 
 
@@ -2697,757 +2958,6 @@ def auth_required(authorization: Optional[str] = Header(default=None)):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
     return user
-
-
-def _require_harry_botter_teacher(user: dict) -> None:
-    if user.get("role") != "teacher":
-        raise HTTPException(status_code=403, detail="A teacher account is required.")
-
-
-def _harry_botter_agent_from_row(row: sqlite3.Row) -> dict:
-    return {
-        "agent_id": row["agent_id"],
-        "display_name": row["display_name"],
-        "purpose": row["purpose"],
-        "instructions": row["instructions"],
-        "generation_temperature": row["generation_temperature"],
-        "generation_max_tokens": row["generation_max_tokens"],
-        "is_builtin": bool(row["is_builtin"]),
-        "updated_at": row["updated_at"],
-    }
-
-
-def _harry_botter_knowledge_from_row(row: sqlite3.Row) -> dict:
-    return {
-        "document_id": row["document_id"],
-        "filename": row["filename"],
-        "title": row["title"],
-        "source": row["source"],
-        "owner": row["owner"],
-        "learning_level": row["learning_level"],
-        "agent_id": row["agent_id"],
-        "review_date": row["review_date"],
-        "content_sha256": row["content_sha256"],
-        "created_by": row["created_by"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
-
-
-def _harry_botter_knowledge_for_draft(
-    text: str,
-    learning_level: str,
-    agent_id: str,
-) -> list[dict]:
-    conn = get_db_connection()
-    try:
-        rows = conn.execute(
-            """
-            SELECT title, source, owner, review_date, text_content, updated_at
-            FROM harry_botter_knowledge
-            WHERE (agent_id IS NULL OR agent_id = ?)
-              AND (learning_level = '' OR learning_level = ?)
-            """,
-            (agent_id, learning_level),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    ignored = {
-        "about", "after", "again", "also", "and", "are", "because", "before",
-        "between", "could", "does", "from", "have", "into", "that", "their",
-        "there", "these", "this", "those", "what", "when", "where", "which",
-        "will", "with", "would", "your",
-    }
-    terms = {
-        term
-        for term in re.findall(r"[a-z0-9]{3,}", text.casefold())
-        if term not in ignored
-    }
-    ranked = []
-    for row in rows:
-        if row["review_date"] < date.today().isoformat():
-            continue
-        combined = f"{row['title']} {row['text_content']}".casefold()
-        score = sum(combined.count(term) for term in terms)
-        if score:
-            ranked.append((score, row))
-    ranked.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
-
-    selected = []
-    for _, row in ranked[:3]:
-        content = row["text_content"]
-        if len(content) > HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS:
-            matching_offset = next(
-                (content.casefold().find(term) for term in terms if term in content.casefold()),
-                0,
-            )
-            start = max(0, matching_offset - HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS // 3)
-            content = content[start : start + HARRY_BOTTER_KNOWLEDGE_EXCERPT_CHARS]
-        selected.append(
-            {
-                "title": row["title"],
-                "source": row["source"],
-                "owner": row["owner"],
-                "review_date": row["review_date"],
-                "excerpt": content,
-            }
-        )
-    return selected
-
-
-@app.get("/api/harry-botter/config")
-def harry_botter_config(user: dict = Depends(auth_required)):
-    _require_harry_botter_teacher(user)
-    conn = get_db_connection()
-    try:
-        agents = conn.execute(
-            "SELECT * FROM harry_botter_agents ORDER BY is_builtin DESC, display_name COLLATE NOCASE"
-        ).fetchall()
-        knowledge = conn.execute(
-            "SELECT * FROM harry_botter_knowledge ORDER BY updated_at DESC, title COLLATE NOCASE"
-        ).fetchall()
-    finally:
-        conn.close()
-    return {
-        "agents": [_harry_botter_agent_from_row(row) for row in agents],
-        "knowledge": [_harry_botter_knowledge_from_row(row) for row in knowledge],
-        "shared_across_teacher_accounts": True,
-        "supported_knowledge_formats": [".txt", ".md"],
-        "maximum_knowledge_bytes": MAX_HARRY_BOTTER_KNOWLEDGE_BYTES,
-        "maximum_knowledge_documents": MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS,
-        "maximum_knowledge_total_bytes": MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES,
-    }
-
-
-@app.post("/api/harry-botter/agents", status_code=201)
-def harry_botter_create_agent(
-    request: HarryBotterAgentRequest,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    display_name = request.display_name.strip()
-    purpose = request.purpose.strip()
-    instructions = request.instructions.strip()
-    if not display_name or not purpose or not instructions:
-        raise HTTPException(status_code=400, detail="Agent name, purpose, and instructions are required.")
-
-    agent_id = f"custom-{uuid.uuid4()}"
-    conn = get_db_connection()
-    try:
-        count = conn.execute("SELECT COUNT(*) AS count FROM harry_botter_agents").fetchone()["count"]
-        if count >= MAX_HARRY_BOTTER_AGENTS:
-            raise HTTPException(
-                status_code=409,
-                detail=f"A maximum of {MAX_HARRY_BOTTER_AGENTS} shared agents is supported.",
-            )
-        conn.execute(
-            """
-            INSERT INTO harry_botter_agents (
-                agent_id, display_name, purpose, instructions,
-                generation_temperature, generation_max_tokens, is_builtin
-            ) VALUES (?, ?, ?, ?, ?, ?, 0)
-            """,
-            (
-                agent_id,
-                display_name,
-                purpose,
-                instructions,
-                request.generation_temperature,
-                request.generation_max_tokens,
-            ),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
-            (agent_id,),
-        ).fetchone()
-    except sqlite3.IntegrityError as exc:
-        raise HTTPException(status_code=409, detail="An agent with that name already exists.") from exc
-    finally:
-        conn.close()
-    return {"agent": _harry_botter_agent_from_row(row)}
-
-
-@app.put("/api/harry-botter/agents/{agent_id}")
-def harry_botter_update_agent(
-    agent_id: str,
-    request: HarryBotterAgentRequest,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    display_name = request.display_name.strip()
-    purpose = request.purpose.strip()
-    instructions = request.instructions.strip()
-    if not display_name or not purpose or not instructions:
-        raise HTTPException(status_code=400, detail="Agent name, purpose, and instructions are required.")
-
-    conn = get_db_connection()
-    try:
-        existing = conn.execute(
-            "SELECT agent_id FROM harry_botter_agents WHERE agent_id = ?",
-            (agent_id,),
-        ).fetchone()
-        if existing is None:
-            raise HTTPException(status_code=404, detail="The agent does not exist.")
-        conn.execute(
-            """
-            UPDATE harry_botter_agents
-            SET display_name = ?, purpose = ?, instructions = ?,
-                generation_temperature = ?, generation_max_tokens = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE agent_id = ?
-            """,
-            (
-                display_name,
-                purpose,
-                instructions,
-                request.generation_temperature,
-                request.generation_max_tokens,
-                agent_id,
-            ),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
-            (agent_id,),
-        ).fetchone()
-    except sqlite3.IntegrityError as exc:
-        raise HTTPException(status_code=409, detail="An agent with that name already exists.") from exc
-    finally:
-        conn.close()
-    return {"agent": _harry_botter_agent_from_row(row)}
-
-
-@app.delete("/api/harry-botter/agents/{agent_id}")
-def harry_botter_delete_agent(
-    agent_id: str,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    conn = get_db_connection()
-    try:
-        existing = conn.execute(
-            "SELECT is_builtin FROM harry_botter_agents WHERE agent_id = ?",
-            (agent_id,),
-        ).fetchone()
-        if existing is None:
-            raise HTTPException(status_code=404, detail="The agent does not exist.")
-        if existing["is_builtin"]:
-            raise HTTPException(status_code=409, detail="Built-in agents cannot be deleted.")
-        conn.execute("DELETE FROM harry_botter_knowledge WHERE agent_id = ?", (agent_id,))
-        conn.execute("DELETE FROM harry_botter_agents WHERE agent_id = ?", (agent_id,))
-        conn.commit()
-    finally:
-        conn.close()
-    return {"deleted": True}
-
-
-@app.post("/api/harry-botter/knowledge", status_code=201)
-def harry_botter_add_knowledge(
-    request: HarryBotterKnowledgeRequest,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    filename, encoded_text = _validate_harry_botter_knowledge(request)
-
-    document_id = str(uuid.uuid4())
-    conn = get_db_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        usage = conn.execute(
-            """
-            SELECT COUNT(*) AS document_count,
-                   COALESCE(SUM(length(CAST(text_content AS BLOB))), 0) AS total_bytes
-            FROM harry_botter_knowledge
-            """
-        ).fetchone()
-        if usage["document_count"] >= MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS:
-            raise HTTPException(
-                status_code=409,
-                detail=f"The shared knowledge library is limited to {MAX_HARRY_BOTTER_KNOWLEDGE_DOCUMENTS} documents.",
-            )
-        if usage["total_bytes"] + len(encoded_text) > MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail="The shared knowledge library has reached its 10 MB storage limit.",
-            )
-        conn.execute(
-            """
-            INSERT INTO harry_botter_knowledge (
-                document_id, filename, title, source, owner, permission_confirmed,
-                learning_level, agent_id, review_date, text_content, content_sha256, created_by
-            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                document_id,
-                filename,
-                request.title.strip(),
-                request.source.strip(),
-                request.owner.strip(),
-                request.learning_level,
-                request.agent_id,
-                request.review_date.isoformat(),
-                request.text,
-                hashlib.sha256(encoded_text).hexdigest(),
-                user["username"],
-            ),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM harry_botter_knowledge WHERE document_id = ?",
-            (document_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    return {"document": _harry_botter_knowledge_from_row(row)}
-
-
-def _validate_harry_botter_knowledge(request: HarryBotterKnowledgeRequest) -> tuple[str, bytes]:
-    filename = re.split(r"[\\/]", request.filename.strip())[-1]
-    if Path(filename).suffix.casefold() not in {".txt", ".md"}:
-        raise HTTPException(status_code=415, detail="Only plain-text .txt and .md knowledge files are supported.")
-    if not request.permission_confirmed:
-        raise HTTPException(status_code=400, detail="Confirm that you have permission to upload this material.")
-    if not request.title.strip() or not request.source.strip() or not request.owner.strip():
-        raise HTTPException(status_code=400, detail="Title, source, and owner are required.")
-    if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Knowledge files must contain readable text.")
-    encoded_text = request.text.encode("utf-8")
-    if len(encoded_text) > MAX_HARRY_BOTTER_KNOWLEDGE_BYTES:
-        raise HTTPException(status_code=413, detail="Knowledge files must be 100 KB or smaller.")
-    if request.agent_id:
-        conn = get_db_connection()
-        try:
-            agent = conn.execute(
-                "SELECT agent_id FROM harry_botter_agents WHERE agent_id = ?",
-                (request.agent_id,),
-            ).fetchone()
-        finally:
-            conn.close()
-        if agent is None:
-            raise HTTPException(status_code=404, detail="The selected agent does not exist.")
-    return filename, encoded_text
-
-
-@app.get("/api/harry-botter/knowledge/{document_id}")
-def harry_botter_get_knowledge(
-    document_id: str,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    conn = get_db_connection()
-    try:
-        row = conn.execute(
-            "SELECT * FROM harry_botter_knowledge WHERE document_id = ?",
-            (document_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        raise HTTPException(status_code=404, detail="The knowledge document does not exist.")
-    return {"document": {**_harry_botter_knowledge_from_row(row), "text": row["text_content"]}}
-
-
-@app.put("/api/harry-botter/knowledge/{document_id}")
-def harry_botter_update_knowledge(
-    document_id: str,
-    request: HarryBotterKnowledgeRequest,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    filename, encoded_text = _validate_harry_botter_knowledge(request)
-    conn = get_db_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        existing = conn.execute(
-            "SELECT length(CAST(text_content AS BLOB)) AS byte_count "
-            "FROM harry_botter_knowledge WHERE document_id = ?",
-            (document_id,),
-        ).fetchone()
-        if existing is None:
-            raise HTTPException(status_code=404, detail="The knowledge document does not exist.")
-        usage = conn.execute(
-            """
-            SELECT COALESCE(SUM(length(CAST(text_content AS BLOB))), 0) AS total_bytes
-            FROM harry_botter_knowledge
-            """
-        ).fetchone()
-        if usage["total_bytes"] - existing["byte_count"] + len(encoded_text) > MAX_HARRY_BOTTER_KNOWLEDGE_TOTAL_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail="The shared knowledge library has reached its 10 MB storage limit.",
-            )
-        conn.execute(
-            """
-            UPDATE harry_botter_knowledge
-            SET filename = ?, title = ?, source = ?, owner = ?, permission_confirmed = 1,
-                learning_level = ?, agent_id = ?, review_date = ?, text_content = ?,
-                content_sha256 = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE document_id = ?
-            """,
-            (
-                filename,
-                request.title.strip(),
-                request.source.strip(),
-                request.owner.strip(),
-                request.learning_level,
-                request.agent_id,
-                request.review_date.isoformat(),
-                request.text,
-                hashlib.sha256(encoded_text).hexdigest(),
-                document_id,
-            ),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT * FROM harry_botter_knowledge WHERE document_id = ?",
-            (document_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    return {"document": _harry_botter_knowledge_from_row(row)}
-
-
-@app.delete("/api/harry-botter/knowledge/{document_id}")
-def harry_botter_delete_knowledge(
-    document_id: str,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    conn = get_db_connection()
-    try:
-        cursor = conn.execute(
-            "DELETE FROM harry_botter_knowledge WHERE document_id = ?",
-            (document_id,),
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="The knowledge document does not exist.")
-    finally:
-        conn.close()
-    return {"deleted": True}
-
-
-@app.get("/api/harry-botter/model-status")
-async def harry_botter_model_status(user: dict = Depends(auth_required)):
-    _require_harry_botter_teacher(user)
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-            response = await client.get("http://127.0.0.1:8765/api/v1/model/status")
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=503, detail="The local Harry Botter service timed out.") from exc
-    except httpx.ConnectError as exc:
-        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Could not check the local model service.") from exc
-
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="The local model service returned invalid JSON.") from exc
-    if response.status_code >= 400:
-        error = body.get("error", {}) if isinstance(body, dict) else {}
-        detail = error.get("message") if isinstance(error, dict) else None
-        raise HTTPException(status_code=502, detail=detail or "Could not check the local model service.")
-    return body
-
-
-@app.get("/api/harry-botter/speech-status")
-async def harry_botter_speech_status(user: dict = Depends(auth_required)):
-    _require_harry_botter_teacher(user)
-    try:
-        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-            response = await client.get("http://127.0.0.1:8765/api/v1/speech/status")
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=503, detail="The local speech service timed out.") from exc
-    except httpx.ConnectError as exc:
-        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Could not check the local speech service.") from exc
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="The local speech service returned invalid JSON.") from exc
-    if response.status_code >= 400:
-        error = body.get("error", {}) if isinstance(body, dict) else {}
-        detail = error.get("message") if isinstance(error, dict) else None
-        raise HTTPException(status_code=502, detail=detail or "Could not check the local speech service.")
-    return body
-
-
-@app.post("/api/harry-botter/transcribe")
-async def harry_botter_transcribe_audio(
-    request: Request,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if content_type not in HARRY_BOTTER_AUDIO_TYPES:
-        raise HTTPException(status_code=415, detail="Send WebM, Ogg, MP4, or WAV audio.")
-    try:
-        content_length = int(request.headers.get("content-length", "0"))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Content-Length must be an integer.") from exc
-    if content_length > MAX_HARRY_BOTTER_AUDIO_BYTES:
-        raise HTTPException(status_code=413, detail="Audio recordings must be 8 MB or smaller.")
-
-    chunks = []
-    total_bytes = 0
-    async for chunk in request.stream():
-        total_bytes += len(chunk)
-        if total_bytes > MAX_HARRY_BOTTER_AUDIO_BYTES:
-            raise HTTPException(status_code=413, detail="Audio recordings must be 8 MB or smaller.")
-        chunks.append(chunk)
-    audio = b"".join(chunks)
-    if not audio:
-        raise HTTPException(status_code=400, detail="A non-empty audio recording is required.")
-
-    try:
-        async with httpx.AsyncClient(timeout=180.0, trust_env=False) as client:
-            response = await client.post(
-                "http://127.0.0.1:8765/api/v1/transcribe",
-                content=audio,
-                headers={"Content-Type": content_type},
-            )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=503, detail="Local transcription timed out.") from exc
-    except httpx.ConnectError as exc:
-        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Could not reach the local speech service.") from exc
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="The local speech service returned invalid JSON.") from exc
-    if response.status_code >= 400:
-        error = body.get("error", {}) if isinstance(body, dict) else {}
-        detail = error.get("message") if isinstance(error, dict) else None
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=detail or "The local speech service could not transcribe this recording.",
-        )
-    return body
-
-
-@app.post("/api/harry-botter/speech")
-async def harry_botter_synthesize_speech(
-    request: HarryBotterSpeechRequest,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    try:
-        async with httpx.AsyncClient(timeout=180.0, trust_env=False) as client:
-            response = await client.post(
-                "http://127.0.0.1:8765/api/v1/speech",
-                json={"text": request.text, "speed": request.speed},
-            )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=503, detail="Local speech generation timed out.") from exc
-    except httpx.ConnectError as exc:
-        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Could not reach the local speech service.") from exc
-    if response.status_code >= 400:
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail="The local speech service returned invalid JSON.") from exc
-        error = body.get("error", {}) if isinstance(body, dict) else {}
-        detail = error.get("message") if isinstance(error, dict) else None
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=detail or "The local speech service could not generate audio.",
-        )
-    media_type = response.headers.get("content-type", "").split(";", 1)[0]
-    if media_type != "audio/wav":
-        raise HTTPException(status_code=502, detail="The local speech service returned an unsupported audio type.")
-    return Response(
-        content=response.content,
-        media_type=media_type,
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-@app.post("/api/harry-botter/g1-speak")
-def harry_botter_speak_on_g1(
-    request: HarryBotterG1SpeakRequest,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    audio_capability = robot_status().get("capabilities", {}).get("audio")
-    if audio_capability is not True:
-        raise HTTPException(
-            status_code=409,
-            detail="Connect the G1 audio client before using the G1 speaker.",
-        )
-    if not request.text.strip() or any(
-        ord(character) < 32 or ord(character) == 127 for character in request.text
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="G1 speech text must contain printable characters.",
-        )
-    return speak_robot_text(request.text, request.speaker_id)
-
-
-@app.websocket("/api/harry-botter/stream")
-async def harry_botter_audio_stream(websocket: WebSocket):
-    protocol = next(
-        (
-            value.strip()
-            for value in websocket.headers.get("sec-websocket-protocol", "").split(",")
-            if value.strip().startswith("edu-auth.")
-        ),
-        None,
-    )
-    token = protocol[len("edu-auth."):] if protocol else None
-    user = get_user_from_token(token) if token else None
-    if not user or user.get("role") != "teacher":
-        await websocket.close(code=1008, reason="Authenticated teacher session required.")
-        return
-    await websocket.accept(subprotocol=protocol)
-
-    async def forward_audio_to_service(service_socket) -> None:
-        try:
-            while True:
-                message = await websocket.receive()
-                if message["type"] == "websocket.disconnect":
-                    return
-                binary = message.get("bytes")
-                text = message.get("text")
-                if binary is not None:
-                    if len(binary) != HARRY_BOTTER_STREAM_FRAME_BYTES:
-                        await websocket.send_json({
-                            "type": "error",
-                            "code": "invalid_audio_frame",
-                            "message": "Audio frames must contain 20 ms of PCM.",
-                        })
-                        await websocket.close(code=1003, reason="Invalid audio frame.")
-                        return
-                    await service_socket.send(binary)
-                elif text is not None and len(text) <= 1024:
-                    await service_socket.send(text)
-                else:
-                    await websocket.close(code=1009, reason="Audio control message is too large.")
-                    return
-        except WebSocketDisconnect:
-            return
-
-    async def forward_service_events(service_socket) -> None:
-        async for message in service_socket:
-            if isinstance(message, bytes):
-                await websocket.send_bytes(message)
-            else:
-                await websocket.send_text(message)
-
-    try:
-        async with websocket_connect(
-            "ws://127.0.0.1:8766/api/v1/audio-stream",
-            subprotocols=["harry-botter-audio-v1"],
-            proxy=None,
-            max_size=16_000,
-            max_queue=8,
-        ) as service_socket:
-            forwarders = {
-                asyncio.create_task(forward_audio_to_service(service_socket)),
-                asyncio.create_task(forward_service_events(service_socket)),
-            }
-            done, pending = await asyncio.wait(
-                forwarders,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            results = await asyncio.gather(*done, *pending, return_exceptions=True)
-            unexpected = next(
-                (
-                    result
-                    for result in results
-                    if isinstance(result, Exception)
-                    and not isinstance(result, (WebSocketDisconnect, WebSocketException, OSError))
-                ),
-                None,
-            )
-            if unexpected:
-                raise unexpected
-        if (
-            websocket.client_state == WebSocketState.CONNECTED
-            and websocket.application_state == WebSocketState.CONNECTED
-        ):
-            await websocket.close(code=1000)
-    except (OSError, WebSocketException, TimeoutError) as exc:
-        try:
-            await websocket.send_json({
-                "type": "error",
-                "code": "stream_unavailable",
-                "message": "The local voice stream is unavailable. Check that the voice service is running.",
-            })
-        except WebSocketDisconnect:
-            return
-        await websocket.close(code=1011, reason="Local voice stream unavailable.")
-
-
-@app.post("/api/harry-botter/draft")
-async def harry_botter_create_draft(
-    request: HarryBotterDraftRequest,
-    user: dict = Depends(auth_required),
-):
-    _require_harry_botter_teacher(user)
-    conn = get_db_connection()
-    try:
-        agent_row = conn.execute(
-            "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
-            (request.agent_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if agent_row is None:
-        raise HTTPException(status_code=404, detail="The selected agent does not exist.")
-
-    agent = _harry_botter_agent_from_row(agent_row)
-    knowledge = _harry_botter_knowledge_for_draft(
-        request.text,
-        request.learning_level,
-        request.agent_id,
-    ) if request.learning_level else []
-    service_payload = request.model_dump(exclude={"agent_id"})
-    service_payload["agent"] = {
-        "agent_id": agent["agent_id"],
-        "display_name": agent["display_name"],
-        "purpose": agent["purpose"],
-        "instructions": agent["instructions"],
-        "generation_temperature": agent["generation_temperature"],
-        "generation_max_tokens": agent["generation_max_tokens"],
-    }
-    service_payload["knowledge"] = knowledge
-
-    try:
-        async with httpx.AsyncClient(timeout=65.0, trust_env=False) as client:
-            response = await client.post(
-                "http://127.0.0.1:8765/api/v1/drafts",
-                json=service_payload,
-            )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=503, detail="The local model request timed out.") from exc
-    except httpx.ConnectError as exc:
-        raise HTTPException(status_code=503, detail="The local Harry Botter service is not running.") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Could not reach the local model service.") from exc
-
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="The local model service returned invalid JSON.") from exc
-    if response.status_code >= 400:
-        error = body.get("error", {}) if isinstance(body, dict) else {}
-        detail = error.get("message") if isinstance(error, dict) else None
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=detail or "The local model service could not create a draft.",
-        )
-    return body
 
 
 @app.get("/api/github-proxy")
@@ -4075,8 +3585,11 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
     try:
         queue = list_queue_items()
         item = next((queued for queued in queue if queued["id"] == request.item_id), None)
-        if not item or item["status"] != "queued":
-            raise HTTPException(status_code=404, detail="The approved queue item is no longer queued.")
+        if not item or item["status"] not in {"queued", "completed"}:
+            raise HTTPException(
+                status_code=404,
+                detail="The approved queue item is neither queued nor previously completed.",
+            )
         planner_request = item.get("planner_request") or {}
         if planner_request.get("planner_mode") == "sensor_corrected":
             if item["controller_version"] != "legacy":
@@ -4897,6 +4410,152 @@ def get_robot_joint_state(response: Response, user: dict = Depends(auth_required
     }
 
 
+@app.get("/api/robot/pose")
+def get_robot_pose(response: Response, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    response.headers["Cache-Control"] = "no-store, no-cache, max-age=0"
+    provider_url = os.getenv("G1_DISTANCE_PROVIDER_URL", "").strip()
+    provider_token = os.getenv("G1_DISTANCE_PROVIDER_TOKEN", "").strip()
+    parsed_provider = urlsplit(provider_url)
+    if (
+        not provider_url
+        or not provider_token
+        or parsed_provider.scheme not in {"http", "https"}
+        or not parsed_provider.netloc
+    ):
+        raise HTTPException(status_code=503, detail="Authenticated ROS pose provider is not configured.")
+    if (
+        parsed_provider.scheme == "http"
+        and parsed_provider.hostname not in {"127.0.0.1", "::1", "localhost"}
+    ):
+        raise HTTPException(status_code=503, detail="Remote ROS pose providers require HTTPS.")
+    provider_path = parsed_provider.path.rstrip("/")
+    for suffix in ("/distance/front", "/distance/rear"):
+        if provider_path.endswith(suffix):
+            provider_path = provider_path[:-len(suffix)]
+            break
+    else:
+        raise HTTPException(status_code=503, detail="ROS pose provider URL has an unsupported path.")
+    pose_url = urlunsplit(
+        (parsed_provider.scheme, parsed_provider.netloc, f"{provider_path}/pose", "", "")
+    )
+    try:
+        provider_response = httpx.get(
+            pose_url,
+            headers={"Authorization": f"Bearer {provider_token}", "Accept": "application/json"},
+            timeout=0.5,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=503, detail="ROS pose provider could not be reached.") from error
+    try:
+        payload = provider_response.json()
+    except ValueError:
+        payload = {}
+    if provider_response.status_code != 200:
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        raise HTTPException(
+            status_code=503,
+            detail=detail if isinstance(detail, str) else "Fresh ROS pose data is unavailable.",
+        )
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("ready"), bool)
+        or not isinstance(payload.get("poses"), list)
+        or not 1 <= len(payload["poses"]) <= 4
+    ):
+        raise HTTPException(status_code=502, detail="ROS pose provider returned an invalid response.")
+
+    poses = []
+    seen_frames = set()
+    for index, pose in enumerate(payload["poses"]):
+        if not isinstance(pose, dict) or not isinstance(pose.get("ready"), bool):
+            raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} is invalid.")
+        frame_id = pose.get("frame_id")
+        base_frame = pose.get("base_frame")
+        if (
+            not isinstance(frame_id, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", frame_id)
+            or "//" in frame_id
+            or frame_id in seen_frames
+            or not isinstance(base_frame, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_/]{0,127}", base_frame)
+            or "//" in base_frame
+        ):
+            raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} has invalid frames.")
+        seen_frames.add(frame_id)
+        if not pose["ready"]:
+            error = pose.get("error")
+            if error is not None and (not isinstance(error, str) or len(error) > 512):
+                raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} has an invalid error.")
+            poses.append({
+                "ready": False,
+                "frame_id": frame_id,
+                "base_frame": base_frame,
+                "error": error,
+            })
+            continue
+        timestamp = pose.get("timestamp")
+        if not isinstance(timestamp, str):
+            raise HTTPException(status_code=502, detail=f"ROS pose provider sample {index + 1} has no timestamp.")
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ROS pose provider sample {index + 1} has an invalid timestamp.",
+            ) from error
+        age_ms = pose.get("age_ms")
+        values = (pose.get("x"), pose.get("y"), pose.get("z"), pose.get("yaw_rad"), age_ms)
+        if (
+            parsed_timestamp.tzinfo is None
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in values
+            )
+            or not 0 <= age_ms <= 1000
+            or pose.get("source") not in {"tf2", "odometry"}
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail=f"ROS pose provider sample {index + 1} is invalid or stale.",
+            )
+        poses.append({
+            "ready": True,
+            "frame_id": frame_id,
+            "base_frame": base_frame,
+            "x": float(pose["x"]),
+            "y": float(pose["y"]),
+            "z": float(pose["z"]),
+            "yaw_rad": float(pose["yaw_rad"]),
+            "timestamp": parsed_timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "age_ms": age_ms,
+            "source": pose["source"],
+        })
+    ready_frames = {pose["frame_id"] for pose in poses if pose["ready"]}
+    preferred_frame = payload.get("preferred_frame")
+    if (
+        payload["ready"] != bool(ready_frames)
+        or (
+            preferred_frame is not None
+            and (not isinstance(preferred_frame, str) or preferred_frame not in ready_frames)
+        )
+        or (ready_frames and preferred_frame is None)
+    ):
+        raise HTTPException(status_code=502, detail="ROS pose provider readiness metadata is inconsistent.")
+    error = payload.get("error")
+    if error is not None and (not isinstance(error, str) or len(error) > 512):
+        raise HTTPException(status_code=502, detail="ROS pose provider returned an invalid status message.")
+    return {
+        "ready": payload["ready"],
+        "preferred_frame": preferred_frame,
+        "poses": poses,
+        "error": error,
+    }
+
+
 @app.post("/api/duet/connect")
 def duet_connect(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
@@ -5005,10 +4664,71 @@ def duet_connect(user: dict = Depends(auth_required)):
 def duet_disconnect(user: dict = Depends(auth_required)):
     if user["role"] != "teacher":
         raise HTTPException(status_code=403, detail="Teacher role required")
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
     try:
+        if active_navigation_operation() or active_lidar_scan():
+            raise HTTPException(
+                status_code=409,
+                detail="A navigation route or scan owns locomotion; stop and confirm it before disconnecting DUET.",
+            )
         return disconnect_duet_controller()
     except DuetControllerError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    finally:
+        _MOTION_START_LOCK.release()
+
+
+@app.post("/api/duet/handoff-to-legacy")
+def duet_handoff_to_legacy(
+    request: DuetLegacyHandoffRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    if request.operator_confirmed_passive is not True:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Before switching, an onsite operator must verify the G1 is stable and press L2+B "
+                "to put DUET in Passive. The backend cannot verify physical stability or Passive state."
+            ),
+        )
+    if not _MOTION_START_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another robot motion operation is starting.")
+    try:
+        sdk_status = robot_status()
+        if sdk_status.get("running"):
+            raise HTTPException(status_code=409, detail="Stop the active legacy SDK program before switching controllers.")
+        duet_status = duet_controller_status()
+        if duet_status.get("programActive") is True or duet_status.get("motionActive") is True:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "DUET still reports an active program or motion. Stop it and have the onsite operator "
+                    "verify the robot is stable and in Passive before retrying."
+                ),
+            )
+        if active_navigation_operation():
+            raise HTTPException(status_code=409, detail="Stop and confirm the active navigation operation before switching controllers.")
+        scan = active_lidar_scan()
+        if scan:
+            raise HTTPException(
+                status_code=409,
+                detail=f"LiDAR scan {scan['job_id']} is active; stop it before switching controllers.",
+            )
+        try:
+            handoff = stop_duet_controller_service()
+        except DuetControllerError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {
+            "status": "handoff_complete",
+            **handoff,
+            "operatorConfirmedPassive": True,
+            "physicalPassiveVerified": False,
+        }
+    finally:
+        _MOTION_START_LOCK.release()
 
 
 @app.get("/api/duet/status")
@@ -5107,6 +4827,7 @@ def create_robot_motion_recording(
         request.joint_names,
         request.frames,
         request.captured_at,
+        request.capture_type,
     )
     return {"recording": recording}
 
@@ -5703,25 +5424,38 @@ def start_lidar_scan(
     if not _MOTION_START_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
     try:
-        ensure_sdk_motion_available()
-        if robot_status()["running"]:
-            raise HTTPException(status_code=409, detail="Stop SDK motion before starting a room scan.")
         if active_navigation_operation():
             raise HTTPException(status_code=409, detail="Cannot scan while ROS navigation owns locomotion.")
         if active_lidar_scan():
             raise HTTPException(status_code=409, detail="A LiDAR room scan is already active.")
+        mode = _select_navigation_controller_mode()
+        job_id = str(uuid.uuid4())
+        _reserve_navigation_motion(job_id, "scan", mode)
+        save_lidar_scan(job_id, "scanning", user["username"], rotation_status="submitted")
         try:
-            scan = navigation_start_scan()
+            scan = navigation_start_scan(job_id)
         except NavigationBridgeError as error:
+            try:
+                _stop_navigation_motion(job_id, reason="scan_start_error")
+            except HTTPException:
+                pass
+            save_lidar_scan(
+                job_id,
+                "scanning",
+                user["username"],
+                rotation_status="uncertain",
+                error=str(error),
+            )
             raise HTTPException(status_code=503, detail=str(error)) from error
         save_lidar_scan(
-            scan["job_id"],
+            job_id,
             scan["status"],
             user["username"],
             rotation_status=scan["rotation_status"],
             rotation_radians=scan["rotation_radians"],
             error=scan.get("error"),
         )
+        scan["job_id"] = job_id
         return scan
     finally:
         _MOTION_START_LOCK.release()
@@ -5748,6 +5482,9 @@ def get_lidar_scan_status(job_id: str, user: dict = Depends(auth_required)):
                 rotation_radians=scan["rotation_radians"],
                 error=scan.get("error"),
             )
+            pin = _navigation_motion_pin()
+            if pin.get("operation_id") == job_id and pin.get("state") != "latched":
+                _stop_navigation_motion(job_id, terminal=True, reason="scan_terminal")
         return scan
     return {
         "job_id": stored["job_id"],
@@ -5856,6 +5593,7 @@ def cancel_lidar_scan(job_id: str, user: dict = Depends(auth_required)):
     if not stored or stored["status"] != "scanning":
         raise HTTPException(status_code=409, detail="There is no active LiDAR scan to cancel.")
     try:
+        _stop_navigation_motion(job_id, reason="teacher_scan_cancel")
         scan = navigation_cancel_scan(job_id)
     except NavigationBridgeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
@@ -5988,29 +5726,29 @@ def update_simulation_visibility(
 
 
 @app.get("/api/classroom/sidebar-settings")
-def get_teacher_sidebar_settings(user: dict = Depends(auth_required)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher role required")
+def get_classroom_sidebar_settings(response: Response, user: dict = Depends(auth_required)):
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     conn = get_db_connection()
-    row = conn.execute(
-        "SELECT locked_panels FROM teacher_sidebar_settings WHERE username = ?",
-        (user["username"],),
-    ).fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            "SELECT locked_panels FROM classroom_sidebar_settings WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
     if row is None:
         return {"locked_panels": [], "configured": False}
     try:
         locked_panels = json.loads(row["locked_panels"])
     except (TypeError, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.") from error
+        raise HTTPException(status_code=503, detail="Classroom sidebar settings are invalid.") from error
     valid_panels = {"blocks", "ide", "planner", "prompt", "camera"}
     if not isinstance(locked_panels, list) or any(panel not in valid_panels for panel in locked_panels):
-        raise HTTPException(status_code=503, detail="Teacher sidebar settings are invalid.")
+        raise HTTPException(status_code=503, detail="Classroom sidebar settings are invalid.")
     return {"locked_panels": locked_panels, "configured": True}
 
 
 @app.put("/api/classroom/sidebar-settings")
-def update_teacher_sidebar_settings(
+def update_classroom_sidebar_settings(
     request: SidebarSettingsRequest,
     user: dict = Depends(auth_required),
 ):
@@ -6018,19 +5756,77 @@ def update_teacher_sidebar_settings(
         raise HTTPException(status_code=403, detail="Teacher role required")
     locked_panels = list(dict.fromkeys(request.locked_panels))
     conn = get_db_connection()
-    conn.execute(
-        """
-        INSERT INTO teacher_sidebar_settings (username, locked_panels, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(username) DO UPDATE SET
-            locked_panels = excluded.locked_panels,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (user["username"], json.dumps(locked_panels)),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO classroom_sidebar_settings (id, locked_panels, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                locked_panels = excluded.locked_panels,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (json.dumps(locked_panels),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"locked_panels": locked_panels, "configured": True}
+
+
+@app.get("/api/classroom/command-visibility")
+def get_classroom_command_visibility(response: Response, user: dict = Depends(auth_required)):
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT hidden_command_types FROM classroom_command_visibility_settings WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=503, detail="Classroom command visibility settings are unavailable.")
+    try:
+        hidden_command_types = json.loads(row["hidden_command_types"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=503, detail="Classroom command visibility settings are invalid.") from error
+    if (
+        not isinstance(hidden_command_types, list)
+        or any(
+            not isinstance(command_type, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,159}", command_type)
+            for command_type in hidden_command_types
+        )
+    ):
+        raise HTTPException(status_code=503, detail="Classroom command visibility settings are invalid.")
+    return {"hidden_command_types": list(dict.fromkeys(hidden_command_types)), "configured": True}
+
+
+@app.put("/api/classroom/command-visibility")
+def update_classroom_command_visibility(
+    request: CommandVisibilitySettingsRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    hidden_command_types = list(dict.fromkeys(request.hidden_command_types))
+    if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,159}", item) for item in hidden_command_types):
+        raise HTTPException(status_code=422, detail="Command type identifiers are invalid.")
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO classroom_command_visibility_settings (id, hidden_command_types, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                hidden_command_types = excluded.hidden_command_types,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (json.dumps(hidden_command_types),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"hidden_command_types": hidden_command_types, "configured": True}
 
 
 def teacher_safe_mode_enabled(username: str) -> bool:
@@ -6159,11 +5955,9 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
     if not _MOTION_START_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Another robot motion operation is starting or running.")
     try:
-        ensure_sdk_motion_available()
         if active_lidar_scan():
             raise HTTPException(status_code=409, detail="Complete or cancel the active LiDAR scan before navigation.")
-        if robot_status()["running"]:
-            raise HTTPException(status_code=409, detail="Stop the active SDK robot program before starting navigation.")
+        mode = _select_navigation_controller_mode()
         operation_id = str(uuid.uuid4())
         route = {
             "map_id": request.map_id,
@@ -6171,6 +5965,7 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
             "frame_id": request.frame_id,
             "waypoints": request.waypoints,
             "planner_mode": request.planner_mode,
+            "controller_mode": mode,
         }
         if request.queue_item_id:
             route["queue_item_id"] = request.queue_item_id
@@ -6184,6 +5979,7 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
 
         def persist_starting_operation():
             nonlocal dispatch_started
+            _reserve_navigation_motion(operation_id, "route", mode)
             save_navigation_operation(
                 {"operation_id": operation_id, "status": "starting"},
                 user["username"],
@@ -6206,6 +6002,14 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
         except NavigationBridgeError as error:
             if dispatch_started:
                 update_navigation_operation(operation_id, "uncertain")
+                try:
+                    navigation_cancel_route(operation_id)
+                except NavigationBridgeError:
+                    pass
+                try:
+                    _stop_navigation_motion(operation_id, reason="route_start_error")
+                except HTTPException:
+                    pass
             raise HTTPException(status_code=503, detail=str(error)) from error
         save_navigation_operation(
             {"operation_id": operation_id, "status": operation.get("status", "accepted")},
@@ -6214,6 +6018,8 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
         )
         operation_status = "completed" if operation["status"] == "succeeded" else operation["status"]
         update_navigation_operation(operation_id, operation_status)
+        if operation_status in {"completed", "canceled", "failed", "rejected"}:
+            _stop_navigation_motion(operation_id, terminal=True, reason="route_terminal")
         return {**operation, "status": operation_status}
     finally:
         _MOTION_START_LOCK.release()
@@ -6221,12 +6027,10 @@ def start_navigation(request: NavigationStartRequest, user: dict = Depends(auth_
 
 @app.post("/api/navigation/plan")
 def preview_navigation_route(request: NavigationStartRequest, user: dict = Depends(auth_required)):
-    ensure_sdk_motion_available()
-    if robot_status()["running"]:
-        raise HTTPException(
-            status_code=409,
-            detail="Stop the active SDK robot program before requesting a route preview.",
-        )
+    if active_navigation_operation() or active_lidar_scan():
+        raise HTTPException(status_code=409, detail="A route preview is unavailable while navigation owns locomotion.")
+    if robot_status().get("running") or duet_controller_status().get("programActive"):
+        raise HTTPException(status_code=409, detail="Stop the active robot program before requesting a route preview.")
     try:
         static_map_snapshot = None
         if request.planner_mode == "static":
@@ -6324,9 +6128,13 @@ def get_navigation_operation(operation_id: str, user: dict = Depends(auth_requir
     if status == "succeeded":
         status = "completed"
     update_navigation_operation(operation_id, status)
+    if status in {"completed", "canceled", "failed", "rejected"}:
+        pin = _navigation_motion_pin()
+        if pin.get("operation_id") == operation_id and pin.get("state") != "latched":
+            _stop_navigation_motion(operation_id, terminal=True, reason="route_terminal")
     route = json.loads(row["route"])
     queue_item_id = route.get("queue_item_id")
-    if queue_item_id and status in {"completed", "canceled", "failed"}:
+    if queue_item_id and status in {"completed", "canceled", "failed", "rejected"}:
         queue_status = "completed" if status == "completed" else "paused" if status == "canceled" else "failed"
         set_queue_item_status(queue_item_id, queue_status)
     if (
@@ -6379,6 +6187,7 @@ def stop_navigation(operation_id: str, user: dict = Depends(auth_required)):
     if not active_navigation_operation():
         raise HTTPException(status_code=409, detail="There is no active navigation operation.")
     try:
+        _stop_navigation_motion(operation_id, reason="teacher_cancel")
         operation = navigation_cancel_route(operation_id)
     except NavigationBridgeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
@@ -6387,6 +6196,103 @@ def stop_navigation(operation_id: str, user: dict = Depends(auth_required)):
         operation_status = "completed"
     update_navigation_operation(operation_id, operation_status)
     return {**operation, "status": operation_status}
+
+
+def _validate_navigation_bridge_authorization(authorization: str | None) -> None:
+    expected = os.getenv("G1_NAV_BRIDGE_TOKEN", "").strip()
+    supplied = authorization.removeprefix("Bearer ").strip() if isinstance(authorization, str) else ""
+    if len(expected) < 24 or not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="A valid navigation bridge bearer token is required.")
+
+
+def _navigation_motion_source_active(operation_id: str, operation_kind: str) -> bool:
+    conn = get_db_connection()
+    if operation_kind == "scan":
+        row = conn.execute(
+            "SELECT status FROM lidar_scans WHERE job_id = ?", (operation_id,)
+        ).fetchone()
+        active = bool(row and row["status"] == "scanning")
+    else:
+        row = conn.execute(
+            "SELECT status FROM navigation_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        active = bool(row and row["status"] in _NAVIGATION_ACTIVE_STATES)
+    conn.close()
+    return active
+
+
+@app.post("/api/internal/navigation-motion/{operation_id}/velocity")
+def navigation_motion_velocity(
+    operation_id: str,
+    request: NavigationVelocityRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_navigation_bridge_authorization(authorization)
+    _navigation_motion_gate()
+    try:
+        operation_id = str(uuid.UUID(operation_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise HTTPException(status_code=400, detail="Navigation operation ID must be a UUID.") from error
+    values = (request.vx, request.vy, request.vyaw)
+    if any(isinstance(value, bool) or not math.isfinite(float(value)) for value in values):
+        raise HTTPException(status_code=422, detail="Navigation velocity values must be finite numbers.")
+    if abs(request.vx) > 0.20 or request.vy != 0.0 or abs(request.vyaw) > 0.30:
+        raise HTTPException(
+            status_code=422,
+            detail="Navigation accepts only bounded forward/reverse and yaw velocities; lateral/vertical motion is disabled.",
+        )
+    with _NAVIGATION_COMMAND_LOCK:
+        pin = _navigation_motion_pin()
+        if (
+            pin["operation_id"] != operation_id
+            or pin["state"] != "active"
+            or pin["operation_kind"] not in {"route", "scan"}
+            or not _navigation_motion_source_active(operation_id, pin["operation_kind"])
+        ):
+            raise HTTPException(status_code=409, detail="No matching active navigation operation owns locomotion.")
+        try:
+            _verify_pinned_navigation_mode(pin["controller_mode"])
+            if pin["controller_mode"] == "legacy":
+                result = navigation_set_velocity(request.vx, request.vyaw)
+            elif pin["controller_mode"] == "duet":
+                result = duet_navigation_move(
+                    request.vx,
+                    request.vyaw,
+                    hardware_acceptance_verified=True,
+                )
+            else:
+                raise HTTPException(status_code=503, detail="Pinned navigation controller mode is invalid.")
+            return {**result, "operation_id": operation_id, "controller_mode": pin["controller_mode"]}
+        except Exception as error:
+            try:
+                _verify_navigation_stop_owner(pin["controller_mode"])
+                _stop_navigation_controller(pin["controller_mode"])
+                _set_navigation_motion_state(operation_id, "stopped", str(error))
+            except Exception as stop_error:
+                try:
+                    _set_navigation_motion_state(
+                        operation_id, "latched", f"{error}; stop failed: {stop_error}"
+                    )
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=503,
+                detail=f"Navigation velocity failed; cancellation/stop is required: {error}",
+            ) from error
+
+
+@app.post("/api/internal/navigation-motion/{operation_id}/stop")
+def navigation_motion_stop(
+    operation_id: str,
+    request: NavigationStopRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _validate_navigation_bridge_authorization(authorization)
+    try:
+        operation_id = str(uuid.UUID(operation_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise HTTPException(status_code=400, detail="Navigation operation ID must be a UUID.") from error
+    return _stop_navigation_motion(operation_id, terminal=request.terminal, reason=request.reason)
 
 @app.post("/api/stop")
 def stop_code(user: dict = Depends(auth_required)):

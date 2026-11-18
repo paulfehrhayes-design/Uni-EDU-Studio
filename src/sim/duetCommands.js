@@ -16,6 +16,7 @@ const numberArgument = (name, label, value, min, max, step = 0.01) => ({
 });
 
 const seconds = () => numberArgument('SECONDS', 'seconds', 1, 0.1, 3, 0.1);
+const waitSeconds = () => numberArgument('SECONDS', 'seconds', 1, 0.1, 20, 0.1);
 const command = (method, message, description, args = [], label = message.replace(/%\d+/g, '1')) => ({
   method,
   label,
@@ -43,7 +44,7 @@ const armGesture = (method, label, poses) => ({
   ...command(
     method,
     `${label} (%1 s per pose)`,
-    `Run the fixed ${label.toLowerCase()} arm trajectory with bounded transitions.`,
+    `Run the fixed ${label.toLowerCase()} arm trajectory, then hold its final pose for 20 seconds before returning to carry. Other actions may continue during the hold, but another gesture must wait until the arms return.`,
     [numberArgument('SECONDS', 'seconds per pose', 1.5, 1, 3, 0.1)],
   ),
   category: 'Arm gestures',
@@ -218,7 +219,7 @@ export const DUET_COMMANDS = Object.freeze([
     )),
     ...catalogGestureCommands,
   ],
-  command('wait', 'Wait %1 s', 'Pause the program.', [seconds()]),
+  command('wait', 'Wait %1 s', 'Pause the program for up to 20 seconds.', [waitSeconds()]),
   command('stop', 'Stop DUET motion', 'Request a DUET controller stop; execution stops at this command.', []),
 ].map((definition) => Object.freeze({
   ...definition,
@@ -622,6 +623,90 @@ function validateArmResetFlow(nodes, possibleHeldStates = new Set([false])) {
   return states;
 }
 
+function duetCommandDuration(node) {
+  if (node.type === 'concurrent') {
+    const movementDefinition = getDuetCommand(node.movement.method)?.motion;
+    const movementDuration = movementDefinition
+      ? node.movement.values[0]
+      : node.movement.values[3];
+    const gestureDefinition = getDuetCommand(node.gesture.method);
+    const gestureDuration = gestureDefinition?.poseInput
+      ? node.gesture.method === 'hold_pose'
+        ? 1 + node.gesture.values[0]
+        : movementDuration
+      : (gestureDefinition?.armPoses?.length || 1) * node.gesture.values[0];
+    return Math.max(movementDuration, gestureDuration);
+  }
+  if (node.type !== 'command') return 0;
+  const definition = getDuetCommand(node.method);
+  if (definition?.motion) return node.values[0];
+  if (node.method === 'move') return node.values[3];
+  if (node.method === 'wait') return node.values[0];
+  if (definition?.armPoses) return definition.armPoses.length * node.values[0];
+  if (definition?.poseInput) return node.method === 'hold_pose' ? 1 + node.values[0] : 0;
+  return 0;
+}
+
+function validateAutomaticGestureFlow(nodes, initialStates = [{ remaining: 0, gesture: null }]) {
+  let states = initialStates;
+  for (const node of nodes) {
+    if (node.type === 'repeat') {
+      for (let iteration = 0; iteration < node.times; iteration += 1) {
+        states = validateAutomaticGestureFlow(node.body, states);
+      }
+      continue;
+    }
+    if (node.type === 'condition') {
+      const branches = [node.then, node.else].map((branch) => (
+        validateAutomaticGestureFlow(branch, states.map((state) => ({ ...state })))
+      ));
+      states = [...new Map(branches.flat().map((state) => [
+        `${state.remaining.toFixed(3)}|${state.gesture ?? ''}`,
+        state,
+      ])).values()];
+      continue;
+    }
+
+    const commands = node.type === 'concurrent' ? [node.gesture] : [node];
+    const startsArmMotion = commands.some(({ method }) => {
+      const definition = getDuetCommand(method);
+      return definition?.armPoses || definition?.poseInput;
+    });
+    const reset = node.type === 'command' && node.method === 'reset_arms';
+    const armMovement = startsArmMotion || reset;
+    const heldGesture = node.type === 'command'
+      && getDuetCommand(node.method)?.category === 'Arm gestures'
+      && getDuetCommand(node.method).armPoses.at(-1) !== 'carry';
+    const nextStates = [];
+    for (const state of states) {
+      if (state.remaining > 0 && armMovement) {
+        const nextAction = reset
+          ? 'reset arms'
+          : commands[0].method.replaceAll('_', ' ');
+        throw new Error(
+          `Cannot submit or run this sequence: the ${state.gesture.replaceAll('_', ' ')} gesture is still holding its arms for about ${state.remaining.toFixed(1)} more seconds. The arm movement "${nextAction}" cannot run during that 20-second hold. Add a wait until the gesture returns to its default/carry position, or move "${nextAction}" after it.`,
+        );
+      }
+      if (reset) {
+        nextStates.push({ remaining: 0, gesture: null });
+      } else if (heldGesture) {
+        nextStates.push({ remaining: 20, gesture: node.method });
+      } else {
+        const duration = duetCommandDuration(node);
+        nextStates.push({
+          remaining: Math.max(0, state.remaining - duration),
+          gesture: state.remaining > duration ? state.gesture : null,
+        });
+      }
+    }
+    states = [...new Map(nextStates.map((state) => [
+      `${state.remaining.toFixed(3)}|${state.gesture ?? ''}`,
+      state,
+    ])).values()];
+  }
+  return states;
+}
+
 export function parseDuetProgram(code = '') {
   const lines = code.replace(/\r/g, '').split('\n').map((raw, index) => ({
     indent: raw.match(/^\s*/)[0].replace(/\t/g, '  ').length,
@@ -637,6 +722,7 @@ export function parseDuetProgram(code = '') {
   }
   validateStopPlacement(nodes);
   validateArmResetFlow(nodes);
+  validateAutomaticGestureFlow(nodes);
   return nodes;
 }
 
@@ -774,6 +860,7 @@ export function getDuetCommandExamples(savedMotions = [], sharedMotions = []) {
           category,
           label: `${definition.method === 'hold_pose' ? 'Hold' : 'Hold until reset'}: ${poseName.replaceAll('_', ' ')}`,
           code,
+          blockTypes: [definition.type, `duet_pose_target_${poseName}`],
         };
       });
     }
@@ -784,6 +871,7 @@ export function getDuetCommandExamples(savedMotions = [], sharedMotions = []) {
       code: `duet.${definition.method}(${definition.args.map((argument) => (
         argument.kind === 'choice' ? JSON.stringify(argument.value) : String(argument.value)
       )).join(', ')})`,
+      blockTypes: [definition.type],
     }];
   });
   return [
@@ -793,24 +881,28 @@ export function getDuetCommandExamples(savedMotions = [], sharedMotions = []) {
       category: 'Saved motions',
       label: `Saved motion: ${name}`,
       code: `duet.saved_motion(${JSON.stringify(id)})`,
+      blockTypes: ['duet_command_saved_motion'],
     })),
     ...sharedMotions.map(({ id, name }) => ({
       key: `shared_motion_${id}`,
       category: 'Shared motions',
       label: `Shared motion: ${name}`,
       code: `duet.shared_motion(${JSON.stringify(id)})`,
+      blockTypes: ['duet_command_shared_motion'],
     })),
     {
       key: 'front_distance_condition',
       category: 'Conditions',
       label: 'Front distance condition example',
       code: 'if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.walk(1)',
+      blockTypes: ['duet_front_distance_m', 'duet_command_stop', 'duet_command_walk'],
     },
     {
       key: 'rear_distance_condition',
       category: 'Conditions',
       label: 'Rear distance condition example',
       code: 'if duet.rear_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.backward(1)',
+      blockTypes: ['duet_rear_distance_m', 'duet_command_stop', 'duet_command_backward'],
     },
   ];
 }
