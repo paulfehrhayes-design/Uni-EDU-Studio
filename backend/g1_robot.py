@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ _run_lock = threading.Lock()
 _stop_requested = threading.Event()
 _MAX_EXPANDED_COMMANDS = 400
 _ARM_ACTION_REQUEST_SPACING_SECONDS = 2.0
+_LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS = 20.0
 _DURABLE_LOG_EVENTS = {
     "connection_attempt",
     "connection_failed",
@@ -111,6 +113,46 @@ _ARM_ACTIONS_THAT_MAY_HOLD = {
     "shake hand",
     "x-ray",
 }
+
+
+@lru_cache(maxsize=1)
+def _legacy_arm_action_run_times() -> dict[str, float]:
+    recordings_path = Path(__file__).resolve().parent.parent / "g1-recorded-motions.json"
+    with recordings_path.open(encoding="utf-8") as recordings_file:
+        recordings = json.load(recordings_file)
+    if not isinstance(recordings, dict) or not isinstance(recordings.get("recordings"), list):
+        raise RuntimeError(f"Legacy arm-action recordings are invalid: {recordings_path}")
+
+    durations: dict[str, float] = {}
+    for recording in recordings["recordings"]:
+        if not isinstance(recording, dict) or recording.get("controller_version") != "legacy":
+            continue
+        command = recording.get("command")
+        if not isinstance(command, str):
+            continue
+        match = re.fullmatch(r"""robot\.arm_action\(["']([^"']+)["']\)""", command)
+        if not match or match.group(1) not in _ARM_ACTIONS_THAT_MAY_HOLD:
+            continue
+        frames = recording.get("frames")
+        if not isinstance(frames, list) or not frames or not isinstance(frames[-1], dict):
+            continue
+        duration = frames[-1].get("time_s")
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or duration <= 0
+        ):
+            continue
+        durations[match.group(1)] = float(duration)
+
+    missing_actions = _ARM_ACTIONS_THAT_MAY_HOLD - durations.keys()
+    if missing_actions:
+        raise RuntimeError(
+            "Recorded runtimes are missing for held Legacy arm actions: "
+            + ", ".join(sorted(missing_actions))
+        )
+    return durations
 
 
 class CommandValidationError(ValueError):
@@ -345,41 +387,117 @@ def _loop_count(node: ast.For) -> int:
 
 
 def _validate_arm_action_release_flow(nodes: list[dict[str, Any]]) -> None:
+    def unique_states(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return list({
+            (
+                state["explicit_hold"],
+                round(state["auto_hold_remaining"], 3),
+                state["held_gesture"],
+            ): state
+            for state in states
+        }.values())
+
     def apply(
         program_nodes: list[dict[str, Any]],
-        held_actions: set[str | None],
-    ) -> set[str | None]:
+        states: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         for node in program_nodes:
             node_type = node.get("type")
             if node_type == "repeat":
                 for _ in range(node["times"]):
-                    held_actions = apply(node["body"], held_actions)
+                    states, conflict = apply(node["body"], states)
+                    if conflict:
+                        return states, conflict
                 continue
             if node_type == "condition":
-                held_actions = (
-                    apply(node["then"], set(held_actions))
-                    | apply(node["else"], set(held_actions))
-                )
+                branch_results = [
+                    apply(branch, [dict(state) for state in states])
+                    for branch in (node["then"], node["else"])
+                ]
+                conflict = next((result[1] for result in branch_results if result[1]), None)
+                if conflict:
+                    return states, conflict
+                states = unique_states([
+                    state
+                    for branch_states, _ in branch_results
+                    for state in branch_states
+                ])
                 continue
             if node_type is not None or node.get("method") not in {"arm_action", "hold_arm"}:
+                duration = _estimated_duration(node) if node_type is None else 0
+                states = unique_states([
+                    {
+                        **state,
+                        "auto_hold_remaining": max(0.0, state["auto_hold_remaining"] - duration),
+                        "held_gesture": (
+                            state["held_gesture"]
+                            if state["auto_hold_remaining"] > duration
+                            else None
+                        ),
+                    }
+                    for state in states
+                ])
                 continue
 
-            action = node["action"]
-            if node["method"] == "arm_action" and action == "release arm":
-                held_actions = {None}
-                continue
-            if any(held_action is not None for held_action in held_actions):
-                previous = next(held_action for held_action in held_actions if held_action is not None)
-                raise CommandValidationError(
-                    f'The {previous} preset may still be holding the arms. Add robot.arm_action("release arm") before the next arm block ({action}); otherwise the G1 SDK may return error 7401. Locomotion blocks may remain between the arm action and release.'
-                )
-            if node["method"] == "hold_arm" or action in _ARM_ACTIONS_THAT_MAY_HOLD:
-                held_actions = {action}
-            else:
-                held_actions = {None}
-        return held_actions
+            next_states = []
+            for state in states:
+                action = node["action"]
+                if node["method"] == "arm_action" and action == "release arm":
+                    next_states.append({
+                        "explicit_hold": None,
+                        "auto_hold_remaining": 0.0,
+                        "held_gesture": None,
+                    })
+                    continue
+                if state["explicit_hold"] is not None:
+                    return states, {
+                        "previous_action": state["explicit_hold"],
+                        "next_action": action,
+                        "explicit": True,
+                    }
+                if state["auto_hold_remaining"] > 0:
+                    return states, {
+                        "previous_action": state["held_gesture"],
+                        "next_action": action,
+                        "remaining": state["auto_hold_remaining"],
+                    }
+                if node["method"] == "hold_arm":
+                    next_states.append({
+                        "explicit_hold": action,
+                        "auto_hold_remaining": 0.0,
+                        "held_gesture": None,
+                    })
+                elif action in _ARM_ACTIONS_THAT_MAY_HOLD:
+                    next_states.append({
+                        "explicit_hold": None,
+                        "auto_hold_remaining": _LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS,
+                        "held_gesture": action,
+                    })
+                else:
+                    next_states.append({
+                        **state,
+                        "auto_hold_remaining": max(
+                            0.0,
+                            state["auto_hold_remaining"] - _estimated_duration(node),
+                        ),
+                    })
+            states = unique_states(next_states)
+        return states, None
 
-    apply(nodes, {None})
+    _, conflict = apply(nodes, [{
+        "explicit_hold": None,
+        "auto_hold_remaining": 0.0,
+        "held_gesture": None,
+    }])
+    if not conflict:
+        return
+    if conflict.get("explicit"):
+        raise CommandValidationError(
+            f'The {conflict["previous_action"]} pose is intentionally held. Add robot.arm_action("release arm") before the next arm block ({conflict["next_action"]}).'
+        )
+    raise CommandValidationError(
+        f'The {conflict["previous_action"]} gesture is still active for about {conflict["remaining"]:.1f} seconds. Run other actions or wait for it to return before the next gesture ({conflict["next_action"]}).'
+    )
 
 
 def parse_robot_program(code: str) -> list[dict[str, Any]]:
@@ -907,12 +1025,49 @@ def execute_robot_program(
     boolean_variables: dict[str, bool] = {}
     executed_count = 0
     safety_interventions: list[dict[str, Any]] = []
+    pending_auto_release: dict[str, Any] | None = None
     try:
         _log_event("program_started", command_count=len(commands), commands=commands)
 
-        def execute_arm_action(command: dict[str, Any], index: int, hold_seconds: float) -> None:
+        def finish_pending_auto_release() -> None:
+            nonlocal pending_auto_release
+            if pending_auto_release is None:
+                return
+            pending_auto_release["completed"].wait()
+            pending_auto_release["timer"].join()
+            error = pending_auto_release["error"]
+            pending_auto_release = None
+            if error is not None:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not return the held arm gesture to the down pose: {error}",
+                ) from error
+
+        def cancel_pending_auto_release() -> None:
+            nonlocal pending_auto_release
+            if pending_auto_release is None:
+                return
+            pending = pending_auto_release
+            with pending["lock"]:
+                pending["cancelled"] = True
+                pending["timer"].cancel()
+                pending["completed"].set()
+            pending["timer"].join()
+            pending_auto_release = None
+
+        def execute_arm_action(
+            command: dict[str, Any],
+            index: int,
+            hold_seconds: float,
+            return_to_down: bool = False,
+        ) -> None:
+            nonlocal pending_auto_release
             if _arm_client is None:
                 raise HTTPException(status_code=409, detail="Connect the G1 arm-action SDK before running an arm preset.")
+            if command["action"] == "release arm":
+                cancel_pending_auto_release()
+            elif pending_auto_release is not None:
+                finish_pending_auto_release()
             _sdk_result(
                 _arm_client.ExecuteAction(command["action_id"]),
                 "ExecuteAction",
@@ -925,11 +1080,62 @@ def execute_robot_program(
                 hold_seconds=hold_seconds,
                 note="SDK acceptance does not confirm pose completion; the hold is a timed delay, not active joint control.",
             )
-            if _stop_requested.wait(max(_ARM_ACTION_REQUEST_SPACING_SECONDS, hold_seconds)):
+            action_runtime = (
+                _legacy_arm_action_run_times()[command["action"]]
+                if return_to_down
+                else max(_ARM_ACTION_REQUEST_SPACING_SECONDS, hold_seconds)
+            )
+            if return_to_down:
+                pending = {
+                    "completed": threading.Event(),
+                    "error": None,
+                    "cancelled": False,
+                    "lock": threading.Lock(),
+                }
+
+                def release_after_hold() -> None:
+                    with pending["lock"]:
+                        if pending["cancelled"]:
+                            pending["completed"].set()
+                            return
+                        try:
+                            _sdk_result(
+                                _arm_client.ExecuteAction(_ARM_ACTION_IDS["release arm"]),
+                                "ExecuteAction (release arm)",
+                            )
+                            _log_event(
+                                "arm_action_return_to_down",
+                                index=index,
+                                action=command["action"],
+                                release_action_id=_ARM_ACTION_IDS["release arm"],
+                                note="The release preset was accepted; the SDK does not confirm pose completion.",
+                            )
+                        except Exception as error:
+                            pending["error"] = error
+                            _log_event(
+                                "arm_action_return_to_down_failed",
+                                index=index,
+                                action=command["action"],
+                                error=str(error),
+                            )
+                        finally:
+                            pending["completed"].set()
+
+                timer = threading.Timer(
+                    action_runtime + _LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS,
+                    release_after_hold,
+                )
+                timer.daemon = True
+                pending["timer"] = timer
+                pending_auto_release = pending
+                timer.start()
+            if _stop_requested.wait(action_runtime):
                 raise HTTPException(
                     status_code=409,
                     detail="Stop requested after the arm preset was accepted. The SDK has no verified way to cancel the active arm motion.",
                 )
+            if return_to_down:
+                return
 
         def execute_locomotion(vx: float, vy: float, vyaw: float, duration: float) -> dict[str, Any] | None:
             if safe_mode:
@@ -944,7 +1150,10 @@ def execute_robot_program(
             _move(vx, vy, vyaw, duration)
             return None
 
-        def execute_command(command: dict[str, Any]) -> None:
+        def execute_command(
+            command: dict[str, Any],
+            next_node: dict[str, Any] | None = None,
+        ) -> None:
             nonlocal executed_count
             method = command["method"]
             if safe_mode and method in {"arm_action", "hold_arm"}:
@@ -980,7 +1189,19 @@ def execute_robot_program(
                         raise HTTPException(status_code=409, detail="Connect the G1 arm-action SDK before listing arm actions.")
                     _sdk_result_if_available(_arm_client.GetActionList(), "GetActionList", results, method)
                 elif method == "arm_action":
-                    execute_arm_action(command, index, _ARM_ACTION_REQUEST_SPACING_SECONDS)
+                    execute_arm_action(
+                        command,
+                        index,
+                        _ARM_ACTION_REQUEST_SPACING_SECONDS,
+                        return_to_down=(
+                            command["action"] in _ARM_ACTIONS_THAT_MAY_HOLD
+                            and not (
+                                next_node
+                                and next_node.get("method") == "arm_action"
+                                and next_node.get("action") == "release arm"
+                            )
+                        ),
+                    )
                 elif method == "hold_arm":
                     execute_arm_action(command, index, command["seconds"])
                 elif method == "getvolume":
@@ -1053,12 +1274,12 @@ def execute_robot_program(
             _log_event("command_completed", index=index, command=command)
 
         def execute_nodes(nodes: list[dict[str, Any]]) -> None:
-            for node in nodes:
+            for index, node in enumerate(nodes):
                 if _stop_requested.is_set():
                     raise HTTPException(status_code=409, detail="Robot program stopped by teacher.")
                 node_type = node.get("type")
                 if node_type is None:
-                    execute_command(node)
+                    execute_command(node, nodes[index + 1] if index + 1 < len(nodes) else None)
                     continue
                 if node_type == "repeat":
                     for _ in range(node["times"]):
@@ -1148,6 +1369,7 @@ def execute_robot_program(
                 execute_nodes(node["then"] if selected_then else node["else"])
 
         execute_nodes(commands)
+        finish_pending_auto_release()
         _log_event("program_completed", command_count=executed_count)
         response = {
             "status": "completed",

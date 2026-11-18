@@ -166,7 +166,7 @@ const commandGroups = [
       'arm_action',
       'Run arm preset',
       'Gestures',
-      'Run the selected arm preset. Some gestures hold the final pose; use Release Arm before another arm block. Locomotion may continue while held. Stop cannot cancel an arm preset; keep the area clear.',
+      'Run the selected arm preset. Presets that finish raised hold for their recorded action runtime plus 20 seconds, then request Release Arm. Locomotion may continue during the preset. Stop cannot cancel an arm preset after acceptance; keep the area clear.',
       [choiceArgument('ACTION', 'arm preset', ARM_PRESETS, 'hands up')],
     ),
     command(
@@ -340,30 +340,40 @@ export const LEGACY_ARM_ACTIONS_THAT_HOLD = new Set([
   'x-ray',
 ]);
 
-function advanceArmActionFlow(nodes, initialHeldActions = new Set([null])) {
-  let heldActions = initialHeldActions;
+const LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS = 20;
+
+function estimatedLegacyCommandDuration(node) {
+  if (node.type !== 'command') return 0;
+  const [first, second] = node.values;
+  if (node.method === 'wait') return first;
+  if (node.method.endsWith('time')) return first;
+  if (['walk', 'backward', 'slowwalk', 'fastwalk'].includes(node.method)) {
+    const speed = node.method.startsWith('slow') ? 0.2 : node.method.startsWith('fast') ? 0.8 : 0.4;
+    return first * 0.345 / speed;
+  }
+  if (node.method === 'sidestep') return second * 0.345 / 0.2;
+  if (node.method === 'turn') return (second * Math.PI / 180) / 0.6;
+  if (node.method === 'turn_around_180') return Math.PI / 0.6;
+  if (node.method === 'hold_arm') return Math.max(2, second);
+  if (node.method === 'arm_action') return 2;
+  return 0;
+}
+
+function uniqueArmFlowStates(states) {
+  return [...new Map(states.map((state) => [
+    `${state.explicitHold ?? ''}|${state.autoHoldRemaining.toFixed(3)}|${state.heldGesture ?? ''}`,
+    state,
+  ])).values()];
+}
+
+function advanceArmActionFlow(nodes, initialStates = [{ explicitHold: null, autoHoldRemaining: 0, heldGesture: null }]) {
+  let states = initialStates;
   for (const node of nodes) {
-    if (node.type === 'command') {
-      if (!['arm_action', 'hold_arm'].includes(node.method)) continue;
-      const preset = node.values[0];
-      if (node.method === 'arm_action' && preset === 'release arm') {
-        heldActions = new Set([null]);
-        continue;
-      }
-      const previousAction = [...heldActions].find(Boolean);
-      if (previousAction) {
-        return { heldActions, conflict: { previousAction, nextAction: preset } };
-      }
-      heldActions = new Set([
-        node.method === 'hold_arm' || LEGACY_ARM_ACTIONS_THAT_HOLD.has(preset) ? preset : null,
-      ]);
-      continue;
-    }
     if (node.type === 'repeat') {
       for (let iteration = 0; iteration < node.times; iteration += 1) {
-        const result = advanceArmActionFlow(node.body, heldActions);
+        const result = advanceArmActionFlow(node.body, states);
         if (result.conflict) return result;
-        heldActions = result.heldActions;
+        states = result.states;
       }
       continue;
     }
@@ -371,20 +381,71 @@ function advanceArmActionFlow(nodes, initialHeldActions = new Set([null])) {
       const branches = typeof node.value === 'boolean'
         ? [node.value ? node.then : node.else]
         : [node.then, node.else];
-      const branchResults = branches.map((branch) => advanceArmActionFlow(branch, new Set(heldActions)));
-      const conflict = branchResults.find((result) => result.conflict)?.conflict;
-      if (conflict) return { heldActions, conflict };
-      heldActions = new Set(branchResults.flatMap((result) => [...result.heldActions]));
+      const results = branches.map((branch) => advanceArmActionFlow(branch, states));
+      const conflict = results.find((result) => result.conflict)?.conflict;
+      if (conflict) return { states, conflict };
+      states = uniqueArmFlowStates(results.flatMap((result) => result.states));
+      continue;
     }
+    const nextStates = [];
+    for (const state of states) {
+      if (node.type !== 'command' || !['arm_action', 'hold_arm'].includes(node.method)) {
+        const duration = estimatedLegacyCommandDuration(node);
+        nextStates.push({
+          ...state,
+          autoHoldRemaining: Math.max(0, state.autoHoldRemaining - duration),
+          heldGesture: state.autoHoldRemaining > duration ? state.heldGesture : null,
+        });
+        continue;
+      }
+      const preset = node.values[0];
+      if (node.method === 'arm_action' && preset === 'release arm') {
+        nextStates.push({ explicitHold: null, autoHoldRemaining: 0, heldGesture: null });
+        continue;
+      }
+      if (state.explicitHold) {
+        return {
+          states,
+          conflict: { previousAction: state.explicitHold, nextAction: preset, explicit: true },
+        };
+      }
+      if (state.autoHoldRemaining > 0) {
+        return {
+          states,
+          conflict: {
+            previousAction: state.heldGesture,
+            nextAction: preset,
+            remaining: state.autoHoldRemaining,
+          },
+        };
+      }
+      if (node.method === 'hold_arm') {
+        nextStates.push({ explicitHold: preset, autoHoldRemaining: 0, heldGesture: null });
+      } else if (LEGACY_ARM_ACTIONS_THAT_HOLD.has(preset)) {
+        nextStates.push({
+          explicitHold: null,
+          autoHoldRemaining: LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS,
+          heldGesture: preset,
+        });
+      } else {
+        nextStates.push({ explicitHold: null, autoHoldRemaining: 0, heldGesture: null });
+      }
+    }
+    states = uniqueArmFlowStates(nextStates);
   }
-  return { heldActions, conflict: null };
+  return { states, conflict: null };
 }
 
 function validateLegacyArmActionFlow(nodes) {
   const { conflict } = advanceArmActionFlow(nodes);
   if (!conflict) return;
+  if (!conflict.explicit) {
+    throw new Error(
+      `The ${conflict.previousAction} gesture is still active for about ${conflict.remaining.toFixed(1)} seconds. Run other actions or wait for it to return before the next gesture (${conflict.nextAction}).`,
+    );
+  }
   throw new Error(
-    `The ${conflict.previousAction} preset may still be holding the arms. Add robot.arm_action("release arm") before the next arm block (${conflict.nextAction}); otherwise the G1 SDK may return error 7401. Locomotion blocks may remain between the arm action and release.`,
+    `The ${conflict.previousAction} pose is intentionally held. Add robot.arm_action("release arm") before the next arm block (${conflict.nextAction}).`,
   );
 }
 

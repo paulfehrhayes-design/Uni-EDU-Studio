@@ -162,6 +162,16 @@ def calibration_failure_status(
     }
 
 
+def merge_odometry_pose_snapshots(
+    tf_snapshot: dict[str, object],
+    odometry_snapshots: list[dict[str, object]],
+) -> dict[str, object]:
+    merged = tf_snapshot
+    for odometry_snapshot in odometry_snapshots:
+        merged = merge_pose_snapshots(merged, odometry_snapshot)
+    return merged
+
+
 class CameraFrameCache:
     def __init__(self, source_specs: list[dict[str, str]]):
         self._specs = {source["topic"]: dict(source) for source in source_specs}
@@ -356,9 +366,17 @@ class PoseCaptureCache:
         yaw_rad: float,
         timestamp: datetime,
         age_ms: float,
+        base_frame: str | None = None,
+        source: str = "tf2",
     ) -> None:
         if frame_id not in self._frame_ids:
             raise ValueError("Pose capture frame is not configured.")
+        selected_base_frame = base_frame or self._base_frame_id
+        if (
+            not ROS_FRAME_PATTERN.fullmatch(selected_base_frame)
+            or source not in {"tf2", "odometry"}
+        ):
+            raise ValueError("Pose capture source or base frame is invalid.")
         if timestamp.tzinfo is None:
             raise ValueError("Pose capture timestamp must include a timezone.")
         values = (x, y, z, yaw_rad, age_ms)
@@ -367,14 +385,14 @@ class PoseCaptureCache:
         with self._lock:
             self._samples[frame_id] = {
                 "frame_id": frame_id,
-                "base_frame": self._base_frame_id,
+                "base_frame": selected_base_frame,
                 "x": x,
                 "y": y,
                 "z": z,
                 "yaw_rad": yaw_rad,
                 "timestamp": timestamp.astimezone(timezone.utc).isoformat(),
                 "age_ms": age_ms,
-                "source": "tf2",
+                "source": source,
                 "received_monotonic": time.monotonic(),
             }
             self._errors.pop(frame_id, None)
@@ -423,6 +441,62 @@ class PoseCaptureCache:
             "poses": poses,
             "error": None if ready_poses else "No fresh odometry or localization TF is available.",
         }
+
+
+def merge_pose_snapshots(
+    tf_snapshot: dict[str, object],
+    odometry_snapshot: dict[str, object],
+) -> dict[str, object]:
+    tf_poses = tf_snapshot.get("poses")
+    odometry_poses = odometry_snapshot.get("poses")
+    if not isinstance(tf_poses, list) or not isinstance(odometry_poses, list):
+        raise ValueError("Pose snapshots must contain pose lists.")
+    odometry_by_frame = {
+        pose["frame_id"]: pose
+        for pose in odometry_poses
+        if isinstance(pose, dict) and isinstance(pose.get("frame_id"), str)
+    }
+    merged = []
+    seen_frames = set()
+    for tf_pose in tf_poses:
+        if not isinstance(tf_pose, dict) or not isinstance(tf_pose.get("frame_id"), str):
+            continue
+        frame_id = tf_pose["frame_id"]
+        seen_frames.add(frame_id)
+        odometry_pose = odometry_by_frame.get(frame_id)
+        if (
+            tf_pose.get("ready") is not True
+            and odometry_pose is not None
+            and odometry_pose.get("ready") is True
+        ):
+            merged.append(odometry_pose)
+        else:
+            merged.append(tf_pose)
+    merged.extend(
+        pose
+        for frame_id, pose in odometry_by_frame.items()
+        if frame_id not in seen_frames
+    )
+    ready_frames = {
+        pose["frame_id"]
+        for pose in merged
+        if isinstance(pose, dict) and pose.get("ready") is True
+    }
+    preferred_frame = next(
+        (frame_id for frame_id in ("odom", "map") if frame_id in ready_frames),
+        next(iter(ready_frames), None),
+    )
+    errors = [
+        snapshot.get("error")
+        for snapshot in (tf_snapshot, odometry_snapshot)
+        if isinstance(snapshot.get("error"), str) and snapshot["error"]
+    ]
+    return {
+        "ready": bool(ready_frames),
+        "preferred_frame": preferred_frame,
+        "poses": merged,
+        "error": None if ready_frames else "No fresh TF or odometry pose is available. " + " ".join(errors),
+    }
 
 
 def should_log_tf_warning(last_warning_at: float | None, now: float) -> bool:
@@ -1251,6 +1325,7 @@ def serve_http(
     camera_cache: CameraFrameCache | None = None,
     joint_state_cache: JointStateCache | None = None,
     pose_capture_cache: PoseCaptureCache | None = None,
+    odometry_pose_caches: list[PoseCaptureCache] | None = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -1319,6 +1394,14 @@ def serve_http(
                     self.send_error(503, "Pose capture relay is unavailable")
                     return
                 payload = pose_capture_cache.current_snapshot()
+                if odometry_pose_caches:
+                    payload = merge_odometry_pose_snapshots(
+                        payload,
+                        [
+                            cache.current_snapshot()
+                            for cache in odometry_pose_caches
+                        ],
+                    )
                 body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1373,6 +1456,7 @@ def main() -> None:
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs_py import point_cloud2
     from sensor_msgs.msg import Image, JointState, PointCloud2
+    from nav_msgs.msg import Odometry
     from rclpy.duration import Duration
     from rclpy.time import Time
     from tf2_ros import Buffer, TransformException, TransformListener
@@ -1406,6 +1490,14 @@ def main() -> None:
         frame_id.strip()
         for frame_id in os.environ.get("G1_POSE_CAPTURE_FRAMES", "odom,map").split(",")
         if frame_id.strip()
+    ]
+    odometry_topics = [
+        item.strip()
+        for item in os.environ.get(
+            "G1_POSE_CAPTURE_ODOMETRY_TOPICS",
+            "/unitree/slam_mapping/odom,/unitree/slam_relocation/odom,/dog_odom",
+        ).split(",")
+        if item.strip()
     ]
     token = os.environ["G1_DISTANCE_PROVIDER_TOKEN"]
     host = os.environ.get("G1_DISTANCE_PROVIDER_BIND_HOST", "127.0.0.1")
@@ -1444,6 +1536,14 @@ def main() -> None:
         or any(not ROS_FRAME_PATTERN.fullmatch(frame_id) for frame_id in pose_frame_ids)
     ):
         raise ValueError("G1_POSE_CAPTURE_FRAMES must list up to four unique valid ROS frame IDs.")
+    if (
+        len(odometry_topics) > 4
+        or len(set(odometry_topics)) != len(odometry_topics)
+        or any(not ROS_TOPIC_PATTERN.fullmatch(topic) for topic in odometry_topics)
+    ):
+        raise ValueError(
+            "G1_POSE_CAPTURE_ODOMETRY_TOPICS must list up to four unique valid ROS topic names."
+        )
     if not 1 <= half_angle <= 45 or minimum_height >= maximum_height:
         raise ValueError("Invalid LiDAR forward-sector or height configuration.")
     class LidarNode(Node):
@@ -1460,6 +1560,13 @@ def main() -> None:
                 pose_frame_ids,
                 base_frame_id or "unconfigured_base_frame",
             )
+            self.odometry_pose_caches = {
+                odometry_topic: PoseCaptureCache(
+                    pose_frame_ids,
+                    base_frame_id or "unconfigured_base_frame",
+                )
+                for odometry_topic in odometry_topics
+            }
             self.cache.update_calibration_status(
                 {
                     "ready": False,
@@ -1491,6 +1598,10 @@ def main() -> None:
             self.pose_clock_normalizers = {
                 frame_id: PoseClockNormalizer()
                 for frame_id in pose_frame_ids
+            }
+            self.odometry_clock_normalizers = {
+                odometry_topic: PoseClockNormalizer()
+                for odometry_topic in odometry_topics
             }
             self.reported_clock_offsets: set[str] = set()
             if camera_configuration_error:
@@ -1524,6 +1635,66 @@ def main() -> None:
                 self.on_joint_state,
                 qos_profile_sensor_data,
             )
+            for odometry_topic in odometry_topics:
+                self.create_subscription(
+                    Odometry,
+                    odometry_topic,
+                    lambda message, selected_topic=odometry_topic: self.on_odometry(
+                        message,
+                        selected_topic,
+                    ),
+                    qos_profile_sensor_data,
+                )
+                self.get_logger().info(
+                    f"Monitoring {odometry_topic} as a direct pose fallback."
+                )
+
+        def on_odometry(self, message: Odometry, topic_name: str) -> None:
+            frame_id = str(message.header.frame_id).strip()
+            child_frame = str(message.child_frame_id).strip()
+            if frame_id not in pose_frame_ids:
+                return
+            try:
+                now_seconds = time.time()
+                stamp = message.header.stamp
+                timestamp = self.odometry_clock_normalizers[topic_name].normalize(
+                    int(stamp.sec),
+                    int(stamp.nanosec),
+                    now_seconds,
+                )
+                position = message.pose.pose.position
+                orientation = message.pose.pose.orientation
+                quaternion = (
+                    float(orientation.x),
+                    float(orientation.y),
+                    float(orientation.z),
+                    float(orientation.w),
+                )
+                norm = math.sqrt(sum(value * value for value in quaternion))
+                if not child_frame or not math.isfinite(norm) or norm <= 1e-9:
+                    raise ValueError("Odometry pose has an invalid child frame or orientation.")
+                qx, qy, qz, qw = (value / norm for value in quaternion)
+                yaw_rad = math.atan2(
+                    2 * (qw * qz + qx * qy),
+                    1 - 2 * (qy * qy + qz * qz),
+                )
+                age_seconds = now_seconds - timestamp.timestamp()
+                self.odometry_pose_caches[topic_name].update(
+                    frame_id,
+                    float(position.x),
+                    float(position.y),
+                    float(position.z),
+                    yaw_rad,
+                    timestamp,
+                    max(0.0, age_seconds) * 1000,
+                    base_frame=child_frame,
+                    source="odometry",
+                )
+            except (TypeError, ValueError) as error:
+                self.odometry_pose_caches[topic_name].mark_unavailable(
+                    frame_id,
+                    f"Odometry pose from {topic_name} is unavailable: {error}",
+                )
 
         def update_pose_samples(self) -> None:
             for frame_id in pose_frame_ids:
@@ -1943,6 +2114,10 @@ def main() -> None:
         node.camera_cache,
         node.joint_state_cache,
         node.pose_capture_cache,
+        [
+            node.odometry_pose_caches[odometry_topic]
+            for odometry_topic in odometry_topics
+        ],
     )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()

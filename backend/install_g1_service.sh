@@ -59,14 +59,52 @@ python3 "$PROJECT_DIR/vendor/DUET/deploy/robots/g1_23dof/install_user_service.py
 echo "Installing backend dependencies"
 "$PYTHON" -m pip install -r "$PROJECT_DIR/backend/requirements.txt"
 
-echo "Preparing hosted frontend dependencies (cached packages are preferred)"
+mkdir -p "$LIDAR_CONFIG_DIR"
+FRONTEND_DEPENDENCIES_SIGNATURE="$(
+  sha256sum "$PROJECT_DIR/package.json" "$PROJECT_DIR/package-lock.json" \
+    | sha256sum | awk '{print $1}'
+)"
+FRONTEND_DEPENDENCIES_MARKER="$LIDAR_CONFIG_DIR/frontend-dependencies.sha256"
 cd "$PROJECT_DIR"
-if ! npm install --prefer-offline --no-audit --no-fund; then
-  echo "Frontend dependency installation failed; see npm output above." >&2
-  exit 1
+if [[ ! -d "$PROJECT_DIR/node_modules" ||
+      ! -f "$FRONTEND_DEPENDENCIES_MARKER" ||
+      "$(cat "$FRONTEND_DEPENDENCIES_MARKER")" != "$FRONTEND_DEPENDENCIES_SIGNATURE" ]]; then
+  echo "Preparing hosted frontend dependencies (cached packages are preferred)"
+  if ! npm install --prefer-offline --no-audit --no-fund; then
+    echo "Frontend dependency installation failed; see npm output above." >&2
+    exit 1
+  fi
+  FRONTEND_DEPENDENCIES_SIGNATURE="$(
+    sha256sum "$PROJECT_DIR/package.json" "$PROJECT_DIR/package-lock.json" \
+      | sha256sum | awk '{print $1}'
+  )"
+  printf '%s\n' "$FRONTEND_DEPENDENCIES_SIGNATURE" > "$FRONTEND_DEPENDENCIES_MARKER"
+else
+  echo "Frontend dependencies are unchanged; reusing node_modules."
 fi
-echo "Building the hosted frontend bundle"
-npm run build
+FRONTEND_BUILD_MARKER="$LIDAR_CONFIG_DIR/frontend-build.sha256"
+FRONTEND_BUILD_SIGNATURE="$(
+  {
+    sha256sum \
+      "$PROJECT_DIR/package.json" \
+      "$PROJECT_DIR/package-lock.json" \
+      "$PROJECT_DIR/index.html" \
+      "$PROJECT_DIR/vite.config.js" \
+      "$PROJECT_DIR/postcss.config.js" \
+      "$PROJECT_DIR/tailwind.config.js"
+    find "$PROJECT_DIR/src" "$PROJECT_DIR/public" -type f -print0 \
+      | sort -z | xargs -0 -r sha256sum
+  } | sha256sum | awk '{print $1}'
+)"
+if [[ ! -f "$PROJECT_DIR/backend/static/index.html" ||
+      ! -f "$FRONTEND_BUILD_MARKER" ||
+      "$(cat "$FRONTEND_BUILD_MARKER")" != "$FRONTEND_BUILD_SIGNATURE" ]]; then
+  echo "Building the hosted frontend bundle"
+  npm run build
+  printf '%s\n' "$FRONTEND_BUILD_SIGNATURE" > "$FRONTEND_BUILD_MARKER"
+else
+  echo "Hosted frontend is unchanged; reusing the existing production bundle."
+fi
 
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"

@@ -122,6 +122,7 @@ if [[ -z "${G1_LIDAR_TOPIC:-}" ]]; then
 fi
 G1_DISTANCE_SENSOR_ID="${G1_DISTANCE_SENSOR_ID:-${DISCOVERED_SENSOR_ID:-${SAVED_SENSOR_ID:-mid360-front}}}"
 G1_LIDAR_LOWSTATE_TOPIC="${G1_LIDAR_LOWSTATE_TOPIC:-/lowstate}"
+G1_POSE_CAPTURE_ODOMETRY_TOPICS="${G1_POSE_CAPTURE_ODOMETRY_TOPICS:-/unitree/slam_mapping/odom,/unitree/slam_relocation/odom,/dog_odom}"
 G1_LIDAR_MOUNT_CONFIRMED="${G1_LIDAR_MOUNT_CONFIRMED:-${SAVED_MOUNT_CONFIRMED:-0}}"
 G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON="${G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON:-${SAVED_EXTRA_POINTCLOUD_SOURCES_JSON:-[]}}"
 CAMERA_DISCOVERY_JSON="$(PYTHONPATH="$PROJECT_DIR/backend" python3 -c 'import json; from camera_discovery import discover_camera_sources; print(json.dumps(discover_camera_sources()))' 2>/dev/null || printf '{}')"
@@ -274,6 +275,58 @@ if [[ ! "$G1_DISTANCE_SENSOR_ID" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
   echo "Configured sensor ID contains invalid characters." >&2
   exit 1
 fi
+ROS_INTERFACE="${G1_LIDAR_ROS_INTERFACE:-${UNITREE_INTERFACE:-eth0}}"
+if [[ ! "$ROS_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; then
+  echo "G1_LIDAR_ROS_INTERFACE must be a valid network interface name." >&2
+  exit 1
+fi
+ROS_INTERFACE_JSON="$(ip -j -4 address show dev "$ROS_INTERFACE" up)" || {
+  echo "Could not inspect configured ROS network interface '$ROS_INTERFACE'." >&2
+  exit 1
+}
+ROS_INTERFACE_IP="$(
+  python3 - "$ROS_INTERFACE_JSON" "$G1_LIDAR_HOST_IP" "$ROS_INTERFACE" <<'PY'
+import ipaddress
+import json
+import sys
+
+try:
+    interfaces = json.loads(sys.argv[1])
+except (TypeError, ValueError) as error:
+    raise SystemExit("Could not parse configured ROS interface addresses: {}".format(error))
+preferred = sys.argv[2].strip()
+addresses = []
+for interface in interfaces:
+    for item in interface.get("addr_info", []):
+        if item.get("family") != "inet" or item.get("scope") != "global":
+            continue
+        try:
+            address = ipaddress.IPv4Address(item.get("local", ""))
+        except ipaddress.AddressValueError:
+            continue
+        if not (address.is_loopback or address.is_link_local or address.is_unspecified):
+            addresses.append(str(address))
+if preferred:
+    if preferred not in addresses:
+        raise SystemExit(
+            "Configured G1_LIDAR_HOST_IP is not assigned to ROS interface {}.".format(
+                sys.argv[3]
+            )
+        )
+    print(preferred)
+elif addresses:
+    print(addresses[0])
+else:
+    raise SystemExit("ROS interface has no usable global IPv4 address.")
+PY
+)" || {
+  echo "Set G1_LIDAR_ROS_INTERFACE to the wired robot/DDS interface; ROS must not fall back to Wi-Fi." >&2
+  exit 1
+}
+FASTDDS_PROFILE_FILE="$CONFIG_DIR/fastdds_profile.xml"
+python3 "$PROJECT_DIR/backend/ros/fastdds_profile.py" \
+  "$ROS_INTERFACE_IP" "$FASTDDS_PROFILE_FILE"
+chmod 600 "$FASTDDS_PROFILE_FILE"
 G1_DISTANCE_EXTRA_POINTCLOUD_SOURCES_JSON="$(
   PYTHONPATH="$PROJECT_DIR/backend" python3 - \
     "$G1_LIDAR_TOPIC" "$G1_DISTANCE_SENSOR_ID" "$G1_DISTANCE_FRAME_ID" \
@@ -470,6 +523,7 @@ G1_CAMERA_TOPICS_JSON=$G1_CAMERA_TOPICS_JSON
 G1_DISTANCE_BASE_FRAME=$G1_DISTANCE_BASE_FRAME
 G1_LIDAR_MOUNT_CONFIRMED=$G1_LIDAR_MOUNT_CONFIRMED
 G1_LIDAR_LOWSTATE_TOPIC=$G1_LIDAR_LOWSTATE_TOPIC
+G1_POSE_CAPTURE_ODOMETRY_TOPICS=$G1_POSE_CAPTURE_ODOMETRY_TOPICS
 G1_DISTANCE_FOOTPRINT_FRONT_M=$FRONT_EXTENT_M
 G1_DISTANCE_FOOTPRINT_REAR_M=$REAR_EXTENT_M
 G1_DISTANCE_FOOTPRINT_HALF_WIDTH_M=$HALF_WIDTH_M
@@ -490,7 +544,22 @@ G1_DISTANCE_PROVIDER_PORT=8181
 G1_LIDAR_FORWARD_HALF_ANGLE_DEGREES=15
 G1_LIDAR_MINIMUM_HEIGHT_M=-0.5
 G1_LIDAR_MAXIMUM_HEIGHT_M=1.5
-FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+G1_LIDAR_ROS_INTERFACE=$ROS_INTERFACE
+G1_LIDAR_ROS_INTERFACE_IP=$ROS_INTERFACE_IP
+FASTDDS_DEFAULT_PROFILES_FILE=$(
+  if [[ "$ROS_RUNTIME" == "container" ]]; then
+    printf '/config/fastdds_profile.xml'
+  else
+    printf '%s' "$FASTDDS_PROFILE_FILE"
+  fi
+)
+FASTRTPS_DEFAULT_PROFILES_FILE=$(
+  if [[ "$ROS_RUNTIME" == "container" ]]; then
+    printf '/config/fastdds_profile.xml'
+  else
+    printf '%s' "$FASTDDS_PROFILE_FILE"
+  fi
+)
 EOF
 chmod 600 "$ENV_FILE"
 
@@ -516,7 +585,7 @@ Requires=docker.service
 
 [Service]
 Type=simple
-  ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-driver --network host --env-file $ENV_FILE -v $CONFIG_FILE:/config/MID360_config.json:ro uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/mid360_launch.py config_path:=/config/MID360_config.json frame_id:=$G1_DISTANCE_FRAME_ID pointcloud_topic:=$G1_LIDAR_TOPIC publish_freq:=$G1_LIDAR_PUBLISH_FREQ
+  ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-driver --network host --env-file $ENV_FILE -v $CONFIG_FILE:/config/MID360_config.json:ro -v $FASTDDS_PROFILE_FILE:/config/fastdds_profile.xml:ro uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/mid360_launch.py config_path:=/config/MID360_config.json frame_id:=$G1_DISTANCE_FRAME_ID pointcloud_topic:=$G1_LIDAR_TOPIC publish_freq:=$G1_LIDAR_PUBLISH_FREQ
 ExecStop=/usr/bin/docker stop --time 10 uni-edu-lidar-driver
 Restart=on-failure
 RestartSec=3
@@ -541,7 +610,7 @@ $PROVIDER_DEPENDENCIES
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --env-file $ENV_FILE --env G1_SENSOR_URDF_PATH=/opt/uni-edu/g1_23dof.urdf.txt --env G1_SENSOR_GEOMETRY_PATH=/opt/uni-edu/g1_23dof.xml uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/g1_sensor_runtime.launch.py
+ExecStart=/usr/bin/docker run --rm --name uni-edu-lidar-provider --network host --env-file $ENV_FILE -v $FASTDDS_PROFILE_FILE:/config/fastdds_profile.xml:ro --env G1_SENSOR_URDF_PATH=/opt/uni-edu/g1_23dof.urdf.txt --env G1_SENSOR_GEOMETRY_PATH=/opt/uni-edu/g1_23dof.xml uni-edu-lidar-humble:local ros2 launch /opt/uni-edu/ros/g1_sensor_runtime.launch.py
 ExecStop=/usr/bin/docker stop --time 10 uni-edu-lidar-provider
 Restart=on-failure
 RestartSec=3

@@ -16,6 +16,7 @@ try:
         PointCloudClockNormalizer,
         PoseClockNormalizer,
         compose_transforms,
+        merge_odometry_pose_snapshots,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -35,6 +36,7 @@ except ImportError:
         PointCloudClockNormalizer,
         PoseClockNormalizer,
         compose_transforms,
+        merge_odometry_pose_snapshots,
         footprint_clear_range_m,
         footprint_clearance_m,
         format_tf_calibration_error,
@@ -268,6 +270,37 @@ class RosLidarProviderTests(unittest.TestCase):
             stale = stale_cache.current_snapshot()
         self.assertFalse(stale["ready"])
         self.assertIn("stale", stale["poses"][0]["error"])
+
+    def test_pose_snapshot_falls_back_to_direct_odometry_when_tf_is_missing(self):
+        timestamp = datetime.now(timezone.utc)
+        tf_cache = PoseCaptureCache(["odom", "map"], "pelvis")
+        tf_cache.mark_unavailable("odom", "TF pose unavailable.")
+        tf_cache.mark_unavailable("map", "TF pose unavailable.")
+        odometry_cache = PoseCaptureCache(["odom", "map"], "pelvis")
+        odometry_cache.update(
+            "odom",
+            1.25,
+            -0.5,
+            0.0,
+            0.2,
+            timestamp,
+            15.0,
+            base_frame="base",
+            source="odometry",
+        )
+        odometry_cache.mark_unavailable("map", "No map odometry.")
+
+        snapshot = merge_odometry_pose_snapshots(
+            tf_cache.current_snapshot(),
+            [odometry_cache.current_snapshot()],
+        )
+
+        self.assertTrue(snapshot["ready"])
+        self.assertEqual(snapshot["preferred_frame"], "odom")
+        self.assertEqual(snapshot["poses"][0]["source"], "odometry")
+        self.assertEqual(snapshot["poses"][0]["base_frame"], "base")
+        self.assertEqual(snapshot["poses"][0]["x"], 1.25)
+        self.assertFalse(snapshot["poses"][1]["ready"])
 
     def test_pose_http_endpoint_requires_token_and_reports_timestamped_tf(self):
         from threading import Thread

@@ -985,8 +985,14 @@ def _distance_condition_result(sample: dict, operator: str, threshold: float) ->
     )
 
 
-def _arm_motion_command(method: str, poses: tuple[str, ...], duration: float) -> dict:
-    return {
+def _arm_motion_command(
+    method: str,
+    poses: tuple[str, ...],
+    duration: float,
+    *,
+    return_to_carry: bool = False,
+) -> dict:
+    command = {
         "type": "arm_trajectory",
         "gesture": method,
         "arm_commands": [
@@ -999,6 +1005,9 @@ def _arm_motion_command(method: str, poses: tuple[str, ...], duration: float) ->
             for pose in poses
         ],
     }
+    if return_to_carry:
+        command["return_to_carry"] = True
+    return command
 
 
 def _command_from_call(call: ast.Call, line_number: int) -> dict | list[dict]:
@@ -1138,6 +1147,7 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict | list[dict]:
         return {
             "type": "arm_trajectory",
             "gesture": method,
+            "return_to_carry": True,
             "arm_commands": [
                 {
                     "type": "arm_target",
@@ -1152,7 +1162,12 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict | list[dict]:
         duration = _finite_number(args[0], "arm pose lease duration")
         if not 1 <= duration <= 3:
             raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
-        return _arm_motion_command(method, DUET_ARM_COMMANDS[method], duration)
+        return _arm_motion_command(
+            method,
+            DUET_ARM_COMMANDS[method],
+            duration,
+            return_to_carry=method not in {"arm_carry", "arm_reach", "arm_box_hold"},
+        )
     if method == "arm_motion" and len(args) == 2:
         motion = args[0]
         if not isinstance(motion, ast.Constant) or not isinstance(motion.value, str):
@@ -1168,7 +1183,7 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict | list[dict]:
             raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
         if isinstance(poses, dict):
             poses = poses.get("mid", tuple())
-        return _arm_motion_command(motion_name, poses, duration)
+        return _arm_motion_command(motion_name, poses, duration, return_to_carry=True)
     if method in {"wave_left", "wave_right", "raise_left_arm", "raise_right_arm", "raise_both_arms"} and len(args) == 2:
         level = args[0]
         if not isinstance(level, ast.Constant) or not isinstance(level.value, str):
@@ -1180,7 +1195,7 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict | list[dict]:
         if not 1 <= duration <= 3:
             raise DuetControllerError("arm pose lease duration must be between 1 and 3 seconds.")
         poses = DUET_ARM_MOTIONS[method][level_name]
-        return _arm_motion_command(method, poses, duration)
+        return _arm_motion_command(method, poses, duration, return_to_carry=True)
     if method == "wait" and len(args) == 1:
         duration = _finite_number(args[0], "duration")
         if not 0.1 <= duration <= 3:
@@ -1383,6 +1398,98 @@ def _parse_duet_program(code: str) -> list[dict]:
         return states
 
     validate_arm_reset_flow(commands, {False})
+
+    def command_arm_commands(command: dict) -> list[dict]:
+        if command.get("type") in {"concurrent", "arm_trajectory"}:
+            return command.get("arm_commands", [])
+        return [command]
+
+    def command_duration(command: dict) -> float:
+        command_type = command.get("type")
+        if command_type in {"wait", "move", "move_and_arm"}:
+            return float(command.get("duration_s") or 0)
+        if command_type == "concurrent":
+            arm_duration = sum(item.get("duration_s", 0) for item in command_arm_commands(command))
+            return max(float(command["movement"]["duration_s"]), arm_duration)
+        if command_type == "arm_trajectory":
+            return sum(item.get("duration_s", 0) for item in command_arm_commands(command))
+        if command_type in {"arm_pose", "arm_target_hold"}:
+            return float(command.get("duration_s") or 0)
+        return 0.0
+
+    def starts_arm_motion(command: dict) -> bool:
+        return any(
+            item.get("type") in {"arm_pose", "arm_target", "arm_target_hold", "arm_trajectory"}
+            for item in command_arm_commands(command)
+        )
+
+    def is_auto_held_gesture(command: dict) -> bool:
+        arm_commands = command_arm_commands(command)
+        return (
+            command.get("type") == "arm_trajectory"
+            and command.get("return_to_carry") is True
+            and bool(arm_commands)
+            and arm_commands[-1].get("pose") != "carry"
+        )
+
+    def advance_gesture_hold(
+        sequence: list[dict],
+        states: list[dict],
+    ) -> tuple[list[dict], dict | None]:
+        for command in sequence:
+            if command.get("type") == "distance_condition":
+                branches = [
+                    advance_gesture_hold(branch, [dict(state) for state in states])
+                    for branch in (command["then"], command["else"])
+                ]
+                conflict = next((branch[1] for branch in branches if branch[1]), None)
+                if conflict:
+                    return states, conflict
+                states = [
+                    state
+                    for branch_states, _ in branches
+                    for state in branch_states
+                ]
+                states = list({
+                    (round(state["remaining"], 3), state["gesture"]): state
+                    for state in states
+                }.values())
+                continue
+
+            arm_reset = command.get("type") == "reset_arms"
+            arm_motion = starts_arm_motion(command)
+            next_states = []
+            for state in states:
+                if state["remaining"] > 0 and arm_motion and not arm_reset:
+                    return states, {
+                        "gesture": state["gesture"],
+                        "next": command.get("gesture") or command.get("type"),
+                        "remaining": state["remaining"],
+                    }
+                if arm_reset:
+                    next_states.append({"remaining": 0.0, "gesture": None})
+                elif is_auto_held_gesture(command):
+                    next_states.append({"remaining": 20.0, "gesture": command.get("gesture")})
+                else:
+                    duration = command_duration(command)
+                    next_states.append({
+                        "remaining": max(0.0, state["remaining"] - duration),
+                        "gesture": state["gesture"] if state["remaining"] > duration else None,
+                    })
+            states = list({
+                (round(state["remaining"], 3), state["gesture"]): state
+                for state in next_states
+            }.values())
+        return states, None
+
+    _, gesture_conflict = advance_gesture_hold(commands, [{"remaining": 0.0, "gesture": None}])
+    if gesture_conflict:
+        raise DuetProgramValidationError(
+            f"The {gesture_conflict['gesture']} gesture is still active for about "
+            f"{gesture_conflict['remaining']:.1f} seconds. Run other actions or wait for it to return "
+            f"before the next arm gesture ({gesture_conflict['next']})."
+        )
+
     return commands
 
 
@@ -1710,6 +1817,7 @@ def execute_program(
             )
 
         active_arm_command: dict | None = None
+        auto_return_deadline: float | None = None
 
         def send_arm_command(arm_command: dict, lease_ms: int | None = None) -> dict:
             if arm_command.get("type") == "arm_pose":
@@ -1745,6 +1853,8 @@ def execute_program(
             while time.monotonic() < deadline:
                 if _stop_requested.is_set():
                     return "teacher_stop"
+                if auto_return_deadline is not None and time.monotonic() >= auto_return_deadline:
+                    reset_arms()
                 if safe_mode and active_arm_command is not None:
                     reason = active_safe_mode_block_reason(0.0, 0.0, 0.0, True)
                     if reason:
@@ -1796,7 +1906,7 @@ def execute_program(
             })
 
         def reset_arms() -> dict:
-            nonlocal active_arm_command
+            nonlocal active_arm_command, auto_return_deadline
             if active_arm_command is not None and active_arm_command.get("until_reset") is True:
                 capture_arm_measurement(active_arm_command)
             result = _validate_controller_status(_gateway_request("RESET_ARMS"))
@@ -1805,6 +1915,7 @@ def execute_program(
             if "arm_feedback" in result["capabilities"]:
                 result = _wait_for_arm_target(DUET_ARM_POSE_TARGETS["carry"])["status"]
             active_arm_command = None
+            auto_return_deadline = None
             return result
 
         conditions_evaluated: list[dict] = []
@@ -1898,6 +2009,8 @@ def execute_program(
             return safe_mode_movement_block_reason(vx_mps, vy_mps, yaw_rate_rps)
 
         while pending_commands:
+            if auto_return_deadline is not None and time.monotonic() >= auto_return_deadline:
+                reset_arms()
             command = pending_commands.pop()
             if _stop_requested.is_set():
                 break
@@ -1960,6 +2073,8 @@ def execute_program(
                 while time.monotonic() < deadline:
                     if _stop_requested.is_set():
                         break
+                    if auto_return_deadline is not None and time.monotonic() >= auto_return_deadline:
+                        reset_arms()
                     if safe_mode:
                         reason = active_safe_mode_block_reason(
                             command["vx_mps"],
@@ -2248,6 +2363,13 @@ def execute_program(
                     if wait_result:
                         break
                     capture_arm_measurement(arm_command)
+                if (
+                    not safety_interrupted
+                    and not _stop_requested.is_set()
+                    and command.get("return_to_carry")
+                    and command["arm_commands"][-1].get("pose") != "carry"
+                ):
+                    auto_return_deadline = time.monotonic() + 20.0
                 if safety_interrupted:
                     continue
                 if _stop_requested.is_set():
@@ -2310,6 +2432,15 @@ def execute_program(
                 active_arm_command = None
                 break
             executed += 1
+        if (
+            active_arm_command is not None
+            and auto_return_deadline is not None
+            and not _stop_requested.is_set()
+        ):
+            wait_result = wait_with_arm_refresh(max(0.0, auto_return_deadline - time.monotonic()))
+            if wait_result == "teacher_stop":
+                _stop_gateway_command()
+                active_arm_command = None
         if active_arm_command is not None:
             if _stop_requested.is_set() or active_arm_command.get("type") == "arm_pose":
                 _stop_gateway_command()

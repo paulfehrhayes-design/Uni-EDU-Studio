@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { getDuetSimulationModelInfo, simulateDuetG1Edu23Program } from './duetG1Edu23Env.js';
 import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
+import { parseDuetProgram } from './duetCommands.js';
 
 test('DUET simulator uses the exact 23-DOF project model mapping', () => {
   const info = getDuetSimulationModelInfo();
@@ -84,6 +85,53 @@ test('DUET simulator previews named arm-pose presets', () => {
     Number((forwardPose[3] * 180 / Math.PI).toFixed(2)),
   );
   assert.equal(final.joints.right_shoulder_roll_joint < 0, true);
+});
+
+test('DUET held gestures allow base actions but reject overlapping gestures', () => {
+  const carry = getDuetArmPoseTarget('carry');
+  const frames = simulateDuetG1Edu23Program(
+    'duet.receive_and_hold(1)\n'
+    + 'duet.forward(0.5)',
+  );
+  const carryFrames = frames.filter((frame) => (
+    frame.actions.at(-1)?.summary === 'Preview the carry preset after the gesture hold.'
+  ));
+  const carryFrame = carryFrames.at(-1);
+  const heldFrame = frames.find((frame) => (
+    frame.actions.at(-1)?.label === 'DUET arm pose'
+    && frame.time > 2
+  ));
+  const final = frames.at(-1);
+  const carryDegrees = carry.map((value) => Number((value * 180 / Math.PI).toFixed(2)));
+  const armJointNames = getDuetArmCatalog().jointOrder;
+
+  assert.throws(
+    () => parseDuetProgram(
+      'duet.receive_and_hold(1)\n'
+      + 'duet.gesture_clap(1)',
+    ),
+    /gesture is still active/,
+  );
+  assert.doesNotThrow(() => parseDuetProgram(
+    'duet.receive_and_hold(1)\n'
+    + 'for _ in range(7):\n'
+    + '    duet.wait(3)\n'
+    + 'duet.gesture_clap(1)',
+  ));
+  assert.ok(carryFrame, 'the gesture should return to carry after its hold');
+  assert.ok(heldFrame, 'the gesture should keep its final target active during its hold');
+  assert.ok(
+    frames.some((frame) => frame.actions.at(-1)?.label === 'DUET velocity'),
+    'base movement should continue while the gesture is held',
+  );
+  assert.ok(
+    carryFrame.time - 2 >= 20,
+    'the gesture should hold its final pose for 20 seconds before returning to carry',
+  );
+  armJointNames.forEach((joint, index) => {
+    assert.equal(carryFrame.joints[joint], carryDegrees[index], `${joint} should return to carry`);
+    assert.equal(final.joints[joint], carryDegrees[index], `${joint} should finish in carry`);
+  });
 });
 
 test('DUET simulator selects front and rear distance branches from obstacle clearance', () => {

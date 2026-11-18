@@ -1157,7 +1157,7 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertNotIn('distanceSensor', response.json())
         sensor_status.assert_not_called()
 
-    def test_robot_pose_is_teacher_only_and_validates_fresh_tf_samples(self):
+    def test_robot_pose_is_teacher_only_and_validates_fresh_ros_pose_samples(self):
         client = TestClient(app)
         teacher = client.post(
             '/api/classroom/login',
@@ -1183,7 +1183,7 @@ class ServerClassroomTests(unittest.TestCase):
                     'yaw_rad': 1.25,
                     'timestamp': '2026-03-01T10:00:00Z',
                     'age_ms': 20.0,
-                    'source': 'tf2',
+                    'source': 'odometry',
                 },
                 {
                     'ready': False,
@@ -1210,6 +1210,7 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertTrue(response.json()['ready'])
         self.assertEqual(response.json()['preferred_frame'], 'odom')
         self.assertEqual(response.json()['poses'][0]['yaw_rad'], 1.25)
+        self.assertEqual(response.json()['poses'][0]['source'], 'odometry')
         self.assertEqual(response.headers['cache-control'], 'no-store, no-cache, max-age=0')
         self.assertEqual(denied.status_code, 403)
         self.assertEqual(provider_get.call_args.args[0], 'http://127.0.0.1:8181/pose')
@@ -1241,7 +1242,7 @@ class ServerClassroomTests(unittest.TestCase):
                 yaw_rad=0.4,
                 timestamp=captured_at,
                 age_ms=20,
-                source='tf2',
+                source='odometry',
             )
             frames = [
                 server.DuetArmRecordingFrame(time=0, joints=[0.0] * 23, pose=pose),

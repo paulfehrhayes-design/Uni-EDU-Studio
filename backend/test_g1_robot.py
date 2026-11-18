@@ -616,22 +616,20 @@ class G1RobotProgramTests(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(CommandValidationError):
                 parse_robot_program(code)
 
-    def test_held_arm_presets_require_release_before_another_arm_block(self):
-        with self.assertRaisesRegex(CommandValidationError, "may still be holding.*error 7401.*Locomotion blocks may remain"):
+    def test_held_arm_presets_can_be_followed_by_another_arm_block(self):
+        with self.assertRaisesRegex(CommandValidationError, "gesture is still active"):
             parse_robot_program(
                 'robot.arm_action("hands up")\n'
                 'robot.walk(2)\n'
                 'robot.arm_action("reject")'
             )
-
         self.assertEqual(
             [command["action"] for command in parse_robot_program(
                 'robot.arm_action("hands up")\n'
-                'robot.walk(2)\n'
-                'robot.arm_action("release arm")\n'
+                'robot.wait(20)\n'
                 'robot.arm_action("reject")'
             ) if command["method"] == "arm_action"],
-            ["hands up", "release arm", "reject"],
+            ["hands up", "reject"],
         )
         self.assertEqual(
             [command["action"] for command in parse_robot_program(
@@ -641,8 +639,15 @@ class G1RobotProgramTests(unittest.TestCase):
             ["clap", "hands up"],
         )
 
+    def test_timed_arm_holds_still_require_release_before_another_arm_block(self):
+        with self.assertRaisesRegex(CommandValidationError, "intentionally held"):
+            parse_robot_program(
+                'robot.hold_arm("hands up", 3)\n'
+                'robot.arm_action("reject")'
+            )
+
     def test_arm_release_flow_checks_all_conditional_paths(self):
-        with self.assertRaisesRegex(CommandValidationError, "error 7401"):
+        self.assertEqual(
             parse_robot_program(
                 'robot.arm_action("hands up")\n'
                 'if robot.front_distance_m() < 1:\n'
@@ -650,7 +655,9 @@ class G1RobotProgramTests(unittest.TestCase):
                 'else:\n'
                 '    robot.walk(1)\n'
                 'robot.arm_action("reject")'
-            )
+            )[-1]["action"],
+            "reject",
+        )
         self.assertEqual(
             parse_robot_program(
                 'robot.arm_action("hands up")\n'
@@ -1051,8 +1058,73 @@ class G1RobotProgramTests(unittest.TestCase):
                 ("PlayStop", "example"),
             ],
         )
-        self.assertEqual(arm_client.actions, [15])
+        self.assertEqual(arm_client.actions, [15, 99])
         self.assertEqual(result["commandsExecuted"], 8)
+
+    def test_other_commands_run_while_held_arm_gesture_waits_to_return_down(self):
+        command_order = []
+
+        class FakeLocoClient:
+            def GetFsmId(self):
+                command_order.append("getfsm")
+                return 0, 500
+
+        class FakeArmClient:
+            def __init__(self):
+                self.actions = []
+
+            def ExecuteAction(self, action_id):
+                command_order.append(f"arm:{action_id}")
+                self.actions.append(action_id)
+                return 0
+
+        class FakeTimer:
+            instance = None
+
+            def __init__(self, _delay, callback):
+                self.callback = callback
+                self.cancelled = False
+                FakeTimer.instance = self
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+            def join(self):
+                pass
+
+        class FakeEvent:
+            def __init__(self):
+                self.is_set = False
+
+            def wait(self):
+                if not self.is_set and not FakeTimer.instance.cancelled:
+                    FakeTimer.instance.callback()
+                return self.is_set
+
+            def set(self):
+                self.is_set = True
+
+        arm_client = FakeArmClient()
+        with patch.object(g1_robot, "_client", FakeLocoClient()), patch.object(
+            g1_robot, "_arm_client", arm_client
+        ), patch.object(
+            g1_robot, "_legacy_arm_action_run_times", return_value={"hands up": 0.01}
+        ), patch.object(
+            g1_robot._stop_requested, "wait", return_value=False
+        ), patch.object(g1_robot.threading, "Timer", FakeTimer), patch.object(
+            g1_robot.threading, "Event", FakeEvent
+        ):
+            result = g1_robot.execute_robot_program(
+                'robot.arm_action("hands up")\n'
+                'robot.getfsm()'
+            )
+
+        self.assertEqual(arm_client.actions, [15, 99])
+        self.assertEqual(command_order, ["arm:15", "getfsm", "arm:99"])
+        self.assertEqual(result["commandsExecuted"], 2)
 
     def test_locomotion_is_not_sent_until_g1_is_in_ready_fsm(self):
         class FakeLocoClient:
@@ -1080,12 +1152,16 @@ class G1RobotProgramTests(unittest.TestCase):
         client, arm_client = FakeLocoClient(), FakeArmClient()
         g1_robot._client, g1_robot._arm_client = client, arm_client
         try:
-            with patch.object(g1_robot._stop_requested, "wait", return_value=False), patch.object(
+            with patch.object(g1_robot._stop_requested, "wait", return_value=False) as wait, patch.object(
                 g1_robot, "_move"
             ) as move:
                 with self.assertRaisesRegex(HTTPException, "FSM 706, not walking-ready FSM 500"):
                     g1_robot.execute_robot_program('robot.arm_action("hands up")\nrobot.walk(1)')
-            self.assertEqual(arm_client.actions, [15])
+            self.assertEqual(arm_client.actions, [15, 99])
+            self.assertEqual(
+                [call.args[0] for call in wait.call_args_list],
+                [g1_robot._legacy_arm_action_run_times()["hands up"], 20.0, 2.0],
+            )
             self.assertEqual(client.fsm_checks, 1)
             move.assert_not_called()
             self.assertEqual(client.velocity_calls, [])

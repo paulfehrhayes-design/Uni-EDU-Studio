@@ -218,7 +218,7 @@ class RobotPoseSample(BaseModel):
     yaw_rad: float
     timestamp: datetime
     age_ms: float
-    source: Literal["tf2"]
+    source: Literal["tf2", "odometry"]
 
 
 class DuetArmRecordingFrame(BaseModel):
@@ -4456,7 +4456,7 @@ def get_robot_pose(response: Response, user: dict = Depends(auth_required)):
                 for value in values
             )
             or not 0 <= age_ms <= 1000
-            or pose.get("source") != "tf2"
+            or pose.get("source") not in {"tf2", "odometry"}
         ):
             raise HTTPException(
                 status_code=502,
@@ -4472,7 +4472,7 @@ def get_robot_pose(response: Response, user: dict = Depends(auth_required)):
             "yaw_rad": float(pose["yaw_rad"]),
             "timestamp": parsed_timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "age_ms": age_ms,
-            "source": "tf2",
+            "source": pose["source"],
         })
     ready_frames = {pose["frame_id"] for pose in poses if pose["ready"]}
     preferred_frame = payload.get("preferred_frame")

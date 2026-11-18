@@ -360,6 +360,16 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   try {
     programNodes = parseG1Program(normalized);
   } catch (error) {
+    if (/gesture is still active|intentionally held/.test(error.message)) {
+      return [{
+        ...createEmptyG1Edu23State(),
+        status: 'Invalid arm sequence',
+        actions: [{ label: 'Gesture conflict', summary: error.message }],
+        blocked: false,
+        collisions: 0,
+        goal: challenge?.goal || null,
+      }];
+    }
     if (/^\s*(?:if|elif|else)\b/m.test(normalized)) {
       return [{
         ...createEmptyG1Edu23State(),
@@ -409,7 +419,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   let gaitPhase = 0;
   let gaitWeight = 0;
   let elapsedSeconds = 0;
-  let heldArmActionDeadline = null;
+  let pendingLegacyArmReturn = null;
   const poseTargets = {};
 
   const addFrame = (isInitial = false) => {
@@ -424,6 +434,33 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       const jointName = name.replace(/_knee_pitch(?:_joint)?$/, '_knee_joint');
       jointState[jointName.endsWith('_joint') ? jointName : `${jointName}_joint`] = value;
     });
+    if (pendingLegacyArmReturn && elapsedSeconds >= pendingLegacyArmReturn.deadline) {
+      if (!pendingLegacyArmReturn.started) {
+        const releaseAction = {
+          label: 'Release Arm',
+          summary: 'Return arms to the down pose after the gesture.',
+        };
+        actions.push(releaseAction);
+        timeline.push(releaseAction);
+        pendingLegacyArmReturn.starts = Object.fromEntries(
+          ANIMATED_ARM_JOINTS.map((joint) => [joint, jointState[joint] || 0]),
+        );
+        pendingLegacyArmReturn.started = true;
+      }
+      const progress = Math.min(
+        1,
+        (elapsedSeconds - pendingLegacyArmReturn.deadline) / 0.8,
+      );
+      ANIMATED_ARM_JOINTS.forEach((joint) => {
+        jointState[joint] = progress === 1
+          ? 0
+          : pendingLegacyArmReturn.starts[joint] * (1 - progress);
+      });
+      if (progress === 1) {
+        ANIMATED_ARM_JOINTS.forEach((joint) => { delete poseTargets[joint]; });
+        pendingLegacyArmReturn = null;
+      }
+    }
 
     frames.push({
       x: Number(x.toFixed(2)),
@@ -463,7 +500,11 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       addFrame();
     });
     if (holdsFinalPose) {
-      heldArmActionDeadline = elapsedSeconds + LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS;
+      pendingLegacyArmReturn = {
+        deadline: elapsedSeconds + LEGACY_HELD_ACTION_EXTRA_HOLD_SECONDS,
+        starts: null,
+        started: false,
+      };
     }
   };
 
@@ -921,7 +962,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       if (node.type === 'command') {
         if (node.method === 'arm_action') {
           const action = node.values[0];
-          if (action === 'release arm') heldArmActionDeadline = null;
+          if (action === 'release arm') pendingLegacyArmReturn = null;
           const nextNode = nodes[index + 1];
           const pairedRecording = nextNode?.type === 'command' && nextNode.method === 'arm_action'
             ? LEGACY_RECORDED_MOTIONS_BY_COMMAND.get(`${node.code}\n${nextNode.code}`)
@@ -991,9 +1032,12 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   if (programNodes) executeNodes(programNodes);
   else commandMatches.forEach(executeCommand);
 
-  if (heldArmActionDeadline !== null && heldArmActionDeadline > elapsedSeconds) {
-    elapsedSeconds = heldArmActionDeadline;
-    addFrame();
+  if (pendingLegacyArmReturn) {
+    const releaseCompletion = pendingLegacyArmReturn.deadline + 0.8;
+    while (elapsedSeconds < releaseCompletion) {
+      elapsedSeconds = Math.min(releaseCompletion, elapsedSeconds + 1 / 30);
+      addFrame();
+    }
   }
 
   if (!frames.length) {

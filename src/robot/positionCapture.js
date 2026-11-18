@@ -22,7 +22,7 @@ export function selectPositionCapturePose(snapshot, requiredFrameId = null) {
     || pose.age_ms > 1000
     || typeof pose.timestamp !== 'string'
     || !Number.isFinite(new Date(pose.timestamp).getTime())
-    || pose.source !== 'tf2'
+    || !['tf2', 'odometry'].includes(pose.source)
   ) {
     throw new Error('The ROS pose sample is invalid or stale.');
   }

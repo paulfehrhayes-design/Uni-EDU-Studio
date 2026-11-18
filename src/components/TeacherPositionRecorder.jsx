@@ -161,7 +161,7 @@ export default function TeacherPositionRecorder({
             : 'Connect an idle legacy SDK robot before starting a capture.'
           : !jointFeedbackReady
             ? 'Fresh, complete 23-joint ROS telemetry is unavailable.'
-            : `Ready to capture ${pose.frame_id} → ${pose.base_frame} pose and all 23 measured joints.`);
+            : `Ready to capture ${pose.frame_id} → ${pose.base_frame} ${pose.source} pose and all 23 measured joints.`);
       } catch (requestError) {
         if (!active) return;
         setIsReady(false);
@@ -411,7 +411,7 @@ export default function TeacherPositionRecorder({
     <section className="rounded-xl border border-cyan-300 bg-cyan-50 p-4">
       <h3 className="text-sm font-semibold text-cyan-950">Record movement for calibration</h3>
       <p className="mt-1 text-xs leading-5 text-cyan-900">
-        Runs a validated command sequence on the selected {controllerLabel} while recording Humble TF pose and all 23 measured G1 joint positions.
+        Runs a validated command sequence on the selected {controllerLabel} while recording Humble TF/odometry pose and all 23 measured G1 joint positions.
         Use short, supervised walking, turning, and arm commands to measure the actual path and joint response.
       </p>
       <p role="status" aria-live="polite" className="mt-2 text-xs font-medium text-slate-700">

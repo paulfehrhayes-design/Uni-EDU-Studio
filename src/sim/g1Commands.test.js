@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as Blockly from 'blockly';
 import { pythonGenerator } from 'blockly/python';
+import recordedMotions from '../../g1-recorded-motions.json' with { type: 'json' };
 import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, LEGACY_ARM_ACTIONS_THAT_HOLD, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './g1Commands.js';
 import { compileMotionPrompt } from './textToMotion.js';
 import { buildG1SimulationFrames } from './g1Edu23Env.js';
@@ -107,7 +108,7 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   );
   assert.ok(!blocks.some((block) => block.type === G1_COMMANDS.find((entry) => entry.method === 'simulate_arm_action').blockType));
   assert.match(armPreset.description, /Stop cannot cancel an arm preset/);
-  assert.match(armPreset.description, /use Release Arm before another arm block/);
+  assert.match(armPreset.description, /recorded action runtime plus 20 seconds.*Release Arm/);
   assert.match(G1_EXECUTABLE_COMMANDS.find((command) => command.method === 'playstop').description, /placeholder app name, not a sound/);
   assert.equal(
     blocks.find((block) => block.type === 'g1_command_arm_action_hands_up').tooltip.startsWith('Raise both hands.'),
@@ -509,18 +510,22 @@ test('simulation expands the same bounded IDE loop syntax', () => {
   assert.ok(Math.abs(finalFrame.x - 2 * G1_NOMINAL_STEP_METERS) < 1e-9);
 });
 
-test('legacy held arm presets require an explicit release before another arm block', () => {
-  assert.throws(
-    () => parseG1Program(
-      'robot.arm_action("hands up")\n'
-      + 'robot.walk(2)\n'
-      + 'robot.arm_action("reject")',
-    ),
-    /may still be holding.*error 7401.*Locomotion blocks may remain/s,
-  );
-  assert.doesNotThrow(() => parseG1Program(
+test('legacy held gestures allow other actions but reject overlapping gestures', () => {
+  assert.throws(() => parseG1Program(
     'robot.arm_action("hands up")\n'
     + 'robot.walk(2)\n'
+    + 'robot.arm_action("reject")',
+  ), /gesture is still active/);
+  assert.doesNotThrow(() => parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
+    + 'robot.arm_action("reject")',
+  ));
+  assert.doesNotThrow(() => parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
     + 'robot.arm_action("release arm")\n'
     + 'robot.arm_action("reject")',
   ));
@@ -530,15 +535,41 @@ test('legacy held arm presets require an explicit release before another arm blo
   ));
   assert.throws(
     () => parseG1Program(
-      'robot.arm_action("hands up")\n'
+      'robot.hold_arm("hands up", 3)\n'
+      + 'robot.arm_action("reject")',
+    ),
+    /intentionally held/,
+  );
+  assert.throws(
+    () => parseG1Program(
+      'robot.hold_arm("hands up", 3)\n'
       + 'if robot.front_distance_m() < 1:\n'
       + '    robot.arm_action("release arm")\n'
       + 'else:\n'
       + '    robot.walk(1)\n'
       + 'robot.arm_action("reject")',
     ),
-    /error 7401/,
+    /intentionally held/,
   );
+  const conflictPreview = buildG1SimulationFrames(
+    'robot.arm_action("hands up")\n'
+    + 'robot.arm_action("reject")',
+  );
+  assert.equal(conflictPreview[0].status, 'Invalid arm sequence');
+  assert.match(conflictPreview[0].actions[0].summary, /gesture is still active/);
+});
+
+test('legacy simulator runs non-gesture actions during the held-pose return delay', () => {
+  const frames = buildG1SimulationFrames(
+    'robot.arm_action("hands up")\n'
+    + 'robot.wait(2)',
+  );
+  const waitFrames = frames.filter((frame) => frame.actions.at(-1)?.label === 'Wait');
+  const releaseFrame = frames.find((frame) => frame.actions.at(-1)?.label === 'Release Arm');
+
+  assert.ok(waitFrames.length > 0, 'the wait should proceed while the arms remain held');
+  assert.ok(releaseFrame, 'the simulator should return the arms after the held-pose delay');
+  assert.ok(waitFrames[0].time < releaseFrame.time, 'the wait should start before the automatic arm return');
 });
 
 test('legacy arm presets replay measured trajectories and explicit release recordings', () => {
@@ -549,29 +580,29 @@ test('legacy arm presets replay measured trajectories and explicit release recor
   const firstRecordedFrame = pairedFrames[1];
   const heldPoseFrame = pairedFrames.find((frame) => frame.time >= 3.5);
   const finalFrame = frames.at(-1);
-  const recordedEndFrame = frames.at(-2);
+  const measuredMotionFrame = frames.find((frame) => (
+    frame.actions.at(-1)?.summary.includes('Measured legacy SDK motion')
+  ));
+  const recordedActionRuntime = recordedMotions.recordings.find((recording) => (
+    recording.command === 'robot.arm_action("hands up")'
+  )).frames.at(-1).time_s;
   const pairedFinalFrame = pairedFrames.at(-1);
   const catalog = getDuetArmCatalog();
 
-  assert.equal(finalFrame.actions.at(-1).label, 'Hands Up Legacy');
-  assert.match(finalFrame.actions.at(-1).summary, /46 samples/);
-  assert.equal(
-    finalFrame.time,
-    recordedEndFrame.time + 20,
-    'a standalone held gesture should add 20 seconds after its recorded movement',
+  assert.equal(finalFrame.actions.at(-1).label, 'Release Arm');
+  assert.match(measuredMotionFrame.actions.at(-1).summary, /46 samples/);
+  assert.ok(
+    finalFrame.time >= recordedActionRuntime + 20,
+    'a held legacy preset should remain posed for 20 seconds after its measured motion',
   );
   catalog.jointOrder.forEach((joint) => {
-    assert.equal(
-      finalFrame.joints[joint],
-      recordedEndFrame.joints[joint],
-      `the final pose should remain held through the added hold for ${joint}`,
-    );
+    assert.equal(finalFrame.joints[joint], 0, `the gesture should finish with ${joint} down`);
   });
   assert.ok(heldPoseFrame, 'the paired capture should include the held pose');
   assert.equal(pairedFinalFrame.actions.at(-1).label, 'Hands Up Then Release Arms Legacy');
   assert.ok(
-    pairedFinalFrame.time > recordedEndFrame.time && pairedFinalFrame.time < finalFrame.time,
-    'the paired recording should preserve its measured release interval without the standalone extra hold',
+    pairedFinalFrame.time > recordedActionRuntime,
+    'the paired recording should preserve its measured release interval',
   );
   assert.ok(catalog.jointOrder.some((joint) => (
     Math.abs(Number(heldPoseFrame.joints[joint]) - Number(firstRecordedFrame.joints[joint])) > 20
@@ -594,14 +625,26 @@ test('legacy arm presets replay measured trajectories and explicit release recor
     if (preset === 'release arm') {
       assert.ok(presetFrames.at(-1).time > 0, 'release arm should retain its simulator transition');
     } else {
-      assert.match(presetFrames.at(-1).actions.at(-1).summary, /Measured legacy SDK motion/);
+      assert.ok(
+        presetFrames.at(-1).actions.some(({ summary }) => /Measured legacy SDK motion/.test(summary)),
+        `${preset} should preview its measured legacy action`,
+      );
       assert.ok(presetFrames.at(-1).time > 2, `${preset} should use the measured recording duration`);
       if (LEGACY_ARM_ACTIONS_THAT_HOLD.has(preset)) {
-        assert.equal(
-          presetFrames.at(-1).time,
-          presetFrames.at(-2).time + 20,
-          `${preset} should add 20 seconds after the recorded motion`,
+        const releaseFrameIndex = presetFrames.findIndex((frame) => (
+          frame.actions.at(-1)?.label === 'Release Arm'
+        ));
+        const actionRuntime = recordedMotions.recordings.find((recording) => (
+          recording.command === `robot.arm_action(${JSON.stringify(preset)})`
+        )).frames.at(-1).time_s;
+        assert.ok(releaseFrameIndex > 0, `${preset} should animate its return to the down pose`);
+        assert.ok(
+          presetFrames[releaseFrameIndex].time - actionRuntime >= 20,
+          `${preset} should stay in its final pose for 20 seconds after the recorded action`,
         );
+        G1_MESH_ARM_JOINT_NAMES.forEach((joint) => {
+          assert.equal(presetFrames.at(-1).joints[joint], 0, `${preset} should end with ${joint} down`);
+        });
       }
     }
     presetFrames.forEach(({ joints }) => {

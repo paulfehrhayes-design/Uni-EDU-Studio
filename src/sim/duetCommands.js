@@ -43,7 +43,7 @@ const armGesture = (method, label, poses) => ({
   ...command(
     method,
     `${label} (%1 s per pose)`,
-    `Run the fixed ${label.toLowerCase()} arm trajectory with bounded transitions.`,
+    `Run the fixed ${label.toLowerCase()} arm trajectory, then hold its final pose for 20 seconds before returning to carry. Other actions may continue during the hold, but another gesture must wait until the arms return.`,
     [numberArgument('SECONDS', 'seconds per pose', 1.5, 1, 3, 0.1)],
   ),
   category: 'Arm gestures',
@@ -622,6 +622,86 @@ function validateArmResetFlow(nodes, possibleHeldStates = new Set([false])) {
   return states;
 }
 
+function duetCommandDuration(node) {
+  if (node.type === 'concurrent') {
+    const movementDefinition = getDuetCommand(node.movement.method)?.motion;
+    const movementDuration = movementDefinition
+      ? node.movement.values[0]
+      : node.movement.values[3];
+    const gestureDefinition = getDuetCommand(node.gesture.method);
+    const gestureDuration = gestureDefinition?.poseInput
+      ? node.gesture.method === 'hold_pose'
+        ? 1 + node.gesture.values[0]
+        : movementDuration
+      : (gestureDefinition?.armPoses?.length || 1) * node.gesture.values[0];
+    return Math.max(movementDuration, gestureDuration);
+  }
+  if (node.type !== 'command') return 0;
+  const definition = getDuetCommand(node.method);
+  if (definition?.motion) return node.values[0];
+  if (node.method === 'move') return node.values[3];
+  if (node.method === 'wait') return node.values[0];
+  if (definition?.armPoses) return definition.armPoses.length * node.values[0];
+  if (definition?.poseInput) return node.method === 'hold_pose' ? 1 + node.values[0] : 0;
+  return 0;
+}
+
+function validateAutomaticGestureFlow(nodes, initialStates = [{ remaining: 0, gesture: null }]) {
+  let states = initialStates;
+  for (const node of nodes) {
+    if (node.type === 'repeat') {
+      for (let iteration = 0; iteration < node.times; iteration += 1) {
+        states = validateAutomaticGestureFlow(node.body, states);
+      }
+      continue;
+    }
+    if (node.type === 'condition') {
+      const branches = [node.then, node.else].map((branch) => (
+        validateAutomaticGestureFlow(branch, states.map((state) => ({ ...state })))
+      ));
+      states = [...new Map(branches.flat().map((state) => [
+        `${state.remaining.toFixed(3)}|${state.gesture ?? ''}`,
+        state,
+      ])).values()];
+      continue;
+    }
+
+    const commands = node.type === 'concurrent' ? [node.gesture] : [node];
+    const startsArmMotion = commands.some(({ method }) => {
+      const definition = getDuetCommand(method);
+      return definition?.armPoses || definition?.poseInput;
+    });
+    const reset = node.type === 'command' && node.method === 'reset_arms';
+    const heldGesture = node.type === 'command'
+      && getDuetCommand(node.method)?.category === 'Arm gestures'
+      && getDuetCommand(node.method).armPoses.at(-1) !== 'carry';
+    const nextStates = [];
+    for (const state of states) {
+      if (state.remaining > 0 && startsArmMotion && !reset) {
+        throw new Error(
+          `The ${state.gesture} gesture is still active for about ${state.remaining.toFixed(1)} seconds. Run other actions or wait for it to return before the next arm gesture (${commands[0].method}).`,
+        );
+      }
+      if (reset) {
+        nextStates.push({ remaining: 0, gesture: null });
+      } else if (heldGesture) {
+        nextStates.push({ remaining: 20, gesture: node.method });
+      } else {
+        const duration = duetCommandDuration(node);
+        nextStates.push({
+          remaining: Math.max(0, state.remaining - duration),
+          gesture: state.remaining > duration ? state.gesture : null,
+        });
+      }
+    }
+    states = [...new Map(nextStates.map((state) => [
+      `${state.remaining.toFixed(3)}|${state.gesture ?? ''}`,
+      state,
+    ])).values()];
+  }
+  return states;
+}
+
 export function parseDuetProgram(code = '') {
   const lines = code.replace(/\r/g, '').split('\n').map((raw, index) => ({
     indent: raw.match(/^\s*/)[0].replace(/\t/g, '  ').length,
@@ -637,6 +717,7 @@ export function parseDuetProgram(code = '') {
   }
   validateStopPlacement(nodes);
   validateArmResetFlow(nodes);
+  validateAutomaticGestureFlow(nodes);
   return nodes;
 }
 

@@ -30,6 +30,16 @@ test('capture selects odometry when available and locks the frame on later sampl
   );
 });
 
+test('capture accepts a fresh direct ROS odometry pose as well as TF', () => {
+  const pose = selectPositionCapturePose({
+    ready: true,
+    preferred_frame: 'odom',
+    poses: [makePose('odom', { source: 'odometry', base_frame: 'base' })],
+  });
+  assert.equal(pose.source, 'odometry');
+  assert.equal(pose.base_frame, 'base');
+});
+
 test('capture rejects stale or malformed pose data instead of inventing a position', () => {
   assert.throws(
     () => selectPositionCapturePose({ ready: false, error: 'TF is unavailable.', poses: [] }),
