@@ -400,6 +400,20 @@ function advanceArmActionFlow(nodes, initialStates = [{ explicitHold: null, auto
       }
       const preset = node.values[0];
       if (node.method === 'arm_action' && preset === 'release arm') {
+        if (state.explicitHold) {
+          nextStates.push({ explicitHold: null, autoHoldRemaining: 0, heldGesture: null });
+          continue;
+        }
+        if (state.autoHoldRemaining > 0) {
+          return {
+            states,
+            conflict: {
+              previousAction: state.heldGesture,
+              nextAction: preset,
+              remaining: state.autoHoldRemaining,
+            },
+          };
+        }
         nextStates.push({ explicitHold: null, autoHoldRemaining: 0, heldGesture: null });
         continue;
       }
@@ -441,11 +455,11 @@ function validateLegacyArmActionFlow(nodes) {
   if (!conflict) return;
   if (!conflict.explicit) {
     throw new Error(
-      `The ${conflict.previousAction} gesture is still active for about ${conflict.remaining.toFixed(1)} seconds. Run other actions or wait for it to return before the next gesture (${conflict.nextAction}).`,
+      `Cannot submit or run this Legacy sequence: the ${conflict.previousAction} gesture is still active for about ${conflict.remaining.toFixed(1)} more seconds. The arm action "${conflict.nextAction}" cannot run during that 20-second hold. Add a wait until the gesture returns to its default position, or move "${conflict.nextAction}" after it.`,
     );
   }
   throw new Error(
-    `The ${conflict.previousAction} pose is intentionally held. Add robot.arm_action("release arm") before the next arm block (${conflict.nextAction}).`,
+    `Cannot submit or run this Legacy sequence: the ${conflict.previousAction} pose is intentionally held. The arm action "${conflict.nextAction}" cannot run until robot.arm_action("release arm") is used to release the pose.`,
   );
 }
 

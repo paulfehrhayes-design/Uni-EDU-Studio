@@ -10,6 +10,16 @@ import duet_robot
 
 
 class DuetProgramValidationTests(unittest.TestCase):
+    def test_duet_gateway_only_overrides_handheld_velocity_during_an_active_move(self):
+        header = Path(__file__).resolve().parent.parent / "vendor" / "DUET" / "deploy" / "include" / "duet_command_gateway.h"
+        source = header.read_text(encoding="utf-8")
+        override = source.split("inline std::optional<std::array<float, 3>> velocity_override()", 1)[1].split(
+            "inline std::optional<std::array<float, 10>> arm_target_override()", 1
+        )[0]
+        self.assertIn("Acquiring the app lease does not commandeer the handheld controller", override)
+        self.assertIn("if (!shared.velocity_active", override)
+        self.assertIn("return std::nullopt;", override)
+
     def test_navigation_uses_only_the_existing_leased_move_and_stop_protocol(self):
         moving = {
             "ready": True,
@@ -398,18 +408,38 @@ class DuetProgramValidationTests(unittest.TestCase):
         self.assertTrue(wait_durations)
 
     def test_overlapping_duet_gestures_are_rejected_before_execution(self):
-        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "gesture is still active"):
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "Cannot submit or run this sequence"):
             duet_robot.parse_duet_program(
                 "duet.receive_and_hold(1)\n"
                 "duet.gesture_clap(1)"
             )
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "arm movement"):
+            duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "duet.arm_carry(1)"
+            )
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "reset arms"):
+            duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "duet.reset_arms()"
+            )
         self.assertEqual(
             len(duet_robot.parse_duet_program(
                 "duet.receive_and_hold(1)\n"
-                "duet.wait(20)\n"
+                "for _ in range(7):\n"
+                "    duet.wait(3)\n"
                 "duet.gesture_clap(1)"
             )),
-            3,
+            9,
+        )
+        self.assertEqual(
+            len(duet_robot.parse_duet_program(
+                "duet.receive_and_hold(1)\n"
+                "for _ in range(7):\n"
+                "    duet.wait(3)\n"
+                "duet.arm_carry(1)"
+            )),
+            9,
         )
 
     def test_stop_must_be_final_and_program_has_no_aggregate_duration_cap(self):

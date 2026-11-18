@@ -110,13 +110,33 @@ test('DUET held gestures allow base actions but reject overlapping gestures', ()
       'duet.receive_and_hold(1)\n'
       + 'duet.gesture_clap(1)',
     ),
-    /gesture is still active/,
+    /Cannot submit or run this sequence/,
+  );
+  assert.throws(
+    () => parseDuetProgram(
+      'duet.receive_and_hold(1)\n'
+      + 'duet.arm_carry(1)',
+    ),
+    /arm movement "arm carry".*cannot run during that 20-second hold/,
+  );
+  assert.throws(
+    () => parseDuetProgram(
+      'duet.receive_and_hold(1)\n'
+      + 'duet.reset_arms()',
+    ),
+    /arm movement "reset arms".*cannot run during that 20-second hold/,
   );
   assert.doesNotThrow(() => parseDuetProgram(
     'duet.receive_and_hold(1)\n'
     + 'for _ in range(7):\n'
     + '    duet.wait(3)\n'
     + 'duet.gesture_clap(1)',
+  ));
+  assert.doesNotThrow(() => parseDuetProgram(
+    'duet.receive_and_hold(1)\n'
+    + 'for _ in range(7):\n'
+    + '    duet.wait(3)\n'
+    + 'duet.arm_carry(1)',
   ));
   assert.ok(carryFrame, 'the gesture should return to carry after its hold');
   assert.ok(heldFrame, 'the gesture should keep its final target active during its hold');

@@ -672,14 +672,18 @@ function validateAutomaticGestureFlow(nodes, initialStates = [{ remaining: 0, ge
       return definition?.armPoses || definition?.poseInput;
     });
     const reset = node.type === 'command' && node.method === 'reset_arms';
+    const armMovement = startsArmMotion || reset;
     const heldGesture = node.type === 'command'
       && getDuetCommand(node.method)?.category === 'Arm gestures'
       && getDuetCommand(node.method).armPoses.at(-1) !== 'carry';
     const nextStates = [];
     for (const state of states) {
-      if (state.remaining > 0 && startsArmMotion && !reset) {
+      if (state.remaining > 0 && armMovement) {
+        const nextAction = reset
+          ? 'reset arms'
+          : commands[0].method.replaceAll('_', ' ');
         throw new Error(
-          `The ${state.gesture} gesture is still active for about ${state.remaining.toFixed(1)} seconds. Run other actions or wait for it to return before the next arm gesture (${commands[0].method}).`,
+          `Cannot submit or run this sequence: the ${state.gesture.replaceAll('_', ' ')} gesture is still holding its arms for about ${state.remaining.toFixed(1)} more seconds. The arm movement "${nextAction}" cannot run during that 20-second hold. Add a wait until the gesture returns to its default/carry position, or move "${nextAction}" after it.`,
         );
       }
       if (reset) {

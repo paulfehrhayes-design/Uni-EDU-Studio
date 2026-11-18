@@ -443,11 +443,24 @@ def _validate_arm_action_release_flow(nodes: list[dict[str, Any]]) -> None:
             for state in states:
                 action = node["action"]
                 if node["method"] == "arm_action" and action == "release arm":
-                    next_states.append({
-                        "explicit_hold": None,
-                        "auto_hold_remaining": 0.0,
-                        "held_gesture": None,
-                    })
+                    if state["explicit_hold"] is not None:
+                        next_states.append({
+                            "explicit_hold": None,
+                            "auto_hold_remaining": 0.0,
+                            "held_gesture": None,
+                        })
+                    elif state["auto_hold_remaining"] > 0:
+                        return states, {
+                            "previous_action": state["held_gesture"],
+                            "next_action": action,
+                            "remaining": state["auto_hold_remaining"],
+                        }
+                    else:
+                        next_states.append({
+                            "explicit_hold": None,
+                            "auto_hold_remaining": 0.0,
+                            "held_gesture": None,
+                        })
                     continue
                 if state["explicit_hold"] is not None:
                     return states, {
@@ -493,10 +506,15 @@ def _validate_arm_action_release_flow(nodes: list[dict[str, Any]]) -> None:
         return
     if conflict.get("explicit"):
         raise CommandValidationError(
-            f'The {conflict["previous_action"]} pose is intentionally held. Add robot.arm_action("release arm") before the next arm block ({conflict["next_action"]}).'
+            f'Cannot submit or run this Legacy sequence: the {conflict["previous_action"]} pose is intentionally held. '
+            f'The arm action "{conflict["next_action"]}" cannot run until robot.arm_action("release arm") is used '
+            "to release the pose."
         )
     raise CommandValidationError(
-        f'The {conflict["previous_action"]} gesture is still active for about {conflict["remaining"]:.1f} seconds. Run other actions or wait for it to return before the next gesture ({conflict["next_action"]}).'
+        f'Cannot submit or run this Legacy sequence: the {conflict["previous_action"]} gesture is still active '
+        f'for about {conflict["remaining"]:.1f} more seconds. The arm action "{conflict["next_action"]}" cannot '
+        "run during that 20-second hold. Add a wait until the gesture returns to its default position, or move "
+        f'"{conflict["next_action"]}" after it.'
     )
 
 

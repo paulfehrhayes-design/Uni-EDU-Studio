@@ -589,13 +589,17 @@ class G1RobotProgramTests(unittest.TestCase):
                 )
 
     def test_arm_presets_only_release_when_the_program_explicitly_requests_it(self):
-        self.assertEqual(
-            parse_robot_program(
+        parsed = parse_robot_program(
                 'for _ in range(2):\n'
                 '    robot.arm_action("hands up")\n'
+                '    for _ in range(2):\n'
+                '        robot.wait(10)\n'
                 '    robot.arm_action("release arm")\n'
                 '    robot.arm_action("face wave")'
-            ),
+            )
+        arm_actions = [command for command in parsed if command["method"] == "arm_action"]
+        self.assertEqual(
+            arm_actions,
             [
                 {"method": "arm_action", "action": "hands up", "action_id": 15},
                 {"method": "arm_action", "action": "release arm", "action_id": 99},
@@ -623,10 +627,16 @@ class G1RobotProgramTests(unittest.TestCase):
                 'robot.walk(2)\n'
                 'robot.arm_action("reject")'
             )
+        with self.assertRaisesRegex(CommandValidationError, "cannot run during that 20-second hold"):
+            parse_robot_program(
+                'robot.arm_action("hands up")\n'
+                'robot.arm_action("release arm")'
+            )
         self.assertEqual(
             [command["action"] for command in parse_robot_program(
                 'robot.arm_action("hands up")\n'
-                'robot.wait(20)\n'
+                'for _ in range(2):\n'
+                '    robot.wait(10)\n'
                 'robot.arm_action("reject")'
             ) if command["method"] == "arm_action"],
             ["hands up", "reject"],
@@ -651,14 +661,17 @@ class G1RobotProgramTests(unittest.TestCase):
             parse_robot_program(
                 'robot.arm_action("hands up")\n'
                 'if robot.front_distance_m() < 1:\n'
+                '    for _ in range(2):\n'
+                '        robot.wait(10)\n'
                 '    robot.arm_action("release arm")\n'
                 'else:\n'
-                '    robot.walk(1)\n'
+                '    for _ in range(2):\n'
+                '        robot.wait(10)\n'
                 'robot.arm_action("reject")'
             )[-1]["action"],
             "reject",
         )
-        self.assertEqual(
+        with self.assertRaisesRegex(CommandValidationError, "cannot run during that 20-second hold"):
             parse_robot_program(
                 'robot.arm_action("hands up")\n'
                 'if robot.front_distance_m() < 1:\n'
@@ -666,9 +679,7 @@ class G1RobotProgramTests(unittest.TestCase):
                 'else:\n'
                 '    robot.arm_action("release arm")\n'
                 'robot.arm_action("reject")'
-            )[-1]["action"],
-            "reject",
-        )
+            )
 
     def test_timed_arm_pose_uses_only_static_presets_and_is_bounded(self):
         self.assertEqual(

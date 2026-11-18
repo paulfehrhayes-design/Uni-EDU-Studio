@@ -516,6 +516,10 @@ test('legacy held gestures allow other actions but reject overlapping gestures',
     + 'robot.walk(2)\n'
     + 'robot.arm_action("reject")',
   ), /gesture is still active/);
+  assert.throws(() => parseG1Program(
+    'robot.arm_action("hands up")\n'
+    + 'robot.arm_action("release arm")',
+  ), /cannot run during that 20-second hold/);
   assert.doesNotThrow(() => parseG1Program(
     'robot.arm_action("hands up")\n'
     + 'for _ in range(2):\n'
@@ -575,7 +579,10 @@ test('legacy simulator runs non-gesture actions during the held-pose return dela
 test('legacy arm presets replay measured trajectories and explicit release recordings', () => {
   const frames = buildG1SimulationFrames('robot.arm_action("hands up")');
   const pairedFrames = buildG1SimulationFrames(
-    'robot.arm_action("hands up")\nrobot.arm_action("release arm")',
+    'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
+    + 'robot.arm_action("release arm")',
   );
   const firstRecordedFrame = pairedFrames[1];
   const heldPoseFrame = pairedFrames.find((frame) => frame.time >= 3.5);
@@ -599,7 +606,7 @@ test('legacy arm presets replay measured trajectories and explicit release recor
     assert.equal(finalFrame.joints[joint], 0, `the gesture should finish with ${joint} down`);
   });
   assert.ok(heldPoseFrame, 'the paired capture should include the held pose');
-  assert.equal(pairedFinalFrame.actions.at(-1).label, 'Hands Up Then Release Arms Legacy');
+  assert.equal(pairedFinalFrame.actions.at(-1).label, 'Arm preset preview: release arm');
   assert.ok(
     pairedFinalFrame.time > recordedActionRuntime,
     'the paired recording should preserve its measured release interval',
@@ -608,10 +615,7 @@ test('legacy arm presets replay measured trajectories and explicit release recor
     Math.abs(Number(heldPoseFrame.joints[joint]) - Number(firstRecordedFrame.joints[joint])) > 20
   )), 'the paired recording should hold a raised pose before release');
   catalog.jointOrder.forEach((joint) => {
-    assert.ok(
-      Math.abs(Number(pairedFinalFrame.joints[joint]) - Number(firstRecordedFrame.joints[joint])) < 1,
-      `the paired recording should return ${joint} close to its recorded starting pose`,
-    );
+    assert.equal(pairedFinalFrame.joints[joint], 0, `the paired recording should return ${joint} to neutral`);
   });
 
   const presets = G1_COMMANDS.find((entry) => entry.method === 'arm_action').args[0].choices;
@@ -701,17 +705,23 @@ test('legacy face and high wave presets use the SDK right-arm side', () => {
 test('arm preset parsing preserves only explicitly requested releases', () => {
   const nodes = parseG1Program(
     'robot.arm_action("hands up")\n'
+    + 'for _ in range(2):\n'
+    + '    robot.wait(10)\n'
     + 'robot.arm_action("release arm")\n'
     + 'robot.arm_action("face wave")',
   );
-  assert.deepEqual(nodes.map(({ values }) => values[0]), [
-    'hands up',
-    'release arm',
-    'face wave',
-  ]);
+  const armActions = [];
+  const collect = (items) => items.forEach((item) => {
+    if (item.type === 'repeat') collect(Array(item.times).fill(item.body).flat());
+    else if (item.method === 'arm_action') armActions.push(item.values[0]);
+  });
+  collect(nodes);
+  assert.deepEqual(armActions, ['hands up', 'release arm', 'face wave']);
   assert.equal(
     formatG1Program(nodes),
     'robot.arm_action("hands up")\n'
+      + 'for _ in range(2):\n'
+      + '    robot.wait(10)\n'
       + 'robot.arm_action("release arm")\n'
       + 'robot.arm_action("face wave")',
   );

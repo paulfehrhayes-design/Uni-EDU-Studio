@@ -1418,6 +1418,8 @@ def _parse_duet_program(code: str) -> list[dict]:
         return 0.0
 
     def starts_arm_motion(command: dict) -> bool:
+        if command.get("type") == "reset_arms":
+            return True
         return any(
             item.get("type") in {"arm_pose", "arm_target", "arm_target_hold", "arm_trajectory"}
             for item in command_arm_commands(command)
@@ -1460,10 +1462,15 @@ def _parse_duet_program(code: str) -> list[dict]:
             arm_motion = starts_arm_motion(command)
             next_states = []
             for state in states:
-                if state["remaining"] > 0 and arm_motion and not arm_reset:
+                if state["remaining"] > 0 and arm_motion:
+                    next_action = (
+                        "reset arms"
+                        if arm_reset
+                        else str(command.get("gesture") or command.get("type") or "arm movement").replace("_", " ")
+                    )
                     return states, {
                         "gesture": state["gesture"],
-                        "next": command.get("gesture") or command.get("type"),
+                        "next": next_action,
                         "remaining": state["remaining"],
                     }
                 if arm_reset:
@@ -1485,9 +1492,12 @@ def _parse_duet_program(code: str) -> list[dict]:
     _, gesture_conflict = advance_gesture_hold(commands, [{"remaining": 0.0, "gesture": None}])
     if gesture_conflict:
         raise DuetProgramValidationError(
-            f"The {gesture_conflict['gesture']} gesture is still active for about "
-            f"{gesture_conflict['remaining']:.1f} seconds. Run other actions or wait for it to return "
-            f"before the next arm gesture ({gesture_conflict['next']})."
+            f"Cannot submit or run this sequence: the "
+            f"{str(gesture_conflict['gesture']).replace('_', ' ')} gesture is still holding its arms "
+            f"for about {gesture_conflict['remaining']:.1f} more seconds. "
+            f"The arm movement \"{gesture_conflict['next']}\" cannot run during that 20-second hold. "
+            "Add a wait until the gesture returns to its default/carry position, or move "
+            f'"{gesture_conflict["next"]}" after it.'
         )
 
     return commands
