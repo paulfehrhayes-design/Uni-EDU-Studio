@@ -111,7 +111,7 @@ const command = (method, label, category, description, args = []) => ({
 
 const steps = (value = 2) => integerArgument('STEPS', 'steps', value, 1, 20);
 const seconds = (value = 1) => numberArgument('SECONDS', 'seconds', value, 0.1, 10, 0.001);
-const wholeSeconds = (value = 1) => integerArgument('SECONDS', 'seconds', value, 1, 10);
+const wholeSeconds = (value = 1) => integerArgument('SECONDS', 'seconds', value, 1, 20);
 const degrees = (value = 90) => numberArgument('DEGREES', 'degrees', value, 0, 120);
 const direction = (value = 'left') => choiceArgument('DIRECTION', 'direction', [['Left', 'left'], ['Right', 'right']], value);
 const level = (value = 'mid') => choiceArgument('LEVEL', 'level', [['High', 'high'], ['Mid', 'mid'], ['Low', 'low']], value);
@@ -671,6 +671,25 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
         codeTemplate: `robot.arm_action(${JSON.stringify(preset)})\n`,
         armPreset: preset,
       }))
+      : definition.method === 'turn'
+        ? [
+          {
+            ...definition,
+            type: definition.blockType,
+            message: definition.blockMessage,
+          },
+          ...[
+            ['left', 'Turn left (110°)'],
+            ['right', 'Turn right (110°)'],
+          ].map(([fixedTurnDirection, message]) => ({
+            ...definition,
+            type: `g1_command_turn_${fixedTurnDirection}_110`,
+            message,
+            args: [],
+            codeTemplate: `robot.turn("${fixedTurnDirection}", 110)\n`,
+            fixedTurnDirection,
+          })),
+        ]
       : [{
         ...definition,
         type: definition.blockType,
@@ -681,6 +700,7 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
       type: variant.type,
       category: definition.category,
       armPreset: variant.armPreset,
+      fixedTurnDirection: variant.fixedTurnDirection,
       message0: variant.message,
       args0: variant.args.map((argument) => ['number', 'integer'].includes(argument.kind)
         ? { type: 'field_number', name: argument.name, value: argument.value, min: argument.min, max: argument.max, precision: argument.step }

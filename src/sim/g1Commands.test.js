@@ -19,6 +19,8 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     [
       ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
         .slice(0, 12).map((command) => command.blockType),
+      'g1_command_turn_left_110',
+      'g1_command_turn_right_110',
       'g1_command_turn_around_180',
       'g1_command_squat_to_stand',
       'g1_command_lie_to_stand',
@@ -47,8 +49,20 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
   );
   assert.ok(blocks.every((block) => G1_EXECUTABLE_COMMANDS.some((command) => (
     command.blockType === block.type
+    || Boolean(block.fixedTurnDirection)
     || (command.method === 'arm_action' && block.armPreset && command.args[0].choices.some(([, preset]) => preset === block.armPreset))
   ))));
+  assert.deepEqual(
+    blocks.filter((block) => block.fixedTurnDirection).map((block) => [
+      block.message0,
+      block.codeTemplate,
+      block.args0,
+    ]),
+    [
+      ['Turn left (110°)', 'robot.turn("left", 110)\n', []],
+      ['Turn right (110°)', 'robot.turn("right", 110)\n', []],
+    ],
+  );
   assert.ok(G1_COMMANDS.some((command) => command.method === 'hold_arm'));
   assert.ok(!G1_EXECUTABLE_COMMANDS.some((command) => command.method === 'hold_arm'));
   assert.ok(getG1BlocklyCommandBlocks(G1_COMMANDS).some((block) => block.type === 'g1_command_hold_arm'));
@@ -183,13 +197,14 @@ test('wait command is bounded, included in the IDE catalog, and previews its ful
   assert.equal(waitBlock.message0, 'Wait for %1 seconds');
   assert.deepEqual(
     [waitBlock.args0[0].value, waitBlock.args0[0].min, waitBlock.args0[0].max, waitBlock.args0[0].precision],
-    [1, 1, 10, 1],
+    [1, 1, 20, 1],
   );
   assert.throws(() => parseG1Program('robot.wait(0.1)'), /integer/);
   assert.equal(parseG1Program('robot.wait(1)')[0].values[0], 1);
   assert.equal(parseG1Program('robot.wait(2)')[0].code, 'robot.wait(2)');
   assert.equal(parseG1Program('robot.wait(2);')[0].code, 'robot.wait(2)');
-  assert.equal(parseG1Program('robot.wait(99)')[0].code, 'robot.wait(10)');
+  assert.equal(parseG1Program('robot.wait(20)')[0].values[0], 20);
+  assert.equal(parseG1Program('robot.wait(99)')[0].code, 'robot.wait(20)');
   assert.throws(() => parseG1Program('robot.wait(1.1)'), /integer/);
   const frames = buildG1SimulationFrames('robot.wait(2)');
   assert.ok(Math.abs(frames.at(-1).time - 2) < 1e-9);

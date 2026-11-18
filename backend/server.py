@@ -362,6 +362,10 @@ class SidebarSettingsRequest(BaseModel):
     locked_panels: List[Literal["blocks", "ide", "planner", "prompt", "camera"]]
 
 
+class CommandVisibilitySettingsRequest(BaseModel):
+    hidden_command_types: List[str] = Field(max_length=1000)
+
+
 class SafeModeSettingsRequest(BaseModel):
     enabled: bool
 
@@ -1448,6 +1452,21 @@ def init_db():
         FROM teacher_sidebar_settings
         ORDER BY updated_at DESC
         LIMIT 1
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classroom_command_visibility_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            hidden_command_types TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO classroom_command_visibility_settings (id, hidden_command_types)
+        VALUES (1, '[]')
         """
     )
     conn.execute(
@@ -5659,6 +5678,62 @@ def update_classroom_sidebar_settings(
     finally:
         conn.close()
     return {"locked_panels": locked_panels, "configured": True}
+
+
+@app.get("/api/classroom/command-visibility")
+def get_classroom_command_visibility(response: Response, user: dict = Depends(auth_required)):
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT hidden_command_types FROM classroom_command_visibility_settings WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=503, detail="Classroom command visibility settings are unavailable.")
+    try:
+        hidden_command_types = json.loads(row["hidden_command_types"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=503, detail="Classroom command visibility settings are invalid.") from error
+    if (
+        not isinstance(hidden_command_types, list)
+        or any(
+            not isinstance(command_type, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,159}", command_type)
+            for command_type in hidden_command_types
+        )
+    ):
+        raise HTTPException(status_code=503, detail="Classroom command visibility settings are invalid.")
+    return {"hidden_command_types": list(dict.fromkeys(hidden_command_types)), "configured": True}
+
+
+@app.put("/api/classroom/command-visibility")
+def update_classroom_command_visibility(
+    request: CommandVisibilitySettingsRequest,
+    user: dict = Depends(auth_required),
+):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher role required")
+    hidden_command_types = list(dict.fromkeys(request.hidden_command_types))
+    if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,159}", item) for item in hidden_command_types):
+        raise HTTPException(status_code=422, detail="Command type identifiers are invalid.")
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO classroom_command_visibility_settings (id, hidden_command_types, updated_at)
+            VALUES (1, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                hidden_command_types = excluded.hidden_command_types,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (json.dumps(hidden_command_types),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"hidden_command_types": hidden_command_types, "configured": True}
 
 
 def teacher_safe_mode_enabled(username: str) -> bool:

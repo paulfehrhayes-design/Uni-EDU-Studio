@@ -545,10 +545,14 @@ class G1RobotProgramTests(unittest.TestCase):
         )
         self.assertEqual(
             parse_robot_program("robot.wait(99)"),
-            [{"method": "wait", "seconds": 10}],
+            [{"method": "wait", "seconds": 20}],
         )
         self.assertEqual(
-            len(parse_robot_program("robot.wait(10)\nrobot.wait(10)\nrobot.wait(10)\nrobot.wait(1)")),
+            parse_robot_program("robot.wait(20)"),
+            [{"method": "wait", "seconds": 20}],
+        )
+        self.assertEqual(
+            len(parse_robot_program("robot.wait(20)\nrobot.wait(20)\nrobot.wait(20)\nrobot.wait(1)")),
             4,
         )
         with self.assertRaisesRegex(CommandValidationError, "whole number"):

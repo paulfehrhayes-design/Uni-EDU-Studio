@@ -540,6 +540,57 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertEqual(student_write.status_code, 403)
         self.assertEqual(restored.json(), {"show_simulation": False})
 
+    def test_command_visibility_is_shared_with_students_and_teacher_only_writable(self):
+        client = TestClient(app)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, "DB_PATH", os.path.join(temp_dir, "classroom.db")
+        ):
+            server.init_db()
+            teacher = client.post(
+                "/api/classroom/login",
+                json={"username": "teacher", "password": "teacher"},
+            ).json()
+            student = client.post(
+                "/api/classroom/login",
+                json={"username": "student1", "password": "student1"},
+            ).json()
+            teacher_headers = {"Authorization": f"Bearer {teacher['token']}"}
+            student_headers = {"Authorization": f"Bearer {student['token']}"}
+            initial = client.get(
+                "/api/classroom/command-visibility",
+                headers=teacher_headers,
+            )
+            saved = client.put(
+                "/api/classroom/command-visibility",
+                headers=teacher_headers,
+                json={"hidden_command_types": ["g1_command_turn", "g1_command_turn", "duet_command_wave"]},
+            )
+            student_setting = client.get(
+                "/api/classroom/command-visibility",
+                headers=student_headers,
+            )
+            student_write = client.put(
+                "/api/classroom/command-visibility",
+                headers=student_headers,
+                json={"hidden_command_types": []},
+            )
+            invalid = client.put(
+                "/api/classroom/command-visibility",
+                headers=teacher_headers,
+                json={"hidden_command_types": ["not a block type"]},
+            )
+
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.json(), {"hidden_command_types": [], "configured": True})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(
+            saved.json(),
+            {"hidden_command_types": ["g1_command_turn", "duet_command_wave"], "configured": True},
+        )
+        self.assertEqual(student_setting.json(), saved.json())
+        self.assertEqual(student_write.status_code, 403)
+        self.assertEqual(invalid.status_code, 422)
+
     def test_planner_mode_setting_is_teacher_controlled_and_shared(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             server, "DB_PATH", os.path.join(temp_dir, "classroom.db")

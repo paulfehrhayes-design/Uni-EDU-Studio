@@ -16,6 +16,7 @@ const numberArgument = (name, label, value, min, max, step = 0.01) => ({
 });
 
 const seconds = () => numberArgument('SECONDS', 'seconds', 1, 0.1, 3, 0.1);
+const waitSeconds = () => numberArgument('SECONDS', 'seconds', 1, 0.1, 20, 0.1);
 const command = (method, message, description, args = [], label = message.replace(/%\d+/g, '1')) => ({
   method,
   label,
@@ -218,7 +219,7 @@ export const DUET_COMMANDS = Object.freeze([
     )),
     ...catalogGestureCommands,
   ],
-  command('wait', 'Wait %1 s', 'Pause the program.', [seconds()]),
+  command('wait', 'Wait %1 s', 'Pause the program for up to 20 seconds.', [waitSeconds()]),
   command('stop', 'Stop DUET motion', 'Request a DUET controller stop; execution stops at this command.', []),
 ].map((definition) => Object.freeze({
   ...definition,
@@ -859,6 +860,7 @@ export function getDuetCommandExamples(savedMotions = [], sharedMotions = []) {
           category,
           label: `${definition.method === 'hold_pose' ? 'Hold' : 'Hold until reset'}: ${poseName.replaceAll('_', ' ')}`,
           code,
+          blockTypes: [definition.type, `duet_pose_target_${poseName}`],
         };
       });
     }
@@ -869,6 +871,7 @@ export function getDuetCommandExamples(savedMotions = [], sharedMotions = []) {
       code: `duet.${definition.method}(${definition.args.map((argument) => (
         argument.kind === 'choice' ? JSON.stringify(argument.value) : String(argument.value)
       )).join(', ')})`,
+      blockTypes: [definition.type],
     }];
   });
   return [
@@ -878,24 +881,28 @@ export function getDuetCommandExamples(savedMotions = [], sharedMotions = []) {
       category: 'Saved motions',
       label: `Saved motion: ${name}`,
       code: `duet.saved_motion(${JSON.stringify(id)})`,
+      blockTypes: ['duet_command_saved_motion'],
     })),
     ...sharedMotions.map(({ id, name }) => ({
       key: `shared_motion_${id}`,
       category: 'Shared motions',
       label: `Shared motion: ${name}`,
       code: `duet.shared_motion(${JSON.stringify(id)})`,
+      blockTypes: ['duet_command_shared_motion'],
     })),
     {
       key: 'front_distance_condition',
       category: 'Conditions',
       label: 'Front distance condition example',
       code: 'if duet.front_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.walk(1)',
+      blockTypes: ['duet_front_distance_m', 'duet_command_stop', 'duet_command_walk'],
     },
     {
       key: 'rear_distance_condition',
       category: 'Conditions',
       label: 'Rear distance condition example',
       code: 'if duet.rear_distance_m() < 1:\n    duet.stop()\nelse:\n    duet.backward(1)',
+      blockTypes: ['duet_rear_distance_m', 'duet_command_stop', 'duet_command_backward'],
     },
   ];
 }

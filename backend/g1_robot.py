@@ -272,8 +272,8 @@ def _validate_call(node: ast.AST) -> dict[str, Any]:
         return {"method": method, "seconds": _number(args[0], "seconds", 0.1, 10)}
     if method == "wait":
         if len(args) != 1:
-            raise CommandValidationError("robot.wait() expects a whole number duration from 1 to 10 seconds.")
-        return {"method": method, "seconds": _integer(args[0], "seconds", 1, 10)}
+            raise CommandValidationError("robot.wait() expects a whole number duration from 1 to 20 seconds.")
+        return {"method": method, "seconds": _integer(args[0], "seconds", 1, 20)}
     if method == "turn_around_180":
         if args:
             raise CommandValidationError("robot.turn_around_180() takes no arguments.")

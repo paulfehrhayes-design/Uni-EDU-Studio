@@ -1198,8 +1198,8 @@ def _command_from_call(call: ast.Call, line_number: int) -> dict | list[dict]:
         return _arm_motion_command(method, poses, duration, return_to_carry=True)
     if method == "wait" and len(args) == 1:
         duration = _finite_number(args[0], "duration")
-        if not 0.1 <= duration <= 3:
-            raise DuetControllerError("wait duration must be between 0.1 and 3 seconds.")
+        if not 0.1 <= duration <= 20:
+            raise DuetControllerError("wait duration must be between 0.1 and 20 seconds.")
         return {"type": "wait", "duration_s": duration}
     if method == "stop" and not args:
         return {"type": "stop"}

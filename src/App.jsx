@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import * as Blockly from 'blockly/core';
 import { pythonGenerator } from 'blockly/python';
+import blocklySpritesUrl from './assets/blockly-sprites.svg?url';
 pythonGenerator.INDENT = '    ';
 import * as En from 'blockly/msg/en';
 import * as Zh from 'blockly/msg/zh-hans';
@@ -693,7 +694,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_turn_left',
     message0: 'Turn Left %1°',
-    args0: [{ type: 'field_number', name: 'ANGLE', value: 90, min: 1, max: 360 }],
+    args0: [{ type: 'field_number', name: 'ANGLE', value: 110, min: 1, max: 360 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -702,7 +703,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_turn_right',
     message0: 'Turn Right %1°',
-    args0: [{ type: 'field_number', name: 'ANGLE', value: 90, min: 1, max: 360 }],
+    args0: [{ type: 'field_number', name: 'ANGLE', value: 110, min: 1, max: 360 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -915,6 +916,10 @@ export default function App() {
   const [isSidebarSettingsLoading, setIsSidebarSettingsLoading] = useState(true);
   const [isSidebarSettingsSaving, setIsSidebarSettingsSaving] = useState(false);
   const [lockedSidebarPanelsError, setLockedSidebarPanelsError] = useState('');
+  const [hiddenCommandTypes, setHiddenCommandTypes] = useState([]);
+  const [isCommandVisibilityLoading, setIsCommandVisibilityLoading] = useState(true);
+  const [isCommandVisibilitySaving, setIsCommandVisibilitySaving] = useState(false);
+  const [commandVisibilityError, setCommandVisibilityError] = useState('');
   const [safeModeEnabled, setSafeModeEnabled] = useState(false);
   const [isSafeModeSettingsLoading, setIsSafeModeSettingsLoading] = useState(true);
   const [isSafeModeSettingsSaving, setIsSafeModeSettingsSaving] = useState(false);
@@ -1023,12 +1028,15 @@ export default function App() {
         category: example.category || 'Commands',
         script: example.code,
         description: example.label,
+        blockTypes: example.blockTypes || [example.blockType],
       }));
     }
     return legacyCommandsForCurrentUser.flatMap((command) => {
       if (command.method === 'arm_action') {
+        const presetBlockTypes = new Map(getG1BlocklyCommandBlocks([command]).map(({ armPreset, type }) => [armPreset, type]));
         return command.args[0].choices.map(([presetLabel, preset]) => ({
           key: `arm_action_${preset}`,
+          blockTypes: [presetBlockTypes.get(preset)],
           category: command.category,
           method: 'arm_action',
           script: `robot.arm_action(${JSON.stringify(preset)})`,
@@ -1045,6 +1053,7 @@ export default function App() {
           : String(argument.value));
       return [{
         key: command.method,
+        blockTypes: [command.blockType],
         category: command.category,
         method: command.method,
         script: `robot.${command.method}(${args.join(', ')})`,
@@ -1055,6 +1064,12 @@ export default function App() {
       }];
     });
   }, [controllerVersion, legacyCommandsForCurrentUser, savedDuetMotions]);
+  const visibleSharedMotions = sharedMotions.filter((motion) => (
+    motion.controller_version === controllerVersion
+    && !hiddenCommandTypes.includes(controllerVersion === 'duet'
+      ? 'duet_command_shared_motion'
+      : `g1_shared_motion_${motion.id}`)
+  ));
   const [savedDuetArmMotions, setSavedDuetArmMotions] = useState([]);
   const [duetArmMotionName, setDuetArmMotionName] = useState('');
   const [duetArmMotionError, setDuetArmMotionError] = useState('');
@@ -1346,6 +1361,42 @@ export default function App() {
   }, [apiFetch, currentUser.role, currentUser.username, session?.token]);
 
   useEffect(() => {
+    if (!session?.token) {
+      setHiddenCommandTypes([]);
+      setIsCommandVisibilityLoading(false);
+      return undefined;
+    }
+    let active = true;
+    setIsCommandVisibilityLoading(true);
+    const loadCommandVisibility = async () => {
+      try {
+        const settings = await apiFetch('/api/classroom/command-visibility');
+        if (!Array.isArray(settings.hidden_command_types)
+          || settings.hidden_command_types.some((type) => typeof type !== 'string')) {
+          throw new Error('Classroom command visibility response is invalid.');
+        }
+        if (!active) return;
+        setHiddenCommandTypes([...new Set(settings.hidden_command_types)]);
+        setCommandVisibilityError('');
+      } catch (error) {
+        if (!active) return;
+        console.error('Unable to load classroom command visibility settings.', error);
+        setCommandVisibilityError(`Command visibility settings could not be loaded: ${error.message}`);
+      } finally {
+        if (active) setIsCommandVisibilityLoading(false);
+      }
+    };
+    void loadCommandVisibility();
+    const refreshInterval = currentUser.role === 'student'
+      ? window.setInterval(() => void loadCommandVisibility(), 5000)
+      : null;
+    return () => {
+      active = false;
+      if (refreshInterval !== null) window.clearInterval(refreshInterval);
+    };
+  }, [apiFetch, currentUser.role, session?.token]);
+
+  useEffect(() => {
     if (currentUser.role !== 'teacher' || !session?.token) {
       setSafeModeEnabled(false);
       setIsSafeModeSettingsLoading(false);
@@ -1480,6 +1531,33 @@ export default function App() {
       setLockedSidebarPanelsError(`Classroom sidebar settings could not be saved: ${error.message}`);
     } finally {
       setIsSidebarSettingsSaving(false);
+    }
+  };
+
+  const handleCommandVisibilityChange = async (commandType, isVisible) => {
+    const previousTypes = hiddenCommandTypes;
+    const nextTypes = isVisible
+      ? previousTypes.filter((type) => type !== commandType)
+      : [...new Set([...previousTypes, commandType])];
+    setHiddenCommandTypes(nextTypes);
+    setIsCommandVisibilitySaving(true);
+    try {
+      const settings = await apiFetch('/api/classroom/command-visibility', {
+        method: 'PUT',
+        body: JSON.stringify({ hidden_command_types: nextTypes }),
+      });
+      if (!Array.isArray(settings.hidden_command_types)
+        || settings.hidden_command_types.some((type) => typeof type !== 'string')) {
+        throw new Error('Classroom command visibility response is invalid.');
+      }
+      setHiddenCommandTypes(settings.hidden_command_types);
+      setCommandVisibilityError('');
+    } catch (error) {
+      setHiddenCommandTypes(previousTypes);
+      console.error('Unable to save classroom command visibility settings.', error);
+      setCommandVisibilityError(`Command visibility settings could not be saved: ${error.message}`);
+    } finally {
+      setIsCommandVisibilitySaving(false);
     }
   };
 
@@ -3916,18 +3994,45 @@ export default function App() {
     [sharedMotions],
   );
 
+  const commandVisibilityGroups = useMemo(() => {
+    const groupDefinitions = (definitions) => {
+      const categories = new Map();
+      definitions.forEach((definition) => {
+        const category = definition.category || 'Commands';
+        if (!categories.has(category)) categories.set(category, []);
+        categories.get(category).push({
+          type: definition.type,
+          label: (definition.message0 || definition.message || definition.type).replace(/%\d+/g, '...'),
+        });
+      });
+      return [...categories.entries()].map(([category, commands]) => ({ category, commands }));
+    };
+    const legacyDefinitions = [
+      ...getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS),
+      ...getG1BlocklyConditionBlocks().map((definition) => ({ ...definition, category: 'Conditions' })),
+      ...legacySharedMotionBlocks,
+    ];
+    const duetDefinitions = getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions());
+    return [
+      { controller: 'Legacy', categories: groupDefinitions(legacyDefinitions) },
+      { controller: 'DUET', categories: groupDefinitions(duetDefinitions) },
+    ];
+  }, [getDuetSharedMotions, legacySharedMotionBlocks, savedDuetMotions]);
+
   const generateToolboxXML = useCallback((language) => {
     const cats = UI_TEXT[language].toolbox;
     const isDuetVersion = controllerVersion === 'duet';
     const commandBlocks = isDuetVersion
       ? getDuetBlocklyCommandBlocks(savedDuetMotions, getDuetSharedMotions())
       : [...getG1BlocklyCommandBlocks(legacyCommandsForCurrentUser), ...legacySharedMotionBlocks];
+    const visibleCommandBlocks = commandBlocks.filter(({ type }) => !hiddenCommandTypes.includes(type));
     const categories = [...new Set(commandBlocks.map((definition) => definition.category))];
     const commandCategoriesXml = categories.map((category) => {
-      const blocks = commandBlocks
+      const blocks = visibleCommandBlocks
         .filter((block) => block.category === category)
         .map((block) => `<block type="${block.type}"></block>`)
         .join('');
+      if (!blocks) return '';
       const colour = category === 'Concurrent actions'
         ? 210
         : category === 'Gestures' || category === 'Arm gestures' || category === 'Arm poses'
@@ -3946,8 +4051,8 @@ export default function App() {
           <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
           <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
           <block type="logic_compare"></block>
-          <block type="duet_front_distance_m"></block>
-          <block type="duet_rear_distance_m"></block>
+          ${hiddenCommandTypes.includes('duet_front_distance_m') ? '' : '<block type="duet_front_distance_m"></block>'}
+          ${hiddenCommandTypes.includes('duet_rear_distance_m') ? '' : '<block type="duet_rear_distance_m"></block>'}
           <block type="math_number"><field name="NUM">1</field></block>
         </category>
       ` : `
@@ -3957,8 +4062,8 @@ export default function App() {
           <block type="logic_boolean"><field name="BOOL">TRUE</field></block>
           <block type="logic_boolean"><field name="BOOL">FALSE</field></block>
           <block type="logic_compare"></block>
-          <block type="g1_front_distance_m"></block>
-          <block type="g1_rear_distance_m"></block>
+          ${hiddenCommandTypes.includes('g1_front_distance_m') ? '' : '<block type="g1_front_distance_m"></block>'}
+          ${hiddenCommandTypes.includes('g1_rear_distance_m') ? '' : '<block type="g1_rear_distance_m"></block>'}
           <block type="math_number"><field name="NUM">1</field></block>
         </category>
       `}
@@ -3973,6 +4078,7 @@ export default function App() {
     getDuetSharedMotions,
     legacyCommandsForCurrentUser,
     legacySharedMotionBlocks,
+    hiddenCommandTypes,
     savedDuetMotions,
   ]);
 
@@ -4107,6 +4213,12 @@ export default function App() {
         zoom: { controls: true, wheel: true, startScale: 0.75, maxScale: 3, minScale: 0.3, scaleSpeed: 1.2 },
         trashcan: true,
       });
+      workspaceRef.current.getParentSvg()
+        .querySelectorAll('.blocklyZoom image, .blocklyTrash image')
+        .forEach((image) => {
+          image.setAttribute('href', blocklySpritesUrl);
+          image.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', blocklySpritesUrl);
+        });
 
       const scheduleResize = () => {
         requestAnimationFrame(() => {
@@ -4790,7 +4902,11 @@ export default function App() {
                 ? `g1_shared_motion_${node.values[0]}`
                 : node.method === 'arm_action'
                   ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
-                  : `g1_command_${node.method}`);
+                  : node.method === 'turn' && node.values[1] === 110
+                    ? getG1BlocklyCommandBlocks().find((definition) => (
+                      definition.fixedTurnDirection === node.values[0]
+                    ))?.type || `g1_command_${node.method}`
+                    : `g1_command_${node.method}`);
           }
           if (node.type === 'repeat') {
             const repeatCount = workspace.newBlock('math_number');
@@ -6300,6 +6416,43 @@ export default function App() {
                 {safeModeSettingsError && <p role="alert" className="mt-2 text-xs text-red-700">{safeModeSettingsError}</p>}
               </fieldset>
               <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
+                <legend className="text-sm font-semibold text-slate-800">Commands shown to students</legend>
+                <p className="mb-3 text-xs text-slate-500">
+                  Choose which commands appear in the Blocks toolbox and IDE command reference for everyone in this classroom.
+                </p>
+                <div className="space-y-2">
+                  {commandVisibilityGroups.map((group) => (
+                    <details key={group.controller} open={group.controller === 'Legacy'} className="rounded-lg border border-slate-200 bg-white p-3">
+                      <summary className="cursor-pointer text-sm font-semibold text-slate-700">{group.controller} commands</summary>
+                      <div className="mt-3 space-y-3">
+                        {group.categories.map(({ category, commands }) => (
+                          <fieldset key={`${group.controller}-${category}`} className="rounded-md border border-slate-100 bg-slate-50 p-2">
+                            <legend className="px-1 text-xs font-semibold text-slate-600">{category}</legend>
+                            <div className="grid gap-x-4 gap-y-2 sm:grid-cols-2">
+                              {commands.map((command) => (
+                                <label key={command.type} className="flex items-start gap-2 text-xs text-slate-700">
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`Show ${group.controller} command ${command.label}`}
+                                    checked={!hiddenCommandTypes.includes(command.type)}
+                                    disabled={isCommandVisibilityLoading || isCommandVisibilitySaving}
+                                    onChange={(event) => handleCommandVisibilityChange(command.type, event.target.checked)}
+                                    className="mt-0.5 h-4 w-4 shrink-0 accent-blue-700"
+                                  />
+                                  <span>{command.label}</span>
+                                </label>
+                              ))}
+                            </div>
+                          </fieldset>
+                        ))}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+                {isCommandVisibilityLoading && <p role="status" className="mt-2 text-xs text-slate-500">Loading classroom command settings…</p>}
+                {commandVisibilityError && <p role="alert" className="mt-2 text-xs text-red-700">{commandVisibilityError}</p>}
+              </fieldset>
+              <fieldset className="rounded-xl border border-slate-200 bg-slate-50 px-5 py-4">
                 <legend className="text-sm font-semibold text-gray-800">Hide sidebar tabs for this teacher account</legend>
                 <p className="mb-2 text-xs text-gray-500">
                   Hidden tabs stay hidden on other devices when this teacher account signs in.
@@ -7402,10 +7555,14 @@ export default function App() {
                       )}
                     </div>
                     <div className="rounded-xl border border-slate-700 bg-slate-900 p-3">
-                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Generated code</p>
-                      <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-6 text-slate-200">
-                        {generatedCode || '# Python code will appear here'}
-                      </pre>
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">IDE text</p>
+                      <textarea
+                        aria-label="IDE text preview"
+                        readOnly
+                        value={generatedCode || '# Python code will appear here'}
+                        spellCheck={false}
+                        className="mt-2 h-40 w-full resize-y rounded-md border border-slate-700 bg-slate-950 p-2 font-mono text-[11px] leading-6 text-slate-200"
+                      />
                     </div>
                     {originalPlannerCode && pathPlannerMode === PLANNER_PATH_MODES.sensor_corrected && (
                       <details open className="rounded-xl border border-amber-800 bg-amber-950/30 p-3">
@@ -8345,13 +8502,15 @@ export default function App() {
                       <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">Quick actions</p>
                       <div className="mt-2 max-h-56 space-y-2 overflow-y-auto text-xs text-slate-200">
                         {(controllerVersion === 'duet'
-                          ? getDuetCommandExamples(savedDuetMotions).map(({ label, code }) => [label, code])
+                          ? getDuetCommandExamples(savedDuetMotions)
                           : [
-                            ['Stand / Ready', 'robot.stand()'],
-                            ['Walk Forward (3 steps)', 'robot.walk(3)'],
-                            ['Turn Left (90°)', 'robot.turn("left", 90)'],
-                            ['Hands Up arm preset', 'robot.arm_action("hands up")'],
-                          ]).map(([label, code]) => (
+                            { label: 'Stand / Ready', code: 'robot.stand()', blockTypes: ['g1_command_stand'] },
+                            { label: 'Walk Forward (3 steps)', code: 'robot.walk(3)', blockTypes: ['g1_command_walk'] },
+                            { label: 'Turn Left (90°)', code: 'robot.turn("left", 90)', blockTypes: ['g1_command_turn'] },
+                            { label: 'Hands Up arm preset', code: 'robot.arm_action("hands up")', blockTypes: ['g1_command_arm_action_hands_up'] },
+                          ])
+                          .filter(({ blockTypes = [] }) => blockTypes.every((type) => !hiddenCommandTypes.includes(type)))
+                          .map(({ label, code }) => (
                           <button
                             key={code}
                             type="button"
@@ -8387,7 +8546,8 @@ export default function App() {
                         {(() => {
                           const query = ideCommandSearch.trim().toLocaleLowerCase();
                           const visibleEntries = ideCommandEntries.filter((entry) => (
-                            !query || `${entry.label} ${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query)
+                            (entry.blockTypes || []).every((type) => !hiddenCommandTypes.includes(type))
+                            && (!query || `${entry.label} ${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query))
                           ));
                           const categories = [...new Set(visibleEntries.map((entry) => entry.category))];
                           return categories.map((category) => (
@@ -8416,13 +8576,12 @@ export default function App() {
                             </details>
                           ));
                         })()}
-                        <details className="rounded-md border border-cyan-800 bg-slate-800 px-2 py-1.5">
+                        {visibleSharedMotions.length > 0 && <details className="rounded-md border border-cyan-800 bg-slate-800 px-2 py-1.5">
                           <summary className="cursor-pointer font-semibold text-cyan-200">
                             Shared {controllerVersion.toUpperCase()} motions
                           </summary>
                           <div className="mt-2 space-y-2">
-                            {sharedMotions
-                              .filter((motion) => motion.controller_version === controllerVersion)
+                            {visibleSharedMotions
                               .filter((motion) => !ideCommandSearch.trim()
                                 || `${motion.name} ${motion.code}`.toLocaleLowerCase().includes(ideCommandSearch.trim().toLocaleLowerCase()))
                               .map((motion) => (
@@ -8435,11 +8594,8 @@ export default function App() {
                                   <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-950 p-2 font-mono text-slate-300">{motion.code}</pre>
                                 </details>
                               ))}
-                            {sharedMotions.filter((motion) => motion.controller_version === controllerVersion).length === 0 && (
-                              <p className="text-slate-400">No shared motions for this controller yet.</p>
-                            )}
                           </div>
-                        </details>
+                        </details>}
                         <details className="rounded-md bg-slate-800 px-2 py-1.5">
                           <summary className="cursor-pointer font-semibold text-slate-200">Loops</summary>
                           <code className="mt-2 block text-cyan-300">for _ in range(3):</code>
@@ -8449,6 +8605,7 @@ export default function App() {
                       </div>
                     </div>
                     <textarea
+                      aria-label="IDE code editor"
                       value={generatedCode || ''}
                       onChange={(event) => {
                         const nextCode = event.target.value;

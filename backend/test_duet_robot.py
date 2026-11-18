@@ -108,6 +108,13 @@ class DuetProgramValidationTests(unittest.TestCase):
         self.assertEqual(commands[0]["type"], "move")
         self.assertEqual(commands[-1]["type"], "wait")
 
+    def test_wait_allows_up_to_twenty_seconds(self):
+        wait = duet_robot.parse_duet_program("duet.wait(20)")[0]
+        self.assertEqual(wait["type"], "wait")
+        self.assertEqual(wait["duration_s"], 20)
+        with self.assertRaisesRegex(duet_robot.DuetProgramValidationError, "0.1 and 20 seconds"):
+            duet_robot.parse_duet_program("duet.wait(20.1)")
+
     def test_parser_accepts_negative_velocity_and_yaw_literals(self):
         command = duet_robot.parse_duet_program("duet.move(-0.1, 0, -0.2, 0.5)")[0]
 

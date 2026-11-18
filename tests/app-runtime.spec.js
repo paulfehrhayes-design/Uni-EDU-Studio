@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { getG1BlocklyCommandBlocks, parseG1Program } from '../src/sim/g1Commands.js';
+import { getG1BlocklyCommandBlocks, G1_EXECUTABLE_COMMANDS, parseG1Program } from '../src/sim/g1Commands.js';
 import { getDuetBlocklyCommandBlocks, parseDuetProgram } from '../src/sim/duetCommands.js';
 
 const G1_JOINT_NAMES = [
@@ -794,6 +794,12 @@ test('teacher can create and delete student accounts from the classroom panel', 
 
   await page.goto('/');
   await expect(page.locator('canvas')).toBeVisible();
+  await expect.poll(async () => (
+    page.locator('.blocklyZoom image').first().getAttribute('href')
+  )).toMatch(/^data:image\/svg\+xml/);
+  await expect.poll(async () => (
+    page.locator('.blocklyTrash image').first().getAttribute('href')
+  )).toMatch(/^data:image\/svg\+xml/);
   await page.getByRole('button', { name: 'Open app settings' }).click();
   await expect(page.getByText('Manage classroom accounts')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Delete account teacher' })).toHaveCount(0);
@@ -1055,14 +1061,24 @@ test('teacher can hide Blocks and IDE tabs and restore them from settings', asyn
   const ideToggle = page.getByRole('checkbox', { name: 'Hide IDE tab from sidebar' });
   await expect(blocksToggle).toBeVisible();
   await expect(ideToggle).toBeVisible();
-  await blocksToggle.check();
-  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toHaveCount(0);
-  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'IDE text preview' })).toBeVisible();
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  const ideEditor = page.getByRole('textbox', { name: 'IDE code editor' });
+  await ideEditor.fill('robot.wait(2)');
+  await ideEditor.blur();
+  await page.getByRole('button', { name: 'Blocks', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'IDE text preview' })).toHaveValue('robot.wait(2)');
+  await page.getByRole('button', { name: 'Open app settings' }).click();
   await ideToggle.check();
+  await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'IDE', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: 'IDE text preview' })).toHaveValue('robot.wait(2)');
+  await blocksToggle.check();
   await expect(page.getByRole('button', { name: 'Blocks', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'IDE', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Path Planner', exact: true })).toBeVisible();
-  await expect.poll(() => lockedPanels).toEqual(['blocks', 'ide']);
+  await expect.poll(() => lockedPanels).toEqual(['ide', 'blocks']);
 
   await ideToggle.uncheck();
   await expect(page.getByRole('button', { name: 'IDE', exact: true })).toBeVisible();
@@ -2236,6 +2252,16 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   expect(blocklyLayout.width).toBeGreaterThan(0);
   expect(blocklyLayout.height).toBeGreaterThan(0);
   await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.getByRole('treeitem', { name: 'Walking' }).click();
+  await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Turn left (110°)' })).toBeVisible();
+  await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Turn right (110°)' })).toBeVisible();
+  const walkingBlockTypes = await page.evaluate(() => (
+    window.Blockly.getMainWorkspace().getFlyout().getWorkspace()
+      .getAllBlocks().map(({ type }) => type)
+  ));
+  expect(walkingBlockTypes).toContain('g1_command_turn_left_110');
+  expect(walkingBlockTypes).toContain('g1_command_turn_right_110');
+  expect(walkingBlockTypes).toContain('g1_command_turn');
   await page.getByRole('treeitem', { name: 'Gestures' }).click();
   await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Arm preset: Hands Up' })).toBeVisible();
   await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Arm preset: Shake Hand' })).toBeVisible();
@@ -2263,6 +2289,65 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   await expect(page.getByText('Raise both hands.')).toBeVisible();
   await expect(page.getByText(/“example” is a placeholder app name, not a sound/)).toBeVisible();
   expect(pageErrors).toEqual([]);
+});
+
+test('teacher command settings hide toolbox commands and remove empty IDE categories', async ({ page }) => {
+  const gestureTypes = getG1BlocklyCommandBlocks(G1_EXECUTABLE_COMMANDS)
+    .filter(({ category }) => category === 'Gestures')
+    .map(({ type }) => type);
+  let hiddenCommandTypes = gestureTypes;
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    let response = {};
+    if (path === '/api/classroom/command-visibility') {
+      if (request.method() === 'PUT') {
+        hiddenCommandTypes = request.postDataJSON().hidden_command_types;
+      }
+      response = { hidden_command_types: hiddenCommandTypes, configured: true };
+    } else if (path === '/api/classroom/sidebar-settings') {
+      response = { locked_panels: [], configured: true };
+    } else if (path === '/api/classroom/safe-mode') {
+      response = { enabled: false };
+    } else if (path === '/api/classroom/simulation-visibility') {
+      response = { show_simulation: true };
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(response),
+    });
+  });
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-command-visibility-token',
+      user: { role: 'teacher', username: 'teacher-command-visibility-test' },
+    }));
+  });
+
+  await page.goto('/');
+  await expect(page.locator('canvas')).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  const commandSettings = page.getByRole('group', { name: 'Commands shown to students' });
+  const gesturesSettings = commandSettings.locator('fieldset').filter({
+    has: commandSettings.locator('legend', { hasText: 'Gestures' }),
+  });
+  const handsUpToggle = gesturesSettings.getByRole('checkbox', { name: 'Show Legacy command Arm preset: Hands Up' });
+  await expect(handsUpToggle).not.toBeChecked();
+  await handsUpToggle.check();
+  await expect.poll(() => hiddenCommandTypes).not.toContain('g1_command_arm_action_hands_up');
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+  await page.getByRole('treeitem', { name: 'Gestures' }).click();
+  await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Arm preset: Hands Up' })).toBeVisible();
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await handsUpToggle.uncheck();
+  await expect.poll(() => hiddenCommandTypes).toContain('g1_command_arm_action_hands_up');
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+  await expect(page.getByRole('treeitem', { name: 'Gestures' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  await expect(page.locator('details > summary').filter({ hasText: /^Gestures/ })).toHaveCount(0);
 });
 
 test('distance if/then/else programs round-trip between IDE text and Blockly', async ({ page }) => {
