@@ -365,16 +365,25 @@ export default function HarryBotterTry() {
   const checkLocalModel = useCallback(async (session = teacherSession) => {
     if (!session?.token) return;
     setIsCheckingModel(true);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
     try {
       const response = await fetch('/api/harry-botter/model-status', {
         headers: { Authorization: `Bearer ${session.token}` },
+        signal: controller.signal,
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || 'Could not check the configured model route.');
       setModelStatus(result);
     } catch (error) {
-      setModelStatus({ status: 'service_unavailable', error: error.message });
+      setModelStatus({
+        status: 'service_unavailable',
+        error: error.name === 'AbortError'
+          ? 'Timed out waiting for the local AI service. Check the startup output and retry.'
+          : error.message,
+      });
     } finally {
+      window.clearTimeout(timeoutId);
       setIsCheckingModel(false);
     }
   }, [teacherSession]);

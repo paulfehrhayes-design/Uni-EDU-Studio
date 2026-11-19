@@ -915,10 +915,11 @@ def _voice_request(
     json_payload: dict[str, Any] | None = None,
     content: bytes | None = None,
     content_type: str | None = None,
+    timeout_seconds: float = 120,
 ) -> httpx.Response:
     headers = {"Content-Type": content_type} if content_type else None
     try:
-        with httpx.Client(timeout=120, trust_env=False) as client:
+        with httpx.Client(timeout=timeout_seconds, trust_env=False) as client:
             response = client.request(
                 method,
                 f"{_voice_service_url()}{path}",
@@ -1082,7 +1083,11 @@ def create_harry_botter_router(
 
     @router.get("/api/harry-botter/model-status")
     def model_status(_: dict[str, Any] = Depends(teacher)) -> dict[str, Any]:
-        return _voice_request("GET", "/api/v1/model/status").json()
+        return _voice_request(
+            "GET",
+            "/api/v1/model/status",
+            timeout_seconds=8,
+        ).json()
 
     @router.post("/api/harry-botter/model-select")
     def select_model(

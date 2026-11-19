@@ -709,6 +709,24 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertEqual(captured["path"], "/api/v1/model/select")
         self.assertEqual(captured["payload"], {"route": "local", "model": "qwen3:1.7b"})
 
+    def test_model_status_proxy_uses_bounded_timeout(self):
+        captured = {}
+
+        def fake_voice_request(method, path, **kwargs):
+            captured.update({"method": method, "path": path, **kwargs})
+            return httpx.Response(200, json={"status": "ready", "model": "qwen3:0.6b"})
+
+        with patch.object(harry_botter_api, "_voice_request", side_effect=fake_voice_request):
+            response = self.client.get(
+                "/api/harry-botter/model-status",
+                headers=self.teacher_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["method"], "GET")
+        self.assertEqual(captured["path"], "/api/v1/model/status")
+        self.assertEqual(captured["timeout_seconds"], 8)
+
     def test_draft_proxy_sends_only_matching_current_knowledge(self):
         self.client.put(
             "/api/harry-botter/sections/persona",
