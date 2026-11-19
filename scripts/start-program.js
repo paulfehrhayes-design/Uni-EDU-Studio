@@ -352,9 +352,21 @@ try {
   }
   if (!(await canBind(voicePort))) throw new Error(`Port ${voicePort} is already in use.`);
 
+  if (process.env.HARRY_BOTTER_SKIP_BUILD !== '1') {
+    log('Building the app...');
+    await npmCommand(['run', 'build']);
+  }
+
+  const backendPython = await ensureBackendPython();
+  const backend = startProcess(backendPython, [path.join(root, 'backend', 'server.py')], {
+    cwd: root,
+    env: { ...env, UNI_EDU_PORT: String(port) },
+  });
+  await waitForService(`http://127.0.0.1:${port}/api/status`, backend, 'Uni-EDU backend');
+  log(`Uni-EDU app is available at http://localhost:${port}; preparing local AI services.`);
+
   await ensureOllama(env);
   const python = await ensureVoicePython();
-  const backendPython = await ensureBackendPython();
   const audioPackagesReady = spawnSync(
     python,
     ['-c', `import ${pythonPackages.join(', ')}`],
@@ -377,11 +389,6 @@ try {
       log(`Speech models could not be prepared: ${error.message}`);
       log('The voice service will still start for typing chat; check speech status and complete model setup before using audio.');
     }
-  }
-
-  if (process.env.HARRY_BOTTER_SKIP_BUILD !== '1') {
-    log('Building the app...');
-    await npmCommand(['run', 'build']);
   }
 
   const voice = startProcess(python, ['-m', 'harry_botter_voice', '--port', String(voicePort)], {
@@ -428,12 +435,6 @@ try {
   } catch (error) {
     log(`Local speech warm-up failed; first spoken reply may be slower: ${error.message}`);
   }
-
-  const backend = startProcess(backendPython, [path.join(root, 'backend', 'server.py')], {
-    cwd: root,
-    env: { ...env, UNI_EDU_PORT: String(port) },
-  });
-  await waitForService(`http://127.0.0.1:${port}/api/status`, backend, 'Uni-EDU backend');
 
   log(`Ready. Open http://localhost:${port}/?try=harry-botter and sign in as a teacher.`);
   log('Press Ctrl+C to stop the backend, voice service, and any Ollama server started here.');

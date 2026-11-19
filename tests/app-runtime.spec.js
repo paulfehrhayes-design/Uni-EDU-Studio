@@ -63,15 +63,32 @@ test('login starts blank and determines role from the account', async ({ page })
   });
 
   await page.goto('/');
-  await expect(page.locator('input[type="text"]')).toHaveValue('');
+  const usernameInput = page.locator('input[autocomplete="username"]');
+  await expect(usernameInput).toHaveValue('');
   const passwordInput = page.locator('input[autocomplete="current-password"]');
   await expect(passwordInput).toHaveAttribute('type', 'password');
   await expect(passwordInput).toHaveValue('');
   await expect(page.getByLabel('Role')).toHaveCount(0);
   await expect(page.getByText('Teacher demo: teacher / teacher')).toHaveCount(0);
   await expect(page.getByText('Student demo: student1 / student1')).toHaveCount(0);
+  const fieldContrast = await page.locator('input[autocomplete="username"], input[autocomplete="current-password"]').evaluateAll((fields) => {
+    const luminance = (color) => {
+      const channels = color.match(/\d+/g).slice(0, 3).map((channel) => Number(channel) / 255);
+      const linear = channels.map((channel) => (
+        channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4
+      ));
+      return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+    };
+    return fields.map((field) => {
+      const style = getComputedStyle(field);
+      const foreground = luminance(style.color);
+      const background = luminance(style.backgroundColor);
+      return (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+    });
+  });
+  expect(fieldContrast.every((ratio) => ratio >= 4.5)).toBe(true);
 
-  await page.locator('input[type="text"]').fill('student-login-test');
+  await usernameInput.fill('student-login-test');
   await passwordInput.fill('classroom-password');
   await page.getByRole('button', { name: 'Show password' }).click();
   await expect(passwordInput).toHaveAttribute('type', 'text');
