@@ -344,7 +344,11 @@ class HarryBotterAPITests(unittest.TestCase):
             "/api/harry-botter/config",
             headers=other_headers,
         ).json()
-        self.assertEqual(listed_after_update["knowledge"][0]["version"], 2)
+        listed_updated_document = next(
+            item for item in listed_after_update["knowledge"]
+            if item["document_id"] == document["document_id"]
+        )
+        self.assertEqual(listed_updated_document["version"], 2)
 
     def test_teacher_sessions_persist_text_are_owner_only_and_can_be_deleted(self):
         created = self.client.post(
