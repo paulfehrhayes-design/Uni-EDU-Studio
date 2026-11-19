@@ -1,9 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 const SESSION_STORAGE_KEY = 'edu-classroom-session';
-const MAX_CHAT_MESSAGES = 12;
 const MAX_KNOWLEDGE_BYTES = 100_000;
 const MAX_G1_SPEECH_PREVIEW_CHARS = 120;
+const TONE_OPTIONS = [
+  'Formal',
+  'Lightly humorous',
+  'Warm and encouraging',
+  'Curious/Socratic',
+  'Concise',
+];
+const TTS_VOICE_LABELS = {
+  af_heart: 'American English - af_heart',
+  af_bella: 'American English - af_bella',
+  af_nicole: 'American English - af_nicole',
+  am_michael: 'American English male - am_michael',
+  bm_fable: 'British English male - bm_fable',
+  bm_george: 'British English male - bm_george',
+  qwen3_youthful_south_london: 'Experimental youthful South London - Qwen3 VoiceDesign',
+};
 const EMPTY_AGENT_DRAFT = {
   agent_id: null,
   display_name: '',
@@ -45,16 +60,56 @@ function getMicrophoneAccessErrorMessage(error) {
   return error?.message || 'The browser reported an unknown microphone error.';
 }
 
+function getStoredTeacherSession() {
+  try {
+    const storedSession = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!storedSession) return null;
+
+    let session;
+    try {
+      session = JSON.parse(storedSession);
+    } catch {
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+      return null;
+    }
+    if (typeof session?.token === 'string' && session.token && session.user?.role === 'teacher') {
+      return session;
+    }
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export default function HarryBotterTry() {
   const [credentials, setCredentials] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
-  const [teacherSession, setTeacherSession] = useState(null);
+  const [teacherSession, setTeacherSession] = useState(getStoredTeacherSession);
   const [learningLevel, setLearningLevel] = useState('');
   const [tone, setTone] = useState('Formal');
   const [speechSpeed, setSpeechSpeed] = useState(1);
+  const [ttsVoice, setTtsVoice] = useState('');
+  const [voiceCandidate, setVoiceCandidate] = useState('');
+  const [voicePreviewUrl, setVoicePreviewUrl] = useState('');
+  const [voicePreviewedId, setVoicePreviewedId] = useState('');
+  const [hasPlayedVoicePreview, setHasPlayedVoicePreview] = useState(false);
+  const [voicePreviewError, setVoicePreviewError] = useState('');
+  const [isGeneratingVoicePreview, setIsGeneratingVoicePreview] = useState(false);
   const [previewMode, setPreviewMode] = useState('text');
   const [agents, setAgents] = useState([]);
+  const [behaviorSections, setBehaviorSections] = useState([]);
+  const [behaviorSectionDraft, setBehaviorSectionDraft] = useState({
+    section_id: 'persona',
+    guidance: '',
+  });
+  const [policyReviewDocumentIds, setPolicyReviewDocumentIds] = useState([]);
+  const [policyReviewProposal, setPolicyReviewProposal] = useState(null);
+  const [policyReviewError, setPolicyReviewError] = useState('');
+  const [isReviewingPolicySources, setIsReviewingPolicySources] = useState(false);
+  const [sectionApprovalConfirmed, setSectionApprovalConfirmed] = useState(false);
+  const [isSavingBehaviorSection, setIsSavingBehaviorSection] = useState(false);
   const [knowledgeDocuments, setKnowledgeDocuments] = useState([]);
   const [selectedAgentId, setSelectedAgentId] = useState('general');
   const [agentDraft, setAgentDraft] = useState(null);
@@ -67,6 +122,7 @@ export default function HarryBotterTry() {
     title: '',
     source: '',
     owner: '',
+    section_id: 'general',
     learning_level: '',
     agent_id: '',
     review_date: '',
@@ -79,6 +135,9 @@ export default function HarryBotterTry() {
   const [knowledgeStatus, setKnowledgeStatus] = useState('');
   const [modelStatus, setModelStatus] = useState(null);
   const [isCheckingModel, setIsCheckingModel] = useState(false);
+  const [modelSelection, setModelSelection] = useState('');
+  const [isSelectingModel, setIsSelectingModel] = useState(false);
+  const [modelSelectionError, setModelSelectionError] = useState('');
   const [speechStatus, setSpeechStatus] = useState(null);
   const [g1RobotStatus, setG1RobotStatus] = useState(null);
   const [draftOutput, setDraftOutput] = useState('browser');
@@ -88,6 +147,17 @@ export default function HarryBotterTry() {
   const [g1SpeechError, setG1SpeechError] = useState('');
   const [chatText, setChatText] = useState('');
   const [chatMessages, setChatMessages] = useState([]);
+  const [plannerTopic, setPlannerTopic] = useState('');
+  const [plannerObjective, setPlannerObjective] = useState('');
+  const [plannerDuration, setPlannerDuration] = useState('30');
+  const [plannerMaterials, setPlannerMaterials] = useState('');
+  const [teacherSessions, setTeacherSessions] = useState([]);
+  const [selectedSessionId, setSelectedSessionId] = useState('');
+  const [isLoadingSessions, setIsLoadingSessions] = useState(false);
+  const [isChangingSession, setIsChangingSession] = useState(false);
+  const [sessionError, setSessionError] = useState('');
+  const [safeguardingAlerts, setSafeguardingAlerts] = useState([]);
+  const [safeguardingAlertError, setSafeguardingAlertError] = useState('');
   const [editingDraftIndex, setEditingDraftIndex] = useState(null);
   const [editedDraftText, setEditedDraftText] = useState('');
   const [isGeneratingDraft, setIsGeneratingDraft] = useState(false);
@@ -110,12 +180,14 @@ export default function HarryBotterTry() {
   const [isPreparingSpeechIndex, setIsPreparingSpeechIndex] = useState(null);
   const [playingSpeechIndex, setPlayingSpeechIndex] = useState(null);
   const [speechError, setSpeechError] = useState('');
+  const conversationSettingsRef = useRef({ learningLevel, tone, selectedAgentId });
   const recorderRef = useRef(null);
   const speechRequestRef = useRef(null);
   const speechAudioRef = useRef(null);
   const streamRef = useRef(null);
   const audioChunksRef = useRef([]);
   const audioElementRef = useRef(null);
+  const voicePreviewUrlRef = useRef('');
   const recordingUrlRef = useRef('');
   const recordingTimerRef = useRef(null);
   const draftRequestRef = useRef(null);
@@ -125,10 +197,28 @@ export default function HarryBotterTry() {
   const voiceTranscriptQueueRef = useRef([]);
   const voiceTranscriptProcessingRef = useRef(false);
   const chatMessagesRef = useRef(chatMessages);
+  const selectedSessionIdRef = useRef(selectedSessionId);
   const isGeneratingDraftRef = useRef(isGeneratingDraft);
   const g1AudioConnected = g1RobotStatus?.capabilities?.audio === true;
+  const selectedBehaviorSection = behaviorSections.find(
+    (section) => section.section_id === behaviorSectionDraft.section_id,
+  );
+  const eligiblePolicyDocuments = knowledgeDocuments.filter((document) => (
+    document.permission_confirmed_at
+    && (!document.review_date || document.review_date >= new Date().toISOString().slice(0, 10))
+    && ['general', behaviorSectionDraft.section_id].includes(document.section_id)
+    && (!document.learning_level || (learningLevel && document.learning_level === learningLevel))
+    && (!document.agent_id || document.agent_id === selectedAgentId)
+  ));
   chatMessagesRef.current = chatMessages;
+  selectedSessionIdRef.current = selectedSessionId;
   isGeneratingDraftRef.current = isGeneratingDraft;
+  conversationSettingsRef.current = {
+    learningLevel,
+    tone,
+    selectedAgentId,
+    agentName: agents.find((agent) => agent.agent_id === selectedAgentId)?.display_name || selectedAgentId,
+  };
 
   const stopVoiceTracks = (session) => {
     if (session.tracksStopped) return;
@@ -211,6 +301,7 @@ export default function HarryBotterTry() {
     }
     streamRef.current?.getTracks().forEach((track) => track.stop());
     if (recordingUrlRef.current) URL.revokeObjectURL(recordingUrlRef.current);
+    if (voicePreviewUrlRef.current) URL.revokeObjectURL(voicePreviewUrlRef.current);
     speechUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
   }, []);
 
@@ -269,7 +360,7 @@ export default function HarryBotterTry() {
         headers: { Authorization: `Bearer ${session.token}` },
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || 'Could not check the local model.');
+      if (!response.ok) throw new Error(result.detail || 'Could not check the configured model route.');
       setModelStatus(result);
     } catch (error) {
       setModelStatus({ status: 'service_unavailable', error: error.message });
@@ -277,6 +368,37 @@ export default function HarryBotterTry() {
       setIsCheckingModel(false);
     }
   }, [teacherSession]);
+
+  const selectLocalModel = async () => {
+    if (!teacherSession?.token || !modelSelection || isSelectingModel) return;
+    let selection;
+    try {
+      selection = JSON.parse(modelSelection);
+    } catch {
+      setModelSelectionError('Choose a model from the available list.');
+      return;
+    }
+    setModelSelectionError('');
+    setIsSelectingModel(true);
+    try {
+      const response = await fetch('/api/harry-botter/model-select', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${teacherSession.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(selection),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not select that model.');
+      setModelStatus(result);
+      setModelSelection(JSON.stringify({ route: result.route, model: result.model }));
+    } catch (error) {
+      setModelSelectionError(error.message || 'Could not select that model.');
+    } finally {
+      setIsSelectingModel(false);
+    }
+  };
 
   const checkLocalSpeech = useCallback(async (session = teacherSession) => {
     if (!session?.token) return;
@@ -323,6 +445,15 @@ export default function HarryBotterTry() {
         throw new Error('No Harry Botter agents are configured.');
       }
       setAgents(result.agents);
+      const sections = Array.isArray(result.sections) ? result.sections : [];
+      setBehaviorSections(sections);
+      setBehaviorSectionDraft((current) => {
+        const selected = sections.find((section) => section.section_id === current.section_id)
+          || sections[0];
+        return selected
+          ? { section_id: selected.section_id, guidance: selected.guidance }
+          : current;
+      });
       setKnowledgeDocuments(Array.isArray(result.knowledge) ? result.knowledge : []);
       setSelectedAgentId((currentId) => (
         result.agents.some((agent) => agent.agent_id === currentId)
@@ -339,9 +470,218 @@ export default function HarryBotterTry() {
     }
   }, [teacherSession]);
 
+  const loadConversation = useCallback(async (sessionId, authSession = teacherSession) => {
+    const response = await fetch(`/api/harry-botter/sessions/${sessionId}`, {
+      headers: { Authorization: `Bearer ${authSession.token}` },
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Could not load the saved conversation.');
+    if (result.session?.session_id !== sessionId || !Array.isArray(result.session.messages)) {
+      throw new Error('The saved conversation response was incomplete.');
+    }
+    stopSpeechPlayback();
+    setEditingDraftIndex(null);
+    setEditedDraftText('');
+    setChatMessages(result.session.messages);
+    chatMessagesRef.current = result.session.messages;
+    setSelectedSessionId(sessionId);
+    selectedSessionIdRef.current = sessionId;
+    setChatError('');
+    setSessionError('');
+  }, [teacherSession]);
+
+  const loadConversationSessions = useCallback(async (authSession = teacherSession) => {
+    if (!authSession?.token) return;
+    setIsLoadingSessions(true);
+    setSessionError('');
+    try {
+      const response = await fetch('/api/harry-botter/sessions', {
+        headers: { Authorization: `Bearer ${authSession.token}` },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not load saved conversations.');
+      if (!Array.isArray(result.sessions)) {
+        throw new Error('The saved conversation list was incomplete.');
+      }
+      let sessions = result.sessions;
+      if (sessions.length === 0) {
+        const createResponse = await fetch('/api/harry-botter/sessions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${authSession.token}` },
+        });
+        const created = await createResponse.json();
+        if (!createResponse.ok) {
+          throw new Error(created.detail || 'Could not create a conversation.');
+        }
+        if (!created.session?.session_id) {
+          throw new Error('The conversation service returned an invalid session.');
+        }
+        sessions = [created.session];
+      }
+      setTeacherSessions(sessions);
+      await loadConversation(sessions[0].session_id, authSession);
+    } catch (error) {
+      setSessionError(error.message || 'Could not load saved conversations.');
+    } finally {
+      setIsLoadingSessions(false);
+    }
+  }, [loadConversation, teacherSession]);
+
+  const saveConversationMessages = useCallback(async (
+    sessionId,
+    messages,
+    authSession = teacherSession,
+  ) => {
+    if (!sessionId || !authSession?.token) return false;
+    try {
+      const serializedMessages = messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+        model: message.model || '',
+        route: message.route || '',
+        source: message.source || '',
+        sources: message.sources || [],
+        settings: message.settings || null,
+        transcriptToDraftMs: message.transcriptToDraftMs ?? null,
+      }));
+      const response = await fetch(`/api/harry-botter/sessions/${sessionId}/messages`, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${authSession.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ messages: serializedMessages }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not save this conversation.');
+      setTeacherSessions((sessions) => sessions.map((item) => (
+        item.session_id === sessionId
+          ? {
+            ...item,
+            title: result.session?.title || item.title,
+            updated_at: result.session?.updated_at || item.updated_at,
+          }
+          : item
+      )));
+      setSessionError('');
+      return true;
+    } catch (error) {
+      setSessionError(`Conversation not saved: ${error.message || 'storage is unavailable.'}`);
+      return false;
+    }
+  }, [teacherSession]);
+
+  const createConversation = async (whileChanging = false) => {
+    if (!teacherSession?.token || (isChangingSession && !whileChanging)) return;
+    setIsChangingSession(true);
+    setSessionError('');
+    try {
+      const response = await fetch('/api/harry-botter/sessions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${teacherSession.token}` },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not create a conversation.');
+      if (!result.session?.session_id) throw new Error('The conversation service returned an invalid session.');
+      setTeacherSessions((sessions) => [result.session, ...sessions]);
+      await loadConversation(result.session.session_id);
+    } catch (error) {
+      setSessionError(error.message || 'Could not create a conversation.');
+    } finally {
+      setIsChangingSession(false);
+    }
+  };
+
+  const selectConversation = async (sessionId) => {
+    if (!sessionId || sessionId === selectedSessionIdRef.current || isChangingSession) return;
+    setIsChangingSession(true);
+    setSessionError('');
+    try {
+      await loadConversation(sessionId);
+    } catch (error) {
+      setSessionError(error.message || 'Could not load the saved conversation.');
+    } finally {
+      setIsChangingSession(false);
+    }
+  };
+
+  const deleteConversation = async () => {
+    if (!selectedSessionIdRef.current || !teacherSession?.token || isChangingSession) return;
+    if (!window.confirm('Delete this saved conversation and its text history? This cannot be undone.')) return;
+    setIsChangingSession(true);
+    setSessionError('');
+    try {
+      const deletedId = selectedSessionIdRef.current;
+      const response = await fetch(`/api/harry-botter/sessions/${deletedId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${teacherSession.token}` },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not delete the conversation.');
+      const remaining = teacherSessions.filter((session) => session.session_id !== deletedId);
+      setTeacherSessions(remaining);
+      setChatMessages([]);
+      chatMessagesRef.current = [];
+      setSelectedSessionId('');
+      selectedSessionIdRef.current = '';
+      if (remaining.length > 0) {
+        await loadConversation(remaining[0].session_id);
+      } else {
+        await createConversation(true);
+      }
+    } catch (error) {
+      setSessionError(error.message || 'Could not delete the conversation.');
+    } finally {
+      setIsChangingSession(false);
+    }
+  };
+
+  const refreshSafeguardingAlerts = useCallback(async (authSession = teacherSession) => {
+    if (!authSession?.token) return;
+    try {
+      const response = await fetch('/api/harry-botter/alerts', {
+        headers: { Authorization: `Bearer ${authSession.token}` },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not load safeguarding alerts.');
+      if (!Array.isArray(result.alerts)) throw new Error('The safeguarding alert response was incomplete.');
+      setSafeguardingAlerts(result.alerts);
+      setSafeguardingAlertError('');
+    } catch (error) {
+      setSafeguardingAlertError(error.message || 'Could not load safeguarding alerts.');
+    }
+  }, [teacherSession]);
+
+  const acknowledgeSafeguardingAlert = async (alertId) => {
+    setSafeguardingAlertError('');
+    try {
+      const response = await fetch(
+        `/api/harry-botter/alerts/${encodeURIComponent(alertId)}/acknowledge`,
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${teacherSession.token}` },
+        },
+      );
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not mark this alert as reviewed.');
+      setSafeguardingAlerts((alerts) => alerts.filter((alert) => alert.alert_id !== alertId));
+    } catch (error) {
+      setSafeguardingAlertError(error.message || 'Could not mark this alert as reviewed.');
+    }
+  };
+
   useEffect(() => {
     if (teacherSession) void checkLocalModel(teacherSession);
   }, [teacherSession, checkLocalModel]);
+
+  useEffect(() => {
+    if (modelStatus?.route && modelStatus?.model) {
+      setModelSelection(JSON.stringify({
+        route: modelStatus.route,
+        model: modelStatus.model,
+      }));
+    }
+  }, [modelStatus?.route, modelStatus?.model]);
 
   useEffect(() => {
     if (teacherSession) void checkLocalSpeech(teacherSession);
@@ -359,6 +699,29 @@ export default function HarryBotterTry() {
   useEffect(() => {
     if (teacherSession) void loadConfiguration(teacherSession);
   }, [teacherSession, loadConfiguration]);
+
+  useEffect(() => {
+    if (teacherSession) {
+      void loadConversationSessions(teacherSession);
+      void refreshSafeguardingAlerts(teacherSession);
+    } else {
+      setTeacherSessions([]);
+      setSelectedSessionId('');
+      selectedSessionIdRef.current = '';
+      setChatMessages([]);
+      chatMessagesRef.current = [];
+      setSafeguardingAlerts([]);
+      setSafeguardingAlertError('');
+    }
+  }, [teacherSession, loadConversationSessions, refreshSafeguardingAlerts]);
+
+  useEffect(() => {
+    if (!teacherSession) return undefined;
+    const timer = window.setInterval(() => {
+      void refreshSafeguardingAlerts(teacherSession);
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [teacherSession, refreshSafeguardingAlerts]);
 
   const speakDraftOnG1 = async (text) => {
     if (isSendingG1Speech || draftOutput !== 'g1' || g1RobotStatus?.capabilities?.audio !== true) return;
@@ -392,14 +755,33 @@ export default function HarryBotterTry() {
     transcriptReceivedAt = null,
   ) => {
     if (!text.trim() || isGeneratingDraftRef.current) return;
+    if (!selectedSessionIdRef.current) {
+      setChatError('Load or create a saved conversation before sending a message.');
+      return false;
+    }
     if (speechRequestRef.current) cancelSpeechGeneration();
     if (replaceMessageIndex === null) stopSpeechPlayback();
+    const requestSessionId = selectedSessionIdRef.current;
+    const pendingMessages = replaceMessageIndex === null
+      ? [...history, { role: 'user', content: text.trim() }]
+      : history;
     setChatError('');
     isGeneratingDraftRef.current = true;
     setIsGeneratingDraft(true);
     const controller = new AbortController();
     draftRequestRef.current = controller;
     try {
+      if (replaceMessageIndex === null) {
+        setChatMessages(pendingMessages);
+        chatMessagesRef.current = pendingMessages;
+        setChatText('');
+        const saved = await saveConversationMessages(requestSessionId, pendingMessages);
+        if (!saved) {
+          setChatError('The message was not sent because it could not be saved to this conversation.');
+          return false;
+        }
+      }
+      const currentSettings = conversationSettingsRef.current;
       const response = await fetch('/api/harry-botter/draft', {
         method: 'POST',
         signal: controller.signal,
@@ -409,47 +791,56 @@ export default function HarryBotterTry() {
         },
         body: JSON.stringify({
           text: text.trim(),
-          learning_level: learningLevel,
-          tone,
-          agent_id: selectedAgentId,
+          session_id: requestSessionId || null,
+          learning_level: currentSettings.learningLevel,
+          tone: currentSettings.tone,
+          agent_id: currentSettings.selectedAgentId,
           history: history.slice(-12).map(({ role, content }) => ({ role, content })),
         }),
       });
       const result = await response.json();
       if (controller.signal.aborted) return;
-      if (!response.ok) throw new Error(result.detail || 'The local model could not create a draft.');
-      if (!result.draft?.text) throw new Error('The local model returned an empty draft.');
+      if (!response.ok) throw new Error(result.detail || 'The configured model could not create a draft.');
+      if (Array.isArray(result.safeguarding_alerts) && result.safeguarding_alerts.length > 0) {
+        setSafeguardingAlerts((alerts) => [
+          ...result.safeguarding_alerts.filter(
+            (created) => !alerts.some((alert) => alert.alert_id === created.alert_id),
+          ),
+          ...alerts,
+        ]);
+      }
+      if (!result.draft?.text) throw new Error('The configured model returned an empty draft.');
       const newDraft = {
           role: 'assistant',
           content: result.draft.text,
           model: result.draft.model,
+          route: result.draft.route,
           source: result.draft.source,
           sources: result.draft.sources || [],
+          settings: {
+            learningLevel: currentSettings.learningLevel,
+            tone: currentSettings.tone,
+            agentName: currentSettings.agentName,
+          },
           transcriptToDraftMs: transcriptReceivedAt === null
             ? null
             : Math.round(performance.now() - transcriptReceivedAt),
       };
-      if (replaceMessageIndex === null) {
-        setChatMessages((messages) => {
-          const nextMessages = [
-            ...messages,
-            { role: 'user', content: text.trim() },
-            newDraft,
-          ].slice(-MAX_CHAT_MESSAGES);
-          chatMessagesRef.current = nextMessages;
-          return nextMessages;
-        });
-        setChatText('');
-      } else {
-        if (playingSpeechIndex === replaceMessageIndex) stopSpeechPlayback();
-        setChatMessages((messages) => messages.map((message, index) => (
+      const nextMessages = replaceMessageIndex === null
+        ? [...pendingMessages, newDraft]
+        : history.map((message, index) => (
           index === replaceMessageIndex ? newDraft : message
-        )));
+        ));
+      if (replaceMessageIndex !== null && playingSpeechIndex === replaceMessageIndex) {
+        stopSpeechPlayback();
       }
+      setChatMessages(nextMessages);
+      chatMessagesRef.current = nextMessages;
+      await saveConversationMessages(requestSessionId, nextMessages);
       return true;
     } catch (error) {
       if (error.name !== 'AbortError') {
-        setChatError(error.message || 'The local model could not create a draft.');
+        setChatError(error.message || 'The configured model could not create a draft.');
       }
       return false;
     } finally {
@@ -476,7 +867,7 @@ export default function HarryBotterTry() {
         null,
         transcript.receivedAt,
       );
-      if (voiceTranscriptQueueRef.current.length === 0) {
+      if (!voiceStartupCancelledRef.current && voiceTranscriptQueueRef.current.length === 0) {
         setVoiceStatus(
           generated
             ? 'Draft ready. Review it and press Play only when you approve the spoken reply.'
@@ -489,6 +880,10 @@ export default function HarryBotterTry() {
 
   const startVoiceSession = async () => {
     if (voiceSessionRef.current || isStartingVoiceSession) return;
+    if (!selectedSessionIdRef.current) {
+      setVoiceError('Load or create a saved conversation before starting voice mode.');
+      return;
+    }
     setVoiceError('');
     setShowMicrophonePermissionHelp(false);
     const AudioContextType = window.AudioContext || window.webkitAudioContext;
@@ -497,7 +892,12 @@ export default function HarryBotterTry() {
       return;
     }
     if (!speechStatus?.streaming_transcription?.available) {
-      setVoiceError('Local streaming transcription is unavailable. Follow the audio setup instructions in the voice-service README.');
+      const missingPackages = speechStatus?.streaming_transcription?.missing_dependencies || [];
+      setVoiceError(
+        speechStatus?.error
+          ? 'The local AI service is unavailable. Run npm start from the project root and check its startup output.'
+          : `Local streaming transcription is unavailable${missingPackages.length ? `; missing packages: ${missingPackages.join(', ')}` : ''}. Follow the audio setup instructions in the voice-service README, then restart with npm start.`,
+      );
       return;
     }
 
@@ -547,7 +947,7 @@ export default function HarryBotterTry() {
         source,
         worklet,
         socket,
-        sessionId: crypto.randomUUID(),
+        sessionId: selectedSessionIdRef.current || crypto.randomUUID(),
         lastSequence: 0,
         stopping: false,
         tracksStopped: false,
@@ -707,6 +1107,73 @@ export default function HarryBotterTry() {
     void requestDraft(text, chatMessages);
   };
 
+  const clearVoicePreview = () => {
+    if (voicePreviewUrlRef.current) {
+      URL.revokeObjectURL(voicePreviewUrlRef.current);
+      voicePreviewUrlRef.current = '';
+    }
+    setVoicePreviewUrl('');
+    setVoicePreviewedId('');
+    setHasPlayedVoicePreview(false);
+  };
+
+  const createVoicePreview = async () => {
+    if (isGeneratingVoicePreview) return;
+    setVoicePreviewError('');
+    setIsGeneratingVoicePreview(true);
+    const voice = voiceCandidate || speechStatus?.speech_generation?.voice || 'af_heart';
+    try {
+      const response = await fetch('/api/harry-botter/speech', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${teacherSession.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: 'Hello, I am Harry Botter. What would you like to explore today?',
+          speed: speechSpeed,
+          voice,
+        }),
+      });
+      if (!response.ok) {
+        const result = await response.json();
+        throw new Error(result.detail || 'Could not synthesize the selected local voice.');
+      }
+      const audioBlob = await response.blob();
+      if (audioBlob.type !== 'audio/wav') {
+        throw new Error('The local speech service returned an unsupported audio type.');
+      }
+      clearVoicePreview();
+      const previewUrl = URL.createObjectURL(audioBlob);
+      voicePreviewUrlRef.current = previewUrl;
+      setVoicePreviewUrl(previewUrl);
+      setVoicePreviewedId(voice);
+    } catch (error) {
+      setVoicePreviewError(error.message || 'Could not synthesize the selected local voice.');
+    } finally {
+      setIsGeneratingVoicePreview(false);
+    }
+  };
+
+  const createActivityPlan = (event) => {
+    event.preventDefault();
+    const topic = plannerTopic.trim();
+    const objective = plannerObjective.trim();
+    if (!topic || !objective || !learningLevel || isGeneratingDraft) return;
+    const materials = plannerMaterials.trim() || 'Suggest simple, low-cost classroom materials.';
+    const prompt = [
+      'Create an editable teacher-facing classroom activity plan, not a student answer.',
+      `IB stage: ${learningLevel}.`,
+      `Topic: ${topic}.`,
+      `Learning objective: ${objective}.`,
+      `Duration: ${plannerDuration} minutes.`,
+      `Available materials or constraints: ${materials}.`,
+      'Include a concise sequence with timings, teacher prompts, learner actions, a check for understanding, and an accessible language-support option.',
+      'Use age-appropriate content, do not invent school policy or facts, and flag assumptions that the teacher should verify.',
+    ].join('\n');
+    void requestDraft(prompt, chatMessagesRef.current);
+  };
+
   const regenerateDraft = (draftIndex) => {
     let userIndex = draftIndex - 1;
     while (userIndex >= 0 && chatMessages[userIndex].role !== 'user') userIndex -= 1;
@@ -715,25 +1182,31 @@ export default function HarryBotterTry() {
     void requestDraft(userText, chatMessages.slice(0, userIndex), draftIndex);
   };
 
-  const saveEditedDraft = (draftIndex) => {
+  const saveEditedDraft = async (draftIndex) => {
     const text = editedDraftText.trim();
     if (!text) return;
     if (playingSpeechIndex === draftIndex) stopSpeechPlayback();
     if (isPreparingSpeechIndex === draftIndex) cancelSpeechGeneration();
-    setChatMessages((messages) => messages.map((message, index) => {
+    const nextMessages = chatMessagesRef.current.map((message, index) => {
       if (index !== draftIndex) return message;
       const updatedMessage = { ...message, content: text };
       delete updatedMessage.speechUrl;
       return updatedMessage;
-    }));
+    });
+    setChatMessages(nextMessages);
+    chatMessagesRef.current = nextMessages;
+    await saveConversationMessages(selectedSessionIdRef.current, nextMessages);
     setEditingDraftIndex(null);
     setEditedDraftText('');
   };
 
-  const dismissDraft = (draftIndex) => {
+  const dismissDraft = async (draftIndex) => {
     if (playingSpeechIndex === draftIndex) stopSpeechPlayback();
     if (isPreparingSpeechIndex === draftIndex) cancelSpeechGeneration();
-    setChatMessages((messages) => messages.filter((_, index) => index !== draftIndex));
+    const nextMessages = chatMessagesRef.current.filter((_, index) => index !== draftIndex);
+    setChatMessages(nextMessages);
+    chatMessagesRef.current = nextMessages;
+    await saveConversationMessages(selectedSessionIdRef.current, nextMessages);
     setEditingDraftIndex(null);
     setEditedDraftText('');
   };
@@ -799,7 +1272,10 @@ export default function HarryBotterTry() {
           Authorization: `Bearer ${teacherSession.token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ text, speed: speechSpeed }),
+        body: JSON.stringify({
+          text,
+          speed: speechSpeed,
+        }),
       });
       if (!response.ok) {
         const result = await response.json();
@@ -833,6 +1309,112 @@ export default function HarryBotterTry() {
 
   const updateAgentDraft = (field, value) => {
     setAgentDraft((current) => ({ ...(current || EMPTY_AGENT_DRAFT), [field]: value }));
+  };
+
+  const selectBehaviorSection = (sectionId) => {
+    const section = behaviorSections.find((item) => item.section_id === sectionId);
+    if (!section) return;
+    setBehaviorSectionDraft({
+      section_id: section.section_id,
+      guidance: section.guidance,
+    });
+    setPolicyReviewDocumentIds([]);
+    setPolicyReviewProposal(null);
+    setPolicyReviewError('');
+    setSectionApprovalConfirmed(false);
+  };
+
+  const reviewPolicySources = async () => {
+    if (
+      isReviewingPolicySources
+      || policyReviewDocumentIds.length < 1
+      || policyReviewDocumentIds.length > 3
+    ) return;
+    setPolicyReviewError('');
+    setPolicyReviewProposal(null);
+    setIsReviewingPolicySources(true);
+    try {
+      const response = await fetch('/api/harry-botter/policy-review', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${teacherSession.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          section_id: behaviorSectionDraft.section_id,
+          document_ids: policyReviewDocumentIds,
+          current_guidance: behaviorSectionDraft.guidance,
+          learning_level: learningLevel,
+          agent_id: selectedAgentId,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not review the selected references.');
+      if (
+        typeof result.proposal?.proposed_guidance !== 'string'
+        || !Array.isArray(result.proposal.source_notes)
+        || !Array.isArray(result.proposal.conflicts)
+        || !Array.isArray(result.proposal.open_questions)
+      ) {
+        throw new Error('The model returned an incomplete policy review proposal.');
+      }
+      setPolicyReviewProposal(result);
+    } catch (error) {
+      setPolicyReviewError(error.message || 'Could not review the selected references.');
+    } finally {
+      setIsReviewingPolicySources(false);
+    }
+  };
+
+  const applyPolicyProposal = () => {
+    if (!policyReviewProposal?.proposal?.proposed_guidance) return;
+    setBehaviorSectionDraft((current) => ({
+      ...current,
+      guidance: policyReviewProposal.proposal.proposed_guidance,
+    }));
+    setSectionApprovalConfirmed(false);
+    setKnowledgeStatus('Proposal copied into the editor only; review and save it explicitly.');
+  };
+
+  const saveBehaviorSection = async (event) => {
+    event.preventDefault();
+    const section = behaviorSections.find(
+      (item) => item.section_id === behaviorSectionDraft.section_id,
+    );
+    if (!section || isSavingBehaviorSection) return;
+    setConfigError('');
+    setIsSavingBehaviorSection(true);
+    try {
+      const response = await fetch(
+        `/api/harry-botter/sections/${encodeURIComponent(section.section_id)}`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${teacherSession.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            guidance: behaviorSectionDraft.guidance,
+            approval_confirmed: sectionApprovalConfirmed,
+          }),
+        },
+      );
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not save this behavior section.');
+      setBehaviorSections((current) => current.map((item) => (
+        item.section_id === result.section.section_id ? result.section : item
+      )));
+      setBehaviorSectionDraft({
+        section_id: result.section.section_id,
+        guidance: result.section.guidance,
+      });
+      setKnowledgeStatus(`${result.section.title} saved for all teacher accounts.`);
+      setSectionApprovalConfirmed(false);
+    } catch (error) {
+      setConfigError(error.message || 'Could not save this behavior section.');
+    } finally {
+      setIsSavingBehaviorSection(false);
+    }
   };
 
   const saveAgent = async (event) => {
@@ -990,6 +1572,7 @@ export default function HarryBotterTry() {
         title: '',
         source: '',
         owner: '',
+        section_id: 'general',
         learning_level: '',
         agent_id: '',
         review_date: '',
@@ -1025,6 +1608,7 @@ export default function HarryBotterTry() {
         title: document.title,
         source: document.source,
         owner: document.owner,
+        section_id: document.section_id || 'general',
         learning_level: document.learning_level || '',
         agent_id: document.agent_id || '',
         review_date: document.review_date || '',
@@ -1043,6 +1627,7 @@ export default function HarryBotterTry() {
       title: '',
       source: '',
       owner: '',
+      section_id: 'general',
       learning_level: '',
       agent_id: '',
       review_date: '',
@@ -1204,6 +1789,31 @@ export default function HarryBotterTry() {
     setAudioStatus('Temporary microphone recording deleted.');
   };
 
+  const clearConversation = async () => {
+    voiceStartupCancelledRef.current = true;
+    const hasVoiceSession = Boolean(voiceSessionRef.current);
+    if (voiceSessionRef.current) {
+      voiceSessionRef.current.suppressTranscriptEvents = true;
+    }
+    voiceTranscriptQueueRef.current = [];
+    draftRequestRef.current?.abort();
+    draftRequestRef.current = null;
+    isGeneratingDraftRef.current = false;
+    setIsGeneratingDraft(false);
+    stopVoiceSession('Conversation cleared; voice conversation stopped.');
+    if (!hasVoiceSession) setVoiceStatus('Conversation cleared.');
+    cancelSpeechGeneration();
+    stopSpeechPlayback();
+    setChatMessages([]);
+    chatMessagesRef.current = [];
+    await saveConversationMessages(selectedSessionIdRef.current, []);
+    setEditingDraftIndex(null);
+    setEditedDraftText('');
+    setChatText('');
+    setChatError('');
+    setVoiceError('');
+  };
+
   const handleLogout = () => {
     voiceStartupCancelledRef.current = true;
     if (voiceSessionRef.current) {
@@ -1238,6 +1848,11 @@ export default function HarryBotterTry() {
     setG1SpeechStatus('');
     setG1SpeechError('');
     setChatMessages([]);
+    chatMessagesRef.current = [];
+    setTeacherSessions([]);
+    setSelectedSessionId('');
+    selectedSessionIdRef.current = '';
+    setSessionError('');
     setEditingDraftIndex(null);
     setEditedDraftText('');
     setChatText('');
@@ -1306,7 +1921,7 @@ export default function HarryBotterTry() {
             <p className="text-sm font-semibold uppercase tracking-wide text-blue-100">Teacher preview</p>
             <h1 className="mt-1 text-3xl font-bold">Harry Botter</h1>
             <p className="mt-2 text-sm text-blue-100">
-              Local-model text drafts, transcription, and approved speech playback.
+              Configured-model text drafts, transcription, and approved speech playback.
             </p>
           </div>
           <div className="flex gap-3">
@@ -1320,15 +1935,18 @@ export default function HarryBotterTry() {
         </header>
 
         <section className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-950">
-          <h2 className="font-semibold">Voice conversations run locally with explicit review</h2>
+          <h2 className="font-semibold">Voice conversations use explicit, visible routes</h2>
           <p className="mt-1">
-            In voice mode, the browser sends temporary 16 kHz microphone frames through the teacher-authenticated backend to local voice activity detection and Whisper. Each recognized turn creates a reviewable draft with the configured local LLM. Spoken replies are synthesized locally and are never played until you press Play. Speaker diarization and barge-in are not implemented.
+            In voice mode, the browser sends temporary 16 kHz microphone frames through the teacher-authenticated backend to local voice activity detection and Whisper. Each recognized turn creates a reviewable draft using the configured loopback model or explicitly configured private-network model; no hosted model is used. Spoken replies are synthesized locally and require you to press Play. Speaker diarization is not implemented; voice activity stops explicitly playing browser speech when a new turn begins.
           </p>
           <p className="mt-2">
             Embedded VS Code or Codespaces previews may block microphone access. A webpage cannot open or change browser permission settings, so use a full browser tab to manage this permission.
           </p>
           <p className="mt-2">
             When this app runs in Codespaces, microphone recordings travel to the remote workspace over its authenticated connection. For audio to stay on your own computer, run the app, backend, and speech service from a local checkout.
+          </p>
+          <p className="mt-2 font-semibold">
+            Safeguarding alerts are advisory phrase-pattern signals only. They may miss disclosures or flag ordinary discussion; they do not prove safety or replace the school process. This preview is not approved for student use.
           </p>
           <a
             href={window.location.href}
@@ -1339,6 +1957,61 @@ export default function HarryBotterTry() {
             Open this preview in a full browser tab
           </a>
         </section>
+
+        {(safeguardingAlerts.length > 0 || safeguardingAlertError) && (
+          <section
+            role="alert"
+            aria-live="assertive"
+            aria-label="Potential safeguarding alerts"
+            className="space-y-3 rounded-2xl border border-red-300 bg-red-50 p-5 text-red-950 shadow-sm"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="font-bold">Potential safeguarding signal — human review required</h2>
+                <p className="mt-1 text-sm">
+                  These limited phrase patterns are not a complete detector. Follow the school’s safeguarding process; do not rely on the app alone.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void refreshSafeguardingAlerts()}
+                className="rounded-lg border border-red-400 px-3 py-2 text-sm font-semibold hover:bg-red-100"
+              >
+                Refresh alerts
+              </button>
+            </div>
+            {safeguardingAlertError && (
+              <p role="status" className="text-sm">{safeguardingAlertError}</p>
+            )}
+            {safeguardingAlerts.map((alert) => (
+              <div
+                key={alert.alert_id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-200 bg-white p-3"
+              >
+                <p className="text-sm">
+                  {alert.category.replaceAll('_', ' ')} · {alert.session_title || 'Saved conversation'}
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void selectConversation(alert.session_id)}
+                    disabled={isChangingSession || isGeneratingDraft}
+                    className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-60"
+                  >
+                    Review conversation
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void acknowledgeSafeguardingAlert(alert.alert_id)}
+                    className="rounded-lg border border-red-300 px-3 py-1.5 text-sm font-semibold hover:bg-red-100"
+                  >
+                    Mark reviewed
+                  </button>
+                </div>
+              </div>
+            ))}
+          </section>
+        )}
 
         <section
           aria-label="Preview mode"
@@ -1389,7 +2062,12 @@ export default function HarryBotterTry() {
             <select
               aria-label="Spoken reply pace"
               value={speechSpeed}
-              onChange={(event) => setSpeechSpeed(Number(event.target.value))}
+              onChange={(event) => {
+                setSpeechSpeed(Number(event.target.value));
+                clearVoicePreview();
+                setVoicePreviewError('');
+              }}
+              disabled={isGeneratingVoicePreview}
               className="rounded-lg border border-slate-300 bg-white px-3 py-2"
             >
               <option value={0.85}>Slower</option>
@@ -1397,6 +2075,68 @@ export default function HarryBotterTry() {
               <option value={1.15}>Faster</option>
             </select>
           </label>
+          <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
+            Current browser voice: {ttsVoice || speechStatus?.speech_generation?.voice || 'af_heart'}
+          </div>
+          <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+            Voice to audition
+            <select
+              aria-label="Voice to audition"
+              value={voiceCandidate}
+              onChange={(event) => {
+                setVoiceCandidate(event.target.value);
+                clearVoicePreview();
+                setVoicePreviewError('');
+              }}
+              disabled={isGeneratingVoicePreview}
+              className="max-w-56 rounded-lg border border-slate-300 bg-white px-3 py-2"
+            >
+              <option value="">
+                Configured default ({speechStatus?.speech_generation?.voice || 'af_heart'})
+              </option>
+              {(speechStatus?.speech_generation?.available_voices || [])
+                .filter((voice) => voice !== (speechStatus?.speech_generation?.voice || 'af_heart'))
+                .map((voice) => (
+                  <option key={voice} value={voice}>
+                    {TTS_VOICE_LABELS[voice] || voice}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            onClick={() => void createVoicePreview()}
+            disabled={
+              isGeneratingVoicePreview
+              || speechStatus?.speech_generation?.available !== true
+            }
+            className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-semibold text-blue-800 disabled:opacity-50"
+          >
+            {isGeneratingVoicePreview ? 'Generating sample…' : 'Preview voice'}
+          </button>
+          <button
+            type="button"
+            onClick={() => setTtsVoice(voicePreviewedId)}
+            disabled={!voicePreviewedId || !hasPlayedVoicePreview}
+            className="rounded-lg border border-emerald-300 px-3 py-2 text-sm font-semibold text-emerald-800 disabled:opacity-50"
+          >
+            Use auditioned voice
+          </button>
+          {voicePreviewUrl && (
+            <audio
+              aria-label="Generated voice preview"
+              controls
+              src={voicePreviewUrl}
+              onPlay={() => setHasPlayedVoicePreview(true)}
+              className="w-full"
+            />
+          )}
+          {voicePreviewError && (
+            <p role="alert" className="w-full text-sm text-red-700">{voicePreviewError}</p>
+          )}
+          <p className="w-full text-xs text-slate-500">
+            Audition a local Kokoro preset or the optional Qwen3 VoiceDesign sample and press Play before applying it to future browser replies. Qwen3 attempts a fictional youthful South London voice from text instructions only; age and Fulham-area accent are not guaranteed. Celebrity voice imitation and reference-voice cloning are not offered. This does not change the separate G1 speaker voice; review voice terms before school deployment.
+          </p>
           <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
             Draft output
             <select
@@ -1451,14 +2191,136 @@ export default function HarryBotterTry() {
           )}
         </section>
 
+        <section
+          aria-label="Saved teacher conversations"
+          className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
+        >
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex min-w-56 flex-1 items-center gap-2 text-sm font-medium text-slate-700">
+              Saved conversations
+              <select
+                aria-label="Saved conversations"
+                value={selectedSessionId}
+                onChange={(event) => void selectConversation(event.target.value)}
+                disabled={
+                  isLoadingSessions || isChangingSession || isGeneratingDraft
+                  || isVoiceSessionActive || isStartingVoiceSession
+                }
+                className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2"
+              >
+                {teacherSessions.map((session) => (
+                  <option key={session.session_id} value={session.session_id}>
+                    {session.title || 'New conversation'}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void createConversation()}
+              disabled={
+                isLoadingSessions || isChangingSession || isGeneratingDraft
+                || isVoiceSessionActive || isStartingVoiceSession
+              }
+              className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-60"
+            >
+              New conversation
+            </button>
+            <button
+              type="button"
+              onClick={() => void deleteConversation()}
+              disabled={
+                !selectedSessionId || isLoadingSessions || isChangingSession || isGeneratingDraft
+                || isVoiceSessionActive || isStartingVoiceSession
+              }
+              className="rounded-lg border border-red-300 px-3 py-2 text-sm font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60"
+            >
+              Delete conversation
+            </button>
+          </div>
+          <p className="text-xs text-slate-500">
+            Text history is stored in the local app database for this teacher until deleted. Only this teacher account can access it; raw audio is never retained.
+          </p>
+          {sessionError && <p role="alert" className="text-sm text-red-700">{sessionError}</p>}
+        </section>
+
         {previewMode === 'text' && (
           <>
+        <section className="space-y-4 rounded-2xl border border-violet-200 bg-white p-6 shadow-sm">
+          <div>
+            <h2 className="text-lg font-semibold">Teacher activity planner</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Generate an editable activity-plan draft using the selected learning stage, agent, and approved references. Review every assumption before using it.
+            </p>
+          </div>
+          <form onSubmit={createActivityPlan} className="grid gap-3 md:grid-cols-2">
+            <label className="block text-sm font-medium">
+              Activity topic
+              <input
+                required
+                maxLength={300}
+                value={plannerTopic}
+                onChange={(event) => setPlannerTopic(event.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+              />
+            </label>
+            <label className="block text-sm font-medium">
+              Learning objective
+              <input
+                required
+                maxLength={400}
+                value={plannerObjective}
+                onChange={(event) => setPlannerObjective(event.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+              />
+            </label>
+            <label className="block text-sm font-medium">
+              Activity duration
+              <select
+                value={plannerDuration}
+                onChange={(event) => setPlannerDuration(event.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2"
+              >
+                <option value="15">15 minutes</option>
+                <option value="30">30 minutes</option>
+                <option value="45">45 minutes</option>
+                <option value="60">60 minutes</option>
+              </select>
+            </label>
+            <label className="block text-sm font-medium">
+              Materials or constraints
+              <input
+                maxLength={500}
+                value={plannerMaterials}
+                onChange={(event) => setPlannerMaterials(event.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+              />
+            </label>
+            <div className="md:col-span-2">
+              <button
+                type="submit"
+                disabled={
+                  !plannerTopic.trim() || !plannerObjective.trim() || !learningLevel
+                  || !selectedSessionId || isGeneratingDraft
+                  || modelStatus?.status !== 'ready'
+                }
+                className="rounded-lg bg-violet-700 px-4 py-2 font-semibold text-white hover:bg-violet-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isGeneratingDraft ? 'Generating draft…' : 'Create activity-plan draft'}
+              </button>
+              {!learningLevel && (
+                <p className="mt-2 text-xs text-slate-500">Select the learning stage in the draft settings before planning.</p>
+              )}
+            </div>
+          </form>
+        </section>
+
         <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <h2 className="text-lg font-semibold">Local AI draft chat</h2>
+              <h2 className="text-lg font-semibold">AI draft chat</h2>
               <p className="mt-1 text-sm text-slate-600">
-                Teacher testing mode. Replies remain drafts; create speech and press Play only when you approve it.
+                Teacher testing mode. Replies remain drafts; create speech and press Play only when you approve it. The configured model route is shown below.
               </p>
             </div>
             <button
@@ -1467,37 +2329,85 @@ export default function HarryBotterTry() {
               disabled={isCheckingModel}
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-60"
             >
-              {isCheckingModel ? 'Checking…' : 'Check local model'}
+              {isCheckingModel ? 'Checking…' : 'Check model route'}
             </button>
             <button
               type="button"
-              onClick={() => {
-                cancelSpeechGeneration();
-                stopSpeechPlayback();
-                setChatMessages([]);
-                setEditingDraftIndex(null);
-                setEditedDraftText('');
-                setChatError('');
-              }}
-              disabled={chatMessages.length === 0 || isGeneratingDraft || isPreparingSpeechIndex !== null}
+              onClick={clearConversation}
+              disabled={
+                chatMessages.length === 0
+                && !isGeneratingDraft
+                && isPreparingSpeechIndex === null
+                && !isVoiceSessionActive
+                && !isStartingVoiceSession
+              }
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Clear chat
             </button>
           </div>
           <div role="status" aria-live="polite" className="rounded-lg bg-slate-100 p-3 text-sm text-slate-700">
-            {isCheckingModel && 'Checking the local model service…'}
+            {isCheckingModel && 'Checking the configured model route…'}
             {!isCheckingModel && modelStatus?.status === 'ready'
-              && `Local model ready: ${modelStatus.model}. Requests go only to the configured loopback server; there is no cloud fallback.`}
+              && `${modelStatus.route === 'network' ? 'Private-network model' : 'Local model'} ready: ${modelStatus.model}. No hosted model is used.`}
+            {!isCheckingModel && modelStatus?.status === 'ready' && modelStatus.fallback
+              && ` ${modelStatus.fallback} Using the configured local model instead.`}
             {!isCheckingModel && modelStatus?.status === 'not_configured'
-              && 'No local model is configured. Configure a loopback OpenAI-compatible model server and model name to enable drafts.'}
+              && (modelStatus?.available_models?.length
+                ? 'A model server is responding but no model is selected. Choose an installed model below.'
+                : 'No local model is configured or installed. Start a loopback OpenAI-compatible model server, install a model, and select it below.')}
             {!isCheckingModel && modelStatus?.status === 'model_missing'
-              && `The local server is running, but model “${modelStatus.model}” is not available there.`}
+              && `${modelStatus.route === 'network' ? 'The private-network model server' : 'The local model server'} is running, but model “${modelStatus.model}” is not available there.`}
             {!isCheckingModel && modelStatus?.status === 'unavailable'
-              && `The configured local model server is unavailable. ${modelStatus.error || 'Check that it is running.'}`}
+              && `The configured model server is unavailable. ${modelStatus.error || 'Check that it is running.'}`}
             {!isCheckingModel && modelStatus?.status === 'service_unavailable'
-              && `Harry Botter local service is unavailable. ${modelStatus.error || ''}`}
-            {!isCheckingModel && !modelStatus && 'Local model status has not been checked.'}
+              && `The local AI service is unavailable. Run npm start from the project root to start the backend and voice service; check its startup output for setup errors. ${modelStatus.error || ''}`}
+            {!isCheckingModel && !modelStatus && 'Model status has not been checked.'}
+          </div>
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="min-w-64 flex-1 text-sm font-medium">
+              Installed model
+              <select
+                aria-label="Installed AI model"
+                value={modelSelection}
+                onChange={(event) => {
+                  setModelSelection(event.target.value);
+                  setModelSelectionError('');
+                }}
+                disabled={!modelStatus?.available_models?.length || isSelectingModel}
+                className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 disabled:bg-slate-100"
+              >
+                {!modelStatus?.available_models?.length && (
+                  <option value="">No installed models found</option>
+                )}
+                {(modelStatus?.available_models || []).map((item) => {
+                  const value = JSON.stringify({ route: item.route, model: item.model });
+                  return (
+                    <option key={`${item.route}:${item.model}`} value={value}>
+                      {item.route === 'network' ? 'Private Wi-Fi' : 'This computer'} - {item.model}
+                    </option>
+                  );
+                })}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void selectLocalModel()}
+              disabled={
+                !modelSelection
+                || !modelStatus?.available_models?.length
+                || isSelectingModel
+              }
+              className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-semibold text-blue-800 disabled:opacity-50"
+            >
+              {isSelectingModel ? 'Selecting…' : 'Use selected model'}
+            </button>
+            {modelSelectionError && (
+              <p role="alert" className="w-full text-sm text-red-700">{modelSelectionError}</p>
+            )}
+            <p className="w-full text-xs text-slate-500">
+              Choose a model already installed on the configured local or private Wi-Fi server. Selection applies until the voice service restarts; configure the environment settings to change its startup default.
+            </p>
           </div>
 
           <div className="max-h-96 space-y-3 overflow-y-auto rounded-lg border border-slate-200 p-4">
@@ -1514,7 +2424,7 @@ export default function HarryBotterTry() {
                     ? 'Your message'
                     : message.source === 'stage_policy'
                       ? 'Stage required'
-                      : `AI draft${message.model ? ` · ${message.model}` : ''}`}
+                      : `AI draft${message.model ? ` · ${message.model}` : ''}${message.route === 'network' ? ' · private Wi-Fi' : message.route === 'local' ? ' · local' : ''}`}
                 </p>
                 {editingDraftIndex === index ? (
                   <div className="mt-2 space-y-2">
@@ -1555,10 +2465,15 @@ export default function HarryBotterTry() {
                     Draft returned in {(message.transcriptToDraftMs / 1000).toFixed(1)} s after transcript receipt.
                   </p>
                 )}
+                {message.settings && (
+                  <p className="mt-1 text-xs text-slate-500">
+                    Draft settings: {message.settings.learningLevel || 'Stage not selected'} · {message.settings.tone} · {message.settings.agentName}
+                  </p>
+                )}
                 {message.sources?.length > 0 && (
                   <p className="mt-2 text-xs text-slate-600">
                     Reference context: {message.sources.map((source) => (
-                      `${source.title} — ${source.source}${source.review_date ? ` (reviewed ${source.review_date})` : ''}`
+                      `${source.section_title ? `${source.section_title}: ` : ''}${source.title} — ${source.source}${source.review_date ? ` (reviewed ${source.review_date})` : ''}`
                     )).join('; ')}
                   </p>
                 )}
@@ -1702,7 +2617,7 @@ export default function HarryBotterTry() {
             </button>
           </form>
           <p className="text-xs leading-relaxed text-slate-500">
-            Messages go through the teacher-authenticated app backend. Chat history stays in this page and is not saved by the service. When no programme/year is selected, the service asks for the stage without calling a model. Reference excerpts are selected locally and sent only to the configured loopback model. Audio playback is always prepared on request and requires you to press Play.
+            Messages go through the teacher-authenticated app backend. Text history is saved in this teacher-only local database until deleted; raw audio is never stored. When no programme/year is selected, the service asks for the stage without calling a model. Reference excerpts are selected locally and sent only to the configured loopback model. Audio playback is always prepared on request and requires you to press Play.
           </p>
         </section>
           </>
@@ -1775,16 +2690,18 @@ export default function HarryBotterTry() {
             </div>
             <div aria-live="polite" className="rounded-lg bg-slate-100 p-3 text-sm text-slate-700">
               {!speechStatus && 'Checking local speech setup…'}
-              {speechStatus?.error && `Speech service unavailable. ${speechStatus.error}`}
+              {speechStatus?.error && `Local AI service unavailable. Run npm start from the project root and check startup output. ${speechStatus.error}`}
               {speechStatus?.transcription && (
                 speechStatus.transcription.available
                   ? `Local transcription model: ${speechStatus.transcription.model} (${speechStatus.transcription.device}).`
-                  : 'Local transcription is not installed. Follow the audio setup instructions in the voice-service README.'
+                  : `Local transcription dependencies are missing${speechStatus.transcription.missing_dependencies?.length ? `: ${speechStatus.transcription.missing_dependencies.join(', ')}` : ''}. Follow the audio setup instructions in the voice-service README, then restart with npm start.`
               )}
+              {speechStatus?.streaming_transcription?.available === false
+                && ` Live streaming requires: ${(speechStatus.streaming_transcription.missing_dependencies || []).join(', ') || 'the optional audio packages'}.`}
               {speechStatus?.speech_generation && (
                 speechStatus.speech_generation.available
-                  ? ` Local TTS package is installed; voice: ${speechStatus.speech_generation.voice}.`
-                  : ' Local speech generation is not installed yet.'
+                  ? ` Local TTS is available; voice: ${speechStatus.speech_generation.voice}.`
+                  : ` Local speech generation dependencies are missing${speechStatus.speech_generation.missing_dependencies?.length ? `: ${speechStatus.speech_generation.missing_dependencies.join(', ')}` : ''}.`
               )}
             </div>
             <p className="text-xs text-slate-500">Recordings stop automatically after 30 seconds.</p>
@@ -1837,7 +2754,6 @@ export default function HarryBotterTry() {
                 <select
                   value={learningLevel}
                   onChange={(event) => setLearningLevel(event.target.value)}
-                  disabled={isVoiceSessionActive}
                   className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2"
                 >
                   <option value="">Choose before substantive answers</option>
@@ -1849,11 +2765,9 @@ export default function HarryBotterTry() {
                 <select
                   value={tone}
                   onChange={(event) => setTone(event.target.value)}
-                  disabled={isVoiceSessionActive}
                   className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2"
                 >
-                  <option>Formal</option>
-                  <option>Lightly humorous</option>
+                  {TONE_OPTIONS.map((option) => <option key={option}>{option}</option>)}
                 </select>
               </label>
               <label className="block text-sm font-medium">
@@ -1873,6 +2787,9 @@ export default function HarryBotterTry() {
                 </select>
               </label>
             </div>
+            <p className="text-xs text-slate-500">
+              Stage, tone, and agent changes apply to the next draft. Microphone changes require stopping and restarting the conversation.
+            </p>
             <div className="flex flex-wrap gap-3">
               {!isVoiceSessionActive ? (
                 <button
@@ -1902,6 +2819,20 @@ export default function HarryBotterTry() {
               >
                 Refresh microphones
               </button>
+              <button
+                type="button"
+                onClick={clearConversation}
+                disabled={
+                  chatMessages.length === 0
+                  && !isGeneratingDraft
+                  && isPreparingSpeechIndex === null
+                  && !isVoiceSessionActive
+                  && !isStartingVoiceSession
+                }
+                className="rounded-lg border border-slate-300 px-4 py-2 font-semibold hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Clear conversation
+              </button>
             </div>
             <div role="status" aria-live="polite" className="rounded-lg bg-slate-100 p-3 text-sm text-slate-700">
               {voiceStatus}
@@ -1920,7 +2851,7 @@ export default function HarryBotterTry() {
               </div>
             )}
             <p className="text-xs leading-relaxed text-slate-500">
-              Microphone frames remain temporary in browser memory and are sent only to the loopback speech service through the authenticated backend. The service uses VAD to segment utterances and clears each segment after transcription. No audio or transcript is persisted.
+              Microphone frames remain temporary in browser memory and are sent only to the loopback speech service through the authenticated backend. The service uses VAD to segment utterances and clears each segment after transcription. Audio is not stored; transcripts are saved as text in this teacher-only conversation until deleted.
             </p>
             <div className="max-h-96 space-y-3 overflow-y-auto rounded-lg border border-slate-200 p-4">
               {chatMessages.length === 0 && (
@@ -1936,6 +2867,11 @@ export default function HarryBotterTry() {
                   {Number.isFinite(message.transcriptToDraftMs) && (
                     <p className="mt-1 text-xs text-slate-500">
                       Draft returned in {(message.transcriptToDraftMs / 1000).toFixed(1)} s after transcript receipt.
+                    </p>
+                  )}
+                  {message.settings && (
+                    <p className="mt-1 text-xs text-slate-500">
+                      Draft settings: {message.settings.learningLevel || 'Stage not selected'} · {message.settings.tone} · {message.settings.agentName}
                     </p>
                   )}
                   {message.role === 'assistant' && (
@@ -1976,6 +2912,13 @@ export default function HarryBotterTry() {
                       src={message.speechUrl}
                       className="mt-3 w-full"
                       aria-label={`Spoken draft ${index + 1}`}
+                      onLoadedMetadata={(event) => {
+                        if (typeof event.currentTarget.setSinkId === 'function') {
+                          event.currentTarget.setSinkId(speakerId).catch((error) => {
+                            setSpeechError(`Could not route speech to the selected speaker: ${error.message}`);
+                          });
+                        }
+                      }}
                       onPlay={(event) => {
                         if (speechAudioRef.current && speechAudioRef.current !== event.currentTarget) {
                           speechAudioRef.current.pause();
@@ -2125,7 +3068,7 @@ export default function HarryBotterTry() {
                 {isLoadingConfig && <p role="status" className="text-sm text-slate-600">Loading shared settings…</p>}
                 {knowledgeStatus && <p role="status" className="text-sm text-emerald-700">{knowledgeStatus}</p>}
                 <p className="rounded-lg bg-amber-50 p-3 text-xs leading-relaxed text-amber-950">
-                  Agent instructions can specialize learning tasks but cannot replace the common safety policy. All profiles currently use the same configured local model; model-provider switching is not enabled.
+                  Agent instructions can specialize learning tasks but cannot replace the common safety policy. All profiles currently use the same configured model route; per-agent model switching is not enabled.
                 </p>
               </div>
 
@@ -2152,21 +3095,175 @@ export default function HarryBotterTry() {
                     onChange={(event) => setTone(event.target.value)}
                     className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2"
                   >
-                    <option>Formal</option>
-                    <option>Lightly humorous</option>
+                    {TONE_OPTIONS.map((option) => <option key={option}>{option}</option>)}
                   </select>
                 </label>
                 <p className="rounded-lg bg-blue-50 p-3 text-sm text-blue-900">
-                  Chat is teacher-preview only. Typed text and recent in-page history go to the configured local model. Voice turns use local transcription; no audio is retained.
+                  Chat is teacher-preview only. Typed text and recent in-page history go to the configured loopback or explicitly selected private-network model. Voice turns use local transcription; no audio is retained.
                 </p>
               </div>
+            </section>
+
+            <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+              <div>
+                <h2 className="text-lg font-semibold">Behavior and information sections</h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  These shared settings are saved in the local app database and included in each next draft. Uploaded references are retrieved as context; they do not train or fine-tune the model.
+                </p>
+              </div>
+              {behaviorSections.length === 0 ? (
+                <p role="status" className="text-sm text-slate-600">
+                  Behavior sections are unavailable. Reload the shared teacher configuration or check the backend.
+                </p>
+              ) : (
+                <form onSubmit={saveBehaviorSection} className="space-y-3">
+                  <label className="block text-sm font-medium">
+                    Behavior settings section
+                    <select
+                      value={behaviorSectionDraft.section_id}
+                      onChange={(event) => selectBehaviorSection(event.target.value)}
+                      disabled={isLoadingConfig || isSavingBehaviorSection}
+                      className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2"
+                    >
+                      {behaviorSections.map((section) => (
+                        <option key={section.section_id} value={section.section_id}>{section.title}</option>
+                      ))}
+                    </select>
+                  </label>
+                  {selectedBehaviorSection && (
+                    <>
+                      <p className="text-sm text-slate-600">{selectedBehaviorSection.description}</p>
+                      <label className="block text-sm font-medium">
+                        Additional shared guidance
+                        <textarea
+                          aria-label="Additional shared guidance"
+                          maxLength={5000}
+                          rows={5}
+                          value={behaviorSectionDraft.guidance}
+                          onChange={(event) => setBehaviorSectionDraft({
+                            ...behaviorSectionDraft,
+                            guidance: event.target.value,
+                          })}
+                          disabled={isSavingBehaviorSection}
+                          className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+                        />
+                      </label>
+                      <fieldset className="space-y-2 rounded-lg border border-slate-200 p-3">
+                        <legend className="px-1 text-sm font-semibold">Review approved references</legend>
+                        <p className="text-sm text-slate-600">
+                          Generate an educator-review proposal from up to three in-scope references. Only the first 2,500 characters of each reference are sent to the configured model. This does not change policy or save guidance.
+                        </p>
+                        {eligiblePolicyDocuments.length === 0 ? (
+                          <p className="text-sm text-slate-500">No current, approved references match this section, stage, and agent.</p>
+                        ) : (
+                          <div className="space-y-2">
+                            {eligiblePolicyDocuments.map((document) => {
+                              const checked = policyReviewDocumentIds.includes(document.document_id);
+                              return (
+                                <label key={document.document_id} className="flex items-start gap-2 text-sm">
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    disabled={isReviewingPolicySources || (!checked && policyReviewDocumentIds.length >= 3)}
+                                    onChange={(event) => {
+                                      setPolicyReviewDocumentIds((current) => (
+                                        event.target.checked
+                                          ? [...current, document.document_id].slice(0, 3)
+                                          : current.filter((id) => id !== document.document_id)
+                                      ));
+                                      setPolicyReviewProposal(null);
+                                      setPolicyReviewError('');
+                                    }}
+                                    className="mt-1"
+                                  />
+                                  <span>{document.title} — {document.source}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void reviewPolicySources()}
+                          disabled={isReviewingPolicySources || policyReviewDocumentIds.length === 0}
+                          className="rounded-lg border border-blue-700 px-3 py-2 text-sm font-semibold text-blue-800 hover:bg-blue-50 disabled:opacity-50"
+                        >
+                          {isReviewingPolicySources ? 'Preparing proposal…' : 'Generate review proposal'}
+                        </button>
+                        {policyReviewError && <p role="alert" className="text-sm text-red-700">{policyReviewError}</p>}
+                        {policyReviewProposal && (
+                          <div className="space-y-3 rounded-lg bg-slate-50 p-3 text-sm">
+                            <p className="font-semibold">
+                              Proposal only · {policyReviewProposal.model} ({policyReviewProposal.route})
+                            </p>
+                            <p className="whitespace-pre-wrap">{policyReviewProposal.proposal.proposed_guidance || 'The model proposed no guidance.'}</p>
+                            {[
+                              ['Source notes', policyReviewProposal.proposal.source_notes],
+                              ['Potential conflicts', policyReviewProposal.proposal.conflicts],
+                              ['Questions for educator', policyReviewProposal.proposal.open_questions],
+                            ].map(([label, items]) => (
+                              <div key={label}>
+                                <p className="font-semibold">{label}</p>
+                                {items.length > 0
+                                  ? <ul className="list-disc space-y-1 pl-5">{items.map((item, index) => <li key={`${label}-${index}`}>{item}</li>)}</ul>
+                                  : <p className="text-slate-600">None identified by the model; this is not confirmation that none exist.</p>}
+                              </div>
+                            ))}
+                            <div>
+                              <p className="font-semibold">References supplied</p>
+                              <ul className="list-disc pl-5">
+                                {policyReviewProposal.sources.map((source, index) => (
+                                  <li key={source.reference_id}>[R{index + 1}] {source.title.replace(/^\[R\d+\]\s*/, '')} — {source.source} · Owner: {source.owner}</li>
+                                ))}
+                              </ul>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={applyPolicyProposal}
+                              className="rounded-lg bg-amber-700 px-3 py-2 font-semibold text-white hover:bg-amber-800"
+                            >
+                              Copy proposal into editor for review
+                            </button>
+                          </div>
+                        )}
+                      </fieldset>
+                      {selectedBehaviorSection.requires_approval && (
+                        <label className="flex items-start gap-2 text-sm text-amber-950">
+                          <input
+                            type="checkbox"
+                            checked={sectionApprovalConfirmed}
+                            onChange={(event) => setSectionApprovalConfirmed(event.target.checked)}
+                            className="mt-1"
+                          />
+                          I confirm that any school-specific guidance in this section has been approved for this use.
+                        </label>
+                      )}
+                      <button
+                        type="submit"
+                        disabled={
+                          isSavingBehaviorSection
+                          || isLoadingConfig
+                          || (selectedBehaviorSection.requires_approval
+                            && Boolean(behaviorSectionDraft.guidance.trim())
+                            && !sectionApprovalConfirmed)
+                        }
+                        className="rounded-lg bg-blue-700 px-4 py-2 font-semibold text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {isSavingBehaviorSection ? 'Saving…' : 'Save shared section'}
+                      </button>
+                    </>
+                  )}
+                  {configError && <p role="alert" className="text-sm text-red-700">{configError}</p>}
+                  {knowledgeStatus && <p role="status" className="text-sm text-emerald-700">{knowledgeStatus}</p>}
+                </form>
+              )}
             </section>
 
             <section className="space-y-5 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <div>
                 <h2 className="text-lg font-semibold">Local knowledge library</h2>
                 <p className="mt-1 text-sm text-slate-600">
-                  Add approved references for all agents or scope a document to one agent and IB stage.
+                  Add approved references to a behavior section, then optionally scope a document to one agent and IB stage.
                 </p>
               </div>
               <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">
@@ -2214,6 +3311,19 @@ export default function HarryBotterTry() {
                     onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, owner: event.target.value })}
                     className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
                   />
+                </label>
+                <label className="block text-sm font-medium">
+                  Reference category
+                  <select
+                    value={knowledgeDraft.section_id}
+                    onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, section_id: event.target.value })}
+                    className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2"
+                  >
+                    <option value="general">General reference</option>
+                    {behaviorSections.map((section) => (
+                      <option key={section.section_id} value={section.section_id}>{section.title}</option>
+                    ))}
+                  </select>
                 </label>
                 <label className="block text-sm font-medium">
                   Review date
@@ -2306,7 +3416,12 @@ export default function HarryBotterTry() {
                             {document.source} · Owner: {document.owner}
                           </p>
                           <p className="text-xs text-slate-500">
-                            {document.learning_level || 'All stages'} · {agent?.display_name || 'All agents'}
+                            {behaviorSections.find((section) => section.section_id === document.section_id)?.title || 'General reference'}
+                            {' · '}{document.learning_level || 'All stages'} · {agent?.display_name || 'All agents'}
+                            {document.version ? ` · v${document.version}` : ''}
+                            {document.permission_confirmed_at
+                              ? ` · Permission confirmed ${document.permission_confirmed_at}`
+                              : ' · Permission confirmation unavailable'}
                             {document.review_date < new Date().toISOString().slice(0, 10)
                               ? ` · REVIEW REQUIRED (reviewed ${document.review_date})`
                               : ` · Review by ${document.review_date}`}

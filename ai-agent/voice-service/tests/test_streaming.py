@@ -115,7 +115,7 @@ class StreamingSpeechSessionTests(unittest.TestCase):
 
     def test_stream_server_accepts_local_audio_and_stops_cleanly(self) -> None:
         runtime = FakeSpeechRuntime()
-        server, thread = start_audio_stream_server(runtime, port=0)
+        server, thread = start_audio_stream_server(runtime, port=0, vad_factory=FakeVAD)
         port = server.socket.getsockname()[1]
         try:
             with connect(
@@ -141,7 +141,11 @@ class StreamingSpeechSessionTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
 
     def test_stream_start_rejects_unsupported_audio_format(self) -> None:
-        server, thread = start_audio_stream_server(FakeSpeechRuntime(), port=0)
+        server, thread = start_audio_stream_server(
+            FakeSpeechRuntime(),
+            port=0,
+            vad_factory=FakeVAD,
+        )
         port = server.socket.getsockname()[1]
         try:
             with connect(

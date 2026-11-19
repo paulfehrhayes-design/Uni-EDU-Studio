@@ -11,7 +11,17 @@ const port = Number(process.env.UNI_EDU_PORT || 5179);
 const voicePort = 8765;
 const ollamaUrl = 'http://127.0.0.1:11434';
 const localModel = 'qwen3:0.6b';
-const pythonPackages = ['faster_whisper', 'kokoro', 'webrtcvad'];
+const defaultLocalModelUrl = `${ollamaUrl}/v1`;
+const pythonPackages = [
+  'faster_whisper',
+  'kokoro',
+  'webrtcvad',
+  'numpy',
+  'websockets',
+  'espeakng_loader',
+  'phonemizer',
+  'torch',
+];
 const configFile = path.join(root, '.env.harry-botter.local');
 const children = [];
 let shuttingDown = false;
@@ -23,6 +33,7 @@ function log(message) {
 function loadLocalConfig() {
   if (!existsSync(configFile)) return {};
   const allowed = new Set([
+    'HARRY_BOTTER_LOCAL_MODEL_URL',
     'HARRY_BOTTER_NETWORK_MODEL_URL',
     'HARRY_BOTTER_NETWORK_MODEL',
     'HARRY_BOTTER_LOCAL_MODEL',
@@ -72,6 +83,13 @@ function startProcess(binary, args, options = {}) {
   });
   child.once('error', (error) => {
     if (!shuttingDown) console.error(`[Harry Botter] ${error.message}`);
+  });
+  child.once('exit', (code, signal) => {
+    if (shuttingDown) return;
+    console.error(
+      `[Harry Botter] A managed service exited unexpectedly (${signal || code}). Stopping the application stack.`,
+    );
+    void shutdown(1);
   });
   children.push(child);
   return child;
@@ -127,7 +145,10 @@ function findPython() {
     if (existsSync(candidate)) return { binary: candidate, isVenv: true };
   }
 
-  const candidates = windows ? ['python'] : ['python3.12', 'python3', 'python'];
+  const candidates = [
+    process.env.UNI_EDU_PYTHON,
+    ...(windows ? ['python'] : ['python3.12', 'python3', 'python']),
+  ].filter(Boolean);
   for (const binary of candidates) {
     const result = spawnSync(binary, ['-c', 'import sys; print(sys.version_info[:2])'], {
       encoding: 'utf8',
@@ -163,19 +184,34 @@ async function ensureVoicePython() {
   );
   if (packages.status !== 0) {
     log('Installing the free local voice-service dependencies (first run only)...');
-    await run(python, [
-      '-m', 'pip', 'install', '--index-url', 'https://download.pytorch.org/whl/cpu',
-      'torch==2.7.1',
-    ], { cwd: voiceDir });
-    await run(python, ['-m', 'pip', 'install', '-e', '.[audio]'], { cwd: voiceDir });
+    try {
+      await run(python, [
+        '-m', 'pip', 'install', '--index-url', 'https://download.pytorch.org/whl/cpu',
+        'torch==2.7.1',
+      ], { cwd: voiceDir });
+      await run(python, ['-m', 'pip', 'install', '-e', '.[audio]'], { cwd: voiceDir });
+    } catch (error) {
+      log(`Audio dependencies could not be installed: ${error.message}`);
+      log('Starting chat where possible; speech features may be unavailable. Rerun npm start after fixing Python/audio setup.');
+    }
   }
   return python;
 }
 
 async function ensureOllama(env) {
+  const configuredLocalUrl = (env.HARRY_BOTTER_LOCAL_MODEL_URL || defaultLocalModelUrl).replace(/\/+$/, '');
+  if (configuredLocalUrl !== defaultLocalModelUrl) {
+    log('Using the configured local OpenAI-compatible model endpoint; Ollama setup is skipped.');
+    return;
+  }
+
   const version = spawnSync('ollama', ['--version'], { stdio: 'ignore' });
   if (version.status !== 0) {
-    throw new Error('Ollama is not installed. Install the free Ollama app, then run npm start again.');
+    log(
+      'Ollama is not installed. The app will still start, but the default local model '
+      + 'is unavailable until a compatible runtime is installed or configured.',
+    );
+    return;
   }
 
   let server = null;
@@ -231,7 +267,7 @@ function serviceEnvironment(config) {
     HF_HOME: path.join(modelsDir, 'huggingface'),
     OLLAMA_MODELS: path.join(modelsDir, 'ollama'),
     HARRY_BOTTER_LOCAL_MODEL: config.HARRY_BOTTER_LOCAL_MODEL || localModel,
-    HARRY_BOTTER_LOCAL_MODEL_URL: `${ollamaUrl}/v1`,
+    HARRY_BOTTER_LOCAL_MODEL_URL: config.HARRY_BOTTER_LOCAL_MODEL_URL || defaultLocalModelUrl,
     HARRY_BOTTER_WHISPER_MODEL: 'Systran/faster-whisper-tiny.en',
     HARRY_BOTTER_STT_DEVICE: 'cpu',
     HARRY_BOTTER_STT_COMPUTE_TYPE: 'int8',
@@ -300,20 +336,34 @@ try {
   await ensureOllama(env);
   const python = await ensureVoicePython();
   const backendPython = await ensureBackendPython();
-  if (!speechModelsCached()) {
+  const audioPackagesReady = spawnSync(
+    python,
+    ['-c', `import ${pythonPackages.join(', ')}`],
+    { stdio: 'ignore' },
+  ).status === 0;
+  if (!audioPackagesReady) {
+    log('Audio dependencies are incomplete. Live transcription and voice previews will report unavailable; typing chat can still run.');
+  } else if (!speechModelsCached()) {
     log('Downloading and warming the free local speech models (first run only)...');
-    await run(python, ['-m', 'harry_botter_voice.setup_models'], {
-      cwd: voiceDir,
-      env: {
-        ...env,
-        HF_HUB_OFFLINE: '0',
-        PYTHONPATH: path.join(voiceDir, 'src'),
-      },
-    });
+    try {
+      await run(python, ['-m', 'harry_botter_voice.setup_models'], {
+        cwd: voiceDir,
+        env: {
+          ...env,
+          HF_HUB_OFFLINE: '0',
+          PYTHONPATH: path.join(voiceDir, 'src'),
+        },
+      });
+    } catch (error) {
+      log(`Speech models could not be prepared: ${error.message}`);
+      log('The voice service will still start for typing chat; check speech status and complete model setup before using audio.');
+    }
   }
 
-  log('Building the app...');
-  await npmCommand(['run', 'build']);
+  if (process.env.HARRY_BOTTER_SKIP_BUILD !== '1') {
+    log('Building the app...');
+    await npmCommand(['run', 'build']);
+  }
 
   const voice = startProcess(python, ['-m', 'harry_botter_voice', '--port', String(voicePort)], {
     cwd: voiceDir,

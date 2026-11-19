@@ -3,7 +3,7 @@
 import gc
 import os
 
-from .speech import create_kokoro_pipeline
+from .speech import SUPPORTED_TTS_VOICES, create_kokoro_pipeline, kokoro_language_code
 
 
 def main() -> None:
@@ -14,7 +14,12 @@ def main() -> None:
     device = os.environ.get("HARRY_BOTTER_STT_DEVICE", "cpu")
     compute_type = os.environ.get("HARRY_BOTTER_STT_COMPUTE_TYPE", "int8")
     cpu_threads = int(os.environ.get("HARRY_BOTTER_STT_CPU_THREADS", "2"))
-    voice = os.environ.get("HARRY_BOTTER_TTS_VOICE", "af_heart")
+    configured_voice = os.environ.get("HARRY_BOTTER_TTS_VOICE", "af_heart")
+    if configured_voice not in SUPPORTED_TTS_VOICES:
+        raise SystemExit(
+            "HARRY_BOTTER_TTS_VOICE must be a supported Kokoro American English voice."
+        )
+    voices = list(dict.fromkeys((configured_voice, *SUPPORTED_TTS_VOICES)))
 
     try:
         from faster_whisper import WhisperModel
@@ -32,13 +37,21 @@ def main() -> None:
     )
     del whisper_model
     gc.collect()
-    print("Preparing the Kokoro English model...")
-    pipeline = create_kokoro_pipeline(
-        device=os.environ.get("HARRY_BOTTER_TTS_DEVICE", "cpu"),
-    )
-    for _ in pipeline("Local voice setup check.", voice=voice):
-        pass
-    print("Speech models are cached. You can now run the service with HF_HUB_OFFLINE=1.")
+    device = os.environ.get("HARRY_BOTTER_TTS_DEVICE", "cpu")
+    for language_code in ("a", "b"):
+        language_voices = [
+            voice for voice in voices
+            if kokoro_language_code(voice) == language_code
+        ]
+        if not language_voices:
+            continue
+        print(f"Preparing Kokoro language {language_code}...")
+        pipeline = create_kokoro_pipeline(device=device, lang_code=language_code)
+        for voice in language_voices:
+            print(f"Preparing Kokoro voice {voice}...")
+            for _ in pipeline("Local voice setup check.", voice=voice):
+                pass
+    print("Speech models and the supported generic voices are cached. You can now run the service with HF_HUB_OFFLINE=1.")
 
 
 if __name__ == "__main__":

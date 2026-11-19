@@ -38,6 +38,7 @@ try:
         navigation_set_velocity,
         parse_robot_program,
         robot_status,
+        speak_robot_text,
         stop_navigation_velocity,
         stop_robot,
     )
@@ -89,6 +90,10 @@ try:
         navigation_start_route,
     )
     from .map_alignment import MapAlignmentError, align_occupancy_maps, transform_pose_between_maps
+    from .harry_botter_api import (
+        create_harry_botter_router,
+        initialize_harry_botter_schema,
+    )
 except ImportError:
     from g1_robot import (
         CommandValidationError,
@@ -98,6 +103,7 @@ except ImportError:
         navigation_set_velocity,
         parse_robot_program,
         robot_status,
+        speak_robot_text,
         stop_navigation_velocity,
         stop_robot,
     )
@@ -149,6 +155,10 @@ except ImportError:
         navigation_start_route,
     )
     from map_alignment import MapAlignmentError, align_occupancy_maps, transform_pose_between_maps
+    from harry_botter_api import (
+        create_harry_botter_router,
+        initialize_harry_botter_schema,
+    )
 
 G1_JOINT_NAMES = tuple(name for name, _ in JOINT_MOTOR_INDICES)
 DUET_ARM_JOINT_NAMES = tuple(
@@ -1375,6 +1385,7 @@ def init_db():
         )
         """
     )
+    initialize_harry_botter_schema(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS navigation_map_versions (
@@ -2958,6 +2969,16 @@ def auth_required(authorization: Optional[str] = Header(default=None)):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
     return user
+
+
+app.include_router(
+    create_harry_botter_router(
+        get_db_connection,
+        auth_required,
+        get_user_from_token,
+        speak_robot_text,
+    )
+)
 
 
 @app.get("/api/github-proxy")

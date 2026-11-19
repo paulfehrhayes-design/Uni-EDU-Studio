@@ -34,6 +34,19 @@ MAX_MESSAGE_CHARS = 2_000
 MAX_HISTORY_MESSAGES = 12
 MAX_KNOWLEDGE_DOCUMENTS = 3
 MAX_KNOWLEDGE_EXCERPT_CHARS = 2_500
+MAX_BEHAVIOR_SECTIONS = 8
+MAX_POLICY_REVIEW_SOURCES = 3
+MAX_POLICY_REVIEW_SOURCE_CHARS = 2_500
+BEHAVIOR_SECTION_IDS = {
+    "persona",
+    "role",
+    "curriculum",
+    "learner_support",
+    "safeguarding",
+    "information_use",
+    "school_context",
+    "voice_personality",
+}
 LEARNING_LEVELS = {
     "Early Years",
     *(f"PYP {year}" for year in range(1, 6)),
@@ -41,7 +54,13 @@ LEARNING_LEVELS = {
     "DP 1",
     "DP 2",
 }
-TONES = {"Formal", "Lightly humorous"}
+TONES = {
+    "Formal",
+    "Lightly humorous",
+    "Warm and encouraging",
+    "Curious/Socratic",
+    "Concise",
+}
 
 
 def _is_iso_date(value: str) -> bool:
@@ -122,6 +141,16 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             if payload is not None:
                 self._create_draft(payload)
             return
+        if path == "/api/v1/model/select":
+            payload = self._read_json()
+            if payload is not None:
+                self._select_model(payload)
+            return
+        if path == "/api/v1/policy-review":
+            payload = self._read_json()
+            if payload is not None:
+                self._create_policy_review(payload)
+            return
         if path == "/api/v1/transcribe":
             audio = self._read_audio()
             if audio is not None:
@@ -191,7 +220,15 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"session": session.to_dict()})
 
     def _create_draft(self, payload: dict[str, Any]) -> None:
-        allowed_keys = {"text", "learning_level", "tone", "history", "agent", "knowledge"}
+        allowed_keys = {
+            "text",
+            "learning_level",
+            "tone",
+            "history",
+            "agent",
+            "knowledge",
+            "sections",
+        }
         if set(payload) - allowed_keys:
             self._send_error(400, "invalid_request", "The draft request contains unsupported fields.")
             return
@@ -202,6 +239,7 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         history = payload.get("history", [])
         agent = payload.get("agent")
         knowledge = payload.get("knowledge", [])
+        sections = payload.get("sections", [])
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
             self._send_error(
                 400,
@@ -268,7 +306,15 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             return
         if any(
             not isinstance(item, dict)
-            or set(item) != {"title", "source", "owner", "review_date", "excerpt"}
+            or set(item) != {
+                "title",
+                "source",
+                "owner",
+                "section_id",
+                "section_title",
+                "review_date",
+                "excerpt",
+            }
             or any(
                 not isinstance(item.get(key), str)
                 or not item[key].strip()
@@ -277,15 +323,42 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                     ("title", 160),
                     ("source", 500),
                     ("owner", 120),
+                    ("section_id", 64),
+                    ("section_title", 100),
                     ("excerpt", MAX_KNOWLEDGE_EXCERPT_CHARS),
                 )
             )
             or not isinstance(item.get("review_date"), str)
-            or len(item["review_date"]) != 10
-            or not _is_iso_date(item["review_date"])
+            or (
+                item["review_date"]
+                and (
+                    len(item["review_date"]) != 10
+                    or not _is_iso_date(item["review_date"])
+                )
+            )
             for item in knowledge
         ):
             self._send_error(400, "invalid_knowledge", "A knowledge excerpt is invalid.")
+            return
+        if not isinstance(sections, list) or len(sections) > MAX_BEHAVIOR_SECTIONS:
+            self._send_error(400, "invalid_sections", "Too many behavior sections were provided.")
+            return
+        if any(
+            not isinstance(item, dict)
+            or set(item) != {"section_id", "title", "guidance"}
+            or any(
+                not isinstance(item.get(key), str)
+                or not item[key].strip()
+                or len(item[key]) > limit
+                for key, limit in (
+                    ("section_id", 64),
+                    ("title", 120),
+                    ("guidance", 5_000),
+                )
+            )
+            for item in sections
+        ):
+            self._send_error(400, "invalid_sections", "A behavior section is invalid.")
             return
 
         if not learning_level:
@@ -299,7 +372,6 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
-            return
 
         try:
             answer, model_name, route = self.server.model_client.complete_with_route(
@@ -309,6 +381,7 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                 history,
                 agent,
                 knowledge,
+                sections,
             )
         except LocalModelNotConfigured as exc:
             self._send_error(503, "model_not_configured", str(exc))
@@ -331,11 +404,139 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                         {
                             "title": item["title"],
                             "source": item["source"],
+                            "section_id": item["section_id"],
+                            "section_title": item["section_title"],
                             "review_date": item["review_date"],
                         }
                         for item in knowledge
                     ],
                 }
+            },
+        )
+
+    def _select_model(self, payload: dict[str, Any]) -> None:
+        if set(payload) != {"route", "model"}:
+            self._send_error(400, "invalid_request", "Select a model route and model ID.")
+            return
+        route = payload.get("route")
+        model = payload.get("model")
+        if (
+            not isinstance(route, str)
+            or route not in {"local", "network"}
+            or not isinstance(model, str)
+            or not model.strip()
+            or len(model) > 200
+        ):
+            self._send_error(400, "invalid_model", "Select an available model route and model ID.")
+            return
+        try:
+            self.server.model_client.select_model(route, model.strip())
+            status = self.server.model_client.status()
+        except LocalModelNotConfigured as exc:
+            self._send_error(400, "model_not_available", str(exc))
+            return
+        except LocalModelError as exc:
+            self._send_error(502, "model_selection_error", str(exc))
+            return
+        self._send_json(200, status)
+
+    def _create_policy_review(self, payload: dict[str, Any]) -> None:
+        if set(payload) != {
+            "section_id",
+            "section_title",
+            "current_guidance",
+            "sources",
+        }:
+            self._send_error(
+                400,
+                "invalid_request",
+                "The policy review request contains unsupported fields.",
+            )
+            return
+        section_id = payload.get("section_id")
+        section_title = payload.get("section_title")
+        current_guidance = payload.get("current_guidance")
+        sources = payload.get("sources")
+        if (
+            not isinstance(section_id, str)
+            or section_id not in BEHAVIOR_SECTION_IDS
+            or not isinstance(section_title, str)
+            or not section_title.strip()
+            or len(section_title) > 120
+            or not isinstance(current_guidance, str)
+            or len(current_guidance) > 5_000
+            or not isinstance(sources, list)
+            or not 1 <= len(sources) <= MAX_POLICY_REVIEW_SOURCES
+        ):
+            self._send_error(400, "invalid_request", "Policy review inputs are invalid.")
+            return
+        required_source_keys = {
+            "reference_id",
+            "title",
+            "source",
+            "owner",
+            "review_date",
+            "excerpt",
+        }
+        if any(
+            not isinstance(source, dict)
+            or set(source) != required_source_keys
+            or any(
+                not isinstance(source.get(key), str)
+                or not source[key].strip()
+                or len(source[key]) > limit
+                for key, limit in (
+                    ("reference_id", 80),
+                    ("title", 170),
+                    ("source", 500),
+                    ("owner", 120),
+                    ("excerpt", MAX_POLICY_REVIEW_SOURCE_CHARS),
+                )
+            )
+            or not isinstance(source.get("review_date"), str)
+            or (
+                source["review_date"]
+                and (
+                    len(source["review_date"]) != 10
+                    or not _is_iso_date(source["review_date"])
+                )
+            )
+            for source in sources
+        ):
+            self._send_error(400, "invalid_sources", "A policy review reference is invalid.")
+            return
+        try:
+            proposal, model, route = self.server.model_client.review_policy_sources(
+                section_id,
+                section_title,
+                current_guidance,
+                sources,
+            )
+        except LocalModelNotConfigured as exc:
+            self._send_error(503, "model_not_configured", str(exc))
+            return
+        except LocalModelUnavailable as exc:
+            self._send_error(503, "model_unavailable", str(exc))
+            return
+        except LocalModelError as exc:
+            self._send_error(502, "model_error", str(exc))
+            return
+        self._send_json(
+            200,
+            {
+                "proposal": proposal,
+                "model": model,
+                "route": route,
+                "sources": [
+                    {
+                        "reference_id": source["reference_id"],
+                        "title": source["title"],
+                        "source": source["source"],
+                        "owner": source["owner"],
+                        "review_date": source["review_date"],
+                    }
+                    for source in sources
+                ],
             },
         )
 
@@ -354,8 +555,12 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"transcript": transcript, "model": self.server.speech_runtime.transcription_model})
 
     def _synthesize(self, payload: dict[str, Any]) -> None:
-        if set(payload) - {"text", "speed"} or "text" not in payload:
-            self._send_error(400, "invalid_request", "Speech requests must contain text and an optional speed.")
+        if set(payload) - {"text", "speed", "voice"} or "text" not in payload:
+            self._send_error(
+                400,
+                "invalid_request",
+                "Speech requests must contain text and optional speed and voice settings.",
+            )
             return
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_SPEECH_CHARS:
@@ -373,8 +578,23 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         ):
             self._send_error(400, "invalid_speed", "Speech speed must be between 0.75 and 1.25.")
             return
+        voice = payload.get("voice")
+        available_voices = self.server.speech_runtime.available_voices()
+        if voice is not None and (
+            not isinstance(voice, str) or voice not in available_voices
+        ):
+            self._send_error(
+                400,
+                "invalid_voice",
+                "Choose a voice available in the local speech service settings.",
+            )
+            return
         try:
-            audio = self.server.speech_runtime.synthesize(text, speed=float(speed))
+            audio = self.server.speech_runtime.synthesize(
+                text,
+                speed=float(speed),
+                voice=voice,
+            )
         except SpeechRuntimeNotConfigured as exc:
             self._send_error(503, "speech_not_configured", str(exc))
             return

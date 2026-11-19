@@ -5,7 +5,7 @@ import re
 import threading
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from .speech import (
     MAX_STREAM_UTTERANCE_BYTES,
@@ -125,7 +125,10 @@ class StreamingSpeechSession:
         }
 
 
-def make_audio_stream_handler(speech_runtime: LocalSpeechRuntime):
+def make_audio_stream_handler(
+    speech_runtime: LocalSpeechRuntime,
+    vad_factory: Callable[[], Any] | None = None,
+):
     def handle(connection) -> None:
         from websockets.exceptions import ConnectionClosed
 
@@ -154,7 +157,10 @@ def make_audio_stream_handler(speech_runtime: LocalSpeechRuntime):
                 or start_payload["format"] != "pcm_s16le_mono"
             ):
                 raise ValueError("The audio stream start message is invalid.")
-            session = StreamingSpeechSession(speech_runtime)
+            session = StreamingSpeechSession(
+                speech_runtime,
+                vad=vad_factory() if vad_factory is not None else None,
+            )
             session.start(start_payload["session_id"])
         except SpeechRuntimeNotConfigured as exc:
             connection.send(
@@ -219,11 +225,12 @@ def start_audio_stream_server(
     speech_runtime: LocalSpeechRuntime,
     host: str = "127.0.0.1",
     port: int = 8766,
+    vad_factory: Callable[[], Any] | None = None,
 ):
     from websockets.sync.server import serve
 
     server = serve(
-        make_audio_stream_handler(speech_runtime),
+        make_audio_stream_handler(speech_runtime, vad_factory),
         host,
         port,
         subprotocols=[STREAM_SUBPROTOCOL],

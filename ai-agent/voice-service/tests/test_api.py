@@ -6,6 +6,7 @@ from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 from harry_botter_voice.api import make_server
+from harry_botter_voice.speech import LocalSpeechRuntime, QWEN_VOICE_DESIGN_ID
 
 
 class VoiceAPITests(unittest.TestCase):
@@ -51,6 +52,58 @@ class VoiceAPITests(unittest.TestCase):
         self.assertFalse(response["capabilities"]["audio_capture"])
         self.assertFalse(response["capabilities"]["motion"])
 
+    def test_speech_status_reports_configured_kokoro_voice(self) -> None:
+        status, response = self.request("GET", "/api/v1/speech/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(response["speech_generation"]["voice"], "af_heart")
+        self.assertEqual(
+            response["speech_generation"]["available_voices"],
+            self.server.speech_runtime.available_voices(),
+        )
+
+    def test_model_selection_route_updates_the_selected_local_model(self) -> None:
+        from harry_botter_voice.local_llm import LocalOpenAIClient
+
+        model_client = LocalOpenAIClient(
+            base_url="http://127.0.0.1:11434/v1",
+            model="old-model",
+        )
+        model_client._request_json = lambda *_args, **_kwargs: {
+            "data": [{"id": "available-model"}],
+        }
+        self.server.model_client = model_client
+        status, response = self.request(
+            "POST",
+            "/api/v1/model/select",
+            data=json.dumps({"route": "local", "model": "available-model"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(model_client.model, "available-model")
+        self.assertEqual(response["model"], "available-model")
+
+        status, response = self.request(
+            "POST",
+            "/api/v1/model/select",
+            data=json.dumps({"route": "local", "model": "missing-model"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"]["code"], "model_not_available")
+
+    def test_unsupported_configured_voice_returns_a_visible_error(self) -> None:
+        runtime = LocalSpeechRuntime()
+        runtime.tts_voice = "unsupported"
+        self.server.speech_runtime = runtime
+        status, response = self.request(
+            "POST",
+            "/api/v1/speech",
+            data=json.dumps({"text": "Test the configured voice."}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(response["error"]["code"], "speech_generation_error")
+
     def test_local_speech_endpoints_transcribe_and_synthesize_without_retaining_audio(self) -> None:
         class ReadySpeechRuntime:
             transcription_model = "test-whisper"
@@ -65,12 +118,15 @@ class VoiceAPITests(unittest.TestCase):
                     "speech_generation": {"available": True, "voice": "test-generic"},
                 }
 
+            def available_voices(self):
+                return ["af_heart", "bm_fable", QWEN_VOICE_DESIGN_ID]
+
             def transcribe(self, audio, content_type):
                 self.transcription_request = (audio, content_type)
                 return "Explain evaporation."
 
-            def synthesize(self, text, speed=1.0):
-                self.speech_request = (text, speed)
+            def synthesize(self, text, speed=1.0, voice=None):
+                self.speech_request = (text, speed, voice)
                 return b"RIFF-test-wave"
 
         speech_runtime = ReadySpeechRuntime()
@@ -101,17 +157,24 @@ class VoiceAPITests(unittest.TestCase):
         with urlopen(request, timeout=2) as audio_response:
             self.assertEqual(audio_response.headers.get_content_type(), "audio/wav")
             self.assertEqual(audio_response.read(), b"RIFF-test-wave")
-        self.assertEqual(speech_runtime.speech_request, ("A spoken local answer.", 1.0))
+        self.assertEqual(speech_runtime.speech_request, ("A spoken local answer.", 1.0, None))
 
         request = Request(
             f"{self.base_url}/api/v1/speech",
-            data=json.dumps({"text": "A slower local answer.", "speed": 0.85}).encode("utf-8"),
+            data=json.dumps({
+                "text": "A slower local answer.",
+                "speed": 0.85,
+                "voice": QWEN_VOICE_DESIGN_ID,
+            }).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urlopen(request, timeout=2) as audio_response:
             self.assertEqual(audio_response.read(), b"RIFF-test-wave")
-        self.assertEqual(speech_runtime.speech_request, ("A slower local answer.", 0.85))
+        self.assertEqual(
+            speech_runtime.speech_request,
+            ("A slower local answer.", 0.85, QWEN_VOICE_DESIGN_ID),
+        )
 
         status, response = self.request(
             "POST",
@@ -121,6 +184,15 @@ class VoiceAPITests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(response["error"]["code"], "invalid_speed")
+
+        status, response = self.request(
+            "POST",
+            "/api/v1/speech",
+            data=json.dumps({"text": "Unapproved voice.", "voice": "not-a-supported-voice"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"]["code"], "invalid_voice")
 
         status, response = self.request(
             "POST",
@@ -228,6 +300,7 @@ class VoiceAPITests(unittest.TestCase):
                 "generation_max_tokens": 500,
             },
             "knowledge": [],
+            "sections": [],
         }
         status, response = self.request(
             "POST",
@@ -265,8 +338,8 @@ class VoiceAPITests(unittest.TestCase):
             model = "test-local-model"
             is_configured = True
 
-            def complete_with_route(self, text, learning_level, tone, history, agent, knowledge):
-                self.request = (text, learning_level, tone, history, agent, knowledge)
+            def complete_with_route(self, text, learning_level, tone, history, agent, knowledge, sections):
+                self.request = (text, learning_level, tone, history, agent, knowledge, sections)
                 return "A teacher-reviewable local draft.", "test-local-model", "local"
 
         model_client = ReadyModelClient()
@@ -283,8 +356,15 @@ class VoiceAPITests(unittest.TestCase):
             "title": "Debate guide",
             "source": "Approved class handout",
             "owner": "Humanities team",
+            "section_id": "curriculum",
+            "section_title": "Curriculum and content boundaries",
             "review_date": "2027-10-01",
             "excerpt": "Use respectful counterarguments.",
+        }]
+        sections = [{
+            "section_id": "persona",
+            "title": "Harry Botter identity and persona",
+            "guidance": "Use a calm and curious robot voice.",
         }]
         status, response = self.request(
             "POST",
@@ -296,6 +376,7 @@ class VoiceAPITests(unittest.TestCase):
                 "history": [],
                 "agent": agent,
                 "knowledge": knowledge,
+                "sections": sections,
             }).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
@@ -307,10 +388,113 @@ class VoiceAPITests(unittest.TestCase):
         self.assertEqual(response["draft"]["sources"], [{
             "title": "Debate guide",
             "source": "Approved class handout",
+            "section_id": "curriculum",
+            "section_title": "Curriculum and content boundaries",
             "review_date": "2027-10-01",
         }])
         self.assertEqual(model_client.request[4], agent)
         self.assertEqual(model_client.request[5], knowledge)
+        self.assertEqual(model_client.request[6], sections)
+
+    def test_policy_review_endpoint_returns_a_proposal_with_source_provenance(self) -> None:
+        class PolicyModelClient:
+            def review_policy_sources(self, section_id, section_title, current_guidance, sources):
+                self.request = (section_id, section_title, current_guidance, sources)
+                return {
+                    "proposed_guidance": "Use the supplied procedure.",
+                    "source_notes": ["[R1] supports this proposal."],
+                    "conflicts": [],
+                    "open_questions": ["Confirm stage applicability."],
+                }, "test-local-model", "local"
+
+        model_client = PolicyModelClient()
+        self.server.model_client = model_client
+        source = {
+            "reference_id": "doc-1",
+            "title": "[R1] School policy",
+            "source": "Approved school document",
+            "owner": "Safeguarding lead",
+            "review_date": "2027-10-01",
+            "excerpt": "A short approved excerpt.",
+        }
+        status, response = self.request(
+            "POST",
+            "/api/v1/policy-review",
+            data=json.dumps({
+                "section_id": "safeguarding",
+                "section_title": "Safeguarding guidance",
+                "current_guidance": "Current guidance.",
+                "sources": [source],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["proposal"]["conflicts"], [])
+        self.assertEqual(response["model"], "test-local-model")
+        self.assertEqual(response["sources"][0]["reference_id"], "doc-1")
+        self.assertEqual(model_client.request[3], [source])
+
+    def test_policy_review_endpoint_rejects_bad_section_date_and_extra_fields(self) -> None:
+        base_payload = {
+            "section_id": "safeguarding",
+            "section_title": "Safeguarding guidance",
+            "current_guidance": "",
+            "sources": [{
+                "reference_id": "doc-1",
+                "title": "[R1] Policy",
+                "source": "Approved document",
+                "owner": "Teacher",
+                "review_date": "",
+                "excerpt": "A short excerpt.",
+            }],
+        }
+        for payload, expected_error in (
+            ({**base_payload, "section_id": "unknown"}, "invalid_request"),
+            (
+                {
+                    **base_payload,
+                    "sources": [{**base_payload["sources"][0], "review_date": "not-a-date"}],
+                },
+                "invalid_sources",
+            ),
+            ({**base_payload, "unexpected": "field"}, "invalid_request"),
+        ):
+            with self.subTest(payload=payload):
+                status, response = self.request(
+                    "POST",
+                    "/api/v1/policy-review",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(response["error"]["code"], expected_error)
+
+    def test_draft_endpoint_accepts_teacher_preview_tone_presets(self):
+        class ToneModelClient:
+            model = "test-local-model"
+            is_configured = True
+
+            def complete_with_route(self, text, learning_level, tone, history, agent, knowledge, sections):
+                self.tone = tone
+                return "A teacher-reviewable local draft.", "test-local-model", "local"
+
+        model_client = ToneModelClient()
+        self.server.model_client = model_client
+        status, response = self.request(
+            "POST",
+            "/api/v1/drafts",
+            data=json.dumps({
+                "text": "Help me think about this.",
+                "learning_level": "MYP 2",
+                "tone": "Curious/Socratic",
+                "history": [],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(model_client.tone, "Curious/Socratic")
 
 
 if __name__ == "__main__":

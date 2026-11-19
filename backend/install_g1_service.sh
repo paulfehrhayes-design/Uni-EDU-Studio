@@ -22,6 +22,11 @@ if ! command -v npm >/dev/null 2>&1; then
   echo "Node.js and npm are required for the initial frontend build." >&2
   exit 1
 fi
+NODE_BIN="$(command -v node)"
+if [[ -z "$NODE_BIN" ]]; then
+  echo "Node.js is required to launch the AI and backend services." >&2
+  exit 1
+fi
 
 LIDAR_CONFIGURED=0
 LIDAR_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uni-edu-studio"
@@ -110,20 +115,24 @@ UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_DIR/uni-edu-studio.service" <<EOF
 [Unit]
-Description=Uni EDU Studio G1 robot control backend
+Description=Uni EDU Studio application and Harry Botter AI services
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=$PROJECT_DIR
+Environment=PATH=$PATH
 Environment=CYCLONEDDS_HOME=$HOME/cyclonedds/install
 Environment=UNITREE_DOMAIN_ID=0
 Environment=UNITREE_INTERFACE=$UNITREE_INTERFACE
 Environment=UNI_EDU_PORT=5179
+Environment=UNI_EDU_PYTHON=$PYTHON
+Environment=HARRY_BOTTER_SKIP_BUILD=1
 Environment=DUET_CONTROL_DIR=$DUET_CONTROL_DIR
 Environment=DUET_EXPECTED_POLICY_ID=$DUET_EXPECTED_POLICY_ID
-ExecStart=$PYTHON $PROJECT_DIR/backend/server.py
+EnvironmentFile=-$PROJECT_DIR/.env.harry-botter.local
+ExecStart=$NODE_BIN $PROJECT_DIR/scripts/start-program.js
 Restart=on-failure
 RestartSec=3
 
@@ -219,12 +228,15 @@ fi
 systemctl --user enable uni-edu-studio.service
 systemctl --user restart uni-edu-studio.service
 APP_READY=0
-for attempt in {1..15}; do
+for attempt in {1..600}; do
   if "$PYTHON" -c \
     'from urllib.request import ProxyHandler, build_opener; build_opener(ProxyHandler({})).open("http://127.0.0.1:5179/", timeout=1).read(1)' \
     >/dev/null 2>&1; then
     APP_READY=1
     break
+  fi
+  if (( attempt % 30 == 0 )); then
+    echo "Waiting for AI model/service initialization ($attempt seconds elapsed)..."
   fi
   sleep 1
 done
@@ -238,8 +250,10 @@ fi
 sudo loginctl enable-linger "$USER"
 
 echo
-echo "Uni EDU Studio is serving its frontend and will start automatically at boot."
-echo "Open http://<this-computer-wifi-ip>:5179 on a device connected to the same Wi-Fi."
+echo "Uni EDU Studio and the Harry Botter voice stack are serving the app and will start automatically at boot."
+echo "Local model configuration: $PROJECT_DIR/.env.harry-botter.local (optional; see .env.harry-botter.example)."
+echo "Open http://<this-computer-wifi-ip>:5179 on a device connected to the same Wi-Fi for text chat."
+echo "Remote browser microphone access requires trusted HTTPS; localhost on this computer is supported."
 echo "Check service status with: systemctl --user status uni-edu-studio"
 echo "DUET controller unit is installed but is NOT enabled or started."
 echo "Before any operator start: verify robot model, clear the area, have a qualified operator present, review the unit, and confirm the chosen DDS interface."

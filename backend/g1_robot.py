@@ -793,6 +793,38 @@ def _sdk_result(result: Any, operation: str) -> None:
         raise RuntimeError(f"G1 SDK operation {operation} failed with code {result}.")
 
 
+def speak_robot_text(text: str, speaker_id: int) -> dict[str, str]:
+    if (
+        not isinstance(text, str)
+        or not text.strip()
+        or len(text) > 120
+        or "\n" in text
+        or "\r" in text
+        or any(ord(character) < 32 for character in text)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="G1 speech must be a non-empty single line of at most 120 characters.",
+        )
+    if isinstance(speaker_id, bool) or not isinstance(speaker_id, int) or speaker_id not in (0, 1):
+        raise HTTPException(status_code=400, detail="G1 speaker ID must be 0 or 1.")
+    if not _run_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the active G1 program before sending a speech preview.",
+        )
+    try:
+        if _audio_client is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Connect the G1 audio client before using text-to-speech.",
+            )
+        _sdk_result(_audio_client.TtsMaker(text.strip(), speaker_id), "TtsMaker")
+        return {"status": "accepted"}
+    finally:
+        _run_lock.release()
+
+
 def _validate_safe_mode_commands(nodes: list[dict[str, Any]]) -> None:
     for node in nodes:
         if node.get("type") == "repeat":

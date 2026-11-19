@@ -19,6 +19,9 @@ audio = [
     "webrtcvad-wheels==2.0.14.post1",
     "websockets==15.0.1",
 ]
+voice-design = [
+    "qwen-tts==0.1.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
