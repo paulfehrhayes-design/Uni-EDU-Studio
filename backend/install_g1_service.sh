@@ -14,6 +14,30 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "Unitree SDK virtual environment not found. Set G1_SDK_ENV_DIR to its path." >&2
   exit 1
 fi
+voice_python_supported() {
+  "$1" -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] <= (3, 13)))' \
+    >/dev/null 2>&1
+}
+VOICE_PYTHON=""
+for candidate in \
+  "$PROJECT_DIR/.venv-audio312/bin/python" \
+  "$PROJECT_DIR/ai-agent/voice-service/.venv/bin/python" \
+  python3.12 python3.11 python3.10 python3.13 python3 python; do
+  if [[ "$candidate" == */* ]]; then
+    [[ -x "$candidate" ]] || continue
+  elif ! command -v "$candidate" >/dev/null 2>&1; then
+    continue
+  fi
+  if voice_python_supported "$candidate"; then
+    VOICE_PYTHON="$candidate"
+    break
+  fi
+done
+if [[ -z "$VOICE_PYTHON" ]]; then
+  echo "The Harry Botter voice service requires Python 3.10-3.13; no compatible Python was found." >&2
+  echo "Install Python 3.12 (the Unitree SDK environment may remain on Python 3.8) and rerun this installer." >&2
+  exit 1
+fi
 if [[ "$DUET_CONTROL_DIR" != /* ]]; then
   echo "DUET_CONTROL_DIR must be an absolute path." >&2
   exit 1
@@ -236,12 +260,14 @@ for attempt in {1..600}; do
     break
   fi
   if (( attempt % 30 == 0 )); then
-    echo "Waiting for AI model/service initialization ($attempt seconds elapsed)..."
+    echo "Waiting for Uni-EDU HTTP service on 127.0.0.1:5179 ($attempt seconds elapsed)..."
+    echo "Recent application service logs:"
+    journalctl --user -u uni-edu-studio.service -n 30 --no-pager || true
   fi
   sleep 1
 done
 if [[ "$APP_READY" != "1" ]]; then
-  echo "Uni EDU Studio did not serve its frontend on http://127.0.0.1:5179 after restart." >&2
+  echo "Uni EDU Studio did not serve its HTTP endpoint on http://127.0.0.1:5179 after restart." >&2
   echo "Service status and recent logs:" >&2
   systemctl --user --no-pager -l status uni-edu-studio.service >&2 || true
   journalctl --user -u uni-edu-studio.service -n 40 --no-pager >&2 || true

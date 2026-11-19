@@ -135,6 +135,21 @@ function canBind(portNumber) {
   });
 }
 
+function getPythonVersion(binary) {
+  const result = spawnSync(binary, ['-c', 'import sys; print(sys.version_info.major, sys.version_info.minor)'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (result.status !== 0) return null;
+  const match = result.stdout.match(/(\d+)\s+(\d+)/);
+  if (!match) return null;
+  return { major: Number(match[1]), minor: Number(match[2]) };
+}
+
+function isSupportedPythonVersion(version) {
+  return version?.major === 3 && version.minor >= 10 && version.minor <= 13;
+}
+
 function findPython() {
   const windows = process.platform === 'win32';
   const venvPaths = [
@@ -142,21 +157,20 @@ function findPython() {
     path.join(voiceDir, '.venv', windows ? 'Scripts/python.exe' : 'bin/python'),
   ];
   for (const candidate of venvPaths) {
-    if (existsSync(candidate)) return { binary: candidate, isVenv: true };
+    if (
+      existsSync(candidate)
+      && isSupportedPythonVersion(getPythonVersion(candidate))
+    ) {
+      return { binary: candidate, isVenv: true };
+    }
   }
 
   const candidates = [
     process.env.UNI_EDU_PYTHON,
-    ...(windows ? ['python'] : ['python3.12', 'python3', 'python']),
+    ...(windows ? ['python'] : ['python3.12', 'python3.11', 'python3.10', 'python3.13', 'python3', 'python']),
   ].filter(Boolean);
   for (const binary of candidates) {
-    const result = spawnSync(binary, ['-c', 'import sys; print(sys.version_info[:2])'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    if (result.status !== 0) continue;
-    const [major, minor] = result.stdout.match(/\d+/g).map(Number);
-    if (major === 3 && minor >= 10 && minor <= 13) return { binary, isVenv: false };
+    if (isSupportedPythonVersion(getPythonVersion(binary))) return { binary, isVenv: false };
   }
   throw new Error('Python 3.10–3.13 is required. Install Python 3.12 and run npm start again.');
 }
