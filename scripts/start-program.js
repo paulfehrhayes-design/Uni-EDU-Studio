@@ -205,19 +205,18 @@ async function ensureOllama(env) {
     return;
   }
 
-  const version = spawnSync('ollama', ['--version'], { stdio: 'ignore' });
-  if (version.status !== 0) {
-    log(
-      'Ollama is not installed. The app will still start, but the default local model '
-      + 'is unavailable until a compatible runtime is installed or configured.',
-    );
-    return;
-  }
-
+  const hasOllamaCli = spawnSync('ollama', ['--version'], { stdio: 'ignore' }).status === 0;
   let server = null;
   try {
     server = await fetchJson(`${ollamaUrl}/api/tags`);
   } catch {
+    if (!hasOllamaCli) {
+      log(
+        'Ollama is not reachable and its CLI is not installed. The app will still start, '
+        + 'but the default local model is unavailable until a compatible runtime is configured.',
+      );
+      return;
+    }
     log('Starting the local Ollama server...');
     const child = startProcess('ollama', ['serve'], {
       env: {
@@ -234,6 +233,10 @@ async function ensureOllama(env) {
   const installed = Array.isArray(server.models)
     && server.models.some((model) => model.name === selectedModel || model.name.startsWith(`${selectedModel}-`));
   if (!installed) {
+    if (!hasOllamaCli) {
+      log(`The Ollama server is reachable, but ${selectedModel} is not installed and the Ollama CLI is unavailable.`);
+      return;
+    }
     log(`Downloading the free local fallback model ${selectedModel} (first run only)...`);
     await run('ollama', ['pull', selectedModel], {
       env: {
@@ -293,8 +296,14 @@ async function shutdown(exitCode = 0) {
 }
 
 async function ensureBackendPython() {
+  const backendVenvPython = path.join(
+    root,
+    '.venv-backend',
+    process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python',
+  );
   const candidates = [
     process.env.UNI_EDU_PYTHON,
+    backendVenvPython,
     process.platform === 'win32' ? 'python' : 'python3',
     process.platform === 'win32' ? null : 'python',
   ].filter(Boolean);
@@ -309,7 +318,17 @@ async function ensureBackendPython() {
 
   const basePython = findPython().binary;
   const venv = path.join(root, '.venv-backend');
-  await run(basePython, ['-m', 'venv', venv]);
+  const venvResult = spawnSync(basePython, ['-m', 'venv', venv], { stdio: 'ignore' });
+  if (venvResult.status !== 0) {
+    try {
+      await run('virtualenv', ['--python', basePython, venv]);
+    } catch {
+      throw new Error(
+        'Could not create the backend Python environment. Install the matching Python venv package '
+        + 'or the virtualenv utility, then retry.',
+      );
+    }
+  }
   const python = path.join(
     venv,
     process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python',
@@ -374,6 +393,41 @@ try {
     },
   });
   await waitForService(`http://127.0.0.1:${voicePort}/api/v1/health`, voice, 'Voice service');
+
+  try {
+    const modelStatus = await fetchJson(`http://127.0.0.1:${voicePort}/api/v1/model/status`);
+    if (modelStatus.status === 'ready') {
+      const response = await fetch(`http://127.0.0.1:${voicePort}/api/v1/model/warmup`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(90_000),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error?.message || result.detail || `HTTP ${response.status}`);
+      }
+      if (result.status === 'ready') {
+        log(`Warmed local model ${result.model}; first response avoids a cold model load.`);
+      }
+    } else {
+      log(`Local model warm-up skipped: ${modelStatus.error || 'the configured model is not ready.'}`);
+    }
+  } catch (error) {
+    log(`Local model warm-up failed; first draft may be slower: ${error.message}`);
+  }
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${voicePort}/api/v1/speech/warmup`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(90_000),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error?.message || result.detail || `HTTP ${response.status}`);
+    }
+    log(`Warmed local speech voice ${result.voice}; first spoken reply avoids model initialization.`);
+  } catch (error) {
+    log(`Local speech warm-up failed; first spoken reply may be slower: ${error.message}`);
+  }
 
   const backend = startProcess(backendPython, [path.join(root, 'backend', 'server.py')], {
     cwd: root,

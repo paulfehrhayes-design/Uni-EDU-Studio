@@ -208,6 +208,20 @@ class LocalOpenAIClient:
         )
         return answer
 
+    def warmup(self) -> dict[str, str]:
+        if not self.model:
+            return {"status": "skipped", "reason": "No local model is configured."}
+        _, model, route = self._complete_messages(
+            [
+                {"role": "system", "content": "Reply with READY only."},
+                {"role": "user", "content": "READY"},
+            ],
+            0,
+            8,
+            only_routes={"local"},
+        )
+        return {"status": "ready", "model": model, "route": route}
+
     def complete_with_route(
         self,
         text: str,
@@ -322,8 +336,13 @@ class LocalOpenAIClient:
         messages: list[dict[str, str]],
         temperature: float,
         max_tokens: int,
+        only_routes: set[str] | None = None,
     ) -> tuple[str, str, str]:
-        targets = self._targets()
+        targets = [
+            target
+            for target in self._targets()
+            if only_routes is None or target[0] in only_routes
+        ]
         if not targets:
             raise LocalModelNotConfigured(
                 "No local model is configured. Set HARRY_BOTTER_LOCAL_MODEL."
@@ -331,28 +350,52 @@ class LocalOpenAIClient:
         errors = []
         for route, base_url, model in targets:
             try:
-                response = self._request_json(
-                    "POST",
-                    "chat/completions",
-                    {
-                        "model": model,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                        "stream": False,
-                    },
-                    base_url=base_url,
-                )
+                if route == "local" and self._uses_default_ollama_api(base_url):
+                    response = self._request_json(
+                        "POST",
+                        "api/chat",
+                        {
+                            "model": model,
+                            "messages": messages,
+                            "stream": False,
+                            "think": False,
+                            "keep_alive": "10m",
+                            "options": {
+                                "temperature": temperature,
+                                "num_predict": max_tokens,
+                            },
+                        },
+                        base_url=base_url.removesuffix("/v1"),
+                    )
+                else:
+                    response = self._request_json(
+                        "POST",
+                        "chat/completions",
+                        {
+                            "model": model,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens,
+                            "stream": False,
+                        },
+                        base_url=base_url,
+                    )
             except LocalModelUnavailable as exc:
                 errors.append(exc)
                 continue
-            choices = response.get("choices")
-            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-                raise LocalModelError("Model server returned no chat completion.")
-            message = choices[0].get("message")
-            if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-                raise LocalModelError("Model server returned an invalid chat completion.")
-            completion = message["content"].strip()
+            if route == "local" and self._uses_default_ollama_api(base_url):
+                message = response.get("message")
+                if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+                    raise LocalModelError("Ollama returned an invalid chat completion.")
+                completion = message["content"].strip()
+            else:
+                choices = response.get("choices")
+                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                    raise LocalModelError("Model server returned no chat completion.")
+                message = choices[0].get("message")
+                if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+                    raise LocalModelError("Model server returned an invalid chat completion.")
+                completion = message["content"].strip()
             if not completion:
                 raise LocalModelError("Model server returned an empty chat completion.")
             if len(completion) > MAX_COMPLETION_CHARS:
@@ -361,6 +404,16 @@ class LocalOpenAIClient:
         if errors:
             raise LocalModelUnavailable(str(errors[-1])) from errors[-1]
         raise LocalModelUnavailable("No configured model server is available.")
+
+    @staticmethod
+    def _uses_default_ollama_api(base_url: str) -> bool:
+        parsed = urlsplit(base_url)
+        return (
+            parsed.scheme == "http"
+            and parsed.hostname == "127.0.0.1"
+            and parsed.port == 11434
+            and parsed.path.rstrip("/") == "/v1"
+        )
 
     def _validate_base_url(self) -> None:
         parsed = urlsplit(self.base_url)

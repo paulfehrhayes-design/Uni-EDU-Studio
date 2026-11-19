@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as Blockly from 'blockly';
 import { pythonGenerator } from 'blockly/python';
 import recordedMotions from '../../g1-recorded-motions.json' with { type: 'json' };
-import { flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, LEGACY_ARM_ACTIONS_THAT_HOLD, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './g1Commands.js';
+import { compileG1VoiceBlockProgram, flattenG1Commands, formatG1Program, G1_COMMANDS, G1_EXECUTABLE_COMMANDS, G1_NOMINAL_STEP_METERS, LEGACY_ARM_ACTIONS_THAT_HOLD, getG1BlocklyCommandBlocks, getG1BlocklyConditionBlocks, parseG1Program } from './g1Commands.js';
 import { compileMotionPrompt } from './textToMotion.js';
 import { buildG1SimulationFrames } from './g1Edu23Env.js';
 import { getDuetArmCatalog, getDuetArmPoseTarget } from './duetArmCatalog.js';
@@ -132,6 +132,19 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     getG1BlocklyCommandBlocks(G1_COMMANDS).find((block) => block.type === 'g1_command_waveleft').tooltip.endsWith('This action is only available in the simulator.'),
     true,
   );
+});
+
+test('AI speech compiles to the existing G1 voice block command', () => {
+  const code = compileG1VoiceBlockProgram('The answer is "water".', 1);
+  assert.equal(code, 'robot.say("The answer is \\"water\\".", 1)\n');
+  assert.deepEqual(parseG1Program(code), [{
+    type: 'command',
+    method: 'say',
+    values: ['The answer is "water".', 1],
+    code: 'robot.say("The answer is \\"water\\".", 1)',
+  }]);
+  assert.throws(() => compileG1VoiceBlockProgram('Not a valid speaker.', 2));
+  assert.throws(() => compileG1VoiceBlockProgram('x'.repeat(121), 0));
 });
 
 test('Legacy shared-motion calls parse as stable references for Blockly and IDE previews', () => {

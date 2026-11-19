@@ -91,6 +91,32 @@ class VoiceAPITests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(response["error"]["code"], "model_not_available")
 
+    def test_model_warmup_runs_local_model_and_returns_its_route(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(
+            self.server.model_client,
+            "warmup",
+            return_value={"status": "ready", "model": "qwen3:0.6b", "route": "local"},
+        ) as warmup:
+            status, response = self.request("POST", "/api/v1/model/warmup")
+        self.assertEqual(status, 200)
+        self.assertEqual(response["route"], "local")
+        warmup.assert_called_once_with()
+
+    def test_speech_warmup_preloads_the_configured_local_voice(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(
+            self.server.speech_runtime,
+            "warmup",
+            return_value={"status": "ready", "voice": "af_heart"},
+        ) as warmup:
+            status, response = self.request("POST", "/api/v1/speech/warmup")
+        self.assertEqual(status, 200)
+        self.assertEqual(response["voice"], "af_heart")
+        warmup.assert_called_once_with()
+
     def test_unsupported_configured_voice_returns_a_visible_error(self) -> None:
         runtime = LocalSpeechRuntime()
         runtime.tts_voice = "unsupported"
@@ -323,6 +349,9 @@ class VoiceAPITests(unittest.TestCase):
                     "title": "Notes",
                     "source": "Teacher handout",
                     "owner": "Science team",
+                    "intended_use": "Use for reviewed science examples.",
+                    "section_id": "curriculum",
+                    "section_title": "Curriculum and content boundaries",
                     "review_date": None,
                     "excerpt": "A useful excerpt.",
                     "unexpected": "field",
@@ -356,6 +385,7 @@ class VoiceAPITests(unittest.TestCase):
             "title": "Debate guide",
             "source": "Approved class handout",
             "owner": "Humanities team",
+            "intended_use": "Support respectful debate and evidence checking.",
             "section_id": "curriculum",
             "section_title": "Curriculum and content boundaries",
             "review_date": "2027-10-01",

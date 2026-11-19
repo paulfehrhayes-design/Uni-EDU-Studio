@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { compileG1VoiceBlockProgram } from '../sim/g1Commands.js';
 
 const SESSION_STORAGE_KEY = 'edu-classroom-session';
 const MAX_KNOWLEDGE_BYTES = 100_000;
@@ -122,6 +123,7 @@ export default function HarryBotterTry() {
     title: '',
     source: '',
     owner: '',
+    intended_use: '',
     section_id: 'general',
     learning_level: '',
     agent_id: '',
@@ -199,6 +201,7 @@ export default function HarryBotterTry() {
   const chatMessagesRef = useRef(chatMessages);
   const selectedSessionIdRef = useRef(selectedSessionId);
   const isGeneratingDraftRef = useRef(isGeneratingDraft);
+  const activeTtsVoice = ttsVoice || speechStatus?.speech_generation?.voice || 'af_heart';
   const g1AudioConnected = g1RobotStatus?.capabilities?.audio === true;
   const selectedBehaviorSection = behaviorSections.find(
     (section) => section.section_id === behaviorSectionDraft.section_id,
@@ -316,6 +319,13 @@ export default function HarryBotterTry() {
       }
     });
   }, [chatMessages]);
+
+  useEffect(() => {
+    const agent = agents.find((item) => item.agent_id === selectedAgentId);
+    if (!agent) return;
+    setTtsVoice(agent.tts_voice || speechStatus?.speech_generation?.voice || 'af_heart');
+    setSpeechSpeed(agent.tts_speed ?? 1);
+  }, [agents, selectedAgentId, speechStatus]);
 
   const refreshAudioDevices = async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
@@ -482,10 +492,23 @@ export default function HarryBotterTry() {
     stopSpeechPlayback();
     setEditingDraftIndex(null);
     setEditedDraftText('');
-    setChatMessages(result.session.messages);
-    chatMessagesRef.current = result.session.messages;
+    const messages = result.session.messages.map((message) => ({
+      ...message,
+      messageId: message.messageId || crypto.randomUUID(),
+      messageSource: message.messageSource || (
+        message.role === 'assistant' ? 'generated_draft' : 'typed'
+      ),
+    }));
+    setChatMessages(messages);
+    chatMessagesRef.current = messages;
     setSelectedSessionId(sessionId);
     selectedSessionIdRef.current = sessionId;
+    const settings = result.session.settings;
+    if (settings) {
+      setLearningLevel(settings.learning_level || '');
+      setTone(settings.tone || 'Formal');
+      setSelectedAgentId(settings.agent_id || 'general');
+    }
     setChatError('');
     setSessionError('');
   }, [teacherSession]);
@@ -535,14 +558,24 @@ export default function HarryBotterTry() {
     if (!sessionId || !authSession?.token) return false;
     try {
       const serializedMessages = messages.map((message) => ({
+        messageId: message.messageId,
         role: message.role,
         content: message.content,
+        messageSource: message.messageSource || (
+          message.role === 'assistant' ? 'generated_draft' : 'typed'
+        ),
+        speakerLabel: message.speakerLabel || null,
+        confidence: message.confidence ?? null,
+        createdAt: message.createdAt || null,
         model: message.model || '',
         route: message.route || '',
         source: message.source || '',
         sources: message.sources || [],
         settings: message.settings || null,
         transcriptToDraftMs: message.transcriptToDraftMs ?? null,
+        speechVoice: message.speechVoice || '',
+        speechSpeed: message.speechSpeed ?? null,
+        draftStatus: message.draftStatus || 'draft',
       }));
       const response = await fetch(`/api/harry-botter/sessions/${sessionId}/messages`, {
         method: 'PUT',
@@ -729,20 +762,21 @@ export default function HarryBotterTry() {
     setG1SpeechStatus('');
     setIsSendingG1Speech(true);
     try {
-      const response = await fetch('/api/harry-botter/g1-speak', {
+      const response = await fetch('/api/run', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${teacherSession.token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ text: text.trim(), speaker_id: Number(g1SpeakerId) }),
+        body: JSON.stringify({
+          code: compileG1VoiceBlockProgram(text.trim(), Number(g1SpeakerId)),
+        }),
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || 'The G1 did not accept the speech request.');
-      setG1SpeechStatus('The G1 SDK accepted the TTS request. Check the robot speaker.');
+      if (!response.ok) throw new Error(result.detail || 'The G1 voice-block program could not run.');
+      setG1SpeechStatus('The compiled robot.say voice block was accepted. Check the G1 speaker.');
     } catch (error) {
-      setG1SpeechError(error.message || 'Could not send this draft to the G1 speaker.');
-      void checkG1AudioStatus();
+      setG1SpeechError(error.message || 'Could not run the G1 voice-block program.');
     } finally {
       setIsSendingG1Speech(false);
     }
@@ -763,7 +797,20 @@ export default function HarryBotterTry() {
     if (replaceMessageIndex === null) stopSpeechPlayback();
     const requestSessionId = selectedSessionIdRef.current;
     const pendingMessages = replaceMessageIndex === null
-      ? [...history, { role: 'user', content: text.trim() }]
+      ? [...history, {
+        messageId: crypto.randomUUID(),
+        role: 'user',
+        content: text.trim(),
+        messageSource: transcriptReceivedAt === null
+          ? 'typed'
+          : 'streaming_transcription',
+        settings: {
+          learningLevel: conversationSettingsRef.current.learningLevel,
+          tone: conversationSettingsRef.current.tone,
+          agentName: conversationSettingsRef.current.agentName,
+          agentId: conversationSettingsRef.current.selectedAgentId,
+        },
+      }]
       : history;
     setChatError('');
     isGeneratingDraftRef.current = true;
@@ -811,8 +858,11 @@ export default function HarryBotterTry() {
       }
       if (!result.draft?.text) throw new Error('The configured model returned an empty draft.');
       const newDraft = {
+          messageId: crypto.randomUUID(),
           role: 'assistant',
           content: result.draft.text,
+          messageSource: 'generated_draft',
+          draftStatus: 'draft',
           model: result.draft.model,
           route: result.draft.route,
           source: result.draft.source,
@@ -821,6 +871,7 @@ export default function HarryBotterTry() {
             learningLevel: currentSettings.learningLevel,
             tone: currentSettings.tone,
             agentName: currentSettings.agentName,
+            agentId: currentSettings.selectedAgentId,
           },
           transcriptToDraftMs: transcriptReceivedAt === null
             ? null
@@ -1117,11 +1168,69 @@ export default function HarryBotterTry() {
     setHasPlayedVoicePreview(false);
   };
 
+  const invalidatePreparedSpeech = () => {
+    speechAudioRef.current?.pause();
+    setPlayingSpeechIndex(null);
+    const messages = chatMessagesRef.current.map((message) => {
+      if (!message.speechUrl) return message;
+      const updatedMessage = { ...message };
+      delete updatedMessage.speechUrl;
+      return updatedMessage;
+    });
+    setChatMessages(messages);
+    chatMessagesRef.current = messages;
+  };
+
+  const persistAgentVoiceSettings = async (voice, speed) => {
+    const response = await fetch(
+      `/api/harry-botter/agents/${encodeURIComponent(selectedAgentId)}/voice-settings`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${teacherSession.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ voice, speed }),
+      },
+    );
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.detail || "Could not save this agent's speech settings.");
+    }
+    setAgents((currentAgents) => currentAgents.map((agent) => (
+      agent.agent_id === selectedAgentId ? result.agent : agent
+    )));
+    setTtsVoice(result.agent.tts_voice);
+    setSpeechSpeed(result.agent.tts_speed);
+    invalidatePreparedSpeech();
+  };
+
+  const applyAuditionedVoice = async () => {
+    if (!voicePreviewedId || !hasPlayedVoicePreview) return;
+    setVoicePreviewError('');
+    try {
+      await persistAgentVoiceSettings(voicePreviewedId, speechSpeed);
+    } catch (error) {
+      setVoicePreviewError(error.message || "Could not save this agent's speech settings.");
+    }
+  };
+
+  const updateSpeechSpeed = async (speed) => {
+    setSpeechSpeed(speed);
+    clearVoicePreview();
+    setVoicePreviewError('');
+    try {
+      await persistAgentVoiceSettings(activeTtsVoice, speed);
+    } catch (error) {
+      setVoicePreviewError(error.message || "Could not save this agent's speech settings.");
+    }
+  };
+
   const createVoicePreview = async () => {
     if (isGeneratingVoicePreview) return;
     setVoicePreviewError('');
     setIsGeneratingVoicePreview(true);
-    const voice = voiceCandidate || speechStatus?.speech_generation?.voice || 'af_heart';
+    const voice = voiceCandidate || activeTtsVoice;
     try {
       const response = await fetch('/api/harry-botter/speech', {
         method: 'POST',
@@ -1189,7 +1298,7 @@ export default function HarryBotterTry() {
     if (isPreparingSpeechIndex === draftIndex) cancelSpeechGeneration();
     const nextMessages = chatMessagesRef.current.map((message, index) => {
       if (index !== draftIndex) return message;
-      const updatedMessage = { ...message, content: text };
+      const updatedMessage = { ...message, content: text, draftStatus: 'edited' };
       delete updatedMessage.speechUrl;
       return updatedMessage;
     });
@@ -1219,6 +1328,35 @@ export default function HarryBotterTry() {
       speechAudioRef.current = null;
     }
     setPlayingSpeechIndex(null);
+  };
+
+  const recordCompletedPlayback = async (message, durationSeconds) => {
+    const sessionId = selectedSessionIdRef.current;
+    if (!sessionId || !message.messageId || !message.speechVoice) return;
+    try {
+      const response = await fetch(
+        `/api/harry-botter/sessions/${sessionId}/playback-events`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${teacherSession.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            draft_id: message.messageId,
+            voice_id: message.speechVoice,
+            speed: message.speechSpeed ?? speechSpeed,
+            duration_ms: Number.isFinite(durationSeconds)
+              ? Math.round(durationSeconds * 1_000)
+              : 0,
+          }),
+        },
+      );
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not save playback history.');
+    } catch (error) {
+      setSpeechError(error.message || 'Could not save playback history.');
+    }
   };
 
   const cancelSpeechGeneration = () => {
@@ -1261,6 +1399,8 @@ export default function HarryBotterTry() {
     if (isPreparingSpeechIndex !== null) return;
     setSpeechError('');
     setIsPreparingSpeechIndex(draftIndex);
+    const voice = activeTtsVoice;
+    const speed = speechSpeed;
     const controller = new AbortController();
     const request = { controller, draftIndex };
     speechRequestRef.current = request;
@@ -1274,7 +1414,8 @@ export default function HarryBotterTry() {
         },
         body: JSON.stringify({
           text,
-          speed: speechSpeed,
+          speed,
+          voice,
         }),
       });
       if (!response.ok) {
@@ -1293,7 +1434,12 @@ export default function HarryBotterTry() {
       }
       setChatMessages((messages) => messages.map((message, index) => {
         if (index !== draftIndex || message.role !== 'assistant') return message;
-        return { ...message, speechUrl: nextUrl };
+        return {
+          ...message,
+          speechUrl: nextUrl,
+          speechVoice: voice,
+          speechSpeed: speed,
+        };
       }));
     } catch (error) {
       if (error.name !== 'AbortError') {
@@ -1572,6 +1718,7 @@ export default function HarryBotterTry() {
         title: '',
         source: '',
         owner: '',
+        intended_use: '',
         section_id: 'general',
         learning_level: '',
         agent_id: '',
@@ -1608,6 +1755,7 @@ export default function HarryBotterTry() {
         title: document.title,
         source: document.source,
         owner: document.owner,
+        intended_use: document.intended_use || '',
         section_id: document.section_id || 'general',
         learning_level: document.learning_level || '',
         agent_id: document.agent_id || '',
@@ -1627,6 +1775,7 @@ export default function HarryBotterTry() {
       title: '',
       source: '',
       owner: '',
+      intended_use: '',
       section_id: 'general',
       learning_level: '',
       agent_id: '',
@@ -2062,11 +2211,7 @@ export default function HarryBotterTry() {
             <select
               aria-label="Spoken reply pace"
               value={speechSpeed}
-              onChange={(event) => {
-                setSpeechSpeed(Number(event.target.value));
-                clearVoicePreview();
-                setVoicePreviewError('');
-              }}
+              onChange={(event) => void updateSpeechSpeed(Number(event.target.value))}
               disabled={isGeneratingVoicePreview}
               className="rounded-lg border border-slate-300 bg-white px-3 py-2"
             >
@@ -2075,7 +2220,10 @@ export default function HarryBotterTry() {
               <option value={1.15}>Faster</option>
             </select>
           </label>
-          <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
+          <div
+            data-testid="current-browser-voice"
+            className="flex items-center gap-2 text-sm font-medium text-slate-700"
+          >
             Current browser voice: {ttsVoice || speechStatus?.speech_generation?.voice || 'af_heart'}
           </div>
           <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
@@ -2116,7 +2264,7 @@ export default function HarryBotterTry() {
           </button>
           <button
             type="button"
-            onClick={() => setTtsVoice(voicePreviewedId)}
+            onClick={() => void applyAuditionedVoice()}
             disabled={!voicePreviewedId || !hasPlayedVoicePreview}
             className="rounded-lg border border-emerald-300 px-3 py-2 text-sm font-semibold text-emerald-800 disabled:opacity-50"
           >
@@ -2537,7 +2685,9 @@ export default function HarryBotterTry() {
                       )}
                   </div>
                 )}
-                {message.speechUrl && (
+                {message.speechUrl
+                  && message.speechVoice === activeTtsVoice
+                  && message.speechSpeed === speechSpeed && (
                   <div className="mt-3">
                     <audio
                       ref={(element) => {
@@ -2548,7 +2698,7 @@ export default function HarryBotterTry() {
                       controls
                       src={message.speechUrl}
                       className="w-full"
-                      aria-label={`Spoken draft ${index + 1}`}
+                      aria-label={`Spoken draft ${index + 1} in ${message.speechVoice}`}
                       data-speech-index={index}
                       onPlay={(event) => {
                         if (speechAudioRef.current && speechAudioRef.current !== event.currentTarget) {
@@ -2561,8 +2711,9 @@ export default function HarryBotterTry() {
                       onPause={() => {
                         setPlayingSpeechIndex((current) => current === index ? null : current);
                       }}
-                      onEnded={() => {
+                      onEnded={(event) => {
                         setPlayingSpeechIndex((current) => current === index ? null : current);
+                        void recordCompletedPlayback(message, event.currentTarget.duration);
                       }}
                       onLoadedMetadata={(event) => {
                         if (typeof event.currentTarget.setSinkId === 'function') {
@@ -2906,12 +3057,14 @@ export default function HarryBotterTry() {
                       )}
                     </div>
                   )}
-                  {message.speechUrl && (
+                  {message.speechUrl
+                    && message.speechVoice === activeTtsVoice
+                    && message.speechSpeed === speechSpeed && (
                     <audio
                       controls
                       src={message.speechUrl}
                       className="mt-3 w-full"
-                      aria-label={`Spoken draft ${index + 1}`}
+                      aria-label={`Spoken draft ${index + 1} in ${message.speechVoice}`}
                       onLoadedMetadata={(event) => {
                         if (typeof event.currentTarget.setSinkId === 'function') {
                           event.currentTarget.setSinkId(speakerId).catch((error) => {
@@ -2928,7 +3081,10 @@ export default function HarryBotterTry() {
                         setPlayingSpeechIndex(index);
                       }}
                       onPause={() => setPlayingSpeechIndex((current) => current === index ? null : current)}
-                      onEnded={() => setPlayingSpeechIndex((current) => current === index ? null : current)}
+                      onEnded={(event) => {
+                        setPlayingSpeechIndex((current) => current === index ? null : current);
+                        void recordCompletedPlayback(message, event.currentTarget.duration);
+                      }}
                     />
                   )}
                 </article>
@@ -3310,6 +3466,20 @@ export default function HarryBotterTry() {
                     value={knowledgeDraft.owner}
                     onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, owner: event.target.value })}
                     className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+                  />
+                </label>
+                <label className="block text-sm font-medium">
+                  Intended classroom use
+                  <input
+                    required
+                    maxLength={500}
+                    value={knowledgeDraft.intended_use}
+                    onChange={(event) => setKnowledgeDraft({
+                      ...knowledgeDraft,
+                      intended_use: event.target.value,
+                    })}
+                    className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+                    placeholder="What should this reference inform, and for which class context?"
                   />
                 </label>
                 <label className="block text-sm font-medium">

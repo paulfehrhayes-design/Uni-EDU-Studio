@@ -146,6 +146,14 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             if payload is not None:
                 self._select_model(payload)
             return
+        if path == "/api/v1/model/warmup":
+            if not self._has_empty_body():
+                return
+            try:
+                self._send_json(200, self.server.model_client.warmup())
+            except LocalModelError as exc:
+                self._send_error(503, "model_warmup_failed", str(exc))
+            return
         if path == "/api/v1/policy-review":
             payload = self._read_json()
             if payload is not None:
@@ -155,6 +163,14 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             audio = self._read_audio()
             if audio is not None:
                 self._transcribe(audio)
+            return
+        if path == "/api/v1/speech/warmup":
+            if not self._has_empty_body():
+                return
+            try:
+                self._send_json(200, self.server.speech_runtime.warmup())
+            except SpeechRuntimeError as exc:
+                self._send_error(503, "speech_warmup_failed", str(exc))
             return
         if path == "/api/v1/speech":
             payload = self._read_json()
@@ -310,6 +326,7 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                 "title",
                 "source",
                 "owner",
+                "intended_use",
                 "section_id",
                 "section_title",
                 "review_date",
@@ -323,6 +340,7 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                     ("title", 160),
                     ("source", 500),
                     ("owner", 120),
+                    ("intended_use", 500),
                     ("section_id", 64),
                     ("section_title", 100),
                     ("excerpt", MAX_KNOWLEDGE_EXCERPT_CHARS),

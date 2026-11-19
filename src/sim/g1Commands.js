@@ -328,6 +328,13 @@ function normalizeCommand(method, rawArgs) {
   return { method, values, code };
 }
 
+export function compileG1VoiceBlockProgram(text, speaker) {
+  if (typeof text !== 'string' || !Number.isInteger(speaker)) {
+    throw new Error('G1 voice block requires text and an integer speaker ID.');
+  }
+  return `${normalizeCommand('say', `${JSON.stringify(text)}, ${speaker}`).code}\n`;
+}
+
 const MIN_DISTANCE_METERS = 0.1;
 const MAX_DISTANCE_METERS = 40;
 export const LEGACY_ARM_ACTIONS_THAT_HOLD = new Set([

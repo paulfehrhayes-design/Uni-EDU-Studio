@@ -4432,7 +4432,20 @@ test('Harry Botter keeps policy review as an unsaved teacher-approved proposal',
 });
 
 test('Harry Botter requires auditioning a voice before applying it', async ({ page }) => {
-  let speechPayload;
+  const speechPayloads = [];
+  let g1ProgramCode;
+  let appliedVoice = 'af_heart';
+  let appliedSpeed = 1;
+  const generalAgent = () => ({
+    agent_id: 'general',
+    display_name: 'General conversation',
+    purpose: 'Support classroom learning.',
+    instructions: '',
+    generation_temperature: 0.4,
+    generation_max_tokens: 500,
+    tts_voice: appliedVoice,
+    tts_speed: appliedSpeed,
+  });
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-harry-botter-voice-config-token',
@@ -4443,11 +4456,47 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/harry-botter/speech') {
-      speechPayload = request.postDataJSON();
+      speechPayloads.push(request.postDataJSON());
       await route.fulfill({
         status: 200,
         contentType: 'audio/wav',
         body: Buffer.from('RIFF-test-audio'),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/agents/general/voice-settings') {
+      const settings = request.postDataJSON();
+      appliedVoice = settings.voice;
+      appliedSpeed = settings.speed;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ agent: generalAgent() }),
+      });
+      return;
+    }
+    if (path === '/api/harry-botter/draft') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          draft: {
+            text: 'Water changes into vapor when it evaporates.',
+            model: 'test-local-model',
+            route: 'local',
+            source: 'local_model',
+            sources: [],
+          },
+        }),
+      });
+      return;
+    }
+    if (path === '/api/run') {
+      g1ProgramCode = request.postDataJSON().code;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ status: 'completed', results: [{ method: 'say' }] }),
       });
       return;
     }
@@ -4478,9 +4527,9 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
           messages: [],
         },
       },
-      '/api/harry-botter/config': { agents: [], knowledge: [], sections: [] },
+      '/api/harry-botter/config': { agents: [generalAgent()], knowledge: [], sections: [] },
       '/api/harry-botter/alerts': { alerts: [] },
-      '/api/robot/status': { capabilities: { audio: false } },
+      '/api/robot/status': { capabilities: { audio: true } },
     };
     await route.fulfill({
       status: 200,
@@ -4490,12 +4539,12 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
   });
 
   await page.goto('/?try=harry-botter');
-  await expect(page.getByText('Current browser voice: af_heart')).toBeVisible();
+  await expect(page.getByTestId('current-browser-voice')).toContainText('af_heart');
   await page.getByLabel('Voice to audition').selectOption('qwen3_youthful_south_london');
   await page.getByLabel('Spoken reply pace').selectOption('1.15');
   await page.getByRole('button', { name: 'Preview voice' }).click();
-  await expect.poll(() => speechPayload).toBeTruthy();
-  expect(speechPayload).toEqual({
+  await expect.poll(() => speechPayloads.length).toBe(1);
+  expect(speechPayloads[0]).toEqual({
     text: 'Hello, I am Harry Botter. What would you like to explore today?',
     speed: 1.15,
     voice: 'qwen3_youthful_south_london',
@@ -4508,5 +4557,20 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
   await preview.dispatchEvent('play');
   await expect(useVoice).toBeEnabled();
   await useVoice.click();
-  await expect(page.getByText('Current browser voice: qwen3_youthful_south_london')).toBeVisible();
+  await expect(page.getByTestId('current-browser-voice')).toContainText('qwen3_youthful_south_london');
+  await page.getByPlaceholder('Ask Harry Botter a question…').fill('Explain evaporation.');
+  await page.getByRole('button', { name: 'Generate local draft' }).click();
+  await expect(page.getByText('Water changes into vapor when it evaporates.')).toBeVisible();
+  await page.getByRole('button', { name: 'Prepare spoken reply' }).click();
+  await expect.poll(() => speechPayloads.length).toBe(2);
+  expect(speechPayloads[1]).toEqual({
+    text: 'Water changes into vapor when it evaporates.',
+    speed: 1.15,
+    voice: 'qwen3_youthful_south_london',
+  });
+  await page.getByLabel('Draft audio output').selectOption('g1');
+  await page.getByRole('button', { name: 'Speak this draft on G1' }).click();
+  await expect.poll(() => g1ProgramCode).toBeTruthy();
+  expect(g1ProgramCode).toBe('robot.say("Water changes into vapor when it evaporates.", 0)\n');
+  await expect(page.getByText('The compiled robot.say voice block was accepted. Check the G1 speaker.')).toBeVisible();
 });

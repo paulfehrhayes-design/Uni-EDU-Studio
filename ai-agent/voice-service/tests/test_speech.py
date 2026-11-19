@@ -72,6 +72,14 @@ class KokoroLanguageTests(unittest.TestCase):
 
 @unittest.skipIf(np is None, "NumPy is required for the optional speech extra.")
 class LocalSpeechRuntimeTests(unittest.TestCase):
+    def test_warmup_synthesizes_and_discards_a_short_default_voice_sample(self) -> None:
+        runtime = LocalSpeechRuntime()
+        with patch.object(runtime, "synthesize", return_value=b"RIFF-test") as synthesize:
+            result = runtime.warmup()
+
+        self.assertEqual(result, {"status": "ready", "voice": "af_heart"})
+        synthesize.assert_called_once_with("Voice ready.", speed=1.0, voice="af_heart")
+
     def test_synthesize_uses_configured_voice_and_speed_with_kokoro(self) -> None:
         class FakeTensor:
             def detach(self):

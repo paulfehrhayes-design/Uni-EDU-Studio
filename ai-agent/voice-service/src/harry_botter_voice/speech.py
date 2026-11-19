@@ -331,6 +331,10 @@ class LocalSpeechRuntime:
             raise SpeechRuntimeError("The local speech model returned no audio.")
         return self._encode_wav(np.concatenate(chunks), SPEECH_SAMPLE_RATE, np)
 
+    def warmup(self) -> dict[str, str]:
+        self.synthesize("Voice ready.", speed=1.0, voice=self.tts_voice)
+        return {"status": "ready", "voice": self.tts_voice}
+
     def _synthesize_qwen_voice_design(self, text: str, speed: float) -> bytes:
         try:
             import numpy as np

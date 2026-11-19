@@ -14,6 +14,12 @@ export default defineConfig({
     port: 5173,
     proxy: {
       // 代理：让本地开发时能连上本地跑的 python server
+      // Keep the browser Host header for the backend's same-origin WebSocket check.
+      '/api/harry-botter/stream': {
+        target: 'http://127.0.0.1:5179',
+        changeOrigin: false,
+        ws: true,
+      },
       '/api': {
         target: 'http://127.0.0.1:5179',
         changeOrigin: true,

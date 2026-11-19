@@ -10,7 +10,7 @@ import os
 import re
 import sqlite3
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import PurePath
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
@@ -199,11 +199,24 @@ class AgentWrite(StrictRequest):
         return value.strip()
 
 
+class AgentVoiceSettingsWrite(StrictRequest):
+    voice: StrictStr = Field(min_length=1, max_length=32)
+    speed: float = Field(ge=0.75, le=1.25)
+
+    @field_validator("speed", mode="before")
+    @classmethod
+    def reject_boolean_speed(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("Speech speed must be a number.")
+        return value
+
+
 class KnowledgeWrite(StrictRequest):
     filename: StrictStr = Field(min_length=1, max_length=255)
     title: StrictStr = Field(min_length=1, max_length=160)
     source: StrictStr = Field(min_length=1, max_length=500)
     owner: StrictStr = Field(min_length=1, max_length=120)
+    intended_use: StrictStr = Field(min_length=1, max_length=500)
     section_id: StrictStr = "general"
     learning_level: StrictStr = ""
     agent_id: StrictStr = ""
@@ -216,6 +229,13 @@ class KnowledgeWrite(StrictRequest):
     def require_nonempty_text(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("This field must not be blank.")
+        return value.strip()
+
+    @field_validator("intended_use")
+    @classmethod
+    def normalize_intended_use(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Describe the intended classroom use.")
         return value.strip()
 
     @field_validator("learning_level")
@@ -267,17 +287,30 @@ class SessionMessageSettings(StrictRequest):
     learningLevel: StrictStr = Field(default="", max_length=40)
     tone: StrictStr = Field(default="", max_length=40)
     agentName: StrictStr = Field(default="", max_length=80)
+    agentId: StrictStr = Field(default="general", max_length=80)
 
 
 class SessionMessageWrite(StrictRequest):
+    message_id: StrictStr = Field(
+        default_factory=lambda: str(uuid.uuid4()), alias="messageId", max_length=36
+    )
     role: Literal["user", "assistant"]
     content: StrictStr = Field(min_length=1, max_length=MAX_DRAFT_CHARS)
+    message_source: Literal[
+        "typed", "streaming_transcription", "generated_draft"
+    ] = Field(default="typed", alias="messageSource")
+    speaker_label: StrictStr | None = Field(default=None, alias="speakerLabel", max_length=80)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    created_at: StrictStr | None = Field(default=None, alias="createdAt", max_length=40)
     model: StrictStr = Field(default="", max_length=120)
     route: StrictStr = Field(default="", max_length=40)
     source: StrictStr = Field(default="", max_length=80)
     sources: list[SessionMessageSource] = Field(default_factory=list, max_length=MAX_KNOWLEDGE_EXCERPTS)
     settings: SessionMessageSettings | None = None
     transcript_to_draft_ms: StrictInt | None = Field(default=None, alias="transcriptToDraftMs", ge=0)
+    speech_voice: StrictStr = Field(default="", alias="speechVoice", max_length=32)
+    speech_speed: float | None = Field(default=None, alias="speechSpeed", ge=0.75, le=1.25)
+    draft_status: Literal["draft", "edited"] = Field(default="draft", alias="draftStatus")
 
     @field_validator("content")
     @classmethod
@@ -289,6 +322,20 @@ class SessionMessageWrite(StrictRequest):
 
 class SessionMessagesWrite(StrictRequest):
     messages: list[SessionMessageWrite] = Field(max_length=MAX_SESSION_MESSAGES)
+
+
+class PlaybackCompletedWrite(StrictRequest):
+    draft_id: StrictStr = Field(min_length=1, max_length=36)
+    voice_id: StrictStr = Field(min_length=1, max_length=32)
+    speed: float = Field(ge=0.75, le=1.25)
+    duration_ms: StrictInt = Field(ge=0, le=120_000)
+
+    @field_validator("speed", mode="before")
+    @classmethod
+    def reject_boolean_speed(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("Speech speed must be a number.")
+        return value
 
 
 class PolicyReviewRequest(StrictRequest):
@@ -377,7 +424,133 @@ BUILTIN_AGENTS = (
 )
 
 
+def _backfill_session_artifacts(conn: sqlite3.Connection) -> None:
+    sessions = conn.execute(
+        "SELECT session_id, created_at FROM harry_botter_sessions"
+    ).fetchall()
+    migration_time = datetime.now(timezone.utc).isoformat()
+    for session in sessions:
+        rows = conn.execute(
+            """
+            SELECT position, message_json
+            FROM harry_botter_session_messages
+            WHERE session_id = ? ORDER BY position
+            """,
+            (session["session_id"],),
+        ).fetchall()
+        last_turn_id = None
+        latest_settings = None
+        for row in rows:
+            message = json.loads(row["message_json"])
+            if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+                raise ValueError(
+                    f"Conversation {session['session_id']} contains an invalid stored message."
+                )
+            message_id = message.get("messageId")
+            if not isinstance(message_id, str) or not message_id:
+                message_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"harry-botter:{session['session_id']}:{row['position']}",
+                    )
+                )
+            settings = message.get("settings")
+            if isinstance(settings, dict):
+                latest_settings = settings
+            learning_level = (
+                settings.get("learningLevel", "")
+                if isinstance(settings, dict)
+                else ""
+            )
+            agent_id = (
+                settings.get("agentId", "general")
+                if isinstance(settings, dict)
+                else "general"
+            )
+            tone = settings.get("tone", "Formal") if isinstance(settings, dict) else "Formal"
+            if message["role"] == "user":
+                last_turn_id = message_id
+                source = message.get("messageSource", "typed")
+                if source not in {"typed", "streaming_transcription"}:
+                    source = "typed"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO harry_botter_transcript_turns
+                        (turn_id, session_id, sequence, speaker_label, source,
+                         content, learning_level, created_at, metadata_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_id,
+                        session["session_id"],
+                        row["position"],
+                        message.get("speakerLabel"),
+                        source,
+                        message["content"],
+                        learning_level,
+                        message.get("createdAt") or session["created_at"] or migration_time,
+                        json.dumps(
+                            {"migrated_from_json": True, "confidence": message.get("confidence")},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO harry_botter_response_drafts
+                    (draft_id, session_id, based_on_turn_id, agent_id,
+                     learning_level, tone, content, status, model_id, model_route,
+                     transcript_to_draft_ms, settings_json, sources_json,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    session["session_id"],
+                    last_turn_id,
+                    agent_id,
+                    learning_level,
+                    tone,
+                    message.get("content", ""),
+                    message.get("draftStatus", "draft"),
+                    message.get("model", ""),
+                    message.get("route", ""),
+                    message.get("transcriptToDraftMs"),
+                    json.dumps(settings or {}, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(message.get("sources", []), ensure_ascii=False, separators=(",", ":")),
+                    message.get("createdAt") or session["created_at"] or migration_time,
+                    migration_time,
+                ),
+            )
+        if latest_settings:
+            conn.execute(
+                """
+                UPDATE harry_botter_session_settings
+                SET agent_id = ?, learning_level = ?, tone = ?, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    latest_settings.get("agentId", "general"),
+                    latest_settings.get("learningLevel", ""),
+                    latest_settings.get("tone", "Formal"),
+                    migration_time,
+                    session["session_id"],
+                ),
+            )
+
+
 def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harry_botter_schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            description TEXT NOT NULL
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS harry_botter_agents (
@@ -387,6 +560,9 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
             instructions TEXT NOT NULL,
             generation_temperature REAL NOT NULL DEFAULT 0.4,
             generation_max_tokens INTEGER NOT NULL DEFAULT 500,
+            safety_policy_id TEXT NOT NULL DEFAULT 'school-v1',
+            tts_voice TEXT NOT NULL DEFAULT 'af_heart',
+            tts_speed REAL NOT NULL DEFAULT 1.0,
             is_builtin INTEGER NOT NULL DEFAULT 0 CHECK (is_builtin IN (0, 1)),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -401,6 +577,7 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             source TEXT NOT NULL,
             owner TEXT NOT NULL,
+            intended_use TEXT NOT NULL DEFAULT '',
             section_id TEXT NOT NULL DEFAULT 'general',
             learning_level TEXT NOT NULL DEFAULT '',
             agent_id TEXT NOT NULL DEFAULT '',
@@ -435,11 +612,19 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE harry_botter_knowledge SET permission_confirmed_at = updated_at"
         )
+    if "intended_use" not in knowledge_columns:
+        conn.execute(
+            "ALTER TABLE harry_botter_knowledge "
+            "ADD COLUMN intended_use TEXT NOT NULL DEFAULT ''"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS harry_botter_behavior_sections (
             section_id TEXT PRIMARY KEY,
             guidance TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            updated_by TEXT NOT NULL DEFAULT '',
+            approval_confirmed_at TEXT,
             updated_at TEXT NOT NULL
         )
         """
@@ -455,6 +640,30 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    agent_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(harry_botter_agents)")
+    }
+    for column, definition in (
+        ("safety_policy_id", "TEXT NOT NULL DEFAULT 'school-v1'"),
+        ("tts_voice", "TEXT NOT NULL DEFAULT 'af_heart'"),
+        ("tts_speed", "REAL NOT NULL DEFAULT 1.0"),
+    ):
+        if column not in agent_columns:
+            conn.execute(f"ALTER TABLE harry_botter_agents ADD COLUMN {column} {definition}")
+
+    section_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(harry_botter_behavior_sections)")
+    }
+    for column, definition in (
+        ("version", "INTEGER NOT NULL DEFAULT 1"),
+        ("updated_by", "TEXT NOT NULL DEFAULT ''"),
+        ("approval_confirmed_at", "TEXT"),
+    ):
+        if column not in section_columns:
+            conn.execute(
+                f"ALTER TABLE harry_botter_behavior_sections ADD COLUMN {column} {definition}"
+            )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS harry_botter_session_messages (
@@ -462,6 +671,95 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
             position INTEGER NOT NULL,
             message_json TEXT NOT NULL,
             PRIMARY KEY (session_id, position)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harry_botter_session_settings (
+            session_id TEXT PRIMARY KEY
+                REFERENCES harry_botter_sessions(session_id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL DEFAULT 'general',
+            learning_level TEXT NOT NULL DEFAULT '',
+            tone TEXT NOT NULL DEFAULT 'Formal',
+            language TEXT NOT NULL DEFAULT 'en',
+            context_policy TEXT NOT NULL DEFAULT 'shared',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harry_botter_transcript_turns (
+            turn_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL
+                REFERENCES harry_botter_sessions(session_id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL,
+            speaker_label TEXT,
+            source TEXT NOT NULL CHECK (source IN ('typed', 'streaming_transcription')),
+            content TEXT NOT NULL,
+            learning_level TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE (session_id, sequence)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harry_botter_session_summaries (
+            summary_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL
+                REFERENCES harry_botter_sessions(session_id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            covers_through_turn_id TEXT,
+            model_id TEXT NOT NULL DEFAULT '',
+            model_route TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE (session_id, revision)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harry_botter_response_drafts (
+            draft_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL
+                REFERENCES harry_botter_sessions(session_id) ON DELETE CASCADE,
+            based_on_turn_id TEXT,
+            agent_id TEXT NOT NULL,
+            learning_level TEXT NOT NULL DEFAULT '',
+            tone TEXT NOT NULL DEFAULT 'Formal',
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft', 'edited', 'dismissed')),
+            model_id TEXT NOT NULL DEFAULT '',
+            model_route TEXT NOT NULL DEFAULT '',
+            transcript_to_draft_ms INTEGER,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            sources_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS harry_botter_playback_events (
+            playback_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL
+                REFERENCES harry_botter_sessions(session_id) ON DELETE CASCADE,
+            draft_id TEXT NOT NULL,
+            text_snapshot TEXT NOT NULL,
+            output_path TEXT NOT NULL CHECK (output_path IN ('browser', 'g1')),
+            voice_id TEXT NOT NULL DEFAULT '',
+            speed REAL NOT NULL DEFAULT 1.0 CHECK (speed >= 0.75 AND speed <= 1.25),
+            status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'stopped')),
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            confirmed_at TEXT
         )
         """
     )
@@ -519,6 +817,46 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
         ON harry_botter_knowledge(section_id, learning_level, agent_id, review_date)
         """
     )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS harry_botter_transcript_order_idx
+        ON harry_botter_transcript_turns(session_id, sequence)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS harry_botter_draft_session_idx
+        ON harry_botter_response_drafts(session_id, created_at)
+        """
+    )
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO harry_botter_schema_migrations
+            (version, applied_at, description)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (1, now, "Teacher-shared agents, behavior sections, and scoped knowledge."),
+            (2, now, "Session settings and separate transcript, draft, summary, and playback records."),
+        ],
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO harry_botter_session_settings
+            (session_id, agent_id, learning_level, tone, language, context_policy, updated_at)
+        SELECT session_id, 'general', '', 'Formal', 'en', 'shared', updated_at
+        FROM harry_botter_sessions
+        """
+    )
+    playback_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(harry_botter_playback_events)")
+    }
+    if "duration_ms" not in playback_columns:
+        conn.execute(
+            "ALTER TABLE harry_botter_playback_events "
+            "ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0"
+        )
+    _backfill_session_artifacts(conn)
 
 
 def _voice_service_url() -> str:
@@ -634,6 +972,9 @@ def _agent_dict(row: sqlite3.Row) -> dict[str, Any]:
         "instructions": row["instructions"],
         "generation_temperature": row["generation_temperature"],
         "generation_max_tokens": row["generation_max_tokens"],
+        "safety_policy_id": row["safety_policy_id"],
+        "tts_voice": row["tts_voice"],
+        "tts_speed": row["tts_speed"],
         "is_builtin": bool(row["is_builtin"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -647,6 +988,7 @@ def _knowledge_dict(row: sqlite3.Row, include_text: bool = False) -> dict[str, A
         "title": row["title"],
         "source": row["source"],
         "owner": row["owner"],
+        "intended_use": row["intended_use"],
         "section_id": row["section_id"],
         "version": row["version"],
         "permission_confirmed": bool(row["permission_confirmed_at"]),
@@ -683,7 +1025,7 @@ def _knowledge_for_draft(
     today = date.today().isoformat()
     rows = conn.execute(
         """
-        SELECT title, source, owner, section_id, review_date, text
+        SELECT title, source, owner, intended_use, section_id, review_date, text
         FROM harry_botter_knowledge
         WHERE (learning_level = '' OR learning_level = ?)
           AND (agent_id = '' OR agent_id = ?)
@@ -715,6 +1057,7 @@ def _knowledge_for_draft(
                 "title": row["title"],
                 "source": row["source"],
                 "owner": row["owner"],
+                "intended_use": row["intended_use"],
                 "section_id": row["section_id"],
                 "section_title": BEHAVIOR_SECTION_BY_ID.get(
                     row["section_id"], {"title": "General reference"}
@@ -766,16 +1109,59 @@ def create_harry_botter_router(
     def speech_status(_: dict[str, Any] = Depends(teacher)) -> dict[str, Any]:
         return _voice_request("GET", "/api/v1/speech/status").json()
 
+    @router.put("/api/harry-botter/agents/{agent_id}/voice-settings")
+    def update_agent_voice_settings(
+        agent_id: str,
+        payload: AgentVoiceSettingsWrite,
+        user: dict[str, Any] = Depends(teacher),
+    ) -> dict[str, Any]:
+        voice_status = _voice_request("GET", "/api/v1/speech/status").json()
+        available_voices = voice_status.get("speech_generation", {}).get("available_voices", [])
+        if payload.voice not in available_voices:
+            raise HTTPException(
+                status_code=400,
+                detail="Choose a voice currently available in the local speech service.",
+            )
+        conn = get_db_connection()
+        try:
+            cursor = conn.execute(
+                """
+                UPDATE harry_botter_agents
+                SET tts_voice = ?, tts_speed = ?, updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (
+                    payload.voice,
+                    payload.speed,
+                    datetime.now(timezone.utc).isoformat(),
+                    agent_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="The selected agent does not exist.")
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            return {"agent": _agent_dict(row), "updated_by": user["username"]}
+        finally:
+            conn.close()
+
     @router.get("/api/harry-botter/sessions")
     def list_sessions(user: dict[str, Any] = Depends(teacher)) -> dict[str, Any]:
         conn = get_db_connection()
         try:
             rows = conn.execute(
                 """
-                SELECT session_id, title, created_at, updated_at
-                FROM harry_botter_sessions
-                WHERE owner_username = ?
-                ORDER BY updated_at DESC, session_id
+                SELECT s.session_id, s.title, s.created_at, s.updated_at,
+                       settings.agent_id, settings.learning_level, settings.tone,
+                       settings.language, settings.context_policy
+                FROM harry_botter_sessions AS s
+                LEFT JOIN harry_botter_session_settings AS settings
+                    ON settings.session_id = s.session_id
+                WHERE s.owner_username = ?
+                ORDER BY s.updated_at DESC, s.session_id
                 """,
                 (user["username"],),
             ).fetchall()
@@ -797,6 +1183,15 @@ def create_harry_botter_router(
                 """,
                 (session_id, user["username"], now, now),
             )
+            conn.execute(
+                """
+                INSERT INTO harry_botter_session_settings
+                    (session_id, agent_id, learning_level, tone, language,
+                     context_policy, updated_at)
+                VALUES (?, 'general', '', 'Formal', 'en', 'shared', ?)
+                """,
+                (session_id, now),
+            )
             conn.commit()
             return {
                 "session": {
@@ -805,6 +1200,13 @@ def create_harry_botter_router(
                     "created_at": now,
                     "updated_at": now,
                     "messages": [],
+                    "settings": {
+                        "agent_id": "general",
+                        "learning_level": "",
+                        "tone": "Formal",
+                        "language": "en",
+                        "context_policy": "shared",
+                    },
                 }
             }
         finally:
@@ -825,6 +1227,13 @@ def create_harry_botter_router(
                 """,
                 (session_id,),
             ).fetchall()
+            settings = conn.execute(
+                """
+                SELECT agent_id, learning_level, tone, language, context_policy
+                FROM harry_botter_session_settings WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
             return {
                 "session": {
                     "session_id": row["session_id"],
@@ -832,6 +1241,13 @@ def create_harry_botter_router(
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                     "messages": [json.loads(message["message_json"]) for message in messages],
+                    "settings": dict(settings) if settings else {
+                        "agent_id": "general",
+                        "learning_level": "",
+                        "tone": "Formal",
+                        "language": "en",
+                        "context_policy": "shared",
+                    },
                 }
             }
         finally:
@@ -853,6 +1269,9 @@ def create_harry_botter_router(
         try:
             row = _owned_session(conn, session_id, user)
             now = datetime.now(timezone.utc).isoformat()
+            message_ids = [message.message_id for message in payload.messages]
+            if len(message_ids) != len(set(message_ids)):
+                raise HTTPException(status_code=400, detail="Conversation message IDs must be unique.")
             first_user_message = next(
                 (message.content for message in payload.messages if message.role == "user"),
                 None,
@@ -866,9 +1285,25 @@ def create_harry_botter_router(
                 "DELETE FROM harry_botter_session_messages WHERE session_id = ?",
                 (session_id,),
             )
+            conn.execute(
+                "DELETE FROM harry_botter_transcript_turns WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
+                "DELETE FROM harry_botter_response_drafts WHERE session_id = ?",
+                (session_id,),
+            )
             if not payload.messages:
                 conn.execute(
                     "DELETE FROM harry_botter_safeguarding_alerts WHERE session_id = ?",
+                    (session_id,),
+                )
+                conn.execute(
+                    "DELETE FROM harry_botter_playback_events WHERE session_id = ?",
+                    (session_id,),
+                )
+                conn.execute(
+                    "DELETE FROM harry_botter_session_summaries WHERE session_id = ?",
                     (session_id,),
                 )
             conn.executemany(
@@ -889,6 +1324,87 @@ def create_harry_botter_router(
                     for position, message in enumerate(payload.messages)
                 ],
             )
+            last_turn_id = None
+            for position, message in enumerate(payload.messages):
+                settings = message.settings
+                learning_level = settings.learningLevel if settings else ""
+                agent_id = settings.agentId if settings else "general"
+                tone_value = settings.tone if settings else "Formal"
+                if message.role == "user":
+                    last_turn_id = message.message_id
+                    conn.execute(
+                        """
+                        INSERT INTO harry_botter_transcript_turns
+                            (turn_id, session_id, sequence, speaker_label, source,
+                             content, learning_level, created_at, metadata_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            message.message_id,
+                            session_id,
+                            position,
+                            message.speaker_label,
+                            message.message_source
+                            if message.message_source in {"typed", "streaming_transcription"}
+                            else "typed",
+                            message.content,
+                            learning_level,
+                            now,
+                            json.dumps(
+                                {"confidence": message.confidence},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO harry_botter_response_drafts
+                            (draft_id, session_id, based_on_turn_id, agent_id,
+                             learning_level, tone, content, status, model_id,
+                             model_route, transcript_to_draft_ms, settings_json,
+                             sources_json, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            message.message_id,
+                            session_id,
+                            last_turn_id,
+                            agent_id,
+                            learning_level,
+                            tone_value,
+                            message.content,
+                            message.draft_status,
+                            message.model,
+                            message.route,
+                            message.transcript_to_draft_ms,
+                            json.dumps(
+                                settings.model_dump(by_alias=True) if settings else {},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            json.dumps(
+                                [
+                                    source.model_dump(by_alias=True)
+                                    for source in message.sources
+                                ],
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            now,
+                            now,
+                        ),
+                    )
+                if settings:
+                    conn.execute(
+                        """
+                        UPDATE harry_botter_session_settings
+                        SET agent_id = ?, learning_level = ?, tone = ?, updated_at = ?
+                        WHERE session_id = ?
+                        """,
+                        (agent_id, learning_level, tone_value, now, session_id),
+                    )
             conn.execute(
                 """
                 UPDATE harry_botter_sessions
@@ -909,6 +1425,68 @@ def create_harry_botter_router(
         finally:
             conn.close()
 
+    @router.post(
+        "/api/harry-botter/sessions/{session_id}/playback-events",
+        status_code=201,
+    )
+    def record_completed_playback(
+        session_id: str,
+        payload: PlaybackCompletedWrite,
+        user: dict[str, Any] = Depends(teacher),
+    ) -> dict[str, Any]:
+        conn = get_db_connection()
+        try:
+            _owned_session(conn, session_id, user)
+            draft = conn.execute(
+                """
+                SELECT content FROM harry_botter_response_drafts
+                WHERE draft_id = ? AND session_id = ?
+                """,
+                (payload.draft_id, session_id),
+            ).fetchone()
+            if draft is None:
+                raise HTTPException(status_code=404, detail="The played draft does not exist.")
+            completed_at = datetime.now(timezone.utc)
+            started_at = completed_at - timedelta(milliseconds=payload.duration_ms)
+            playback_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO harry_botter_playback_events
+                    (playback_id, session_id, draft_id, text_snapshot, output_path,
+                     voice_id, speed, status, duration_ms, started_at, completed_at,
+                     confirmed_at)
+                VALUES (?, ?, ?, ?, 'browser', ?, ?, 'completed', ?, ?, ?, ?)
+                """,
+                (
+                    playback_id,
+                    session_id,
+                    payload.draft_id,
+                    draft["content"],
+                    payload.voice_id,
+                    payload.speed,
+                    payload.duration_ms,
+                    started_at.isoformat(),
+                    completed_at.isoformat(),
+                    completed_at.isoformat(),
+                ),
+            )
+            conn.commit()
+            return {
+                "playback": {
+                    "playback_id": playback_id,
+                    "session_id": session_id,
+                    "draft_id": payload.draft_id,
+                    "output_path": "browser",
+                    "voice_id": payload.voice_id,
+                    "speed": payload.speed,
+                    "status": "completed",
+                    "duration_ms": payload.duration_ms,
+                    "confirmed_at": completed_at.isoformat(),
+                }
+            }
+        finally:
+            conn.close()
+
     @router.delete("/api/harry-botter/sessions/{session_id}")
     def delete_session(
         session_id: str,
@@ -921,6 +1499,14 @@ def create_harry_botter_router(
                 "DELETE FROM harry_botter_session_messages WHERE session_id = ?",
                 (session_id,),
             )
+            for table in (
+                "harry_botter_session_settings",
+                "harry_botter_transcript_turns",
+                "harry_botter_session_summaries",
+                "harry_botter_response_drafts",
+                "harry_botter_playback_events",
+            ):
+                conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
             conn.execute(
                 "DELETE FROM harry_botter_safeguarding_alerts WHERE session_id = ?",
                 (session_id,),
@@ -993,8 +1579,8 @@ def create_harry_botter_router(
             ).fetchall()
             documents = conn.execute(
                 """
-                SELECT document_id, filename, title, source, owner, learning_level,
-                       section_id, agent_id, review_date, digest, version,
+                SELECT document_id, filename, title, source, owner, intended_use,
+                       learning_level, section_id, agent_id, review_date, digest, version,
                        permission_confirmed_at, created_at, updated_at
                 FROM harry_botter_knowledge
                 ORDER BY title COLLATE NOCASE, document_id
@@ -1003,7 +1589,11 @@ def create_harry_botter_router(
             section_rows = {
                 row["section_id"]: row
                 for row in conn.execute(
-                    "SELECT section_id, guidance, updated_at FROM harry_botter_behavior_sections"
+                    """
+                    SELECT section_id, guidance, version, updated_by,
+                           approval_confirmed_at, updated_at
+                    FROM harry_botter_behavior_sections
+                    """
                 )
             }
             return {
@@ -1024,7 +1614,7 @@ def create_harry_botter_router(
     def update_behavior_section(
         section_id: str,
         payload: BehaviorSectionWrite,
-        _: dict[str, Any] = Depends(teacher),
+        user: dict[str, Any] = Depends(teacher),
     ) -> dict[str, Any]:
         definition = BEHAVIOR_SECTION_BY_ID.get(section_id)
         if definition is None:
@@ -1040,16 +1630,31 @@ def create_harry_botter_router(
             conn.execute(
                 """
                 UPDATE harry_botter_behavior_sections
-                SET guidance = ?, updated_at = ?
+                SET guidance = ?, version = version + 1, updated_by = ?,
+                    approval_confirmed_at = ?, updated_at = ?
                 WHERE section_id = ?
                 """,
-                (payload.guidance, now, section_id),
+                (
+                    payload.guidance,
+                    user["username"],
+                    now if payload.approval_confirmed else None,
+                    now,
+                    section_id,
+                ),
             )
             conn.commit()
+            version_row = conn.execute(
+                """
+                SELECT version, updated_by, approval_confirmed_at
+                FROM harry_botter_behavior_sections WHERE section_id = ?
+                """,
+                (section_id,),
+            ).fetchone()
             return {
                 "section": {
                     **definition,
                     "guidance": payload.guidance,
+                    **dict(version_row),
                     "updated_at": now,
                 }
             }
@@ -1174,10 +1779,10 @@ def create_harry_botter_router(
             conn.execute(
                 """
                 INSERT INTO harry_botter_knowledge
-                    (document_id, filename, title, source, owner, section_id,
+                    (document_id, filename, title, source, owner, intended_use, section_id,
                      learning_level, agent_id, review_date, text, digest, version,
                      permission_confirmed_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     document_id,
@@ -1185,6 +1790,7 @@ def create_harry_botter_router(
                     payload.title,
                     payload.source,
                     payload.owner,
+                    payload.intended_use,
                     payload.section_id,
                     payload.learning_level,
                     agent_id,
@@ -1256,7 +1862,8 @@ def create_harry_botter_router(
             conn.execute(
                 """
                 UPDATE harry_botter_knowledge
-                SET filename = ?, title = ?, source = ?, owner = ?, section_id = ?,
+                SET filename = ?, title = ?, source = ?, owner = ?, intended_use = ?,
+                    section_id = ?,
                     learning_level = ?, agent_id = ?, review_date = ?, text = ?,
                     digest = ?, version = version + 1,
                     permission_confirmed_at = ?, updated_at = ?
@@ -1267,6 +1874,7 @@ def create_harry_botter_router(
                     payload.title,
                     payload.source,
                     payload.owner,
+                    payload.intended_use,
                     payload.section_id,
                     payload.learning_level,
                     agent_id,
@@ -1443,6 +2051,26 @@ def create_harry_botter_router(
         try:
             if payload.session_id:
                 _owned_session(conn, payload.session_id, user)
+                conn.execute(
+                    """
+                    INSERT INTO harry_botter_session_settings
+                        (session_id, agent_id, learning_level, tone, language,
+                         context_policy, updated_at)
+                    VALUES (?, ?, ?, ?, 'en', 'shared', ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        agent_id = excluded.agent_id,
+                        learning_level = excluded.learning_level,
+                        tone = excluded.tone,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        payload.session_id,
+                        payload.agent_id,
+                        payload.learning_level,
+                        payload.tone,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
             agent_row = conn.execute(
                 "SELECT * FROM harry_botter_agents WHERE agent_id = ?",
                 (payload.agent_id,),
@@ -1510,8 +2138,7 @@ def create_harry_botter_router(
                             "created_at": created_at,
                         }
                     )
-            if detected_alerts:
-                conn.commit()
+            conn.commit()
         finally:
             conn.close()
 

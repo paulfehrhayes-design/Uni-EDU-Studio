@@ -89,7 +89,58 @@ class LocalOpenAIClientTests(unittest.TestCase):
         self.assertEqual(request["messages"][1]["content"], "What is water?")
         self.assertIn("MYP 2", request["messages"][0]["content"])
         self.assertIn("occasional, brief robot-related humor", request["messages"][0]["content"])
+        self.assertIn("Prefer concise replies", request["messages"][0]["content"])
         self.assertEqual(request["messages"][-1], {"role": "user", "content": "Explain evaporation."})
+        self.assertNotIn("think", request)
+
+    def test_default_ollama_endpoint_uses_native_chat_with_thinking_disabled(self) -> None:
+        client = LocalOpenAIClient(
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3:0.6b",
+        )
+        requests = []
+
+        def fake_request(method, path, payload=None, base_url=None):
+            requests.append((method, path, payload, base_url))
+            return {"message": {"content": "A concise local draft."}}
+
+        client._request_json = fake_request
+        answer = client.complete(
+            "Explain evaporation.",
+            "MYP 2",
+            "Formal",
+            [],
+        )
+
+        self.assertEqual(answer, "A concise local draft.")
+        method, path, payload, base_url = requests[0]
+        self.assertEqual((method, path, base_url), ("POST", "api/chat", "http://127.0.0.1:11434"))
+        self.assertFalse(payload["think"])
+        self.assertEqual(payload["keep_alive"], "10m")
+        self.assertEqual(payload["options"]["num_predict"], 500)
+
+    def test_model_warmup_never_uses_the_optional_network_route(self) -> None:
+        client = LocalOpenAIClient(
+            base_url=f"http://127.0.0.1:{self.server.server_port}/v1",
+            model="test-local-model",
+            network_base_url="http://192.168.1.20:11434/v1",
+            network_model="test-large-model",
+        )
+        routes = []
+
+        def fake_request(method, path, payload=None, base_url=None):
+            routes.append(base_url)
+            return {"choices": [{"message": {"content": "READY"}}]}
+
+        client._request_json = fake_request
+        result = client.warmup()
+
+        self.assertEqual(result, {
+            "status": "ready",
+            "model": "test-local-model",
+            "route": "local",
+        })
+        self.assertEqual(routes, [client.base_url])
 
     def test_select_model_only_accepts_a_model_listed_by_its_route(self) -> None:
         self.client.select_model("local", "test-local-model")
@@ -112,6 +163,7 @@ class LocalOpenAIClientTests(unittest.TestCase):
             "title": "Class debate guide",
             "source": "Teacher-approved class handout",
             "owner": "Humanities team",
+            "intended_use": "Support respectful debate and evidence checking.",
             "section_id": "curriculum",
             "section_title": "Curriculum and content boundaries",
             "review_date": "2026-10-01",

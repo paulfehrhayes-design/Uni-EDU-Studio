@@ -11,6 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 audio = [
+    "av==18.1.0",
     "faster-whisper==1.1.0",
     "kokoro==0.7.4",
     "espeakng-loader==0.2.4",

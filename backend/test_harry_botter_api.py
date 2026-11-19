@@ -67,6 +67,7 @@ class HarryBotterAPITests(unittest.TestCase):
             "title": "Evaporation lesson",
             "source": "Teacher-approved class handout",
             "owner": "Science department",
+            "intended_use": "Clarify the PYP-to-MYP transition for teacher-reviewed science explanations.",
             "section_id": "curriculum",
             "learning_level": "MYP 3",
             "agent_id": "debate",
@@ -95,6 +96,40 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertIn("persona", {
             section["section_id"] for section in response.json()["sections"]
         })
+
+    def test_agent_voice_settings_are_auditionable_and_shared(self):
+        status = httpx.Response(
+            200,
+            json={
+                "speech_generation": {
+                    "available_voices": ["af_heart", "af_bella"],
+                }
+            },
+        )
+        with patch.object(harry_botter_api, "_voice_request", return_value=status):
+            saved = self.client.put(
+                "/api/harry-botter/agents/general/voice-settings",
+                headers=self.teacher_headers,
+                json={"voice": "af_bella", "speed": 1.15},
+            )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["agent"]["tts_voice"], "af_bella")
+        self.assertEqual(saved.json()["agent"]["tts_speed"], 1.15)
+
+        other_teacher = self.client.get(
+            "/api/harry-botter/config",
+            headers={"Authorization": "Bearer ai-other-teacher-token"},
+        ).json()
+        general = next(agent for agent in other_teacher["agents"] if agent["agent_id"] == "general")
+        self.assertEqual(general["tts_voice"], "af_bella")
+
+        with patch.object(harry_botter_api, "_voice_request", return_value=status):
+            unavailable = self.client.put(
+                "/api/harry-botter/agents/general/voice-settings",
+                headers=self.teacher_headers,
+                json={"voice": "not-installed", "speed": 1.0},
+            )
+        self.assertEqual(unavailable.status_code, 400)
 
     def test_behavior_sections_are_shared_and_require_approval_when_appropriate(self):
         updated = self.client.put(
@@ -208,6 +243,7 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertEqual(document["version"], 1)
         self.assertTrue(document["permission_confirmed"])
         self.assertTrue(document["permission_confirmed_at"])
+        self.assertIn("PYP-to-MYP transition", document["intended_use"])
 
         listed = self.client.get("/api/harry-botter/config", headers=other_headers).json()
         self.assertEqual(listed["knowledge"][0]["document_id"], document["document_id"])
@@ -246,8 +282,19 @@ class HarryBotterAPITests(unittest.TestCase):
             headers=self.teacher_headers,
             json={
                 "messages": [
-                    {"role": "user", "content": "Explain evaporation."},
                     {
+                        "messageId": "turn-1",
+                        "role": "user",
+                        "content": "Explain evaporation.",
+                        "settings": {
+                            "learningLevel": "MYP 3",
+                            "tone": "Formal",
+                            "agentName": "General assistant",
+                            "agentId": "general",
+                        },
+                    },
+                    {
+                        "messageId": "draft-1",
                         "role": "assistant",
                         "content": "Water changes from liquid to vapour.",
                         "model": "configured-local-model",
@@ -266,6 +313,7 @@ class HarryBotterAPITests(unittest.TestCase):
                             "learningLevel": "MYP 3",
                             "tone": "Formal",
                             "agentName": "General assistant",
+                            "agentId": "general",
                         },
                         "transcriptToDraftMs": 1420,
                     },
@@ -285,6 +333,61 @@ class HarryBotterAPITests(unittest.TestCase):
             restored.json()["session"]["messages"][1]["sources"][0]["title"],
             "Water cycle",
         )
+        self.assertEqual(
+            restored.json()["session"]["settings"],
+            {
+                "agent_id": "general",
+                "learning_level": "MYP 3",
+                "tone": "Formal",
+                "language": "en",
+                "context_policy": "shared",
+            },
+        )
+        draft_id = restored.json()["session"]["messages"][1]["messageId"]
+        conn = server.get_db_connection()
+        try:
+            transcript = conn.execute(
+                """
+                SELECT source, content, learning_level
+                FROM harry_botter_transcript_turns
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            draft = conn.execute(
+                """
+                SELECT draft_id, based_on_turn_id, model_id, model_route,
+                       transcript_to_draft_ms, status
+                FROM harry_botter_response_drafts
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(dict(transcript), {
+            "source": "typed",
+            "content": "Explain evaporation.",
+            "learning_level": "MYP 3",
+        })
+        self.assertEqual(draft["draft_id"], "draft-1")
+        self.assertEqual(draft["model_id"], "configured-local-model")
+        self.assertEqual(draft["transcript_to_draft_ms"], 1420)
+        self.assertEqual(draft["status"], "draft")
+
+        played = self.client.post(
+            f"/api/harry-botter/sessions/{session_id}/playback-events",
+            headers=self.teacher_headers,
+            json={
+                "draft_id": draft_id,
+                "voice_id": "af_bella",
+                "speed": 1.15,
+                "duration_ms": 1800,
+            },
+        )
+        self.assertEqual(played.status_code, 201)
+        self.assertEqual(played.json()["playback"]["status"], "completed")
+        self.assertEqual(played.json()["playback"]["voice_id"], "af_bella")
 
         other_teacher = self.client.get(
             f"/api/harry-botter/sessions/{session_id}",
@@ -314,6 +417,45 @@ class HarryBotterAPITests(unittest.TestCase):
             ).status_code,
             404,
         )
+
+    def test_legacy_conversation_json_is_backfilled_into_explicit_records(self):
+        created = self.client.post(
+            "/api/harry-botter/sessions",
+            headers=self.teacher_headers,
+        )
+        session_id = created.json()["session"]["session_id"]
+        conn = server.get_db_connection()
+        conn.execute(
+            """
+            INSERT INTO harry_botter_session_messages
+                (session_id, position, message_json)
+            VALUES (?, 0, ?), (?, 1, ?)
+            """,
+            (
+                session_id,
+                '{"role":"user","content":"A saved question."}',
+                session_id,
+                '{"role":"assistant","content":"A saved draft.","model":"qwen3:0.6b","route":"local"}',
+            ),
+        )
+        harry_botter_api.initialize_harry_botter_schema(conn)
+        turns = conn.execute(
+            "SELECT content, source FROM harry_botter_transcript_turns WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        drafts = conn.execute(
+            "SELECT content, model_id FROM harry_botter_response_drafts WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        conn.close()
+        self.assertEqual([dict(row) for row in turns], [{
+            "content": "A saved question.",
+            "source": "typed",
+        }])
+        self.assertEqual([dict(row) for row in drafts], [{
+            "content": "A saved draft.",
+            "model_id": "qwen3:0.6b",
+        }])
 
     def test_safeguarding_signal_creates_owner_only_advisory_alert(self):
         created = self.client.post(
