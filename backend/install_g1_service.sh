@@ -18,9 +18,26 @@ voice_python_supported() {
   "$1" -c 'import sys; raise SystemExit(not ((3, 10) <= sys.version_info[:2] <= (3, 13)))' \
     >/dev/null 2>&1
 }
+UV_BIN=""
+ensure_uv() {
+  if [[ -n "$UV_BIN" && -x "$UV_BIN" ]]; then
+    return
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    UV_BIN="$(command -v uv)"
+  else
+    "$PYTHON" -m pip install uv
+    UV_BIN="$SDK_ENV_DIR/bin/uv"
+  fi
+  if [[ ! -x "$UV_BIN" ]]; then
+    echo "Could not install uv to provision the voice-service Python runtime." >&2
+    exit 1
+  fi
+}
+VOICE_VENV="$PROJECT_DIR/.venv-audio312"
 VOICE_PYTHON=""
 for candidate in \
-  "$PROJECT_DIR/.venv-audio312/bin/python" \
+  "$VOICE_VENV/bin/python" \
   "$PROJECT_DIR/ai-agent/voice-service/.venv/bin/python" \
   python3.12 python3.11 python3.10 python3.13 python3 python; do
   if [[ "$candidate" == */* ]]; then
@@ -34,9 +51,30 @@ for candidate in \
   fi
 done
 if [[ -z "$VOICE_PYTHON" ]]; then
-  echo "The Harry Botter voice service requires Python 3.10-3.13; no compatible Python was found." >&2
-  echo "Install Python 3.12 (the Unitree SDK environment may remain on Python 3.8) and rerun this installer." >&2
-  exit 1
+  echo "Provisioning Python 3.12 for the Harry Botter voice service."
+  ensure_uv
+  if ! "$UV_BIN" python install 3.12; then
+    echo "Could not install the Python 3.12 runtime required by the voice service." >&2
+    exit 1
+  fi
+  VOICE_PYTHON="$("$UV_BIN" python find 3.12)"
+  if ! voice_python_supported "$VOICE_PYTHON"; then
+    echo "uv did not provide a compatible Python 3.12 runtime for the voice service." >&2
+    exit 1
+  fi
+fi
+if [[ "$VOICE_PYTHON" != "$VOICE_VENV/bin/python" &&
+      "$VOICE_PYTHON" != "$PROJECT_DIR/ai-agent/voice-service/.venv/bin/python" ]]; then
+  if [[ -e "$VOICE_VENV" ]]; then
+    echo "The existing voice environment at $VOICE_VENV is incompatible; move it aside and rerun." >&2
+    exit 1
+  fi
+  ensure_uv
+  if ! "$UV_BIN" venv --seed --python "$VOICE_PYTHON" "$VOICE_VENV"; then
+    echo "Could not create the Python 3.12 voice-service environment at $VOICE_VENV." >&2
+    exit 1
+  fi
+  VOICE_PYTHON="$VOICE_VENV/bin/python"
 fi
 if [[ "$DUET_CONTROL_DIR" != /* ]]; then
   echo "DUET_CONTROL_DIR must be an absolute path." >&2

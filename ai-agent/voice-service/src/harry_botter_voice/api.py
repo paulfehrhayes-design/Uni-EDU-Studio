@@ -28,12 +28,13 @@ from .sessions import (
     SessionManager,
     SessionNotFoundError,
 )
+from .context_store import ContextStore
 
 MAX_REQUEST_BYTES = 64_000
 MAX_MESSAGE_CHARS = 2_000
 MAX_HISTORY_MESSAGES = 12
-MAX_KNOWLEDGE_DOCUMENTS = 3
-MAX_KNOWLEDGE_EXCERPT_CHARS = 2_500
+MAX_KNOWLEDGE_DOCUMENTS = 10
+MAX_KNOWLEDGE_EXCERPT_CHARS = 4_000
 MAX_BEHAVIOR_SECTIONS = 8
 MAX_POLICY_REVIEW_SOURCES = 3
 MAX_POLICY_REVIEW_SOURCE_CHARS = 2_500
@@ -82,10 +83,12 @@ class VoiceHTTPServer(ThreadingHTTPServer):
         session_manager: SessionManager,
         model_client: LocalOpenAIClient,
         speech_runtime: LocalSpeechRuntime,
+        context_store: ContextStore,
     ) -> None:
         self.session_manager = session_manager
         self.model_client = model_client
         self.speech_runtime = speech_runtime
+        self.context_store = context_store
         super().__init__(server_address, request_handler)
 
 
@@ -126,6 +129,16 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/speech/status":
             self._send_json(200, self.server.speech_runtime.status())
             return
+        if path == "/api/v1/context/status":
+            self._send_json(
+                200,
+                {
+                    "status": "integrated",
+                    "revision": self.server.context_store.revision(),
+                    "persistent": True,
+                },
+            )
+            return
 
         parts = path.strip("/").split("/")
         if len(parts) == 4 and parts[:3] == ["api", "v1", "sessions"]:
@@ -136,6 +149,22 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/v1/context/snapshot":
+            payload = self._read_json()
+            if payload is not None:
+                try:
+                    self.server.context_store.replace(payload)
+                except (KeyError, TypeError, ValueError) as exc:
+                    self._send_error(400, "invalid_context_snapshot", str(exc))
+                    return
+                self._send_json(
+                    200,
+                    {
+                        "status": "integrated",
+                        "revision": self.server.context_store.revision(),
+                    },
+                )
+            return
         if path == "/api/v1/drafts":
             payload = self._read_json()
             if payload is not None:
@@ -242,8 +271,6 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             "tone",
             "history",
             "agent",
-            "knowledge",
-            "sections",
         }
         if set(payload) - allowed_keys:
             self._send_error(400, "invalid_request", "The draft request contains unsupported fields.")
@@ -253,9 +280,6 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         learning_level = payload.get("learning_level", "")
         tone = payload.get("tone", "Formal")
         history = payload.get("history", [])
-        agent = payload.get("agent")
-        knowledge = payload.get("knowledge", [])
-        sections = payload.get("sections", [])
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
             self._send_error(
                 400,
@@ -263,6 +287,15 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                 f"Text must contain 1 to {MAX_MESSAGE_CHARS} characters.",
             )
             return
+        agent = payload.get("agent")
+        if isinstance(agent, dict) and isinstance(agent.get("agent_id"), str):
+            agent = self.server.context_store.agent(agent["agent_id"]) or agent
+        knowledge = self.server.context_store.retrieve(
+            text,
+            learning_level,
+            agent.get("agent_id", "") if isinstance(agent, dict) else "",
+        )
+        sections = self.server.context_store.sections()
         if not isinstance(learning_level, str) or learning_level not in LEARNING_LEVELS | {""}:
             self._send_error(400, "invalid_learning_level", "Choose a supported IB programme and year.")
             return
@@ -721,6 +754,7 @@ def make_server(
     session_manager: SessionManager | None = None,
     model_client: LocalOpenAIClient | None = None,
     speech_runtime: LocalSpeechRuntime | None = None,
+    context_store: ContextStore | None = None,
 ) -> VoiceHTTPServer:
     try:
         address = ipaddress.ip_address(host)
@@ -735,4 +769,5 @@ def make_server(
         session_manager or SessionManager(),
         model_client or LocalOpenAIClient(),
         speech_runtime or LocalSpeechRuntime(),
+        context_store or ContextStore(),
     )

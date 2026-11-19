@@ -89,7 +89,7 @@ class LocalOpenAIClientTests(unittest.TestCase):
         self.assertEqual(request["messages"][1]["content"], "What is water?")
         self.assertIn("MYP 2", request["messages"][0]["content"])
         self.assertIn("occasional, brief robot-related humor", request["messages"][0]["content"])
-        self.assertIn("Prefer concise replies", request["messages"][0]["content"])
+        self.assertIn("Give thorough, useful answers", request["messages"][0]["content"])
         self.assertEqual(request["messages"][-1], {"role": "user", "content": "Explain evaporation."})
         self.assertNotIn("think", request)
 

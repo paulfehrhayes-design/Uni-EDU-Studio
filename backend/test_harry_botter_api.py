@@ -91,11 +91,86 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             {agent["agent_id"] for agent in response.json()["agents"]},
-            {"general", "debate"},
+            {"general", "debate", "debate_partner"},
         )
         self.assertIn("persona", {
             section["section_id"] for section in response.json()["sections"]
         })
+
+    def test_debate_agent_is_detailed_and_persistent(self):
+        response = self.client.get(
+            "/api/harry-botter/config",
+            headers=self.teacher_headers,
+        )
+        debate = next(
+            agent for agent in response.json()["agents"]
+            if agent["agent_id"] == "debate"
+        )
+        self.assertIn("claims", debate["purpose"].casefold())
+        self.assertIn("key question", debate["instructions"].casefold())
+        self.assertIn("counterarguments", debate["instructions"].casefold())
+        self.assertIn("Early Years", debate["instructions"])
+        self.assertIn("DP", debate["instructions"])
+        self.assertGreater(len(debate["instructions"]), 2_000)
+
+        other_teacher = self.client.get(
+            "/api/harry-botter/config",
+            headers={"Authorization": "Bearer ai-other-teacher-token"},
+        ).json()
+        shared = next(
+            agent for agent in other_teacher["agents"]
+            if agent["agent_id"] == "debate"
+        )
+        self.assertEqual(shared["instructions"], debate["instructions"])
+
+    def test_debate_partner_is_a_distinct_persistent_argumentative_agent(self):
+        response = self.client.get(
+            "/api/harry-botter/config",
+            headers=self.teacher_headers,
+        )
+        agents = {agent["agent_id"]: agent for agent in response.json()["agents"]}
+        self.assertIn("debate_partner", agents)
+        partner = agents["debate_partner"]
+        self.assertIn("debate constructively", partner["purpose"].casefold())
+        self.assertIn("acknowledge the student's strongest point", partner["instructions"].casefold())
+        self.assertIn("never attack", partner["instructions"].casefold())
+        self.assertIn("Early Years", partner["instructions"])
+        self.assertIn("approved database sources", partner["instructions"].casefold())
+        self.assertGreater(len(partner["instructions"]), 2_000)
+
+    def test_database_sections_and_cais_context_are_substantial(self):
+        response = self.client.get(
+            "/api/harry-botter/config",
+            headers=self.teacher_headers,
+        )
+        sections = {
+            section["section_id"]: section
+            for section in response.json()["sections"]
+        }
+        self.assertEqual(set(sections), {
+            "persona",
+            "role",
+            "curriculum",
+            "learner_support",
+            "safeguarding",
+            "information_use",
+            "school_context",
+            "voice_personality",
+        })
+        for section_id, section in sections.items():
+            self.assertGreater(
+                len(section["guidance"]),
+                800,
+                f"{section_id} should contain detailed integrated guidance",
+            )
+
+        cais_documents = [
+            document for document in response.json()["knowledge"]
+            if document["section_id"] == "school_context"
+        ]
+        self.assertGreaterEqual(len(cais_documents), 3)
+        combined = "\n".join(document["source"] for document in cais_documents)
+        self.assertIn("caischina.org", combined)
 
     def test_agent_voice_settings_are_auditionable_and_shared(self):
         status = httpx.Response(
@@ -246,8 +321,11 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertIn("PYP-to-MYP transition", document["intended_use"])
 
         listed = self.client.get("/api/harry-botter/config", headers=other_headers).json()
-        self.assertEqual(listed["knowledge"][0]["document_id"], document["document_id"])
-        self.assertNotIn("text", listed["knowledge"][0])
+        listed_document = next(
+            item for item in listed["knowledge"]
+            if item["document_id"] == document["document_id"]
+        )
+        self.assertNotIn("text", listed_document)
 
         updated_payload = self.knowledge_payload(
             agent_id=agent["agent_id"],
@@ -798,16 +876,8 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertEqual(response.json()["draft"]["route"], "local")
         self.assertEqual(captured["method"], "POST")
         self.assertEqual(captured["path"], "/api/v1/drafts")
-        self.assertEqual(len(captured["payload"]["knowledge"]), 1)
-        self.assertEqual(captured["payload"]["knowledge"][0]["title"], "Evaporation lesson")
-        self.assertEqual(captured["payload"]["knowledge"][0]["section_id"], "curriculum")
-        self.assertEqual(
-            next(
-                section["guidance"] for section in captured["payload"]["sections"]
-                if section["section_id"] == "persona"
-            ),
-            "Use a calm, curious robot voice.",
-        )
+        self.assertNotIn("knowledge", captured["payload"])
+        self.assertNotIn("sections", captured["payload"])
         self.assertEqual(captured["payload"]["agent"]["agent_id"], "debate")
 
     def test_g1_speech_requires_teacher_and_uses_existing_audio_client(self):

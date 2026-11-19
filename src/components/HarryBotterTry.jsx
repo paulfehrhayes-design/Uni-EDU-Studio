@@ -443,10 +443,8 @@ export default function HarryBotterTry() {
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || 'Could not check the G1 audio connection.');
       setG1RobotStatus(result);
-      if (result.capabilities?.audio !== true) setDraftOutput('browser');
     } catch (error) {
       setG1RobotStatus({ error: error.message || 'Could not check the G1 audio connection.' });
-      setDraftOutput('browser');
     }
   }, [teacherSession]);
 
@@ -2294,58 +2292,6 @@ export default function HarryBotterTry() {
           <p className="w-full text-xs text-slate-500">
             Audition a local Kokoro preset or the optional Qwen3 VoiceDesign sample and press Play before applying it to future browser replies. Qwen3 attempts a fictional youthful South London voice from text instructions only; age and Fulham-area accent are not guaranteed. Celebrity voice imitation and reference-voice cloning are not offered. This does not change the separate G1 speaker voice; review voice terms before school deployment.
           </p>
-          <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
-            Draft output
-            <select
-              aria-label="Draft audio output"
-              value={draftOutput}
-              onChange={(event) => {
-                setDraftOutput(event.target.value);
-                setG1SpeechStatus('');
-                setG1SpeechError('');
-              }}
-              className="rounded-lg border border-slate-300 bg-white px-3 py-2"
-            >
-              <option value="browser">Browser/local speaker (default)</option>
-              {g1AudioConnected && <option value="g1">G1 speaker</option>}
-            </select>
-          </label>
-          <button
-            type="button"
-            onClick={() => void checkG1AudioStatus()}
-            className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50"
-          >
-            Refresh G1 audio status
-          </button>
-          <p role="status" aria-live="polite" className="w-full text-xs text-slate-600">
-            {g1AudioConnected
-              ? 'G1 audio client connected. Selecting G1 will not send audio; use the explicit speak button on a draft.'
-              : g1RobotStatus?.error
-                ? `G1 audio status unavailable. ${g1RobotStatus.error}`
-                : g1RobotStatus
-                  ? 'G1 speaker unavailable. Connect the G1 audio client from the teacher robot panel.'
-                  : 'Checking G1 audio connection…'}
-          </p>
-          {draftOutput === 'g1' && g1AudioConnected && (
-            <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
-              G1 speaker ID
-              <select
-                aria-label="G1 speaker ID"
-                value={g1SpeakerId}
-                onChange={(event) => setG1SpeakerId(event.target.value)}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-2"
-              >
-                <option value="0">Voice 0</option>
-                <option value="1">Voice 1</option>
-              </select>
-            </label>
-          )}
-          {g1SpeechStatus && (
-            <p role="status" aria-live="polite" className="w-full text-sm text-emerald-700">{g1SpeechStatus}</p>
-          )}
-          {g1SpeechError && (
-            <p role="alert" className="w-full text-sm text-red-700">{g1SpeechError}</p>
-          )}
         </section>
 
         <section
@@ -2477,7 +2423,7 @@ export default function HarryBotterTry() {
             <div>
               <h2 className="text-lg font-semibold">AI draft chat</h2>
               <p className="mt-1 text-sm text-slate-600">
-                Teacher testing mode. Replies remain drafts; create speech and press Play only when you approve it. The configured model route is shown below.
+                Teacher testing mode. Replies remain drafts. Choose G1 below, then explicitly send an approved reply through Uni-EDU Studio&apos;s Audio block.
               </p>
             </div>
             <button
@@ -2566,6 +2512,86 @@ export default function HarryBotterTry() {
               Choose a model already installed on the configured local or private Wi-Fi server. Selection applies until the voice service restarts; configure the environment settings to change its startup default.
             </p>
           </div>
+          <section
+            aria-label="G1 chat output"
+            data-testid="g1-chat-routing"
+            className="space-y-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="font-semibold text-emerald-950">Send a chat reply to the G1</h3>
+                <p className="text-sm text-emerald-900">
+                  Uni-EDU Studio sends approved text through its Audio block command
+                  {' '}<code>robot.say(text, speaker_id)</code>.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void checkG1AudioStatus()}
+                className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-sm font-semibold text-emerald-900"
+              >
+                Refresh G1 status
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="flex items-center gap-2 text-sm font-medium text-emerald-950">
+                Chat reply destination
+                <select
+                  aria-label="Draft audio output"
+                  value={draftOutput}
+                  onChange={(event) => {
+                    setDraftOutput(event.target.value);
+                    setG1SpeechStatus('');
+                    setG1SpeechError('');
+                  }}
+                  className="rounded-lg border border-emerald-300 bg-white px-3 py-2"
+                >
+                  <option value="browser">Browser/local speaker (prepare/play manually)</option>
+                  <option value="g1">G1 speaker (Uni-EDU Studio Audio block)</option>
+                </select>
+              </label>
+              {draftOutput === 'g1' && (
+                <label className="flex items-center gap-2 text-sm font-medium text-emerald-950">
+                  G1 speaker ID
+                  <select
+                    aria-label="G1 speaker ID"
+                    value={g1SpeakerId}
+                    onChange={(event) => setG1SpeakerId(event.target.value)}
+                    className="rounded-lg border border-emerald-300 bg-white px-3 py-2"
+                  >
+                    <option value="0">Voice 0</option>
+                    <option value="1">Voice 1</option>
+                  </select>
+                </label>
+              )}
+            </div>
+            <p role="status" aria-live="polite" className="text-sm text-emerald-950">
+              {g1AudioConnected
+                ? 'G1 audio capability connected. Select G1 and use “Speak this draft on G1” on the reply you approve.'
+                : g1RobotStatus?.error
+                  ? `G1 connection status could not be checked. ${g1RobotStatus.error}`
+                  : g1RobotStatus
+                    ? 'G1 audio capability is not connected. The G1 route remains visible here, but sending is disabled until the robot connects.'
+                    : 'Checking G1 audio capability…'}
+            </p>
+            {!g1AudioConnected && (
+              <p className="text-sm text-emerald-950">
+                To connect it, open{' '}
+                <a href="/" className="font-semibold underline">Uni-EDU Studio</a>
+                {' '}and use the teacher Robot connection panel. Return to this preview after the G1 connects.
+              </p>
+            )}
+            <p className="text-xs text-emerald-900">
+              G1 uses its own speaker voice; the browser voice setting only affects browser playback.
+              No reply is sent automatically, and this route does not use the robot microphone.
+            </p>
+            {g1SpeechStatus && (
+              <p role="status" aria-live="polite" className="text-sm text-emerald-800">{g1SpeechStatus}</p>
+            )}
+            {g1SpeechError && (
+              <p role="alert" className="text-sm text-red-700">{g1SpeechError}</p>
+            )}
+          </section>
 
           <div className="max-h-96 space-y-3 overflow-y-auto rounded-lg border border-slate-200 p-4">
             {chatMessages.length === 0 && (
@@ -2671,12 +2697,13 @@ export default function HarryBotterTry() {
                     >
                       {isPreparingSpeechIndex === index ? 'Creating speech…' : 'Prepare spoken reply'}
                     </button>
-                    {draftOutput === 'g1' && g1AudioConnected && (
+                    {draftOutput === 'g1' && (
                       <button
                         type="button"
                         onClick={() => void speakDraftOnG1(message.content)}
                         disabled={
                           isSendingG1Speech
+                          || !g1AudioConnected
                           || editingDraftIndex !== null
                           || !message.content.trim()
                           || message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS
@@ -2686,12 +2713,11 @@ export default function HarryBotterTry() {
                         {isSendingG1Speech ? 'Sending to G1…' : 'Speak this draft on G1'}
                       </button>
                     )}
-                    {draftOutput === 'g1' && g1AudioConnected
-                      && message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS && (
+                    {draftOutput === 'g1' && message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS && (
                         <span className="self-center text-xs text-slate-600">
                           Shorten this draft to 120 characters before sending it to the G1.
                         </span>
-                      )}
+                    )}
                   </div>
                 )}
                 {message.speechUrl
@@ -3044,12 +3070,13 @@ export default function HarryBotterTry() {
                       >
                         {isPreparingSpeechIndex === index ? 'Creating speech…' : 'Prepare spoken reply'}
                       </button>
-                      {draftOutput === 'g1' && g1AudioConnected && (
+                      {draftOutput === 'g1' && (
                         <button
                           type="button"
                           onClick={() => void speakDraftOnG1(message.content)}
                           disabled={
                             isSendingG1Speech
+                            || !g1AudioConnected
                             || !message.content.trim()
                             || message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS
                           }
@@ -3058,8 +3085,7 @@ export default function HarryBotterTry() {
                           {isSendingG1Speech ? 'Sending to G1…' : 'Speak this draft on G1'}
                         </button>
                       )}
-                      {draftOutput === 'g1' && g1AudioConnected
-                        && message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS && (
+                      {draftOutput === 'g1' && message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS && (
                           <span className="self-center text-xs text-slate-600">
                             Shorten this draft to 120 characters before sending it to the G1.
                           </span>

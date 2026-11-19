@@ -135,6 +135,24 @@ function canBind(portNumber) {
   });
 }
 
+async function serviceIsReady(url) {
+  try {
+    await fetchJson(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function requireFreePortOrReadyService(portNumber, healthUrl, label) {
+  if (await canBind(portNumber)) return false;
+  if (await serviceIsReady(healthUrl)) {
+    log(`${label} is already running; reusing it.`);
+    return true;
+  }
+  throw new Error(`Port ${portNumber} is in use, but ${label} is not responding at ${healthUrl}.`);
+}
+
 function getPythonVersion(binary) {
   const result = spawnSync(binary, ['-c', 'import sys; print(sys.version_info.major, sys.version_info.minor)'], {
     encoding: 'utf8',
@@ -361,59 +379,63 @@ try {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) {
     throw new Error('UNI_EDU_PORT must be an integer between 1024 and 65535.');
   }
-  if (!(await canBind(port))) {
-    throw new Error(`Port ${port} is already in use. Set UNI_EDU_PORT to another available port.`);
-  }
-  if (!(await canBind(voicePort))) throw new Error(`Port ${voicePort} is already in use.`);
+  const backendUrl = `http://127.0.0.1:${port}/api/status`;
+  const backendAlreadyRunning = await requireFreePortOrReadyService(port, backendUrl, 'Uni-EDU');
 
   if (process.env.HARRY_BOTTER_SKIP_BUILD !== '1') {
     log('Building the app...');
     await npmCommand(['run', 'build']);
   }
 
-  const backendPython = await ensureBackendPython();
-  const backend = startProcess(backendPython, [path.join(root, 'backend', 'server.py')], {
-    cwd: root,
-    env: { ...env, UNI_EDU_PORT: String(port) },
-  });
-  await waitForService(`http://127.0.0.1:${port}/api/status`, backend, 'Uni-EDU backend');
+  if (!backendAlreadyRunning) {
+    const backendPython = await ensureBackendPython();
+    const backend = startProcess(backendPython, [path.join(root, 'backend', 'server.py')], {
+      cwd: root,
+      env: { ...env, UNI_EDU_PORT: String(port) },
+    });
+    await waitForService(backendUrl, backend, 'Uni-EDU backend');
+  }
   log(`Uni-EDU app is available at http://localhost:${port}; preparing local AI services.`);
 
   await ensureOllama(env);
-  const python = await ensureVoicePython();
-  const audioPackagesReady = spawnSync(
-    python,
-    ['-c', `import ${pythonPackages.join(', ')}`],
-    { stdio: 'ignore' },
-  ).status === 0;
-  if (!audioPackagesReady) {
-    log('Audio dependencies are incomplete. Live transcription and voice previews will report unavailable; typing chat can still run.');
-  } else if (!speechModelsCached()) {
-    log('Downloading and warming the free local speech models (first run only)...');
-    try {
-      await run(python, ['-m', 'harry_botter_voice.setup_models'], {
-        cwd: voiceDir,
-        env: {
-          ...env,
-          HF_HUB_OFFLINE: '0',
-          PYTHONPATH: path.join(voiceDir, 'src'),
-        },
-      });
-    } catch (error) {
-      log(`Speech models could not be prepared: ${error.message}`);
-      log('The voice service will still start for typing chat; check speech status and complete model setup before using audio.');
+  const voiceHealthUrl = `http://127.0.0.1:${voicePort}/api/v1/health`;
+  const voiceAlreadyRunning = await requireFreePortOrReadyService(voicePort, voiceHealthUrl, 'Harry Botter voice service');
+  if (!voiceAlreadyRunning) {
+    const python = await ensureVoicePython();
+    const audioPackagesReady = spawnSync(
+      python,
+      ['-c', `import ${pythonPackages.join(', ')}`],
+      { stdio: 'ignore' },
+    ).status === 0;
+    if (!audioPackagesReady) {
+      log('Audio dependencies are incomplete. Live transcription and voice previews will report unavailable; typing chat can still run.');
+    } else if (!speechModelsCached()) {
+      log('Downloading and warming the free local speech models (first run only)...');
+      try {
+        await run(python, ['-m', 'harry_botter_voice.setup_models'], {
+          cwd: voiceDir,
+          env: {
+            ...env,
+            HF_HUB_OFFLINE: '0',
+            PYTHONPATH: path.join(voiceDir, 'src'),
+          },
+        });
+      } catch (error) {
+        log(`Speech models could not be prepared: ${error.message}`);
+        log('The voice service will still start for typing chat; check speech status and complete model setup before using audio.');
+      }
     }
-  }
 
-  const voice = startProcess(python, ['-m', 'harry_botter_voice', '--port', String(voicePort)], {
-    cwd: voiceDir,
-    env: {
-      ...env,
-      HF_HUB_OFFLINE: '1',
-      PYTHONPATH: path.join(voiceDir, 'src'),
-    },
-  });
-  await waitForService(`http://127.0.0.1:${voicePort}/api/v1/health`, voice, 'Voice service');
+    const voice = startProcess(python, ['-m', 'harry_botter_voice', '--port', String(voicePort)], {
+      cwd: voiceDir,
+      env: {
+        ...env,
+        HF_HUB_OFFLINE: '1',
+        PYTHONPATH: path.join(voiceDir, 'src'),
+      },
+    });
+    await waitForService(voiceHealthUrl, voice, 'Voice service');
+  }
 
   try {
     const modelStatus = await fetchJson(`http://127.0.0.1:${voicePort}/api/v1/model/status`);
@@ -451,7 +473,8 @@ try {
   }
 
   log(`Ready. Open http://localhost:${port}/?try=harry-botter and sign in as a teacher.`);
-  log('Press Ctrl+C to stop the backend, voice service, and any Ollama server started here.');
+  log('Services started by this launcher will remain available while npm start is running. Press Ctrl+C to stop those services.');
+  setInterval(() => {}, 60_000);
 } catch (error) {
   console.error(`[Harry Botter] Startup failed: ${error.message}`);
   await shutdown(1);

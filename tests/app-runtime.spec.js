@@ -4451,6 +4451,7 @@ test('Harry Botter keeps policy review as an unsaved teacher-approved proposal',
 test('Harry Botter requires auditioning a voice before applying it', async ({ page }) => {
   const speechPayloads = [];
   let g1ProgramCode;
+  let g1AudioConnected = false;
   let appliedVoice = 'af_heart';
   let appliedSpeed = 1;
   const generalAgent = () => ({
@@ -4546,7 +4547,7 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
       },
       '/api/harry-botter/config': { agents: [generalAgent()], knowledge: [], sections: [] },
       '/api/harry-botter/alerts': { alerts: [] },
-      '/api/robot/status': { capabilities: { audio: true } },
+      '/api/robot/status': { capabilities: { audio: g1AudioConnected } },
     };
     await route.fulfill({
       status: 200,
@@ -4557,6 +4558,9 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
 
   await page.goto('/?try=harry-botter');
   await expect(page.getByTestId('current-browser-voice')).toContainText('af_heart');
+  await expect(page.getByTestId('g1-chat-routing')).toContainText('G1 audio capability is not connected');
+  await page.getByLabel('Draft audio output').selectOption('g1');
+  await expect(page.getByLabel('G1 speaker ID')).toBeVisible();
   await page.getByLabel('Voice to audition').selectOption('qwen3_youthful_south_london');
   await page.getByLabel('Spoken reply pace').selectOption('1.15');
   await page.getByRole('button', { name: 'Preview voice' }).click();
@@ -4585,8 +4589,13 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
     speed: 1.15,
     voice: 'qwen3_youthful_south_london',
   });
-  await page.getByLabel('Draft audio output').selectOption('g1');
-  await page.getByRole('button', { name: 'Speak this draft on G1' }).click();
+  const speakOnG1 = page.getByRole('button', { name: 'Speak this draft on G1' });
+  await expect(speakOnG1).toBeDisabled();
+  g1AudioConnected = true;
+  await page.getByRole('button', { name: 'Refresh G1 status' }).click();
+  await expect(page.getByTestId('g1-chat-routing')).toContainText('G1 audio capability connected');
+  await expect(speakOnG1).toBeEnabled();
+  await speakOnG1.click();
   await expect.poll(() => g1ProgramCode).toBeTruthy();
   expect(g1ProgramCode).toBe('robot.say("Water changes into vapor when it evaporates.", 0)\n');
   await expect(page.getByText('The compiled robot.say voice block was accepted. Check the G1 speaker.')).toBeVisible();
