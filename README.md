@@ -122,22 +122,24 @@ pip install fastapi uvicorn pydantic
 
 ### 0004 Startup
 
-Return to the `backend` directory and start the program.
+The G1 installation script creates a systemd user service that starts Uni++ EDU Studio, the backend,
+and Harry Botter's local voice service together. Rebooting or restarting the service requires no
+separate backend or voice command:
 
 ```bash
-cd ~/unipp-edu-studio/backend
-python -m server
-
+systemctl --user restart uni-edu-studio.service
+systemctl --user status uni-edu-studio.service
 ```
 
-Note that for future use, you need to activate the `UnippEduStudio` environment using conda first.
+For a source checkout, use the same complete one-command launcher from the project root:
 
 ```bash
-conda activate UnippEduStudio
-
+npm install
+npm start
 ```
 
-Subsequently, you can access the robot's `IP address:5179` under the same Wi-Fi to enter Uni++ EDU Studio.
+`npm start` selects the installed backend environment and starts any missing backend, Ollama, and
+voice processes automatically. Open the robot's `IP address:5179` under the same Wi-Fi.
 
 ## Classroom Mode
 

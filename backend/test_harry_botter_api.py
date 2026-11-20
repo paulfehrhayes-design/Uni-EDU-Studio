@@ -350,6 +350,41 @@ class HarryBotterAPITests(unittest.TestCase):
         )
         self.assertEqual(listed_updated_document["version"], 2)
 
+    def test_session_settings_apply_saved_agent_immediately(self):
+        created = self.client.post(
+            "/api/harry-botter/sessions",
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(created.status_code, 201)
+        session_id = created.json()["session"]["session_id"]
+
+        updated = self.client.put(
+            f"/api/harry-botter/sessions/{session_id}/settings",
+            headers=self.teacher_headers,
+            json={
+                "agent_id": "debate",
+                "learning_level": "MYP 3",
+                "tone": "Curious/Socratic",
+                "participant_mode": "group",
+                "speaker_assignment_mode": "adaptive",
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["settings"]["agent_id"], "debate")
+        self.assertEqual(updated.json()["settings"]["participant_mode"], "group")
+        self.assertEqual(updated.json()["settings"]["speaker_assignment_mode"], "adaptive")
+
+        loaded = self.client.get(
+            f"/api/harry-botter/sessions/{session_id}",
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(loaded.status_code, 200)
+        self.assertEqual(loaded.json()["session"]["settings"]["agent_id"], "debate")
+        self.assertEqual(loaded.json()["session"]["settings"]["learning_level"], "MYP 3")
+        self.assertEqual(loaded.json()["session"]["settings"]["tone"], "Curious/Socratic")
+        self.assertEqual(loaded.json()["session"]["settings"]["participant_mode"], "group")
+        self.assertEqual(loaded.json()["session"]["settings"]["speaker_assignment_mode"], "adaptive")
+
     def test_teacher_sessions_persist_text_are_owner_only_and_can_be_deleted(self):
         created = self.client.post(
             "/api/harry-botter/sessions",
@@ -914,12 +949,6 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "accepted"})
         self.assertEqual(audio_client.calls, [("A generated draft.", 0)])
 
-        too_long = self.client.post(
-            "/api/harry-botter/g1-speak",
-            headers=self.teacher_headers,
-            json={"text": "x" * 121, "speaker_id": 0},
-        )
-        self.assertEqual(too_long.status_code, 422)
 
     def test_audio_stream_rejects_missing_and_student_authentication(self):
         cases = (

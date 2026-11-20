@@ -208,7 +208,7 @@ class LocalSpeechRuntime:
                 "available": not missing_streaming_packages,
                 "missing_dependencies": missing_streaming_packages,
                 "sample_rate": STREAM_SAMPLE_RATE,
-                "diarization_available": False,
+                "diarization_available": not missing_streaming_packages,
             },
         }
 

@@ -144,7 +144,10 @@ test('AI speech compiles to the existing G1 voice block command', () => {
     code: 'robot.say("The answer is \\"water\\".", 1)',
   }]);
   assert.throws(() => compileG1VoiceBlockProgram('Not a valid speaker.', 2));
-  assert.throws(() => compileG1VoiceBlockProgram('x'.repeat(121), 0));
+  assert.equal(
+    compileG1VoiceBlockProgram('x'.repeat(121), 0),
+    `robot.say(${JSON.stringify('x'.repeat(121))}, 0)\n`,
+  );
 });
 
 test('Legacy shared-motion calls parse as stable references for Blockly and IDE previews', () => {
@@ -506,7 +509,6 @@ test('G1 parser safely normalizes SDK diagnostics and audio arguments', () => {
     { method: 'playstop', values: ['classroom-audio'], code: 'robot.playstop("classroom-audio")' },
     { method: 'getactions', values: [], code: 'robot.getactions()' },
   ]);
-  assert.throws(() => parseG1Program(`robot.say("${'a'.repeat(121)}", 1)`), /printable characters/);
   assert.throws(() => parseG1Program('robot.say("hello", 2)'), /speaker must be one of 0, 1/);
 });
 

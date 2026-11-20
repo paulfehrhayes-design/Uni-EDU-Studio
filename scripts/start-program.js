@@ -8,6 +8,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const voiceDir = path.join(root, 'ai-agent', 'voice-service');
 const modelsDir = path.join(voiceDir, 'models');
 const port = Number(process.env.UNI_EDU_PORT || 5179);
+const devMode = process.env.UNI_EDU_DEV === '1';
+const vitePort = Number(process.env.UNI_EDU_VITE_PORT || 5173);
 const voicePort = 8765;
 const ollamaUrl = 'http://127.0.0.1:11434';
 const localModel = 'qwen3:0.6b';
@@ -24,6 +26,7 @@ const pythonPackages = [
 ];
 const configFile = path.join(root, '.env.harry-botter.local');
 const children = [];
+const managedServices = new Map();
 let shuttingDown = false;
 
 function log(message) {
@@ -81,15 +84,40 @@ function startProcess(binary, args, options = {}) {
     stdio: 'inherit',
     shell: false,
   });
+  const serviceKey = options.serviceKey;
+  if (serviceKey) {
+    managedServices.set(serviceKey, {
+      binary,
+      args,
+      options,
+      child,
+      healthUrl: options.healthUrl,
+    });
+  }
   child.once('error', (error) => {
     if (!shuttingDown) console.error(`[Harry Botter] ${error.message}`);
   });
   child.once('exit', (code, signal) => {
     if (shuttingDown) return;
+    if (serviceKey) {
+      const managed = managedServices.get(serviceKey);
+      if (managed?.child === child) managedServices.delete(serviceKey);
+    }
+    if (options.restart === false) {
+      console.error(
+        `[Harry Botter] A managed service exited unexpectedly (${signal || code}). The launcher is not stopping.`,
+      );
+      return;
+    }
+    const label = options.label || path.basename(binary);
+    const delayMs = options.restartDelayMs || 2_000;
     console.error(
-      `[Harry Botter] A managed service exited unexpectedly (${signal || code}). Stopping the application stack.`,
+      `[Harry Botter] ${label} exited unexpectedly (${signal || code}). Restarting it in ${delayMs / 1000} seconds.`,
     );
-    void shutdown(1);
+    const timer = setTimeout(() => {
+      if (!shuttingDown) startProcess(binary, args, { ...options, restartDelayMs: Math.min(delayMs * 2, 30_000) });
+    }, delayMs);
+    timer.unref();
   });
   children.push(child);
   return child;
@@ -111,9 +139,6 @@ async function waitForService(url, child, label, timeoutMs = 45_000) {
   const deadline = Date.now() + timeoutMs;
   let lastError = 'not responding';
   while (Date.now() < deadline) {
-    if (child?.exitCode !== null && child?.exitCode !== undefined) {
-      throw new Error(`${label} exited before becoming ready.`);
-    }
     try {
       await fetchJson(url);
       return;
@@ -142,6 +167,22 @@ async function serviceIsReady(url) {
   } catch {
     return false;
   }
+}
+
+async function waitForHttp(url, child, label, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = 'not responding';
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError = error.message;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`${label} did not become ready: ${lastError}`);
 }
 
 async function requireFreePortOrReadyService(portNumber, healthUrl, label) {
@@ -251,6 +292,9 @@ async function ensureOllama(env) {
     }
     log('Starting the local Ollama server...');
     const child = startProcess('ollama', ['serve'], {
+      label: 'Ollama',
+      serviceKey: 'ollama',
+      healthUrl: `${ollamaUrl}/api/tags`,
       env: {
         ...env,
         OLLAMA_HOST: '127.0.0.1:11434',
@@ -327,6 +371,25 @@ async function shutdown(exitCode = 0) {
   process.exit(exitCode);
 }
 
+function startHealthMonitor() {
+  setInterval(async () => {
+    if (shuttingDown) return;
+    for (const [serviceKey, managed] of managedServices) {
+      if (!managed.healthUrl || managed.child.exitCode !== null) continue;
+      try {
+        await fetchJson(managed.healthUrl, 3_000);
+      } catch {
+        console.error(
+          `[Harry Botter] ${managed.options.label || serviceKey} is no longer healthy. Restarting it.`,
+        );
+        if (managed.child.exitCode === null) {
+          managed.child.kill('SIGTERM');
+        }
+      }
+    }
+  }, 30_000).unref();
+}
+
 async function ensureBackendPython() {
   const backendVenvPython = path.join(
     root,
@@ -382,7 +445,7 @@ try {
   const backendUrl = `http://127.0.0.1:${port}/api/status`;
   const backendAlreadyRunning = await requireFreePortOrReadyService(port, backendUrl, 'Uni-EDU');
 
-  if (process.env.HARRY_BOTTER_SKIP_BUILD !== '1') {
+  if (!devMode && process.env.HARRY_BOTTER_SKIP_BUILD !== '1') {
     log('Building the app...');
     await npmCommand(['run', 'build']);
   }
@@ -390,6 +453,9 @@ try {
   if (!backendAlreadyRunning) {
     const backendPython = await ensureBackendPython();
     const backend = startProcess(backendPython, [path.join(root, 'backend', 'server.py')], {
+      label: 'Uni-EDU backend',
+      serviceKey: 'backend',
+      healthUrl: backendUrl,
       cwd: root,
       env: { ...env, UNI_EDU_PORT: String(port) },
     });
@@ -427,6 +493,9 @@ try {
     }
 
     const voice = startProcess(python, ['-m', 'harry_botter_voice', '--port', String(voicePort)], {
+      label: 'Harry Botter voice service',
+      serviceKey: 'voice',
+      healthUrl: voiceHealthUrl,
       cwd: voiceDir,
       env: {
         ...env,
@@ -435,6 +504,16 @@ try {
       },
     });
     await waitForService(voiceHealthUrl, voice, 'Voice service');
+  }
+
+  if (devMode) {
+    log('Starting the Vite development frontend...');
+    const vite = startProcess(
+      process.platform === 'win32' ? 'npm.cmd' : 'npm',
+      ['run', 'dev:frontend', '--', '--host', '0.0.0.0', '--port', String(vitePort)],
+      { cwd: root, env: { ...env }, label: 'Vite development server', serviceKey: 'vite' },
+    );
+    await waitForHttp(`http://127.0.0.1:${vitePort}/`, vite, 'Vite development server');
   }
 
   try {
@@ -472,7 +551,13 @@ try {
     log(`Local speech warm-up failed; first spoken reply may be slower: ${error.message}`);
   }
 
-  log(`Ready. Open http://localhost:${port}/?try=harry-botter and sign in as a teacher.`);
+  startHealthMonitor();
+
+  log(
+    devMode
+      ? `Ready. Open http://localhost:${vitePort}/?try=harry-botter and sign in as a teacher.`
+      : `Ready. Open http://localhost:${port}/?try=harry-botter and sign in as a teacher.`,
+  );
   log('Services started by this launcher will remain available while npm start is running. Press Ctrl+C to stop those services.');
   setInterval(() => {}, 60_000);
 } catch (error) {

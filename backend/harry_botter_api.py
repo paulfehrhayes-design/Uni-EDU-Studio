@@ -39,7 +39,6 @@ MAX_SESSION_TEXT_BYTES = 1_000_000
 MAX_KNOWLEDGE_EXCERPTS = 10
 MAX_KNOWLEDGE_EXCERPT_CHARS = 4_000
 MAX_DRAFT_CHARS = 12_000
-MAX_G1_SPEECH_CHARS = 120
 TONES = {
     "Formal",
     "Lightly humorous",
@@ -479,6 +478,20 @@ class SessionMessagesWrite(StrictRequest):
     messages: list[SessionMessageWrite] = Field(max_length=MAX_SESSION_MESSAGES)
 
 
+class SessionSettingsWrite(StrictRequest):
+    agent_id: StrictStr = Field(min_length=1, max_length=80)
+    learning_level: StrictStr = ""
+    participant_mode: Literal["single", "group"] = "single"
+    speaker_assignment_mode: Literal["selected", "adaptive"] = "adaptive"
+    tone: Literal[
+        "Formal",
+        "Lightly humorous",
+        "Warm and encouraging",
+        "Curious/Socratic",
+        "Concise",
+    ] = "Formal"
+
+
 class PlaybackCompletedWrite(StrictRequest):
     draft_id: StrictStr = Field(min_length=1, max_length=36)
     voice_id: StrictStr = Field(min_length=1, max_length=32)
@@ -552,7 +565,7 @@ class DraftRequest(StrictRequest):
 
 
 class G1SpeakRequest(StrictRequest):
-    text: StrictStr = Field(min_length=1, max_length=MAX_G1_SPEECH_CHARS)
+    text: StrictStr = Field(min_length=1, max_length=MAX_DRAFT_CHARS)
     speaker_id: StrictInt = Field(ge=0, le=1)
 
     @field_validator("text")
@@ -962,10 +975,30 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
             tone TEXT NOT NULL DEFAULT 'Formal',
             language TEXT NOT NULL DEFAULT 'en',
             context_policy TEXT NOT NULL DEFAULT 'shared',
+            participant_mode TEXT NOT NULL DEFAULT 'single',
+            speaker_assignment_mode TEXT NOT NULL DEFAULT 'adaptive',
             updated_at TEXT NOT NULL
         )
         """
     )
+    settings_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(harry_botter_session_settings)")
+    }
+    if "participant_mode" not in settings_columns:
+        conn.execute(
+            "ALTER TABLE harry_botter_session_settings "
+            "ADD COLUMN participant_mode TEXT NOT NULL DEFAULT 'single'"
+        )
+    settings_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(harry_botter_session_settings)")
+    }
+    if "speaker_assignment_mode" not in settings_columns:
+        conn.execute(
+            "ALTER TABLE harry_botter_session_settings "
+            "ADD COLUMN speaker_assignment_mode TEXT NOT NULL DEFAULT 'adaptive'"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS harry_botter_transcript_turns (
@@ -1773,6 +1806,9 @@ def create_harry_botter_router(
                         "tone": "Formal",
                         "language": "en",
                         "context_policy": "shared",
+                        "participant_mode": "single",
+                        "speaker_assignment_mode": "adaptive",
+                        "speaker_assignment_mode": "adaptive",
                     },
                 }
             }
@@ -1796,7 +1832,8 @@ def create_harry_botter_router(
             ).fetchall()
             settings = conn.execute(
                 """
-                SELECT agent_id, learning_level, tone, language, context_policy
+                SELECT agent_id, learning_level, tone, language, context_policy,
+                       participant_mode, speaker_assignment_mode
                 FROM harry_botter_session_settings WHERE session_id = ?
                 """,
                 (session_id,),
@@ -1814,7 +1851,63 @@ def create_harry_botter_router(
                         "tone": "Formal",
                         "language": "en",
                         "context_policy": "shared",
+                        "participant_mode": "single",
                     },
+                }
+            }
+        finally:
+            conn.close()
+
+    @router.put("/api/harry-botter/sessions/{session_id}/settings")
+    def update_session_settings(
+        session_id: str,
+        payload: SessionSettingsWrite,
+        user: dict[str, Any] = Depends(teacher),
+    ) -> dict[str, Any]:
+        conn = get_db_connection()
+        try:
+            _owned_session(conn, session_id, user)
+            agent_row = conn.execute(
+                "SELECT agent_id FROM harry_botter_agents WHERE agent_id = ?",
+                (payload.agent_id,),
+            ).fetchone()
+            if agent_row is None:
+                raise HTTPException(status_code=404, detail="The selected agent does not exist.")
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT INTO harry_botter_session_settings
+                    (session_id, agent_id, learning_level, tone, language,
+                     context_policy, participant_mode, speaker_assignment_mode, updated_at)
+                VALUES (?, ?, ?, ?, 'en', 'shared', ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    agent_id = excluded.agent_id,
+                    learning_level = excluded.learning_level,
+                    tone = excluded.tone,
+                    participant_mode = excluded.participant_mode,
+                    speaker_assignment_mode = excluded.speaker_assignment_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id,
+                    payload.agent_id,
+                    payload.learning_level,
+                    payload.tone,
+                    payload.participant_mode,
+                    payload.speaker_assignment_mode,
+                    now,
+                ),
+            )
+            conn.commit()
+            return {
+                "settings": {
+                    "agent_id": payload.agent_id,
+                    "learning_level": payload.learning_level,
+                    "tone": payload.tone,
+                    "language": "en",
+                    "context_policy": "shared",
+                    "participant_mode": payload.participant_mode,
+                    "speaker_assignment_mode": payload.speaker_assignment_mode,
                 }
             }
         finally:

@@ -238,7 +238,7 @@ def _integer_choice(value: ast.AST, name: str, choices: tuple[int, ...]) -> int:
     return number
 
 
-def _text(value: ast.AST, name: str, maximum: int = 120) -> str:
+def _text(value: ast.AST, name: str, maximum: int = 12_000) -> str:
     if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
         raise CommandValidationError(f"{name} must be a quoted string.")
     text = value.value
@@ -797,14 +797,13 @@ def speak_robot_text(text: str, speaker_id: int) -> dict[str, str]:
     if (
         not isinstance(text, str)
         or not text.strip()
-        or len(text) > 120
         or "\n" in text
         or "\r" in text
         or any(ord(character) < 32 for character in text)
     ):
         raise HTTPException(
             status_code=400,
-            detail="G1 speech must be a non-empty single line of at most 120 characters.",
+            detail="G1 speech must be a non-empty single line.",
         )
     if isinstance(speaker_id, bool) or not isinstance(speaker_id, int) or speaker_id not in (0, 1):
         raise HTTPException(status_code=400, detail="G1 speaker ID must be 0 or 1.")

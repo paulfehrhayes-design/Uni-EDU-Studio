@@ -783,16 +783,17 @@ class G1RobotProgramTests(unittest.TestCase):
             result = g1_robot.speak_robot_text("Teacher-approved draft.", 0)
             self.assertEqual(result, {"status": "accepted"})
             self.assertEqual(audio_client.calls, [("Teacher-approved draft.", 0)])
+            result = g1_robot.speak_robot_text("x" * 121, 1)
+            self.assertEqual(result, {"status": "accepted"})
+            self.assertEqual(audio_client.calls[-1], ("x" * 121, 1))
             for text, speaker_id in (
                 (" ", 0),
-                ("x" * 121, 0),
                 ("line\nbreak", 0),
                 ("valid text", True),
                 ("valid text", 2),
             ):
                 with self.subTest(text=text, speaker_id=speaker_id), self.assertRaises(HTTPException):
                     g1_robot.speak_robot_text(text, speaker_id)
-            self.assertEqual(audio_client.calls, [("Teacher-approved draft.", 0)])
 
             self.assertTrue(g1_robot._run_lock.acquire(blocking=False))
             try:
@@ -800,7 +801,13 @@ class G1RobotProgramTests(unittest.TestCase):
                     g1_robot.speak_robot_text("Another draft.", 0)
             finally:
                 g1_robot._run_lock.release()
-            self.assertEqual(audio_client.calls, [("Teacher-approved draft.", 0)])
+            self.assertEqual(
+                audio_client.calls,
+                [
+                    ("Teacher-approved draft.", 0),
+                    ("x" * 121, 1),
+                ],
+            )
         finally:
             g1_robot._audio_client = original_audio_client
 

@@ -6,6 +6,7 @@ import threading
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable
+import numpy as np
 
 from .speech import (
     MAX_STREAM_UTTERANCE_BYTES,
@@ -26,12 +27,85 @@ MAX_UTTERANCE_FRAMES = MAX_STREAM_UTTERANCE_BYTES // STREAM_FRAME_BYTES
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
+class AdaptiveSpeakerTracker:
+    """Session-local spectral speaker clustering, not identity recognition."""
+
+    def __init__(self, similarity_threshold: float = 0.82) -> None:
+        self.similarity_threshold = similarity_threshold
+        self._profiles: list[dict[str, Any]] = []
+
+    def _embedding(self, audio: bytes) -> np.ndarray | None:
+        if len(audio) < STREAM_FRAME_BYTES * 20:
+            return None
+        samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
+        samples -= np.mean(samples)
+        if float(np.max(np.abs(samples))) < 1.0:
+            return None
+        window_count = min(120, max(1, len(samples) // STREAM_FRAME_BYTES))
+        chunk = len(samples) // window_count
+        chunks = [
+            samples[index:index + chunk]
+            for index in range(0, len(samples), chunk)
+            if len(samples[index:index + chunk]) >= 256
+        ]
+        bins: list[np.ndarray] = []
+        for frame in chunks[:60]:
+            frame = frame[: min(len(frame), 4_096)]
+            if len(frame) < 256:
+                continue
+            frame = frame * np.hanning(len(frame))
+            spectrum = np.abs(np.fft.rfft(frame))
+            groups = np.array_split(spectrum[: min(2048, len(spectrum))], 32)
+            bins.append(np.log1p(np.concatenate([
+                np.array([float(np.mean(group))]) for group in groups
+            ])))
+        if not bins:
+            return None
+        embedding = np.mean(np.stack(bins), axis=0)
+        norm = float(np.linalg.norm(embedding))
+        return embedding / norm if norm else None
+
+    def identify(self, audio: bytes) -> tuple[str, float]:
+        embedding = self._embedding(audio)
+        if embedding is None:
+            return "Speaker 1", 0.0
+        best_index = -1
+        best_similarity = -1.0
+        for index, profile in enumerate(self._profiles):
+            similarity = float(np.dot(embedding, profile["embedding"]))
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_index = index
+        if best_index >= 0 and best_similarity >= self.similarity_threshold:
+            profile = self._profiles[best_index]
+            profile["embedding"] = (
+                profile["embedding"] * 0.8 + embedding * 0.2
+            )
+            profile["embedding"] /= np.linalg.norm(profile["embedding"])
+            profile["samples"] += 1
+            return profile["label"], max(0.0, min(1.0, best_similarity))
+        index = len(self._profiles) + 1
+        label = f"Speaker {index}"
+        self._profiles.append({
+            "label": label,
+            "embedding": embedding,
+            "samples": 1,
+        })
+        return label, 0.0
+
+
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class StreamingSpeechSession:
-    def __init__(self, speech_runtime: LocalSpeechRuntime, vad: Any | None = None) -> None:
+    def __init__(
+        self,
+        speech_runtime: LocalSpeechRuntime,
+        vad: Any | None = None,
+        adaptive_speakers: bool = False,
+        current_speaker: str | None = None,
+    ) -> None:
         if vad is None:
             try:
                 import webrtcvad
@@ -49,6 +123,9 @@ class StreamingSpeechSession:
         self._utterance_frames: list[bytes] = []
         self._active = False
         self._quiet_frames = 0
+        self._adaptive_speakers = adaptive_speakers
+        self._current_speaker = current_speaker
+        self._speaker_tracker = AdaptiveSpeakerTracker()
 
     def start(self, session_id: str) -> None:
         if not SESSION_ID_PATTERN.fullmatch(session_id):
@@ -101,12 +178,21 @@ class StreamingSpeechSession:
             ]
         events = []
         if transcript:
+            speaker = None
+            confidence = None
+            if self._adaptive_speakers:
+                if self._current_speaker:
+                    speaker = self._current_speaker
+                    confidence = 1.0
+                else:
+                    speaker, confidence = self._speaker_tracker.identify(audio)
             events.append(
                 self._event(
                     "transcript_final",
                     text=transcript,
-                    speaker=None,
-                    diarization_available=False,
+                    speaker=speaker,
+                    speaker_confidence=confidence,
+                    diarization_available=self._adaptive_speakers,
                 )
             )
         else:
@@ -151,7 +237,16 @@ def make_audio_stream_handler(
             start_payload = json.loads(connection.recv(timeout=5))
             if (
                 not isinstance(start_payload, dict)
-                or set(start_payload) != {"type", "session_id", "sample_rate", "format"}
+                or start_payload.keys() - {
+                    "type",
+                    "session_id",
+                    "sample_rate",
+                    "format",
+                    "participant_mode",
+                    "current_speaker",
+                    "speaker_assignment_mode",
+                }
+                or not {"type", "session_id", "sample_rate", "format"} <= start_payload.keys()
                 or start_payload["type"] != "start"
                 or start_payload["sample_rate"] != STREAM_SAMPLE_RATE
                 or start_payload["format"] != "pcm_s16le_mono"
@@ -160,6 +255,15 @@ def make_audio_stream_handler(
             session = StreamingSpeechSession(
                 speech_runtime,
                 vad=vad_factory() if vad_factory is not None else None,
+                adaptive_speakers=(
+                    start_payload.get("participant_mode") == "group"
+                    and start_payload.get("speaker_assignment_mode") == "adaptive"
+                ),
+                current_speaker=(
+                    start_payload.get("current_speaker")
+                    if start_payload.get("speaker_assignment_mode") == "selected"
+                    else None
+                ),
             )
             session.start(start_payload["session_id"])
         except SpeechRuntimeNotConfigured as exc:

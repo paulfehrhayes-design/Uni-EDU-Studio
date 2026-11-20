@@ -45,12 +45,15 @@ npm start
 Open `http://localhost:5179/?try=harry-botter` and sign in as a teacher.
 Keep the `npm start` terminal running while you use the app; it supervises
 services that it starts. Use **Ctrl+C** to stop the services started by this
-command. If port 5179 already serves Uni-EDU, the launcher reuses that backend
+command. Managed services that exit unexpectedly are restarted after a short
+delay instead of stopping the application stack. If port 5179 already serves Uni-EDU, the launcher reuses that backend
 instead of failing or switching ports, then starts any missing local AI
 services. An Ollama or voice service that was already responding is reused and
 left alone when the launcher exits.
-`npm run dev` remains the frontend-only development server; it does not start
-the AI services.
+`npm run dev` also uses the complete launcher and starts the backend and AI
+services, then serves the React frontend on Vite at `http://localhost:5173`.
+Use `npm run dev:frontend` only for a frontend-only process when another complete
+application stack is already running.
 
 The default local model is Qwen3 0.6B. Speech recognition and speech generation use
 the locally cached Whisper tiny.en and Kokoro models. Model files are stored

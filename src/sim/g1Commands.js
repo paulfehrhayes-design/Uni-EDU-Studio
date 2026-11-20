@@ -277,9 +277,9 @@ function decodeArgument(raw, definition) {
       }
       value = raw.slice(1, -1).replace(/\\\\/g, '\\').replace(/\\'/g, "'");
     }
-    if (typeof value !== 'string' || !value.trim() || value.length > 120
+    if (typeof value !== 'string' || !value.trim() || value.length > 12_000
       || [...value].some((character) => character.codePointAt(0) < 32 || character.codePointAt(0) === 127)) {
-      throw new Error(`${definition.label} must contain 1 to 120 printable characters.`);
+      throw new Error(`${definition.label} must contain 1 to 12000 printable characters.`);
     }
     return value;
   }

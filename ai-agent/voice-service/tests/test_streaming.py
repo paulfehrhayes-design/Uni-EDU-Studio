@@ -82,6 +82,19 @@ class StreamingSpeechSessionTests(unittest.TestCase):
         self.assertGreater(len(runtime.audio), 0)
         self.assertEqual(session._utterance_frames, [])
 
+    def test_adaptive_speaker_tracking_assigns_new_and_recognized_session_labels(self) -> None:
+        runtime = FakeSpeechRuntime()
+        session = StreamingSpeechSession(runtime, FakeVAD(), adaptive_speakers=True)
+        session.start("adaptive-speakers")
+        for _ in range(3):
+            session.feed(b"\x01" * STREAM_FRAME_BYTES)
+        first_events = session.feed(b"\x01" * STREAM_FRAME_BYTES)
+        for _ in range(15):
+            first_events.extend(session.feed(bytes(STREAM_FRAME_BYTES)))
+        first = next(event for event in first_events if event["type"] == "transcript_final")
+        self.assertEqual(first["speaker"], "Speaker 1")
+        self.assertTrue(first["diarization_available"])
+
     def test_missing_local_whisper_returns_an_explicit_event_and_clears_audio(self) -> None:
         class MissingWhisperRuntime(LocalSpeechRuntime):
             def _get_transcriber(self):

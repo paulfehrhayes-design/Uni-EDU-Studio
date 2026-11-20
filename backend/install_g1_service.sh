@@ -195,7 +195,7 @@ Environment=DUET_CONTROL_DIR=$DUET_CONTROL_DIR
 Environment=DUET_EXPECTED_POLICY_ID=$DUET_EXPECTED_POLICY_ID
 EnvironmentFile=-$PROJECT_DIR/.env.harry-botter.local
 ExecStart=$NODE_BIN $PROJECT_DIR/scripts/start-program.js
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 [Install]
@@ -309,6 +309,26 @@ if [[ "$APP_READY" != "1" ]]; then
   echo "Service status and recent logs:" >&2
   systemctl --user --no-pager -l status uni-edu-studio.service >&2 || true
   journalctl --user -u uni-edu-studio.service -n 40 --no-pager >&2 || true
+  exit 1
+fi
+VOICE_READY=0
+for attempt in {1..600}; do
+  if curl -fsS --max-time 1 http://127.0.0.1:8765/api/v1/health >/dev/null 2>&1; then
+    VOICE_READY=1
+    break
+  fi
+  if (( attempt % 30 == 0 )); then
+    echo "Waiting for Harry Botter voice service on 127.0.0.1:8765 ($attempt seconds elapsed)..."
+    echo "Recent application service logs:"
+    journalctl --user -u uni-edu-studio.service -n 30 --no-pager || true
+  fi
+  sleep 1
+done
+if [[ "$VOICE_READY" != "1" ]]; then
+  echo "Uni EDU Studio started, but the Harry Botter voice service did not become healthy." >&2
+  echo "Service status and recent logs:" >&2
+  systemctl --user --no-pager -l status uni-edu-studio.service >&2 || true
+  journalctl --user -u uni-edu-studio.service -n 80 --no-pager >&2 || true
   exit 1
 fi
 sudo loginctl enable-linger "$USER"

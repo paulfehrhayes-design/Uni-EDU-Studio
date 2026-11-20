@@ -3,7 +3,6 @@ import { compileG1VoiceBlockProgram } from '../sim/g1Commands.js';
 
 const SESSION_STORAGE_KEY = 'edu-classroom-session';
 const MAX_KNOWLEDGE_BYTES = 100_000;
-const MAX_G1_SPEECH_PREVIEW_CHARS = 120;
 const TONE_OPTIONS = [
   'Formal',
   'Lightly humorous',
@@ -90,6 +89,9 @@ export default function HarryBotterTry() {
   const [teacherSession, setTeacherSession] = useState(getStoredTeacherSession);
   const [learningLevel, setLearningLevel] = useState('');
   const [tone, setTone] = useState('Formal');
+  const [participantMode, setParticipantMode] = useState('single');
+  const [speakerAssignmentMode, setSpeakerAssignmentMode] = useState('adaptive');
+  const [currentSpeaker, setCurrentSpeaker] = useState('Speaker 1');
   const [speechSpeed, setSpeechSpeed] = useState(1);
   const [ttsVoice, setTtsVoice] = useState('');
   const [voiceCandidate, setVoiceCandidate] = useState('');
@@ -182,7 +184,14 @@ export default function HarryBotterTry() {
   const [isPreparingSpeechIndex, setIsPreparingSpeechIndex] = useState(null);
   const [playingSpeechIndex, setPlayingSpeechIndex] = useState(null);
   const [speechError, setSpeechError] = useState('');
-  const conversationSettingsRef = useRef({ learningLevel, tone, selectedAgentId });
+  const conversationSettingsRef = useRef({
+    learningLevel,
+    tone,
+    selectedAgentId,
+    participantMode,
+    speakerAssignmentMode,
+    currentSpeaker,
+  });
   const recorderRef = useRef(null);
   const speechRequestRef = useRef(null);
   const speechAudioRef = useRef(null);
@@ -220,6 +229,8 @@ export default function HarryBotterTry() {
     learningLevel,
     tone,
     selectedAgentId,
+    participantMode,
+    currentSpeaker,
     agentName: agents.find((agent) => agent.agent_id === selectedAgentId)?.display_name || selectedAgentId,
   };
 
@@ -515,6 +526,8 @@ export default function HarryBotterTry() {
       setLearningLevel(settings.learning_level || '');
       setTone(settings.tone || 'Formal');
       setSelectedAgentId(settings.agent_id || 'general');
+      setParticipantMode(settings.participant_mode || 'single');
+      setSpeakerAssignmentMode(settings.speaker_assignment_mode || 'adaptive');
     }
     setChatError('');
     setSessionError('');
@@ -794,6 +807,7 @@ export default function HarryBotterTry() {
     history,
     replaceMessageIndex = null,
     transcriptReceivedAt = null,
+    speakerLabel = null,
   ) => {
     if (!text.trim() || isGeneratingDraftRef.current) return;
     if (!selectedSessionIdRef.current) {
@@ -811,6 +825,7 @@ export default function HarryBotterTry() {
         messageSource: transcriptReceivedAt === null
           ? 'typed'
           : 'streaming_transcription',
+        speakerLabel,
         settings: {
           learningLevel: conversationSettingsRef.current.learningLevel,
           tone: conversationSettingsRef.current.tone,
@@ -924,6 +939,7 @@ export default function HarryBotterTry() {
         chatMessagesRef.current,
         null,
         transcript.receivedAt,
+        transcript.speakerLabel,
       );
       if (!voiceStartupCancelledRef.current && voiceTranscriptQueueRef.current.length === 0) {
         setVoiceStatus(
@@ -953,8 +969,8 @@ export default function HarryBotterTry() {
       const missingPackages = speechStatus?.streaming_transcription?.missing_dependencies || [];
       setVoiceError(
         speechStatus?.error
-          ? 'The local AI service is unavailable. Run npm start from the project root and check its startup output.'
-          : `Local streaming transcription is unavailable${missingPackages.length ? `; missing packages: ${missingPackages.join(', ')}` : ''}. Follow the audio setup instructions in the voice-service README, then restart with npm start.`,
+          ? 'The local AI service is unavailable. Restart the Uni-EDU system service and check its startup logs.'
+          : `Local streaming transcription is unavailable${missingPackages.length ? `; missing packages: ${missingPackages.join(', ')}` : ''}. Restart the Uni-EDU system service and check the voice-service setup logs.`,
       );
       return;
     }
@@ -1073,6 +1089,13 @@ export default function HarryBotterTry() {
           voiceTranscriptQueueRef.current.push({
             text: transcript,
             receivedAt: performance.now(),
+            speakerLabel: conversationSettingsRef.current.participantMode === 'group'
+              ? (
+                  conversationSettingsRef.current.speakerAssignmentMode === 'adaptive'
+                    ? message.speaker || null
+                    : conversationSettingsRef.current.currentSpeaker
+                )
+              : null,
           });
           void processVoiceTranscriptQueue();
         } else if (message.type === 'speech_not_recognized') {
@@ -1134,6 +1157,9 @@ export default function HarryBotterTry() {
         session_id: session.sessionId,
         sample_rate: 16_000,
         format: 'pcm_s16le_mono',
+        participant_mode: participantMode,
+        current_speaker: participantMode === 'group' ? currentSpeaker : null,
+        speaker_assignment_mode: participantMode === 'group' ? speakerAssignmentMode : 'selected',
       }));
       await waitForReady;
     } catch (error) {
@@ -1617,7 +1643,47 @@ export default function HarryBotterTry() {
     setKnowledgeStatus('');
   };
 
-  const selectAgent = (event) => {
+  const updateParticipantSettings = async (
+    nextMode,
+    nextSpeaker = currentSpeaker,
+    nextAssignmentMode = speakerAssignmentMode,
+  ) => {
+    setParticipantMode(nextMode);
+    setCurrentSpeaker(nextSpeaker);
+    setSpeakerAssignmentMode(nextAssignmentMode);
+    const sessionId = selectedSessionIdRef.current;
+    if (!sessionId) return;
+    try {
+      const response = await fetch(
+        `/api/harry-botter/sessions/${encodeURIComponent(sessionId)}/settings`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${teacherSession.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            agent_id: selectedAgentId,
+            learning_level: learningLevel,
+            tone,
+            participant_mode: nextMode,
+            speaker_assignment_mode: nextAssignmentMode,
+          }),
+        },
+      );
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not save conversation participant settings.');
+      setSessionError(
+        nextMode === 'group'
+          ? 'Group conversation mode enabled. Select the current speaker before each person speaks.'
+          : 'Single-person conversation mode enabled.',
+      );
+    } catch (error) {
+      setSessionError(error.message || 'Could not save conversation participant settings.');
+    }
+  };
+
+  const selectAgent = async (event) => {
     const nextId = event.target.value;
     setSelectedAgentId(nextId);
     setAgentDraft(
@@ -1626,6 +1692,35 @@ export default function HarryBotterTry() {
         : agents.find((agent) => agent.agent_id === nextId) || null,
     );
     setConfigError('');
+    if (nextId === '__new__') return;
+    const sessionId = selectedSessionIdRef.current;
+    if (!sessionId) return;
+    try {
+      const response = await fetch(
+        `/api/harry-botter/sessions/${encodeURIComponent(sessionId)}/settings`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${teacherSession.token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            agent_id: nextId,
+            learning_level: learningLevel,
+            tone,
+            participant_mode: participantMode,
+            speaker_assignment_mode: speakerAssignmentMode,
+          }),
+        },
+      );
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not apply the agent to this conversation.');
+      setSessionError(
+        `${agents.find((agent) => agent.agent_id === nextId)?.display_name || nextId} applied to this conversation.`,
+      );
+    } catch (error) {
+      setSessionError(error.message || 'Could not apply the agent to this conversation.');
+    }
   };
 
   const deleteAgent = async () => {
@@ -2227,6 +2322,56 @@ export default function HarryBotterTry() {
               <option value={1.15}>Faster</option>
             </select>
           </label>
+          <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+            Conversation
+            <select
+              aria-label="Conversation participant mode"
+              value={participantMode}
+              onChange={(event) => void updateParticipantSettings(event.target.value)}
+              disabled={isLoadingSessions || isChangingSession || isVoiceSessionActive}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-2"
+            >
+              <option value="single">One person</option>
+              <option value="group">Group</option>
+            </select>
+          </label>
+          {participantMode === 'group' && (
+            <>
+              <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                Speaker matching
+                <select
+                  aria-label="Speaker matching mode"
+                  value={speakerAssignmentMode}
+                  onChange={(event) => void updateParticipantSettings(
+                    participantMode,
+                    currentSpeaker,
+                    event.target.value,
+                  )}
+                  disabled={isLoadingSessions || isChangingSession || isVoiceSessionActive}
+                  className="rounded-lg border border-slate-300 bg-white px-3 py-2"
+                >
+                  <option value="adaptive">Learn and recognize voices</option>
+                  <option value="selected">Teacher selects speaker</option>
+                </select>
+              </label>
+              {speakerAssignmentMode === 'selected' && (
+                <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                  Current speaker
+                  <select
+                    aria-label="Current speaker"
+                    value={currentSpeaker}
+                    onChange={(event) => setCurrentSpeaker(event.target.value)}
+                    disabled={isLoadingSessions || isChangingSession}
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-2"
+                  >
+                    {['Speaker 1', 'Speaker 2', 'Speaker 3', 'Speaker 4', 'Speaker 5', 'Speaker 6'].map((label) => (
+                      <option key={label} value={label}>{label}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </>
+          )}
           <div
             data-testid="current-browser-voice"
             className="flex items-center gap-2 text-sm font-medium text-slate-700"
@@ -2464,7 +2609,7 @@ export default function HarryBotterTry() {
             {!isCheckingModel && modelStatus?.status === 'unavailable'
               && `The configured model server is unavailable. ${modelStatus.error || 'Check that it is running.'}`}
             {!isCheckingModel && modelStatus?.status === 'service_unavailable'
-              && `The local AI service is unavailable. Run npm start from the project root to start the backend and voice service; check its startup output for setup errors. ${modelStatus.error || ''}`}
+              && `The local AI service is unavailable. Restart the Uni-EDU system service and check its startup logs. ${modelStatus.error || ''}`}
             {!isCheckingModel && !modelStatus && 'Model status has not been checked.'}
           </div>
           <div className="flex flex-wrap items-end gap-3">
@@ -2604,7 +2749,7 @@ export default function HarryBotterTry() {
               >
                 <p className="font-semibold">
                   {message.role === 'user'
-                    ? 'Your message'
+                    ? (message.speakerLabel ? `${message.speakerLabel} · Your message` : 'Your message')
                     : message.source === 'stage_policy'
                       ? 'Stage required'
                       : `AI draft${message.model ? ` · ${message.model}` : ''}${message.route === 'network' ? ' · private Wi-Fi' : message.route === 'local' ? ' · local' : ''}`}
@@ -2706,17 +2851,11 @@ export default function HarryBotterTry() {
                           || !g1AudioConnected
                           || editingDraftIndex !== null
                           || !message.content.trim()
-                          || message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS
                         }
                         className="rounded-lg border border-emerald-300 px-3 py-1.5 text-xs font-semibold text-emerald-800 disabled:opacity-50"
                       >
                         {isSendingG1Speech ? 'Sending to G1…' : 'Speak this draft on G1'}
                       </button>
-                    )}
-                    {draftOutput === 'g1' && message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS && (
-                        <span className="self-center text-xs text-slate-600">
-                          Shorten this draft to 120 characters before sending it to the G1.
-                        </span>
                     )}
                   </div>
                 )}
@@ -2876,7 +3015,7 @@ export default function HarryBotterTry() {
             </div>
             <div aria-live="polite" className="rounded-lg bg-slate-100 p-3 text-sm text-slate-700">
               {!speechStatus && 'Checking local speech setup…'}
-              {speechStatus?.error && `Local AI service unavailable. Run npm start from the project root and check startup output. ${speechStatus.error}`}
+              {speechStatus?.error && `Local AI service unavailable. Restart the Uni-EDU system service and check startup logs. ${speechStatus.error}`}
               {speechStatus?.transcription && (
                 speechStatus.transcription.available
                   ? `Local transcription model: ${speechStatus.transcription.model} (${speechStatus.transcription.device}).`
@@ -3048,7 +3187,11 @@ export default function HarryBotterTry() {
                   key={`voice-${index}-${message.role}`}
                   className={`rounded-lg p-3 text-sm ${message.role === 'user' ? 'bg-blue-50' : 'bg-amber-50'}`}
                 >
-                  <p className="font-semibold">{message.role === 'user' ? 'Recognized transcript' : 'AI draft'}</p>
+                  <p className="font-semibold">
+                    {message.role === 'user'
+                      ? (message.speakerLabel ? `${message.speakerLabel} · Recognized transcript` : 'Recognized transcript')
+                      : 'AI draft'}
+                  </p>
                   <p className="mt-1 whitespace-pre-wrap">{message.content}</p>
                   {Number.isFinite(message.transcriptToDraftMs) && (
                     <p className="mt-1 text-xs text-slate-500">
@@ -3078,17 +3221,11 @@ export default function HarryBotterTry() {
                             isSendingG1Speech
                             || !g1AudioConnected
                             || !message.content.trim()
-                            || message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS
                           }
                           className="rounded-lg border border-emerald-300 px-3 py-1.5 text-xs font-semibold text-emerald-800 disabled:opacity-50"
                         >
                           {isSendingG1Speech ? 'Sending to G1…' : 'Speak this draft on G1'}
                         </button>
-                      )}
-                      {draftOutput === 'g1' && message.content.length > MAX_G1_SPEECH_PREVIEW_CHARS && (
-                          <span className="self-center text-xs text-slate-600">
-                            Shorten this draft to 120 characters before sending it to the G1.
-                          </span>
                       )}
                     </div>
                   )}
