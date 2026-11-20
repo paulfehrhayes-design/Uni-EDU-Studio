@@ -33,9 +33,11 @@ Prerequisites: Node.js/npm, Python 3.10–3.13 (Python 3.12 is recommended), and
 the backend Python dependencies. When the default local route is selected, the
 startup command installs Ollama into the current user's data directory on
 Linux x64/arm64 if it is missing, starts its local server, and downloads the
-default model. A different local compatible runtime must already be running
-and configured as described below. The startup command also installs voice
-dependencies into the ignored `.venv-audio312` environment when absent.
+default model. This first download requires internet access and substantial
+free disk space for the runtime and model weights. A different local compatible
+runtime must already be running and configured as described below. The startup
+command also installs voice dependencies into the ignored `.venv-audio312`
+environment when absent.
 
 ```bash
 npm install
@@ -326,7 +328,7 @@ If LiDAR was installed before rear-distance support was added, rerun the same in
 
 Set `G1_SDK_ENV_DIR` to the actual, already-installed Unitree SDK environment path if yours differs. The backend can use the SDK's Python 3.8 environment; its requirements install Pydantic's annotation backport for that Python version. The separate Harry Botter voice service requires Python 3.10–3.13. If no compatible interpreter is installed, the G1 installer uses `uv` to install a user-local Python 3.12 runtime and seed the ignored `.venv-audio312` environment; the Unitree SDK environment does not need to be rebuilt. This command installs/checks sensor dependencies, Python backend requirements, frontend dependencies, builds the hosted frontend, and prepares DUET. The generated user service launches the application manager, which starts the backend and isolated voice service together; it also starts the local Ollama server when the default route is selected. On first AI startup, voice dependencies and model weights may need to download, and the installer waits for the application to become responsive. On repeat installer runs it reuses frontend dependencies and the production bundle when their manifests and source files are unchanged. The DUET build installs missing standard C++ development packages when needed, but the vendor Unitree SDK2 C++ and DDS/Iceoryx libraries must already be installed on the host. The policy hash configured for backend DUET status is derived from the exact policy path selected by the controller configuration. `UNITREE_INTERFACE` defaults to the existing `eth0` setting; set it explicitly when the DDS interface differs. The Humble sensor runtime uses that wired interface for Fast DDS and does not change Wi-Fi, routes, or NetworkManager settings. An optional custom `DUET_CONTROL_DIR` must be absolute and is shared by the backend and controller unit. The selected Python SDK environment must already exist and pass its import check; the installer does not install the vendor Unitree Python SDK. For Ubuntu 20.04, the LiDAR runtime uses a native-architecture ROS 2 Humble container and host networking, leaving the JetPack host image unchanged; Ubuntu's `docker.io` package is installed if needed. Ubuntu 22.04 uses native ROS 2 Humble. ROS 2 Foxy is not used.
 
-With the default local model route, `npm start` and the generated G1 user service install Ollama into `~/.local/share/uni-edu-studio/` when needed, then start its server and download the configured default model. This Linux auto-install supports x64 and arm64 (including the G1's Ubuntu arm64 host) and requires internet access on first startup. The installer does not require `sudo` or install a system-wide service. A configured custom `HARRY_BOTTER_LOCAL_MODEL_URL` skips Ollama installation; that compatible model server must already be running and reachable from the G1 host. Check the managed service startup output with:
+With the default local model route, `npm start` and the generated G1 user service install Ollama into `~/.local/share/uni-edu-studio/` when needed, then start its server and download the configured default model. This Linux auto-install supports x64 and arm64 (including the G1's Ubuntu arm64 host) and requires internet access and substantial free disk space on first startup. Ollama itself is installed user-locally without `sudo`; the G1 sensor setup installs the `zstd` archive extractor with the host package manager. No system-wide Ollama service is installed. A configured custom `HARRY_BOTTER_LOCAL_MODEL_URL` skips Ollama installation; that compatible model server must already be running and reachable from the G1 host. Check the managed service startup output with:
 
 ```bash
 ollama --version

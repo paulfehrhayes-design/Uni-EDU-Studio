@@ -15,14 +15,14 @@ test('installs and reuses the official Linux ARM64 Ollama binary in the user dat
       if (binary === 'curl') {
         const outputPath = args[args.indexOf('--output') + 1];
         await writeFile(outputPath, 'mock archive');
-      } else if (binary === 'tar') {
-        const prefix = args[args.indexOf('-C') + 1];
-        const binDirectory = path.join(prefix, 'bin');
-        await mkdir(binDirectory, { recursive: true });
-        await writeFile(path.join(binDirectory, 'ollama'), 'mock executable');
       }
     };
     const canRun = (binary) => existsSync(binary);
+    const unpackArchive = async (_archivePath, prefix) => {
+      const binDirectory = path.join(prefix, 'bin');
+      await mkdir(binDirectory, { recursive: true });
+      await writeFile(path.join(binDirectory, 'ollama'), 'mock executable');
+    };
 
     const cli = await ensureOllamaCli({
       homeDirectory,
@@ -30,14 +30,15 @@ test('installs and reuses the official Linux ARM64 Ollama binary in the user dat
       architecture: 'arm64',
       runCommand,
       canRun,
+      unpackArchive,
     });
 
     assert.equal(
       cli,
       path.join(homeDirectory, '.local', 'share', 'uni-edu-studio', 'ollama-linux-arm64', 'bin', 'ollama'),
     );
-    assert.equal(commands.length, 2);
-    assert.ok(commands[0][1].includes('https://ollama.com/download/ollama-linux-arm64.tgz'));
+    assert.equal(commands.length, 1);
+    assert.ok(commands[0][1].includes('https://ollama.com/download/ollama-linux-arm64.tar.zst'));
     assert.equal(await readFile(cli, 'utf8'), 'mock executable');
 
     const reusedCli = await ensureOllamaCli({
@@ -46,9 +47,10 @@ test('installs and reuses the official Linux ARM64 Ollama binary in the user dat
       architecture: 'arm64',
       runCommand,
       canRun,
+      unpackArchive,
     });
     assert.equal(reusedCli, cli);
-    assert.equal(commands.length, 2);
+    assert.equal(commands.length, 1);
   } finally {
     await rm(homeDirectory, { recursive: true, force: true });
   }

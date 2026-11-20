@@ -89,6 +89,11 @@ if [[ -z "$NODE_BIN" ]]; then
   echo "Node.js is required to launch the AI and backend services." >&2
   exit 1
 fi
+if ! command -v zstd >/dev/null 2>&1; then
+  echo "Installing zstd, required to extract Ollama on first app startup."
+  sudo apt-get update
+  sudo apt-get install -y zstd
+fi
 
 LIDAR_CONFIGURED=0
 LIDAR_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/uni-edu-studio"
