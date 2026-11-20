@@ -140,7 +140,8 @@ FRONTEND_DEPENDENCIES_MARKER="$LIDAR_CONFIG_DIR/frontend-dependencies.sha256"
 cd "$PROJECT_DIR"
 if [[ ! -d "$PROJECT_DIR/node_modules" ||
       ! -f "$FRONTEND_DEPENDENCIES_MARKER" ||
-      "$(cat "$FRONTEND_DEPENDENCIES_MARKER")" != "$FRONTEND_DEPENDENCIES_SIGNATURE" ]]; then
+      "$(cat "$FRONTEND_DEPENDENCIES_MARKER")" != "$FRONTEND_DEPENDENCIES_SIGNATURE" ]] ||
+   ! npm ls --depth=0 --omit=optional >/dev/null 2>&1; then
   echo "Preparing hosted frontend dependencies (cached packages are preferred)"
   if ! npm install --prefer-offline --no-audit --no-fund; then
     echo "Frontend dependency installation failed; see npm output above." >&2
