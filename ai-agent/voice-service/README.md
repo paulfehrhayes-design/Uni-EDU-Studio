@@ -219,6 +219,31 @@ changes the model for the running voice-service process; set
 `HARRY_BOTTER_LOCAL_MODEL` or the corresponding network model variables in
 `.env.harry-botter.local` to make that selection the startup default.
 
+### Optional live web research
+
+Current-information questions (for example, those asking for the latest news,
+today's weather, or current prices) can use a locally running SearXNG instance.
+Set `HARRY_BOTTER_SEARXNG_URL=http://127.0.0.1:8080` in
+`.env.harry-botter.local`; the URL may also use a trusted private-network IP.
+SearXNG must have JSON search output enabled. The app does not start or install
+SearXNG automatically. Use the SearXNG setup files under
+`ai-agent/research/searxng/` and keep its service bound to localhost or a trusted
+private network.
+
+The backend uses SearXNG result snippets when available. It also enriches up to
+two results with Crawl4AI when Crawl4AI is installed in the backend's Python
+environment and its browser runtime is ready. Crawl4AI is optional; missing
+packages, an unavailable browser, SearXNG, or internet connection only disables
+live references for that request and does not prevent normal chat. To install
+Crawl4AI, follow its setup instructions in `ai-agent/research/crawl4ai/`; the
+app never installs either research project at startup.
+
+Live searching is limited to queries that appear to ask for current information.
+The query is sent to the configured SearXNG instance, which may forward it to
+its selected search engines. Retrieved web text is treated as untrusted context,
+is not independently verified, and is shown with source links and retrieval
+dates. The local model remains the only answer generator.
+
 ## Run the service
 
 The base text-only service requires Python 3.10 or later. See above to install

@@ -2799,10 +2799,25 @@ export default function HarryBotterTry() {
                   </p>
                 )}
                 {message.sources?.length > 0 && (
-                  <p className="mt-2 text-xs text-slate-600">
-                    Reference context: {message.sources.map((source) => (
-                      `${source.section_title ? `${source.section_title}: ` : ''}${source.title} — ${source.source}${source.review_date ? ` (reviewed ${source.review_date})` : ''}`
-                    )).join('; ')}
+                  <p className="mt-2 flex flex-wrap gap-x-1 text-xs text-slate-600">
+                    <span>Sources:</span>
+                    {message.sources.map((source, sourceIndex) => (
+                      <span key={`${source.url || source.title}-${sourceIndex}`}>
+                        {sourceIndex > 0 && ' · '}
+                        {source.url ? (
+                          <a
+                            href={source.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-700 underline"
+                          >
+                            {source.title}
+                          </a>
+                        ) : source.title}
+                        {' — '}{source.source}
+                        {source.review_date ? ` (reviewed ${source.review_date})` : ''}
+                      </span>
+                    ))}
                   </p>
                 )}
                 {message.role === 'assistant' && (
@@ -2942,7 +2957,7 @@ export default function HarryBotterTry() {
             </button>
           </form>
           <p className="text-xs leading-relaxed text-slate-500">
-            Messages go through the teacher-authenticated app backend. Text history is saved in this teacher-only local database until deleted; raw audio is never stored. When no programme/year is selected, the service asks for the stage without calling a model. Reference excerpts are selected locally and sent only to the configured loopback model. Audio playback is always prepared on request and requires you to press Play.
+            Messages go through the teacher-authenticated app backend. Text history is saved in this teacher-only local database until deleted; raw audio is never stored. When no programme/year is selected, the service asks for the stage without calling a model. Current-information questions may use the configured SearXNG search service; if it is unavailable, chat continues without live sources. Search results are untrusted and shown with their source links. Audio playback is always prepared on request and requires you to press Play.
           </p>
         </section>
           </>

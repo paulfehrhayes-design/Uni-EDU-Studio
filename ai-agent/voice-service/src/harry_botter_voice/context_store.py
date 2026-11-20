@@ -115,14 +115,35 @@ class ContextStore:
             row = connection.execute(
                 "SELECT data_json FROM agents WHERE agent_id = ?", (agent_id,)
             ).fetchone()
-        return __import__("json").loads(row["data_json"]) if row else None
+        if row is None:
+            return None
+        agent = __import__("json").loads(row["data_json"])
+        return {
+            key: agent[key]
+            for key in (
+                "agent_id",
+                "display_name",
+                "purpose",
+                "instructions",
+                "generation_temperature",
+                "generation_max_tokens",
+            )
+        }
 
     def sections(self) -> list[dict]:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT data_json FROM sections ORDER BY section_id"
             ).fetchall()
-        return [__import__("json").loads(row["data_json"]) for row in rows]
+        sections = [__import__("json").loads(row["data_json"]) for row in rows]
+        return [
+            {
+                "section_id": section["section_id"],
+                "title": section["title"],
+                "guidance": section["guidance"],
+            }
+            for section in sections
+        ]
 
     def retrieve(
         self,

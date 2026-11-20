@@ -30,12 +30,12 @@ launcher creates the ignored audio environment and downloads the speech models.
 No API key or paid service is required.
 
 Prerequisites: Node.js/npm, Python 3.10–3.13 (Python 3.12 is recommended), and
-the backend Python dependencies. Ollama is required to provide the default
-local model; a different local compatible runtime must already be running and
-its URL/model configured as described below. If no model server is available,
-the app still starts and reports model unavailability in the preview. The
-startup command installs voice dependencies into the ignored `.venv-audio312`
-environment when absent.
+the backend Python dependencies. When the default local route is selected, the
+startup command installs Ollama into the current user's data directory on
+Linux x64/arm64 if it is missing, starts its local server, and downloads the
+default model. A different local compatible runtime must already be running
+and configured as described below. The startup command also installs voice
+dependencies into the ignored `.venv-audio312` environment when absent.
 
 ```bash
 npm install
@@ -325,6 +325,16 @@ For an existing checkout, run `git pull` in the project directory before the ins
 If LiDAR was installed before rear-distance support was added, rerun the same install command after pulling the update so the generated service environment includes the rear provider endpoint and the startup check can report both sectors.
 
 Set `G1_SDK_ENV_DIR` to the actual, already-installed Unitree SDK environment path if yours differs. The backend can use the SDK's Python 3.8 environment; its requirements install Pydantic's annotation backport for that Python version. The separate Harry Botter voice service requires Python 3.10–3.13. If no compatible interpreter is installed, the G1 installer uses `uv` to install a user-local Python 3.12 runtime and seed the ignored `.venv-audio312` environment; the Unitree SDK environment does not need to be rebuilt. This command installs/checks sensor dependencies, Python backend requirements, frontend dependencies, builds the hosted frontend, and prepares DUET. The generated user service launches the application manager, which starts the backend and isolated voice service together; it also starts the local Ollama server when the default route is selected. On first AI startup, voice dependencies and model weights may need to download, and the installer waits for the application to become responsive. On repeat installer runs it reuses frontend dependencies and the production bundle when their manifests and source files are unchanged. The DUET build installs missing standard C++ development packages when needed, but the vendor Unitree SDK2 C++ and DDS/Iceoryx libraries must already be installed on the host. The policy hash configured for backend DUET status is derived from the exact policy path selected by the controller configuration. `UNITREE_INTERFACE` defaults to the existing `eth0` setting; set it explicitly when the DDS interface differs. The Humble sensor runtime uses that wired interface for Fast DDS and does not change Wi-Fi, routes, or NetworkManager settings. An optional custom `DUET_CONTROL_DIR` must be absolute and is shared by the backend and controller unit. The selected Python SDK environment must already exist and pass its import check; the installer does not install the vendor Unitree Python SDK. For Ubuntu 20.04, the LiDAR runtime uses a native-architecture ROS 2 Humble container and host networking, leaving the JetPack host image unchanged; Ubuntu's `docker.io` package is installed if needed. Ubuntu 22.04 uses native ROS 2 Humble. ROS 2 Foxy is not used.
+
+With the default local model route, `npm start` and the generated G1 user service install Ollama into `~/.local/share/uni-edu-studio/` when needed, then start its server and download the configured default model. This Linux auto-install supports x64 and arm64 (including the G1's Ubuntu arm64 host) and requires internet access on first startup. The installer does not require `sudo` or install a system-wide service. A configured custom `HARRY_BOTTER_LOCAL_MODEL_URL` skips Ollama installation; that compatible model server must already be running and reachable from the G1 host. Check the managed service startup output with:
+
+```bash
+ollama --version
+curl -fsS http://127.0.0.1:11434/api/tags
+ollama list
+```
+
+For the managed systemd setup, inspect startup messages with `journalctl --user -u uni-edu-studio.service`. A configured `HARRY_BOTTER_LOCAL_MODEL_URL` other than the default loopback URL intentionally skips Ollama management; that model server must already be running and reachable **from the G1 host**. Optional `HARRY_BOTTER_NETWORK_MODEL_URL` likewise names a private-network server accessed by the G1 backend, not by the browser. Model-server health is separate from the Unitree SDK connection and from ROS/LiDAR sensor status: a sensor-only setup or absent ROS locomotion bridge does not start or validate Ollama, and an unavailable model server does not establish anything about robot SDK connectivity.
 
 DUET remains a separate physical controller. The installer writes its unit and reloads the systemd user unit definitions but does **not** start or enable it. App Connect may start the unit only after teacher confirmation and only when no SDK program is running. An idle legacy SDK client may remain initialized, but backend SDK motion is blocked while the DUET service is active. The controller remains no-command in Handoff. If the robot is already in Velocity, do not transition it through FixStand; if its actual FSM or posture cannot be verified, do not guess at a transition. A qualified onsite operator must verify the state and decide whether the configured FixStand → Velocity procedure is needed. Do not start it as part of unattended boot or a software test.
 

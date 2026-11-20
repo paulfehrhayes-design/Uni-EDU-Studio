@@ -27,6 +27,11 @@ from pydantic import (
     field_validator,
 )
 
+try:
+    from .web_research import search_current_web
+except ImportError:
+    from web_research import search_current_web
+
 VOICE_SERVICE_URL = "http://127.0.0.1:8765"
 VOICE_STREAM_URL = "ws://127.0.0.1:8766/api/v1/audio-stream"
 MAX_AUDIO_BYTES = 8_000_000
@@ -435,6 +440,7 @@ class SessionMessageSource(StrictRequest):
     section_id: StrictStr = Field(default="general", max_length=40)
     section_title: StrictStr = Field(default="", max_length=160)
     review_date: StrictStr = Field(default="", max_length=10)
+    url: StrictStr = Field(default="", max_length=2_000)
 
 
 class SessionMessageSettings(StrictRequest):
@@ -2827,16 +2833,20 @@ def create_harry_botter_router(
         finally:
             conn.close()
 
+        web_context = search_current_web(payload.text) if payload.learning_level else []
+        draft_payload = {
+            "text": payload.text,
+            "learning_level": payload.learning_level,
+            "tone": payload.tone,
+            "history": [message.model_dump() for message in payload.history],
+            "agent": agent,
+        }
+        if web_context:
+            draft_payload["web_context"] = web_context
         result = _voice_request(
             "POST",
             "/api/v1/drafts",
-            json_payload={
-                "text": payload.text,
-                "learning_level": payload.learning_level,
-                "tone": payload.tone,
-                "history": [message.model_dump() for message in payload.history],
-                "agent": agent,
-            },
+            json_payload=draft_payload,
         ).json()
         draft = result.get("draft")
         if not isinstance(draft, dict) or not isinstance(draft.get("text"), str):

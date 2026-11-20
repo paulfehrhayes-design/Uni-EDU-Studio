@@ -919,6 +919,57 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertNotIn("sections", captured["payload"])
         self.assertEqual(captured["payload"]["agent"]["agent_id"], "debate")
 
+    def test_current_draft_forwards_live_web_context_to_the_voice_service(self):
+        reference = {
+            "title": "Current science update",
+            "source": "example.com",
+            "url": "https://example.com/science",
+            "excerpt": "A recent science result.",
+            "retrieved_at": date.today().isoformat(),
+        }
+        captured = {}
+
+        def fake_voice_request(method, path, *, json_payload=None, **_kwargs):
+            captured.update({"method": method, "path": path, "payload": json_payload})
+            return httpx.Response(200, json={
+                "draft": {
+                    "text": "A current, sourced draft.",
+                    "source": "local_model",
+                    "model": "configured-local-model",
+                    "route": "local",
+                    "sources": [{
+                        "title": reference["title"],
+                        "source": reference["source"],
+                        "section_id": "web",
+                        "section_title": "Live web research",
+                        "review_date": "",
+                        "url": reference["url"],
+                    }],
+                },
+            })
+
+        with (
+            patch.object(harry_botter_api, "search_current_web", return_value=[reference]),
+            patch.object(harry_botter_api, "_voice_request", side_effect=fake_voice_request),
+        ):
+            response = self.client.post(
+                "/api/harry-botter/draft",
+                headers=self.teacher_headers,
+                json={
+                    "text": "What is the latest science news?",
+                    "learning_level": "MYP 3",
+                    "tone": "Formal",
+                    "agent_id": "general",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/v1/drafts")
+        self.assertEqual(captured["payload"]["web_context"], [reference])
+        self.assertEqual(response.json()["draft"]["sources"][0]["url"], reference["url"])
+
     def test_g1_speech_requires_teacher_and_uses_existing_audio_client(self):
         class FakeAudioClient:
             def __init__(self):

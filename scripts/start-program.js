@@ -3,6 +3,7 @@ import { createServer } from 'node:net';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ensureOllamaCli } from './ollama-install.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const voiceDir = path.join(root, 'ai-agent', 'voice-service');
@@ -40,6 +41,7 @@ function loadLocalConfig() {
     'HARRY_BOTTER_NETWORK_MODEL_URL',
     'HARRY_BOTTER_NETWORK_MODEL',
     'HARRY_BOTTER_LOCAL_MODEL',
+    'HARRY_BOTTER_SEARXNG_URL',
   ]);
   const values = {};
   for (const [index, rawLine] of readFileSync(configFile, 'utf8').split(/\r?\n/).entries()) {
@@ -278,20 +280,28 @@ async function ensureOllama(env) {
     return;
   }
 
-  const hasOllamaCli = spawnSync('ollama', ['--version'], { stdio: 'ignore' }).status === 0;
+  let ollamaCli = spawnSync('ollama', ['--version'], { stdio: 'ignore' }).status === 0
+    ? 'ollama'
+    : null;
+  const installOllamaCli = async () => {
+    if (ollamaCli) return ollamaCli;
+    log('Ollama is missing; installing a user-local copy for the default model route...');
+    try {
+      ollamaCli = await ensureOllamaCli({ runCommand: run });
+      return ollamaCli;
+    } catch (error) {
+      log(`Automatic Ollama installation failed: ${error.message}`);
+      return null;
+    }
+  };
+
   let server = null;
   try {
     server = await fetchJson(`${ollamaUrl}/api/tags`);
   } catch {
-    if (!hasOllamaCli) {
-      log(
-        'Ollama is not reachable and its CLI is not installed. The app will still start, '
-        + 'but the default local model is unavailable until a compatible runtime is configured.',
-      );
-      return;
-    }
+    if (!(await installOllamaCli())) return;
     log('Starting the local Ollama server...');
-    const child = startProcess('ollama', ['serve'], {
+    const child = startProcess(ollamaCli, ['serve'], {
       label: 'Ollama',
       serviceKey: 'ollama',
       healthUrl: `${ollamaUrl}/api/tags`,
@@ -309,12 +319,9 @@ async function ensureOllama(env) {
   const installed = Array.isArray(server.models)
     && server.models.some((model) => model.name === selectedModel || model.name.startsWith(`${selectedModel}-`));
   if (!installed) {
-    if (!hasOllamaCli) {
-      log(`The Ollama server is reachable, but ${selectedModel} is not installed and the Ollama CLI is unavailable.`);
-      return;
-    }
+    if (!(await installOllamaCli())) return;
     log(`Downloading the free local fallback model ${selectedModel} (first run only)...`);
-    await run('ollama', ['pull', selectedModel], {
+    await run(ollamaCli, ['pull', selectedModel], {
       env: {
         ...env,
         OLLAMA_HOST: '127.0.0.1:11434',

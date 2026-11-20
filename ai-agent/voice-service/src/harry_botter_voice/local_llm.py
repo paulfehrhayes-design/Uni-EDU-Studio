@@ -231,6 +231,7 @@ class LocalOpenAIClient:
         agent: dict | None = None,
         knowledge: list[dict] | None = None,
         sections: list[dict] | None = None,
+        web_context: list[dict[str, str]] | None = None,
     ) -> tuple[str, str, str]:
         if not learning_level:
             return MISSING_STAGE_RESPONSE, "", "stage_policy"
@@ -244,7 +245,7 @@ class LocalOpenAIClient:
             {
                 "role": "system",
                 "content": build_system_prompt(
-                    learning_level, tone, agent, knowledge, sections
+                    learning_level, tone, agent, knowledge, sections, web_context
                 ),
             },
             *history,
@@ -489,8 +490,11 @@ class LocalOpenAIClient:
                 f"Model server returned HTTP {exc.code}."
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            diagnostic = str(reason).strip() or type(reason).__name__
             raise LocalModelUnavailable(
-                "Could not reach the configured model server."
+                f"Could not reach the configured model server at "
+                f"{base_url or self.base_url} ({diagnostic})."
             ) from exc
 
         if len(body) > 2_000_000:

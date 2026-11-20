@@ -1,17 +1,22 @@
 import json
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
 from harry_botter_voice.api import make_server
+from harry_botter_voice.context_store import ContextStore
 from harry_botter_voice.speech import LocalSpeechRuntime, QWEN_VOICE_DESIGN_ID
 
 
 class VoiceAPITests(unittest.TestCase):
     def setUp(self) -> None:
-        self.server = make_server(port=0)
+        self.context_dir = tempfile.TemporaryDirectory()
+        context_store = ContextStore(str(Path(self.context_dir.name) / "context.db"))
+        self.server = make_server(port=0, context_store=context_store)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -20,6 +25,7 @@ class VoiceAPITests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self.context_dir.cleanup()
 
     def request(
         self,
@@ -51,6 +57,43 @@ class VoiceAPITests(unittest.TestCase):
         self.assertEqual(response["status"], "ok")
         self.assertFalse(response["capabilities"]["audio_capture"])
         self.assertFalse(response["capabilities"]["motion"])
+
+    def test_context_snapshot_is_reduced_to_prompt_fields(self) -> None:
+        agent = {
+            "agent_id": "general",
+            "display_name": "General conversation",
+            "purpose": "Answer learner questions.",
+            "instructions": "Be clear.",
+            "generation_temperature": 0.4,
+            "generation_max_tokens": 500,
+            "is_builtin": True,
+            "updated_at": "2026-11-20T00:00:00+00:00",
+        }
+        section = {
+            "section_id": "persona",
+            "title": "Assistant identity",
+            "description": "Additional metadata.",
+            "guidance": "Be transparent.",
+            "version": 1,
+        }
+        self.server.context_store.replace({
+            "agents": [agent],
+            "knowledge": [],
+            "sections": [section],
+        })
+
+        self.assertEqual(
+            self.server.context_store.agent("general"),
+            {key: value for key, value in agent.items() if key != "is_builtin" and key != "updated_at"},
+        )
+        self.assertEqual(
+            self.server.context_store.sections(),
+            [{
+                "section_id": "persona",
+                "title": "Assistant identity",
+                "guidance": "Be transparent.",
+            }],
+        )
 
     def test_speech_status_reports_configured_kokoro_voice(self) -> None:
         status, response = self.request("GET", "/api/v1/speech/status")
@@ -425,6 +468,66 @@ class VoiceAPITests(unittest.TestCase):
         self.assertEqual(model_client.request[4], agent)
         self.assertEqual(model_client.request[5], knowledge)
         self.assertEqual(model_client.request[6], sections)
+
+    def test_draft_uses_untrusted_live_web_context_and_returns_its_source(self) -> None:
+        class ReadyModelClient:
+            def complete_with_route(
+                self, text, learning_level, tone, history, agent, knowledge, sections, *, web_context
+            ):
+                self.web_context = web_context
+                return "A current, sourced draft.", "test-local-model", "local"
+
+        model_client = ReadyModelClient()
+        self.server.model_client = model_client
+        reference = {
+            "title": "Current science update",
+            "source": "example.com",
+            "url": "https://example.com/science",
+            "excerpt": "A recent science result.",
+            "retrieved_at": "2026-11-20",
+        }
+        status, response = self.request(
+            "POST",
+            "/api/v1/drafts",
+            data=json.dumps({
+                "text": "What is the latest science news?",
+                "learning_level": "MYP 2",
+                "tone": "Formal",
+                "history": [],
+                "web_context": [reference],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(model_client.web_context, [reference])
+        web_source = next(
+            source for source in response["draft"]["sources"]
+            if source["section_title"] == "Live web research"
+        )
+        self.assertEqual(web_source["url"], reference["url"])
+
+    def test_draft_rejects_malformed_live_web_urls(self) -> None:
+        reference = {
+            "title": "Local service",
+            "source": "localhost",
+            "url": "file:///etc/passwd",
+            "excerpt": "Invalid web context.",
+            "retrieved_at": "2026-11-20",
+        }
+        status, response = self.request(
+            "POST",
+            "/api/v1/drafts",
+            data=json.dumps({
+                "text": "What is the latest science news?",
+                "learning_level": "MYP 2",
+                "web_context": [reference],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"]["code"], "invalid_web_context")
 
     def test_policy_review_endpoint_returns_a_proposal_with_source_provenance(self) -> None:
         class PolicyModelClient:

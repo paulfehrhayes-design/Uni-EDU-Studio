@@ -38,6 +38,8 @@ MAX_KNOWLEDGE_EXCERPT_CHARS = 4_000
 MAX_BEHAVIOR_SECTIONS = 8
 MAX_POLICY_REVIEW_SOURCES = 3
 MAX_POLICY_REVIEW_SOURCE_CHARS = 2_500
+MAX_WEB_CONTEXT_ITEMS = 3
+MAX_WEB_CONTEXT_CHARS = 2_000
 BEHAVIOR_SECTION_IDS = {
     "persona",
     "role",
@@ -70,6 +72,47 @@ def _is_iso_date(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_valid_web_reference(item: object) -> bool:
+    if not isinstance(item, dict) or set(item) != {
+        "title",
+        "source",
+        "url",
+        "excerpt",
+        "retrieved_at",
+    }:
+        return False
+    if any(
+        not isinstance(item.get(key), str)
+        or not item[key].strip()
+        or len(item[key]) > limit
+        for key, limit in (
+            ("title", 160),
+            ("source", 253),
+            ("url", 2_000),
+            ("excerpt", MAX_WEB_CONTEXT_CHARS),
+        )
+    ):
+        return False
+    retrieved_at = item.get("retrieved_at")
+    if (
+        not isinstance(retrieved_at, str)
+        or len(retrieved_at) != 10
+        or not _is_iso_date(retrieved_at)
+    ):
+        return False
+    try:
+        parsed = urlsplit(item["url"])
+        parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+    )
 
 
 class VoiceHTTPServer(ThreadingHTTPServer):
@@ -271,6 +314,9 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             "tone",
             "history",
             "agent",
+            "knowledge",
+            "sections",
+            "web_context",
         }
         if set(payload) - allowed_keys:
             self._send_error(400, "invalid_request", "The draft request contains unsupported fields.")
@@ -280,6 +326,7 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         learning_level = payload.get("learning_level", "")
         tone = payload.get("tone", "Formal")
         history = payload.get("history", [])
+        web_context = payload.get("web_context", [])
         if not isinstance(text, str) or not text.strip() or len(text) > MAX_MESSAGE_CHARS:
             self._send_error(
                 400,
@@ -288,14 +335,16 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
             )
             return
         agent = payload.get("agent")
-        if isinstance(agent, dict) and isinstance(agent.get("agent_id"), str):
-            agent = self.server.context_store.agent(agent["agent_id"]) or agent
-        knowledge = self.server.context_store.retrieve(
-            text,
-            learning_level,
-            agent.get("agent_id", "") if isinstance(agent, dict) else "",
-        )
-        sections = self.server.context_store.sections()
+        knowledge = payload.get("knowledge")
+        if knowledge is None:
+            knowledge = self.server.context_store.retrieve(
+                text,
+                learning_level,
+                agent.get("agent_id", "") if isinstance(agent, dict) else "",
+            )
+        sections = payload.get("sections")
+        if sections is None:
+            sections = self.server.context_store.sections()
         if not isinstance(learning_level, str) or learning_level not in LEARNING_LEVELS | {""}:
             self._send_error(400, "invalid_learning_level", "Choose a supported IB programme and year.")
             return
@@ -319,6 +368,13 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                 "invalid_history",
                 "History must contain only non-empty user and assistant messages.",
             )
+            return
+        if (
+            not isinstance(web_context, list)
+            or len(web_context) > MAX_WEB_CONTEXT_ITEMS
+            or any(not _is_valid_web_reference(item) for item in web_context)
+        ):
+            self._send_error(400, "invalid_web_context", "A live web reference is invalid.")
             return
         if agent is not None and (
             not isinstance(agent, dict)
@@ -350,6 +406,8 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
         ):
             self._send_error(400, "invalid_agent", "The selected agent configuration is invalid.")
             return
+        if isinstance(agent, dict):
+            agent = self.server.context_store.agent(agent["agent_id"]) or agent
         if not isinstance(knowledge, list) or len(knowledge) > MAX_KNOWLEDGE_DOCUMENTS:
             self._send_error(400, "invalid_knowledge", "Too many knowledge excerpts were provided.")
             return
@@ -423,9 +481,10 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                     }
                 },
             )
+            return
 
         try:
-            answer, model_name, route = self.server.model_client.complete_with_route(
+            completion_args = (
                 text.strip(),
                 learning_level,
                 tone,
@@ -434,6 +493,15 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                 knowledge,
                 sections,
             )
+            if web_context:
+                answer, model_name, route = self.server.model_client.complete_with_route(
+                    *completion_args,
+                    web_context=web_context,
+                )
+            else:
+                answer, model_name, route = self.server.model_client.complete_with_route(
+                    *completion_args
+                )
         except LocalModelNotConfigured as exc:
             self._send_error(503, "model_not_configured", str(exc))
             return
@@ -460,6 +528,18 @@ class VoiceRequestHandler(BaseHTTPRequestHandler):
                             "review_date": item["review_date"],
                         }
                         for item in knowledge
+                    ] + [
+                        {
+                            "title": item["title"],
+                            "source": item["source"],
+                            "section_id": "web",
+                            "section_title": "Live web research",
+                            "review_date": "",
+                            "url": item["url"],
+                        }
+                        for item in web_context[
+                            : max(0, MAX_KNOWLEDGE_DOCUMENTS - len(knowledge))
+                        ]
                     ],
                 }
             },
