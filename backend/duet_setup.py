@@ -13,6 +13,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from .duet_build import record_handoff_build
+except ImportError:
+    from duet_build import record_handoff_build
+
 
 PACKAGE_NAMES = (
     "build-essential",
@@ -126,6 +131,7 @@ def prepare_controller(project_dir: Path) -> str:
     subprocess.run(["cmake", "--build", str(build_dir), "--parallel", "2"], check=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise RuntimeError(f"CMake completed without producing an executable: {binary}")
+    record_handoff_build(controller)
     print(f"Built DUET controller: {binary}")
     return str(binary)
 

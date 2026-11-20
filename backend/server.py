@@ -1209,28 +1209,14 @@ def stop_duet_controller_service() -> dict:
 
 
 def _validate_duet_handoff_build(controller_dir: Path) -> None:
-    binary = controller_dir / "build" / "g1_ctrl"
-    sources = (
-        controller_dir / "main.cpp",
-        controller_dir / "config" / "config.yaml",
-        controller_dir.parents[1] / "include" / "FSM" / "State_Handoff.h",
-        controller_dir.parents[1] / "include" / "FSM" / "State_FixStand.h",
-        controller_dir.parents[1] / "include" / "FSM" / "CtrlFSM.h",
-    )
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise DuetControllerError(
-            "The DUET controller binary is missing or not executable. Run the G1 setup installer to build it."
-        )
     try:
-        newest_source = max(source.stat().st_mtime_ns for source in sources)
-        binary_mtime = binary.stat().st_mtime_ns
-    except OSError as error:
-        raise DuetControllerError(f"Could not verify the DUET no-command handoff build: {error}") from error
-    if binary_mtime < newest_source:
-        raise DuetControllerError(
-            "The DUET controller binary predates the no-command handoff sources. "
-            "Run backend/install_g1_service.sh on the G1 host before connecting."
-        )
+        try:
+            from .duet_build import verify_handoff_build
+        except ImportError:
+            from duet_build import verify_handoff_build
+        verify_handoff_build(controller_dir)
+    except ValueError as error:
+        raise DuetControllerError(str(error)) from error
 
 
 def ensure_sdk_motion_available() -> None:

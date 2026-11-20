@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend import duet_setup
+from backend.duet_build import MANIFEST_NAME, verify_handoff_build
 
 
 class DuetSetupTests(unittest.TestCase):
@@ -17,6 +18,11 @@ class DuetSetupTests(unittest.TestCase):
             "FSM:\n  Velocity:\n    policy_dir: config/policy/velocity\n",
             encoding="utf-8",
         )
+        (controller / "main.cpp").write_text("int main() {}\n", encoding="utf-8")
+        handoff_include = controller.parents[1] / "include" / "FSM"
+        handoff_include.mkdir(parents=True)
+        for filename in ("State_Handoff.h", "State_FixStand.h", "CtrlFSM.h"):
+            (handoff_include / filename).write_text("// fixture\n", encoding="utf-8")
         return controller
 
     def test_policy_identity_matches_latest_policy_selected_by_controller_config(self):
@@ -62,6 +68,8 @@ class DuetSetupTests(unittest.TestCase):
                     patch.object(duet_setup, "_missing_apt_packages", return_value=[]), \
                     patch.object(duet_setup.subprocess, "run") as run:
                 self.assertEqual(duet_setup.prepare_controller(root), str(binary))
+                self.assertTrue((binary.parent / MANIFEST_NAME).is_file())
+                verify_handoff_build(controller)
 
         self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args_list[0].args[0][0], "cmake")

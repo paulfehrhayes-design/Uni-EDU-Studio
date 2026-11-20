@@ -4450,7 +4450,7 @@ test('Harry Botter keeps policy review as an unsaved teacher-approved proposal',
 
 test('Harry Botter requires auditioning a voice before applying it', async ({ page }) => {
   const speechPayloads = [];
-  let g1ProgramCode;
+  let g1SpeakPayload;
   let g1AudioConnected = false;
   let appliedVoice = 'af_heart';
   let appliedSpeed = 1;
@@ -4509,12 +4509,12 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
       });
       return;
     }
-    if (path === '/api/run') {
-      g1ProgramCode = request.postDataJSON().code;
+    if (path === '/api/harry-botter/g1-speak') {
+      g1SpeakPayload = request.postDataJSON();
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify({ status: 'completed', results: [{ method: 'say' }] }),
+        body: JSON.stringify({ status: 'accepted' }),
       });
       return;
     }
@@ -4594,9 +4594,16 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
   g1AudioConnected = true;
   await page.getByRole('button', { name: 'Refresh G1 status' }).click();
   await expect(page.getByTestId('g1-chat-routing')).toContainText('G1 audio capability connected');
+  await page.getByRole('button', { name: 'Voice conversation' }).click();
+  await expect(page.getByLabel('Microphone')).toBeVisible();
+  await page.getByLabel('Voice reply destination').selectOption('g1');
+  await page.getByLabel('G1 speaker ID').selectOption('1');
   await expect(speakOnG1).toBeEnabled();
   await speakOnG1.click();
-  await expect.poll(() => g1ProgramCode).toBeTruthy();
-  expect(g1ProgramCode).toBe('robot.say("Water changes into vapor when it evaporates.", 0)\n');
-  await expect(page.getByText('The compiled robot.say voice block was accepted. Check the G1 speaker.')).toBeVisible();
+  await expect.poll(() => g1SpeakPayload).toBeTruthy();
+  expect(g1SpeakPayload).toEqual({
+    text: 'Water changes into vapor when it evaporates.',
+    speaker_id: 1,
+  });
+  await expect(page.getByText('The G1 accepted the speech request. Check the G1 speaker.')).toBeVisible();
 });

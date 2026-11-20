@@ -470,7 +470,6 @@ try {
   }
   log(`Uni-EDU app is available at http://localhost:${port}; preparing local AI services.`);
 
-  await ensureOllama(env);
   const voiceHealthUrl = `http://127.0.0.1:${voicePort}/api/v1/health`;
   const voiceAlreadyRunning = await requireFreePortOrReadyService(voicePort, voiceHealthUrl, 'Harry Botter voice service');
   if (!voiceAlreadyRunning) {
@@ -513,6 +512,13 @@ try {
     await waitForService(voiceHealthUrl, voice, 'Voice service');
   }
 
+  // Ollama installation/model downloads are independent of voice API health.
+  // Start them only after the voice service is ready so first-run model setup
+  // cannot make the G1 installer report the voice service as unavailable.
+  const ollamaSetup = ensureOllama(env).catch((error) => {
+    log(`Local model setup failed; text generation may be unavailable: ${error.message}`);
+  });
+
   if (devMode) {
     log('Starting the Vite development frontend...');
     const vite = startProcess(
@@ -522,6 +528,8 @@ try {
     );
     await waitForHttp(`http://127.0.0.1:${vitePort}/`, vite, 'Vite development server');
   }
+
+  await ollamaSetup;
 
   try {
     const modelStatus = await fetchJson(`http://127.0.0.1:${voicePort}/api/v1/model/status`);

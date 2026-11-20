@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import server
+from backend import duet_build
 
 app = server.app
 
@@ -150,7 +151,7 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertIn(["systemctl", "--user", "start", server.DUET_CONTROLLER_UNIT], commands)
         self.assertFalse(any("enable" in command for command in commands))
 
-    def test_duet_handoff_build_requires_binary_newer_than_handoff_sources(self):
+    def test_duet_handoff_build_uses_content_record_instead_of_file_timestamps(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = server.Path(temp_dir) / "vendor" / "DUET" / "deploy" / "robots" / "g1_23dof"
             build_dir = controller / "build"
@@ -166,19 +167,32 @@ class ServerClassroomTests(unittest.TestCase):
                 include_dir / "State_FixStand.h",
                 include_dir / "CtrlFSM.h",
             )
+            (controller / "CMakeLists.txt").write_text("cmake", encoding="utf-8")
             for source in source_paths:
                 source.write_text("source", encoding="utf-8")
             binary = build_dir / "g1_ctrl"
             binary.write_text("binary", encoding="utf-8")
             binary.chmod(0o755)
-            source_mtime = max(source.stat().st_mtime_ns for source in source_paths)
-            os.utime(binary, ns=(source_mtime - 1, source_mtime - 1))
 
-            with self.assertRaisesRegex(server.DuetControllerError, "predates the no-command handoff"):
+            with self.assertRaisesRegex(server.DuetControllerError, "Run backend/install_g1_service.sh"):
                 server._validate_duet_handoff_build(controller)
 
-            os.utime(binary, ns=(source_mtime + 1, source_mtime + 1))
+            duet_build.record_handoff_build(controller)
+            source_mtime = max(
+                source.stat().st_mtime_ns
+                for source in (controller / "CMakeLists.txt", *source_paths)
+            )
+            os.utime(binary, ns=(source_mtime - 1, source_mtime - 1))
             server._validate_duet_handoff_build(controller)
+
+            (controller / "main.cpp").write_text("changed source", encoding="utf-8")
+            with self.assertRaisesRegex(server.DuetControllerError, "does not match the current"):
+                server._validate_duet_handoff_build(controller)
+
+            (controller / "main.cpp").write_text("source", encoding="utf-8")
+            binary.write_text("changed binary", encoding="utf-8")
+            with self.assertRaisesRegex(server.DuetControllerError, "differs from its recorded"):
+                server._validate_duet_handoff_build(controller)
 
     def test_duet_start_refuses_a_stale_handoff_binary_before_systemctl(self):
         with patch.object(server, "duet_controller_service_state", return_value="inactive"), \

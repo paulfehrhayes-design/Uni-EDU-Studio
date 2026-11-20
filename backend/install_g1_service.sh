@@ -316,6 +316,25 @@ if [[ "$APP_READY" != "1" ]]; then
   journalctl --user -u uni-edu-studio.service -n 40 --no-pager >&2 || true
   exit 1
 fi
+report_voice_service_diagnostics() {
+  echo "Loopback voice health probe:"
+  curl -sS --max-time 2 -o /dev/null \
+    -w 'HTTP response: %{http_code}\n' \
+    http://127.0.0.1:8765/api/v1/health || true
+  echo "Application service status:"
+  systemctl --user --no-pager -l status uni-edu-studio.service || true
+  echo "Recent application service logs:"
+  local service_logs
+  service_logs="$(journalctl --user -u uni-edu-studio.service -n 80 --no-pager 2>&1)" || true
+  if [[ -n "$service_logs" ]]; then
+    printf '%s\n' "$service_logs"
+  else
+    echo "No application service log entries were returned."
+  fi
+  if grep -Fq "No journal files were found" <<< "$service_logs"; then
+    echo "The user journal is unavailable, so journalctl cannot show the voice startup error. This is a logging limitation, not the cause of the failed health check."
+  fi
+}
 VOICE_READY=0
 for attempt in {1..600}; do
   if curl -fsS --max-time 1 http://127.0.0.1:8765/api/v1/health >/dev/null 2>&1; then
@@ -324,16 +343,13 @@ for attempt in {1..600}; do
   fi
   if (( attempt % 30 == 0 )); then
     echo "Waiting for Harry Botter voice service on 127.0.0.1:8765 ($attempt seconds elapsed)..."
-    echo "Recent application service logs:"
-    journalctl --user -u uni-edu-studio.service -n 30 --no-pager || true
+    report_voice_service_diagnostics
   fi
   sleep 1
 done
 if [[ "$VOICE_READY" != "1" ]]; then
   echo "Uni EDU Studio started, but the Harry Botter voice service did not become healthy." >&2
-  echo "Service status and recent logs:" >&2
-  systemctl --user --no-pager -l status uni-edu-studio.service >&2 || true
-  journalctl --user -u uni-edu-studio.service -n 80 --no-pager >&2 || true
+  report_voice_service_diagnostics >&2
   exit 1
 fi
 sudo loginctl enable-linger "$USER"

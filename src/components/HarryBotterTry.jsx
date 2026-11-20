@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { compileG1VoiceBlockProgram } from '../sim/g1Commands.js';
 
 const SESSION_STORAGE_KEY = 'edu-classroom-session';
 const MAX_KNOWLEDGE_BYTES = 100_000;
@@ -782,21 +781,19 @@ export default function HarryBotterTry() {
     setG1SpeechStatus('');
     setIsSendingG1Speech(true);
     try {
-      const response = await fetch('/api/run', {
+      const response = await fetch('/api/harry-botter/g1-speak', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${teacherSession.token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          code: compileG1VoiceBlockProgram(text.trim(), Number(g1SpeakerId)),
-        }),
+        body: JSON.stringify({ text: text.trim(), speaker_id: Number(g1SpeakerId) }),
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.detail || 'The G1 voice-block program could not run.');
-      setG1SpeechStatus('The compiled robot.say voice block was accepted. Check the G1 speaker.');
+      if (!response.ok) throw new Error(result.detail || 'The G1 could not speak this draft.');
+      setG1SpeechStatus('The G1 accepted the speech request. Check the G1 speaker.');
     } catch (error) {
-      setG1SpeechError(error.message || 'Could not run the G1 voice-block program.');
+      setG1SpeechError(error.message || 'Could not send this draft to the G1 speaker.');
     } finally {
       setIsSendingG1Speech(false);
     }
@@ -2666,8 +2663,7 @@ export default function HarryBotterTry() {
               <div>
                 <h3 className="font-semibold text-emerald-950">Send a chat reply to the G1</h3>
                 <p className="text-sm text-emerald-900">
-                  Uni-EDU Studio sends approved text through its Audio block command
-                  {' '}<code>robot.say(text, speaker_id)</code>.
+                  Approved text is sent through the authenticated G1 audio speech service.
                 </p>
               </div>
               <button
@@ -3127,6 +3123,63 @@ export default function HarryBotterTry() {
                 </select>
               </label>
             </div>
+            <section
+              aria-label="Voice conversation audio routing"
+              className="space-y-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4"
+            >
+              <div className="flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2 text-sm font-medium text-emerald-950">
+                  Voice reply destination
+                  <select
+                    aria-label="Voice reply destination"
+                    value={draftOutput}
+                    onChange={(event) => {
+                      setDraftOutput(event.target.value);
+                      setG1SpeechStatus('');
+                      setG1SpeechError('');
+                    }}
+                    className="rounded-lg border border-emerald-300 bg-white px-3 py-2"
+                  >
+                    <option value="browser">Browser/local speaker</option>
+                    <option value="g1">G1 speaker</option>
+                  </select>
+                </label>
+                {draftOutput === 'g1' && (
+                  <label className="flex items-center gap-2 text-sm font-medium text-emerald-950">
+                    G1 speaker ID
+                    <select
+                      aria-label="G1 speaker ID"
+                      value={g1SpeakerId}
+                      onChange={(event) => setG1SpeakerId(event.target.value)}
+                      className="rounded-lg border border-emerald-300 bg-white px-3 py-2"
+                    >
+                      <option value="0">Voice 0</option>
+                      <option value="1">Voice 1</option>
+                    </select>
+                  </label>
+                )}
+              </div>
+              <p role="status" aria-live="polite" className="text-sm text-emerald-950">
+                {draftOutput === 'g1'
+                  ? g1AudioConnected
+                    ? 'Your selected device microphone is used for listening. Review each draft and press “Speak this draft on G1” to send it to the robot speaker.'
+                    : 'Your selected device microphone is used for listening. Connect G1 audio in Uni-EDU Studio before sending approved drafts to its speaker.'
+                  : 'Your selected device microphone is used for listening. Approved replies play through the browser or selected local speaker.'}
+              </p>
+              {!g1AudioConnected && draftOutput === 'g1' && (
+                <p className="text-sm text-emerald-950">
+                  Open{' '}
+                  <a href="/" className="font-semibold underline">Uni-EDU Studio</a>
+                  {' '}and use the teacher Robot connection panel, then return here.
+                </p>
+              )}
+              {g1SpeechStatus && (
+                <p role="status" aria-live="polite" className="text-sm text-emerald-800">{g1SpeechStatus}</p>
+              )}
+              {g1SpeechError && (
+                <p role="alert" className="text-sm text-red-700">{g1SpeechError}</p>
+              )}
+            </section>
             <p className="text-xs text-slate-500">
               Stage, tone, and agent changes apply to the next draft. Microphone changes require stopping and restarting the conversation.
             </p>
