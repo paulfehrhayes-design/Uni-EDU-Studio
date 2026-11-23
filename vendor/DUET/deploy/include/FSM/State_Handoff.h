@@ -5,8 +5,8 @@
 #include "FSMState.h"
 
 // Startup state: keep a current pose in the command buffer without publishing it.
-// The first publication is made by FixStand only after the configured operator
-// transition is received.
+// The first publication is made only after an explicit configured operator
+// transition to FixStand or the damped Passive state.
 class State_Handoff : public FSMState
 {
 public:

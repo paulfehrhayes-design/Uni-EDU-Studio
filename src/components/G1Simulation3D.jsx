@@ -19,6 +19,20 @@ import {
   DEFAULT_CAMERA_YAW, getCameraHorizontalFocusOffset, getCameraPanDirection, getCameraPanTargetOffset,
 } from '../sim/cameraNavigation';
 
+const G1_SHELL_COLOR = 0xd7d9dc;
+const G1_DARK_COMPONENT_COLOR = 0x202225;
+const G1_DARK_MESH_NAMES = new Set([
+  'pelvis',
+  'left_hip_pitch_link',
+  'right_hip_pitch_link',
+  'left_ankle_roll_link',
+  'right_ankle_roll_link',
+  'head_link',
+  'logo_link',
+  'left_rubber_hand',
+  'right_rubber_hand',
+]);
+
 const JOINT_AXES = {
   left_hip_pitch: 'x', right_hip_pitch: 'x', left_knee: 'x', right_knee: 'x', left_knee_pitch: 'x', right_knee_pitch: 'x',
   left_ankle_pitch: 'x', right_ankle_pitch: 'x',
@@ -169,8 +183,8 @@ function createRobot() {
   const robot = new THREE.Group();
   robot.name = 'G1-23DoF';
   robot.scale.setScalar(0.45);
-  const dark = 0x263241;
-  const light = 0xd7e0e8;
+  const dark = G1_DARK_COMPONENT_COLOR;
+  const light = G1_SHELL_COLOR;
   const accent = 0x19b5fe;
   const joints = {};
   const register = (name, parent, position = [0, 0, 0]) => {
@@ -189,7 +203,7 @@ function createRobot() {
   const waistYaw = register('waist_yaw_joint', pelvis, [0, 0.28, 0]);
   const torso = new THREE.Group();
   waistYaw.add(torso);
-  addBox(torso, [0.62, 0.72, 0.38], [0, 0.38, 0], dark, 0);
+  addBox(torso, [0.62, 0.72, 0.38], [0, 0.38, 0], light, 0);
   addBox(torso, [0.4, 0.3, 0.42], [0, 0.76, 0], light, 0);
 
   const head = register('head', torso, [0, 0.95, 0]);
@@ -200,7 +214,7 @@ function createRobot() {
     const hipRoll = register(`${side}_hip_roll_joint`, pelvis, [x, -0.02, 0]);
     const hipYaw = register(`${side}_hip_yaw_joint`, hipRoll);
     const hipPitch = register(`${side}_hip_pitch_joint`, hipYaw);
-    addSegment(hipPitch, [0, 0, 0], [0, -0.55, 0], 0.13, dark);
+    addSegment(hipPitch, [0, 0, 0], [0, -0.55, 0], 0.13, light);
     const knee = register(`${side}_knee_joint`, hipPitch, [0, -0.55, 0]);
     addSegment(knee, [0, 0, 0], [0, -0.62, 0], 0.12, light);
     const anklePitch = register(`${side}_ankle_pitch_joint`, knee, [0, -0.62, 0]);
@@ -217,9 +231,9 @@ function createRobot() {
     const shoulderYaw = register(`${side}_shoulder_yaw_joint`, shoulderRoll);
     addSegment(shoulderYaw, [0, 0, 0], [0, -0.48, 0], 0.1, light);
     const elbow = register(`${side}_elbow_joint`, shoulderYaw, [0, -0.48, 0]);
-    addSegment(elbow, [0, 0, 0], [0, -0.46, 0], 0.085, dark);
+    addSegment(elbow, [0, 0, 0], [0, -0.46, 0], 0.085, light);
     const wristRoll = register(`${side}_wrist_roll_joint`, elbow, [0, -0.46, 0]);
-    addBox(wristRoll, [0.16, 0.2, 0.2], [0, -0.1, 0], light, 0);
+    addBox(wristRoll, [0.16, 0.2, 0.2], [0, -0.1, 0], dark, 0);
   };
   arm('left', -0.46);
   arm('right', 0.46);
@@ -475,11 +489,11 @@ async function loadG1MeshRig() {
   };
 
   const getMaterial = (meshName) => {
-    const dark = /pelvis|hip|knee|waist|torso|head|logo|elbow|hand/.test(meshName);
+    const dark = G1_DARK_MESH_NAMES.has(meshName);
     const key = dark ? 'dark' : 'light';
     if (!materialCache.has(key)) {
       materialCache.set(key, new THREE.MeshStandardMaterial({
-        color: dark ? 0x263241 : 0xcbd5e1,
+        color: dark ? G1_DARK_COMPONENT_COLOR : G1_SHELL_COLOR,
         metalness: 0.5,
         roughness: 0.36,
       }));

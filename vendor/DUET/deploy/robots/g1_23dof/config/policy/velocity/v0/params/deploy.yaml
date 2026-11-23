@@ -22,36 +22,12 @@ commands:
       lin_vel_y: [-0.5, 0.5]
       ang_vel_z: [-1.0, 1.0]
       heading: null
-  # Pelvis-height (squat) command. Read by the base_height_command observation.
-  # Must match BaseHeightCommandCfg.height_range in the trained task.
-  #
-  # !! CHANGED 2026-08-06: floor 0.12 -> 0.18. The old floor was KINEMATICALLY
-  # !! IMPOSSIBLE. Measured deepest reachable pelvis-above-flat-foot on this
-  # !! robot is 0.144 m, and only with hip_pitch pinned at its -2.53 rad limit.
-  # !! Commanding below that asked for something the robot cannot do, and the
-  # !! policy correctly learned to stop chasing it (it saturated ~0.22-0.25 m).
-  # !!
-  # !! CHANGED 2026-09-16: floor 0.18 -> 0.27. This is the operator clamp and it
-  # !! is what stops the D-pad asking for a depth the policy cannot hold. The
-  # !! arm-robustness policy trains down to 0.27 m only. Below that it does NOT
-  # !! fail loudly, it extrapolates: measured on model_11500, a 0.18 command
-  # !! produced ~0.20 m with the knee 0.05 rad and hip_pitch 0.09 rad PAST their
-  # !! soft limits. In sim that only costs reward; on hardware the SDK clamps the
-  # !! target, so the PD error never closes and the joint holds a stall current.
-  # !! That is a thermal and a margin problem, not a tracking one, and it is
-  # !! invisible in MuJoCo. 0.27 keeps every commandable depth inside the band
-  # !! the policy was trained and disturbance-tested at. 0.24 is the deepest
-# !! value that still leaves ~0.13 rad of joint-limit margin (0.204 m is the
-# !! zero-margin kinematic floor), so it must be paired with a policy whose
-# !! HEIGHT_RANGE floor is 0.24.
-  # !!
-  # !! Narrowing is safe for older policies too: the checker requires the
-  # !! deployed range to be a SUBSET of the trained range, and [0.27, 0.73] sits
-  # !! inside the 0.18 and 0.12 floors those were trained on.
-  # !! scripts/check_deploy_consistency.py enforces the pairing.
+  # Pelvis-height command used by base_height_command. The deployed [0.24, 0.73]
+  # range is narrower than the exported policy contract [0.18, 0.73]; Y/X changes
+  # are clamped to this runtime range. Do not expand it without policy review and
+  # supervised acceptance on the target G1.
   base_height:
-    # Resting and max height both 0.73, the top of the trained band
-    # (D-pad Up won't exceed it). Floor 0.27 = the trained squat floor.
+    # Resting target is the current configured maximum; X can lower it in Velocity.
     range: [0.24, 0.73]
     standstill: 0.73
 actions:

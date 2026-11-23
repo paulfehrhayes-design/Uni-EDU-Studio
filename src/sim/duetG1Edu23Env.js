@@ -247,7 +247,7 @@ export function simulateDuetG1Edu23Program(code, { obstacles = G1_EDU_23_ENV.def
     }];
   }
   const state = { ...createEmptyG1Edu23State(), status: 'DUET preview' };
-  const joints = Object.fromEntries(G1_MODEL_INFO.joints.map((joint) => [joint, 0]));
+  const joints = { ...state.joints };
   const frames = [];
   const actions = [];
   const timeline = [];

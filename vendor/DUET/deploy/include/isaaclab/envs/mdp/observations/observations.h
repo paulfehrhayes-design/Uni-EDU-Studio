@@ -137,31 +137,29 @@ REGISTER_OBSERVATION(velocity_commands)
 
 REGISTER_OBSERVATION(base_height_command)
 {
-    // Target base (pelvis) height, driven by the remote D-pad:
-    //   Up   = stand taller (ramp toward hi)
-    //   Down = squat lower  (ramp toward lo)
-    // The target integrates while a key is held and persists across control
-    // steps (single-robot deploy), so the height stays where the user left it.
+    // Target base (pelvis) height, driven by the documented face buttons:
+    //   Y = stand taller, X = lower the standing target.
+    // Keep the command inside the deployed policy's validated training range.
     auto & joystick = env->robot->data.joystick;
     const auto base_height_cfg = env->cfg["commands"]["base_height"];
     const auto cfg = base_height_cfg["range"];
     const float lo = cfg[0].as<float>();
     const float hi = cfg[1].as<float>();
-    // Resting height when idle with no D-pad input. Defaults to a hair below the
-    // 0.75 max so the standing pose sits just inside the trained band (off the
-    // exact-max edge, slightly more stable) while hi=0.75 stays reachable via
-    // D-pad Up. Falls back to hi if `standstill` is absent from the config.
+    // Resting height when idle. Falls back to hi if `standstill` is absent.
     const float standstill = base_height_cfg["standstill"]
                                  ? base_height_cfg["standstill"].as<float>()
                                  : hi;
 
     static float target = standstill;               // start at the resting height
-    const float ADJ_RATE = 0.40f;                   // m/s — how fast Up/Down move the target
+    const float ADJ_RATE = 0.40f;                   // m/s — bounded height adjustment
     const float adj_step = ADJ_RATE * env->step_dt;
-    if (joystick->up.pressed)   target += adj_step;
-    if (joystick->down.pressed) target -= adj_step;
-    if (joystick->left.pressed)  target = 0.60f;  // D-pad Left: walk-height preset (walk-band floor)
-    if (joystick->right.pressed) target = hi;     // D-pad Right: full-stand preset (top of range, 0.73)
+    // L1+X is an unsupported lying-mode chord, not a height adjustment.
+    // R2+X is the documented run-control chord in Velocity; there X still
+    // adjusts the bounded stand-height target.
+    if (!joystick->LB.pressed && joystick->Y.pressed) target += adj_step;
+    if (!joystick->LB.pressed && joystick->X.pressed) {
+        target -= adj_step;
+    }
     target = std::clamp(target, lo, hi);
 
     // Velocity/height decoupling (Run-7 walk band): the policy learned to WALK at

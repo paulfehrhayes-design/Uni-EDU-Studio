@@ -155,25 +155,31 @@ class ServerClassroomTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = server.Path(temp_dir) / "vendor" / "DUET" / "deploy" / "robots" / "g1_23dof"
             build_dir = controller / "build"
-            include_dir = controller.parents[1] / "include" / "FSM"
-            config_dir = controller / "config"
-            for directory in (build_dir, include_dir, config_dir):
-                directory.mkdir(parents=True, exist_ok=True)
-
+            include_dir = controller.parents[1] / "include"
+            runtime_config = controller / "config" / "config.yaml"
             source_paths = (
+                controller / "CMakeLists.txt",
                 controller / "main.cpp",
-                config_dir / "config.yaml",
-                include_dir / "State_Handoff.h",
-                include_dir / "State_FixStand.h",
-                include_dir / "CtrlFSM.h",
+                include_dir / "FSM" / "State_Handoff.h",
+                include_dir / "FSM" / "State_FixStand.h",
+                include_dir / "FSM" / "State_RLBase.h",
+                include_dir / "FSM" / "FSMState.h",
+                include_dir / "FSM" / "CtrlFSM.h",
+                include_dir / "Types.h",
+                include_dir / "unitree_joystick_dsl.hpp",
+                include_dir / "DuetCommandGateway.h",
+                include_dir / "duet_command_gateway.h",
+                include_dir / "isaaclab" / "envs" / "mdp" / "observations" / "observations.h",
+                controller / "src" / "State_RLBase.cpp",
+                controller / "src" / "DuetCommandGateway.cpp",
             )
             (controller / "CMakeLists.txt").write_text("cmake", encoding="utf-8")
             for source in source_paths:
                 source.write_text("source", encoding="utf-8")
+            build_dir.mkdir(parents=True)
             binary = build_dir / "g1_ctrl"
             binary.write_text("binary", encoding="utf-8")
             binary.chmod(0o755)
-
             with self.assertRaisesRegex(server.DuetControllerError, "Run backend/install_g1_service.sh"):
                 server._validate_duet_handoff_build(controller)
 

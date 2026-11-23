@@ -199,7 +199,8 @@ test('teacher confirms Passive before the app stops DUET and switches to legacy'
   await controllerToggle.uncheck();
 
   await expect(controllerToggle).not.toBeChecked();
-  expect(handoffConfirmation).toContain('press L2+B');
+  expect(handoffConfirmation).toContain('press L1+A');
+  expect(handoffConfirmation).toContain('damped Passive state (not zero torque)');
   expect(handoffConfirmation).toContain('cannot verify the robot’s physical stability or Passive state');
   expect(requests).toContain('POST /api/duet/handoff-to-legacy');
   expect(requests).not.toContain('POST /api/duet/disconnect');

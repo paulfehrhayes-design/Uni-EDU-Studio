@@ -1,4 +1,6 @@
 import hashlib
+import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +26,62 @@ class DuetSetupTests(unittest.TestCase):
         for filename in ("State_Handoff.h", "State_FixStand.h", "CtrlFSM.h"):
             (handoff_include / filename).write_text("// fixture\n", encoding="utf-8")
         return controller
+
+    def test_handheld_fsm_map_and_standing_height_stay_inside_deployed_policy(self):
+        project = Path(__file__).resolve().parents[1]
+        controller = project / "vendor" / "DUET" / "deploy" / "robots" / "g1_23dof"
+        fsm_config = (controller / "config" / "config.yaml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'FixStand: "(LB + up.on_pressed) | F1.on_pressed"',
+            fsm_config,
+        )
+        self.assertIn(
+            'Velocity: "(RT + X.on_pressed) | F2.on_pressed"',
+            fsm_config,
+        )
+        self.assertIn(
+            'Passive: "LB + A.on_pressed"',
+            fsm_config,
+        )
+        self.assertNotIn("start.on_pressed", fsm_config)
+
+        deploy_include = project / "vendor" / "DUET" / "deploy" / "include"
+        height_observation = (
+            deploy_include / "isaaclab" / "envs" / "mdp" / "observations" / "observations.h"
+        ).read_text(encoding="utf-8")
+        self.assertIn("joystick->Y.pressed", height_observation)
+        self.assertIn("joystick->X.pressed", height_observation)
+        self.assertIn("target = std::clamp(target, lo, hi)", height_observation)
+        self.assertNotIn("joystick->up.pressed", height_observation)
+        self.assertNotIn("joystick->down.pressed", height_observation)
+        self.assertIn("if (!joystick->LB.pressed && joystick->X.pressed)", height_observation)
+
+        rl_state = (controller / "src" / "State_RLBase.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("js->Y.pressed", rl_state)
+        self.assertNotIn("js->B.pressed", rl_state)
+        rl_header = (deploy_include / "FSM" / "State_RLBase.h").read_text(encoding="utf-8")
+        self.assertNotIn("ArmPose", rl_header)
+
+        deploy_config = (
+            controller / "config" / "policy" / "velocity" / "v0" / "params" / "deploy.yaml"
+        ).read_text(encoding="utf-8")
+        trained_contract = json.loads(
+            (project / "vendor" / "DUET" / "exported" / "deploy_contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        height_range = re.search(r"(?m)^\s+range:\s*\[([0-9.]+),\s*([0-9.]+)\]", deploy_config)
+        standstill = re.search(r"(?m)^\s+standstill:\s*([0-9.]+)", deploy_config)
+        self.assertIsNotNone(height_range)
+        self.assertIsNotNone(standstill)
+        deployed_min, deployed_max = map(float, height_range.groups())
+        standstill_height = float(standstill.group(1))
+        trained_min, trained_max = map(float, trained_contract["height_command_range"])
+        self.assertLessEqual(deployed_min, deployed_max)
+        self.assertGreaterEqual(deployed_min, trained_min)
+        self.assertLessEqual(deployed_max, trained_max)
+        self.assertEqual(standstill_height, deployed_max)
 
     def test_policy_identity_matches_latest_policy_selected_by_controller_config(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

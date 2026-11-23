@@ -181,11 +181,12 @@ state copies fresh measured joint positions into the command buffer but does not
 publish `rt/lowcmd`; it also remains non-publishing if low-state times out. Handoff
 does not establish the robot's physical posture or whether a mode transition is
 appropriate. If the robot is already in `Velocity`, leave it there; do not press
-L2+Up (or F1) to send it back through `FixStand`. If the actual controller state
+L1+Up (or F1) to send it back through `FixStand`. If the actual controller state
 cannot be verified, do not guess at a transition based on the missing gateway.
 Only a qualified onsite operator who has verified the robot and controller state
-may use the configured L2+Up/F1 transition into `FixStand`, followed by R2+A to
-enter `Velocity`, when the model-specific procedure requires it. The local gateway
+may use the configured L1+Up/F1 transition into `FixStand`, followed by R2+X to
+enter `Velocity`, when the model-specific procedure requires it. L1+A selects the
+damped `Passive` state; it is not a zero-torque command. The local gateway
 socket starts only in Velocity, so a running service by itself is not evidence that
 the app can reach the gateway. The interface check does not prove DDS connectivity,
 and this software handoff is not physical-safety acceptance.

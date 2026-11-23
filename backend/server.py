@@ -4697,8 +4697,9 @@ def duet_handoff_to_legacy(
         raise HTTPException(
             status_code=409,
             detail=(
-                "Before switching, an onsite operator must verify the G1 is stable and press L2+B "
-                "to put DUET in Passive. The backend cannot verify physical stability or Passive state."
+                "Before switching, an onsite operator must verify the G1 is stable and press L1+A "
+                "to select DUET's damped Passive state (not zero torque). "
+                "The backend cannot verify physical stability or Passive state."
             ),
         )
     if not _MOTION_START_LOCK.acquire(blocking=False):

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import recordedMotions from '../../g1-recorded-motions.json' with { type: 'json' };
 import { getG1GaitEnvelope, getG1GaitJointTargets } from './g1Gait.js';
 import { buildLegacyG1SimulationFrames, createEmptyG1Edu23State } from './g1Edu23Env.js';
 import { simulateDuetG1Edu23Program } from './duetG1Edu23Env.js';
@@ -37,13 +38,30 @@ test('G1 gait ramps in and out rather than freezing mid-stride', () => {
   assert.equal(getG1GaitEnvelope(1), 0);
 });
 
-test('empty simulator state initializes every rendered joint to numeric neutral', () => {
+test('simulator starts with the measured relaxed arm pose', () => {
   const { joints } = createEmptyG1Edu23State();
+  const firstRecording = recordedMotions.recordings[0];
+  const initialFrames = [
+    buildLegacyG1SimulationFrames('robot.wait(1)')[0],
+    simulateDuetG1Edu23Program('duet.wait(1)')[0],
+  ];
 
   assert.equal(Object.keys(joints).length, 23);
   assert.equal(Object.keys(joints).length, G1_MODEL_INFO.jointCount);
-  G1_MESH_ARM_JOINT_NAMES.forEach((joint) => assert.ok(Object.hasOwn(joints, joint)));
-  assert.ok(Object.values(joints).every((angle) => angle === 0));
+  G1_MESH_ARM_JOINT_NAMES.forEach((joint) => {
+    const recordedAngle = firstRecording.frames[0].positions_rad[firstRecording.joint_names.indexOf(joint)];
+    const expectedAngle = recordedAngle * 180 / Math.PI;
+    assert.ok(Object.hasOwn(joints, joint));
+    assert.ok(Math.abs(joints[joint] - expectedAngle) < 1e-10);
+    initialFrames.forEach(({ joints: frameJoints }) => {
+      assert.ok(Math.abs(frameJoints[joint] - expectedAngle) < 1e-10);
+    });
+  });
+  assert.ok(
+    Object.entries(joints)
+      .filter(([joint]) => !G1_MESH_ARM_JOINT_NAMES.includes(joint))
+      .every(([, angle]) => angle === 0),
+  );
 });
 
 test('legacy walking alternates both legs, swings articulated arms, and ends neutral', () => {
