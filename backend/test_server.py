@@ -150,34 +150,59 @@ class ServerClassroomTests(unittest.TestCase):
         self.assertIn(["systemctl", "--user", "start", server.DUET_CONTROLLER_UNIT], commands)
         self.assertFalse(any("enable" in command for command in commands))
 
-    def test_duet_handoff_build_requires_binary_newer_than_handoff_sources(self):
+    def test_duet_handoff_build_requires_binary_newer_than_all_runtime_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = server.Path(temp_dir) / "vendor" / "DUET" / "deploy" / "robots" / "g1_23dof"
             build_dir = controller / "build"
-            include_dir = controller.parents[1] / "include" / "FSM"
-            config_dir = controller / "config"
-            for directory in (build_dir, include_dir, config_dir):
-                directory.mkdir(parents=True, exist_ok=True)
-
+            include_dir = controller.parents[1] / "include"
+            runtime_config = controller / "config" / "config.yaml"
             source_paths = (
+                controller / "CMakeLists.txt",
                 controller / "main.cpp",
-                config_dir / "config.yaml",
-                include_dir / "State_Handoff.h",
-                include_dir / "State_FixStand.h",
-                include_dir / "CtrlFSM.h",
+                include_dir / "FSM" / "State_Handoff.h",
+                include_dir / "FSM" / "State_FixStand.h",
+                include_dir / "FSM" / "State_RLBase.h",
+                include_dir / "FSM" / "FSMState.h",
+                include_dir / "FSM" / "CtrlFSM.h",
+                include_dir / "Types.h",
+                include_dir / "unitree_joystick_dsl.hpp",
+                include_dir / "DuetCommandGateway.h",
+                include_dir / "duet_command_gateway.h",
+                include_dir / "isaaclab" / "envs" / "mdp" / "observations" / "observations.h",
+                controller / "src" / "State_RLBase.cpp",
+                controller / "src" / "DuetCommandGateway.cpp",
             )
-            for source in source_paths:
+            for source in (*source_paths, runtime_config):
+                source.parent.mkdir(parents=True, exist_ok=True)
                 source.write_text("source", encoding="utf-8")
+            build_dir.mkdir(parents=True)
             binary = build_dir / "g1_ctrl"
             binary.write_text("binary", encoding="utf-8")
             binary.chmod(0o755)
             source_mtime = max(source.stat().st_mtime_ns for source in source_paths)
-            os.utime(binary, ns=(source_mtime - 1, source_mtime - 1))
+            os.utime(binary, ns=(source_mtime + 1, source_mtime + 1))
 
-            with self.assertRaisesRegex(server.DuetControllerError, "predates the no-command handoff"):
+            # config.yaml is loaded at process startup and is not embedded in
+            # g1_ctrl; editing the handheld mapping must not require a needless
+            # binary rebuild or block Connect.
+            os.utime(
+                runtime_config,
+                ns=(source_mtime + 2, source_mtime + 2),
+            )
+            server._validate_duet_handoff_build(controller)
+
+            # This controller implementation used to be omitted from the
+            # startup freshness check, even though its binary is what Connect
+            # would launch.
+            newer_runtime_source = controller / "src" / "State_RLBase.cpp"
+            os.utime(
+                newer_runtime_source,
+                ns=(source_mtime + 3, source_mtime + 3),
+            )
+            with self.assertRaisesRegex(server.DuetControllerError, "predates one or more"):
                 server._validate_duet_handoff_build(controller)
 
-            os.utime(binary, ns=(source_mtime + 1, source_mtime + 1))
+            os.utime(binary, ns=(source_mtime + 4, source_mtime + 4))
             server._validate_duet_handoff_build(controller)
 
     def test_duet_start_refuses_a_stale_handoff_binary_before_systemctl(self):

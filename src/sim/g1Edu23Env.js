@@ -31,6 +31,16 @@ const LEGACY_ARM_GESTURES = {
   'shake hand': ['legacy_shake_hand_right'],
 };
 
+const RECORDED_START_POSE = recordedMotions.recordings.find(
+  (recording) => recording.controller_version === 'legacy',
+);
+const DEFAULT_ARM_POSE = Object.fromEntries(ARM_JOINTS.map((joint) => [
+  joint,
+  RECORDED_START_POSE.frames[0].positions_rad[
+    RECORDED_START_POSE.joint_names.indexOf(joint)
+  ] * RADIANS_TO_DEGREES,
+]));
+
 function getArmTargetsFromPose(poseName) {
   const target = getDuetArmPoseTarget(poseName);
   return Object.fromEntries(ARM_JOINTS.map((joint, index) => [
@@ -176,6 +186,14 @@ export const G1_MOTION_TEMPLATES = [
   },
 ];
 
+function createInitialJointState() {
+  const joints = Object.fromEntries(
+    G1_EDU_23_ENV.joints.map((joint) => [joint, 0]),
+  );
+  Object.assign(joints, DEFAULT_ARM_POSE);
+  return joints;
+}
+
 export const createEmptyG1Edu23State = () => ({
   x: 0,
   y: 0,
@@ -190,9 +208,7 @@ export const createEmptyG1Edu23State = () => ({
   goalReached: false,
   goal: null,
   timeline: [],
-  joints: Object.fromEntries(
-    G1_EDU_23_ENV.joints.map((joint) => [joint, 0]),
-  ),
+  joints: createInitialJointState(),
 });
 
 function normalizeAngle(angle) {
@@ -414,7 +430,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
   const path = [{ x, y }];
   const actions = [];
   const timeline = [];
-  const jointState = Object.fromEntries(G1_EDU_23_ENV.joints.map((joint) => [joint, 0]));
+  const jointState = createInitialJointState();
   let collisionCount = 0;
   let gaitPhase = 0;
   let gaitWeight = 0;
@@ -430,6 +446,7 @@ export function buildLegacyG1SimulationFrames(pythonCode, options = {}) {
       jointState,
       getG1GaitJointTargets(gaitPhase * Math.PI * 2, isInitial ? 0 : gaitWeight, torsoPitch, torsoRoll),
     );
+    if (isInitial) Object.assign(jointState, DEFAULT_ARM_POSE);
     Object.entries(poseTargets).forEach(([name, value]) => {
       const jointName = name.replace(/_knee_pitch(?:_joint)?$/, '_knee_joint');
       jointState[jointName.endsWith('_joint') ? jointName : `${jointName}_joint`] = value;

@@ -3079,8 +3079,8 @@ export default function App() {
       const operatorConfirmed = window.confirm(
         'DUET → Legacy SDK handoff\n\n'
         + 'Before continuing, an onsite operator must stop any active motion, verify the G1 is stable, '
-        + 'and press L2+B on the handheld controller to put DUET in Passive. The app cannot verify '
-        + 'the robot’s physical stability or Passive state and will not command a mode change.\n\n'
+        + 'and press L1+A on the handheld controller to select DUET’s damped Passive state (not zero torque). '
+        + 'The app cannot verify the robot’s physical stability or Passive state and will not command a mode change.\n\n'
         + 'After you have personally confirmed those steps, choose OK. The app will stop the managed '
         + 'DUET systemd user service and proceed only if the service is inactive and backend DUET '
         + 'ownership is reported released. This does not start legacy motion; connect and run remain '

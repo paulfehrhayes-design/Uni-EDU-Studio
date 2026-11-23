@@ -1200,12 +1200,22 @@ def stop_duet_controller_service() -> dict:
 
 def _validate_duet_handoff_build(controller_dir: Path) -> None:
     binary = controller_dir / "build" / "g1_ctrl"
+    deploy_include = controller_dir.parents[1] / "include"
     sources = (
+        controller_dir / "CMakeLists.txt",
         controller_dir / "main.cpp",
-        controller_dir / "config" / "config.yaml",
-        controller_dir.parents[1] / "include" / "FSM" / "State_Handoff.h",
-        controller_dir.parents[1] / "include" / "FSM" / "State_FixStand.h",
-        controller_dir.parents[1] / "include" / "FSM" / "CtrlFSM.h",
+        deploy_include / "FSM" / "State_Handoff.h",
+        deploy_include / "FSM" / "State_FixStand.h",
+        deploy_include / "FSM" / "State_RLBase.h",
+        deploy_include / "FSM" / "FSMState.h",
+        deploy_include / "FSM" / "CtrlFSM.h",
+        deploy_include / "Types.h",
+        deploy_include / "unitree_joystick_dsl.hpp",
+        deploy_include / "DuetCommandGateway.h",
+        deploy_include / "duet_command_gateway.h",
+        deploy_include / "isaaclab" / "envs" / "mdp" / "observations" / "observations.h",
+        controller_dir / "src" / "State_RLBase.cpp",
+        controller_dir / "src" / "DuetCommandGateway.cpp",
     )
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise DuetControllerError(
@@ -1218,8 +1228,10 @@ def _validate_duet_handoff_build(controller_dir: Path) -> None:
         raise DuetControllerError(f"Could not verify the DUET no-command handoff build: {error}") from error
     if binary_mtime < newest_source:
         raise DuetControllerError(
-            "The DUET controller binary predates the no-command handoff sources. "
-            "Run backend/install_g1_service.sh on the G1 host before connecting."
+            "The DUET controller binary predates one or more current handoff, "
+            "handheld-mapping, or motion-gateway sources. Rebuild it on the G1 host "
+            "with `python3 backend/duet_setup.py --prepare`, then retry Connect. "
+            "No controller was started."
         )
 
 
@@ -4690,8 +4702,9 @@ def duet_handoff_to_legacy(
         raise HTTPException(
             status_code=409,
             detail=(
-                "Before switching, an onsite operator must verify the G1 is stable and press L2+B "
-                "to put DUET in Passive. The backend cannot verify physical stability or Passive state."
+                "Before switching, an onsite operator must verify the G1 is stable and press L1+A "
+                "to select DUET's damped Passive state (not zero torque). "
+                "The backend cannot verify physical stability or Passive state."
             ),
         )
     if not _MOTION_START_LOCK.acquire(blocking=False):

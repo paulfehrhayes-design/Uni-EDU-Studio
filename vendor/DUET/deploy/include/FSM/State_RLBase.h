@@ -31,7 +31,6 @@ public:
         env->robot->update();
         arm_ramp_init_ = false;
         arm_first_run_ = true;
-        arm_pose_ = ArmPose::DEFAULT;
         // Start policy thread
         policy_thread_running = true;
         policy_thread = std::thread([this]{
@@ -85,12 +84,6 @@ private:
     bool arm_first_run_ = true;
     std::chrono::steady_clock::time_point arm_last_tp_;
 
-    // Remote arm-pose state machine (gamepad Y/B), imported from arm.py:
-    //   Y: DEFAULT <-> FORWARD ,  B: FORWARD <-> BOX_HOLD.
-    enum class ArmPose { DEFAULT, FORWARD, BOX_HOLD };
-    ArmPose arm_pose_ = ArmPose::DEFAULT;
-    bool arm_prev_y_ = false;
-    bool arm_prev_b_ = false;
 };
 
 REGISTER_FSM(State_RLBase)

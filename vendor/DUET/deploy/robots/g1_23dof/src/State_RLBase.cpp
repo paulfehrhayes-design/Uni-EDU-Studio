@@ -50,7 +50,7 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
 
 void State_RLBase::run()
 {
-    if (duet_gateway::consume_arm_reset_request()) arm_pose_ = ArmPose::DEFAULT;
+    (void)duet_gateway::consume_arm_reset_request();
 
     auto action = env->action_manager->processed_actions();
     auto & jmap = env->robot->data.joint_ids_map;
@@ -88,48 +88,17 @@ void State_RLBase::run()
         : requested_app_arm_target;
     const bool arm_active = app_arm_target.has_value() || external_arm_active;
 
-    // Remote arm-pose selection via the gamepad (imported from arm.py). A live
-    // rt/arm_targets (IL/GR00T) stream still overrides these when present.
-    //   Y : toggle DEFAULT (carry) <-> FORWARD (arms out to receive a box)
-    //   B : toggle FORWARD <-> BOX_HOLD (arms in, gripping) [only in those states]
-    {
-        auto js = env->robot->data.joystick;
-        const bool y_now = js->Y.pressed;
-        const bool b_now = js->B.pressed;
-        if (y_now && !arm_prev_y_) {
-            arm_pose_ = (arm_pose_ == ArmPose::DEFAULT) ? ArmPose::FORWARD
-                                                        : ArmPose::DEFAULT;
-        }
-        if (b_now && !arm_prev_b_) {
-            if      (arm_pose_ == ArmPose::FORWARD)  arm_pose_ = ArmPose::BOX_HOLD;
-            else if (arm_pose_ == ArmPose::BOX_HOLD) arm_pose_ = ArmPose::FORWARD;
-        }
-        arm_prev_y_ = y_now;
-        arm_prev_b_ = b_now;
-    }
-
-    // Arm-pose presets (imported from arm.py), mapped to the G1's 10 arm joints in
-    // jmap arm order [L: sh_pitch, sh_roll, sh_yaw, elbow, wrist_roll, R: ...];
-    // wrist_roll (idx 4/9) is 0. Applied only when the arm layout is the expected
-    // 10 joints, else fall back to the carry/default pose.
-    static const float POSE_FORWARD[10] = {
-        -1.35f, 0.50f, 0.0f, 0.87f, 0.0f,  -1.35f, -0.50f, 0.0f, 0.87f, 0.0f};
-    static const float POSE_BOXHOLD[10] = {
-        -1.25f, 0.00f, 0.0f, 0.70f, 0.0f,  -1.25f,  0.00f, 0.0f, 0.70f, 0.0f};
-    const bool pose_ok = (n_arm == 10);
-
     // Ramp rate: fast+transparent while tracking IL; gentle when homing to the
-    // default/carry pose (finger-safe); moderate for a deliberate button pose.
+    // default/carry pose (finger-safe); moderate for an app-requested pose.
     const float ARM_RATE_ACTIVE = 20.0f;  // rad/s, transparent tracking of IL
     const float ARM_RATE_RETURN = 0.7f;   // rad/s, gentle homing to default/carry
     const float ARM_RATE_POSE   = 2.0f;   // rad/s, deliberate bounded pose motion
     const float ARM_ACCEL_RETURN = 2.0f;  // rad/s^2, smooth return to carry/default
-    const float ARM_ACCEL_POSE = 4.0f;    // rad/s^2, smooth app and gamepad targets
+    const float ARM_ACCEL_POSE = 4.0f;    // rad/s^2, smooth app targets
     float arm_rate;
     if (app_arm_target)                     arm_rate = ARM_RATE_POSE;
     else if (arm_active)                    arm_rate = ARM_RATE_ACTIVE;
-    else if (arm_pose_ == ArmPose::DEFAULT) arm_rate = ARM_RATE_RETURN;
-    else                                    arm_rate = ARM_RATE_POSE;
+    else                                    arm_rate = ARM_RATE_RETURN;
     // Snapshot the IL arm command once (the DDS callback writes msg_ on another
     // thread).
     std::vector<float> il_q(n_arm), il_kp(n_arm), il_kd(n_arm), il_tau(n_arm);
@@ -151,14 +120,11 @@ void State_RLBase::run()
             lowcmd->msg_.motor_cmd()[motor].q() = action[i];
             continue;
         }
-        // Arm joint: follow IL target when live, else the button-selected pose
-        // (FORWARD / BOX_HOLD), else the default carry pose.
+        // Arm joint: follow a live IL/app target, else the default carry pose.
         const int k = i - n_lower;
         float target;
         if (app_arm_target)                                 target = (*app_arm_target)[k];
         else if (external_arm_active)                       target = il_q[k];
-        else if (pose_ok && arm_pose_ == ArmPose::FORWARD)  target = POSE_FORWARD[k];
-        else if (pose_ok && arm_pose_ == ArmPose::BOX_HOLD) target = POSE_BOXHOLD[k];
         else                                                target = (float)qdef[i];
         const float err = target - arm_q_applied_[k];
         if (external_arm_active && !app_arm_target) {
@@ -172,9 +138,7 @@ void State_RLBase::run()
                 arm_velocity_applied_[k] = dt > 0.0f ? step / dt : 0.0f;
             }
         } else {
-            const float acceleration = arm_pose_ == ArmPose::DEFAULT && !app_arm_target
-                ? ARM_ACCEL_RETURN
-                : ARM_ACCEL_POSE;
+            const float acceleration = app_arm_target ? ARM_ACCEL_POSE : ARM_ACCEL_RETURN;
             const float desired_velocity = std::clamp(err / std::max(dt, 0.001f), -arm_rate, arm_rate);
             const float max_velocity_delta = acceleration * dt;
             arm_velocity_applied_[k] += std::clamp(
