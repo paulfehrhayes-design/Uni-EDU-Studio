@@ -1,3 +1,4 @@
+import importlib
 import json
 import tempfile
 import threading
@@ -26,6 +27,12 @@ class VoiceAPITests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         self.context_dir.cleanup()
+
+    def test_voice_service_entrypoint_loads_without_optional_audio_packages(self) -> None:
+        with patch.dict("sys.modules", {"numpy": None}):
+            entrypoint = importlib.import_module("harry_botter_voice.__main__")
+
+        self.assertTrue(callable(entrypoint.main))
 
     def request(
         self,
@@ -94,6 +101,60 @@ class VoiceAPITests(unittest.TestCase):
                 "guidance": "Be transparent.",
             }],
         )
+
+    def test_context_retrieval_prefers_rare_relevant_terms_over_repetition(self) -> None:
+        common_text = " ".join(
+            ["Plants grow with water and sunlight in a classroom garden."] * 12
+        )
+        self.server.context_store.replace({
+            "agents": [],
+            "sections": [],
+            "knowledge": [
+                {
+                    "document_id": "common",
+                    "title": "Reference A",
+                    "source": "Class handout",
+                    "owner": "Science team",
+                    "intended_use": "Teacher-reviewed lesson context.",
+                    "section_id": "curriculum",
+                    "section_title": "Curriculum",
+                    "permission_confirmed_at": "2026-01-01",
+                    "learning_level": "MYP 3",
+                    "agent_id": "general",
+                    "review_date": "",
+                    "text": common_text,
+                },
+                {
+                    "document_id": "focused",
+                    "title": "Reference B",
+                    "source": "Class handout",
+                    "owner": "Science team",
+                    "intended_use": "Teacher-reviewed lesson context.",
+                    "section_id": "curriculum",
+                    "section_title": "Curriculum",
+                    "permission_confirmed_at": "2026-01-01",
+                    "learning_level": "MYP 3",
+                    "agent_id": "general",
+                    "review_date": "",
+                    "text": (
+                        "Photosynthesis helps plants make food using sunlight and "
+                        "carbon dioxide."
+                    ),
+                },
+            ],
+        })
+
+        results = self.server.context_store.retrieve(
+            "Explain photosynthesis in plants.",
+            "MYP 3",
+            "general",
+        )
+
+        self.assertEqual([item["title"] for item in results], ["Reference B", "Reference A"])
+
+    def test_context_retrieval_returns_no_matches_for_query_without_search_terms(self) -> None:
+        results = self.server.context_store.retrieve("What is it?", "MYP 3", "general")
+        self.assertEqual(results, [])
 
     def test_speech_status_reports_configured_kokoro_voice(self) -> None:
         status, response = self.request("GET", "/api/v1/speech/status")

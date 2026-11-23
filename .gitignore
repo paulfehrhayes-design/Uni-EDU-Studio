@@ -33,6 +33,7 @@ __pycache__/
 ai-agent/voice-service/models/
 ai-agent/voice-service/build/
 ai-agent/voice-service/src/*.egg-info/
+.searxng-runtime/
 
 # Generated test artifacts
 test-results/

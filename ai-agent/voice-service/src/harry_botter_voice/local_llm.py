@@ -24,6 +24,7 @@ class LocalModelNotConfigured(LocalModelError):
 
 MAX_COMPLETION_CHARS = 12_000
 NETWORK_MODEL_LIST_TIMEOUT_SECONDS = 5.0
+MODEL_REQUEST_TIMEOUT_SECONDS = 180.0
 MAX_POLICY_REVIEW_CHARS = 8_000
 
 
@@ -34,7 +35,7 @@ class LocalOpenAIClient:
         model: str | None = None,
         network_base_url: str | None = None,
         network_model: str | None = None,
-        timeout_seconds: float = 60.0,
+        timeout_seconds: float = MODEL_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.base_url = (
             base_url

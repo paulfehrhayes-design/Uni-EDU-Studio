@@ -34,6 +34,7 @@ except ImportError:
 
 VOICE_SERVICE_URL = "http://127.0.0.1:8765"
 VOICE_STREAM_URL = "ws://127.0.0.1:8766/api/v1/audio-stream"
+DRAFT_MODEL_TIMEOUT_SECONDS = 240
 MAX_AUDIO_BYTES = 8_000_000
 MAX_DOCUMENT_BYTES = 100_000
 MAX_DOCUMENT_COUNT = 100
@@ -479,9 +480,28 @@ class SessionMessageWrite(StrictRequest):
             raise ValueError("Conversation messages must not be blank.")
         return value
 
+    @field_validator("speaker_label")
+    @classmethod
+    def require_anonymous_speaker_label(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"Speaker [1-9]\d*", value):
+            raise ValueError("Speaker labels must use the anonymous 'Speaker N' format.")
+        return value
+
 
 class SessionMessagesWrite(StrictRequest):
     messages: list[SessionMessageWrite] = Field(max_length=MAX_SESSION_MESSAGES)
+
+
+class SessionTitleWrite(StrictRequest):
+    title: StrictStr = Field(min_length=1, max_length=80)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Conversation titles must not be blank.")
+        return normalized
 
 
 class SessionSettingsWrite(StrictRequest):
@@ -932,11 +952,20 @@ def initialize_harry_botter_schema(conn: sqlite3.Connection) -> None:
             session_id TEXT PRIMARY KEY,
             owner_username TEXT NOT NULL,
             title TEXT NOT NULL,
+            title_is_custom INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
         """
     )
+    session_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(harry_botter_sessions)")
+    }
+    if "title_is_custom" not in session_columns:
+        conn.execute(
+            "ALTER TABLE harry_botter_sessions "
+            "ADD COLUMN title_is_custom INTEGER NOT NULL DEFAULT 0"
+        )
     agent_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(harry_botter_agents)")
     }
@@ -1502,90 +1531,6 @@ def _rebuild_knowledge_chunks(
     )
 
 
-def _knowledge_for_draft(
-    conn: sqlite3.Connection,
-    text: str,
-    learning_level: str,
-    agent_id: str,
-) -> list[dict[str, str]]:
-    if not learning_level:
-        return []
-    today = date.today().isoformat()
-    rows = conn.execute(
-        """
-        SELECT document_id, title, source, owner, intended_use, section_id, review_date, text
-        FROM harry_botter_knowledge
-        WHERE permission_confirmed_at != ''
-          AND (learning_level = '' OR learning_level = ?)
-          AND (agent_id = '' OR agent_id = ?)
-          AND (review_date IS NULL OR review_date >= ?)
-        """,
-        (learning_level, agent_id, today),
-    ).fetchall()
-    terms = {
-        term
-        for term in re.findall(r"[a-z0-9]{3,}", text.casefold())
-        if term not in {"the", "and", "for", "with", "that", "this", "from", "what", "how"}
-    }
-    ranked: list[tuple[int, int, sqlite3.Row, str]] = []
-    for row in rows:
-        title_metadata = f"{row['title']} {row['source']} {row['intended_use']}".casefold()
-        metadata_score = sum(title_metadata.count(term) * 3 for term in terms)
-        indexed_chunks = conn.execute(
-            """
-            SELECT chunk_index, content
-            FROM harry_botter_knowledge_chunks
-            WHERE document_id = ?
-            ORDER BY chunk_index
-            """,
-            (row["document_id"],),
-        ).fetchall()
-        chunks = (
-            [(chunk["chunk_index"], chunk["content"]) for chunk in indexed_chunks]
-            if indexed_chunks
-            else [(index, chunk) for index, chunk in enumerate(re.split(r"\n\s*\n+", row["text"])) if chunk.strip()]
-        )
-        for chunk_index, chunk in chunks:
-            chunk = " ".join(chunk.split())
-            if len(chunk) < 40:
-                continue
-            searchable = chunk.casefold()
-            score = metadata_score + sum(searchable.count(term) for term in terms)
-            if score:
-                ranked.append((score, chunk_index, row, chunk[:MAX_KNOWLEDGE_EXCERPT_CHARS]))
-    ranked.sort(
-        key=lambda item: (
-            -item[0],
-            item[2]["title"].casefold(),
-            item[1],
-        )
-    )
-    excerpts = []
-    seen_chunks: set[tuple[str, str]] = set()
-    for _, _, row, excerpt in ranked:
-        if len(excerpts) >= MAX_KNOWLEDGE_EXCERPTS:
-            break
-        identity = (row["title"], excerpt)
-        if identity in seen_chunks:
-            continue
-        seen_chunks.add(identity)
-        excerpts.append(
-            {
-                "title": row["title"],
-                "source": row["source"],
-                "owner": row["owner"],
-                "intended_use": row["intended_use"],
-                "section_id": row["section_id"],
-                "section_title": BEHAVIOR_SECTION_BY_ID.get(
-                    row["section_id"], {"title": "General reference"}
-                )["title"],
-                "review_date": row["review_date"] or "",
-                "excerpt": excerpt,
-            }
-        )
-    return excerpts
-
-
 def create_harry_botter_router(
     get_db_connection: Callable[[], sqlite3.Connection],
     auth_required: Callable[..., dict[str, Any]],
@@ -2071,19 +2016,60 @@ def create_harry_botter_router(
                         """,
                         (agent_id, learning_level, tone_value, now, session_id),
                     )
-            conn.execute(
-                """
-                UPDATE harry_botter_sessions
-                SET title = ?, updated_at = ?
-                WHERE session_id = ? AND owner_username = ?
-                """,
-                (title, now, session_id, user["username"]),
-            )
+            if row["title_is_custom"]:
+                title = row["title"]
+                conn.execute(
+                    """
+                    UPDATE harry_botter_sessions
+                    SET updated_at = ?
+                    WHERE session_id = ? AND owner_username = ?
+                    """,
+                    (now, session_id, user["username"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE harry_botter_sessions
+                    SET title = ?, updated_at = ?
+                    WHERE session_id = ? AND owner_username = ?
+                    """,
+                    (title, now, session_id, user["username"]),
+                )
             conn.commit()
             return {
                 "session": {
                     "session_id": row["session_id"],
                     "title": title,
+                    "created_at": row["created_at"],
+                    "updated_at": now,
+                }
+            }
+        finally:
+            conn.close()
+
+    @router.put("/api/harry-botter/sessions/{session_id}/title")
+    def update_session_title(
+        session_id: str,
+        payload: SessionTitleWrite,
+        user: dict[str, Any] = Depends(teacher),
+    ) -> dict[str, Any]:
+        conn = get_db_connection()
+        try:
+            row = _owned_session(conn, session_id, user)
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                UPDATE harry_botter_sessions
+                SET title = ?, title_is_custom = 1, updated_at = ?
+                WHERE session_id = ? AND owner_username = ?
+                """,
+                (payload.title, now, session_id, user["username"]),
+            )
+            conn.commit()
+            return {
+                "session": {
+                    "session_id": row["session_id"],
+                    "title": payload.title,
                     "created_at": row["created_at"],
                     "updated_at": now,
                 }
@@ -2779,12 +2765,6 @@ def create_harry_botter_router(
                     "generation_max_tokens",
                 )
             }
-            knowledge = _knowledge_for_draft(
-                conn,
-                payload.text,
-                payload.learning_level,
-                payload.agent_id,
-            )
             sections = [
                 {
                     "section_id": row["section_id"],
@@ -2847,6 +2827,7 @@ def create_harry_botter_router(
             "POST",
             "/api/v1/drafts",
             json_payload=draft_payload,
+            timeout_seconds=DRAFT_MODEL_TIMEOUT_SECONDS,
         ).json()
         draft = result.get("draft")
         if not isinstance(draft, dict) or not isinstance(draft.get("text"), str):

@@ -1,17 +1,41 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
-import { existsSync, readFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statfsSync,
+  writeFileSync,
+} from 'node:fs';
+import { freemem } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureOllamaCli } from './ollama-install.js';
+import {
+  crawl4aiContainerArgs,
+  crawl4aiImage,
+  crawl4aiMinimumDockerStorageBytes,
+  crawl4aiMinimumMemoryBytes,
+  hasCrawl4AIResources,
+  searxngContainerArgs,
+  searxngImage,
+  searxngSettings,
+} from './web-research-services.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const voiceDir = path.join(root, 'ai-agent', 'voice-service');
+const searxngRuntimeDir = path.join(root, '.searxng-runtime');
 const modelsDir = path.join(voiceDir, 'models');
 const port = Number(process.env.UNI_EDU_PORT || 5179);
 const devMode = process.env.UNI_EDU_DEV === '1';
 const vitePort = Number(process.env.UNI_EDU_VITE_PORT || 5173);
 const voicePort = 8765;
+const searxngUrl = 'http://127.0.0.1:8080';
+const searxngContainer = 'uni-edu-searxng';
+const crawl4aiUrl = 'http://127.0.0.1:11235';
+const crawl4aiContainer = 'uni-edu-crawl4ai';
 const ollamaUrl = 'http://127.0.0.1:11434';
 const localModel = 'qwen3:0.6b';
 const defaultLocalModelUrl = `${ollamaUrl}/v1`;
@@ -440,11 +464,213 @@ async function ensureBackendPython() {
   return python;
 }
 
+function getContainerDetails(name) {
+  const result = spawnSync(
+    'docker',
+    ['container', 'inspect', '--format', '{{.Config.Image}}|{{.State.Running}}', name],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+  );
+  if (result.status !== 0) return null;
+  const [image, running] = result.stdout.trim().split('|');
+  return { image, running: running === 'true' };
+}
+
+function createCrawl4AIToken() {
+  mkdirSync(searxngRuntimeDir, { recursive: true, mode: 0o700 });
+  const tokenPath = path.join(searxngRuntimeDir, 'crawl4ai.token');
+  let token = existsSync(tokenPath) ? readFileSync(tokenPath, 'utf8').trim() : '';
+  let created = false;
+  if (!/^[a-f0-9]{64}$/.test(token)) {
+    token = randomBytes(32).toString('hex');
+    writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
+    created = true;
+  }
+  if (process.platform !== 'win32') {
+    chmodSync(searxngRuntimeDir, 0o700);
+    chmodSync(tokenPath, 0o600);
+  }
+  return { token, created };
+}
+
+function canStartCrawl4AI(imageCached) {
+  let availableMemory = freemem();
+  if (process.platform === 'linux') {
+    const memoryInfo = readFileSync('/proc/meminfo', 'utf8');
+    const match = memoryInfo.match(/^MemAvailable:\s+(\d+)\s+kB$/m);
+    if (!match) {
+      log('Could not verify available memory; skipping optional Crawl4AI startup.');
+      return false;
+    }
+    availableMemory = Number(match[1]) * 1024;
+  }
+  let availableDockerStorage = null;
+  if (!imageCached && process.platform === 'linux') {
+    const dockerRoot = spawnSync(
+      'docker',
+      ['info', '--format', '{{.DockerRootDir}}'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    if (dockerRoot.status !== 0 || !dockerRoot.stdout.trim()) {
+      log('Could not verify Docker storage; skipping the optional Crawl4AI image pull.');
+      return false;
+    }
+    try {
+      const { bavail, bsize } = statfsSync(dockerRoot.stdout.trim());
+      availableDockerStorage = bavail * bsize;
+    } catch (error) {
+      log(`Could not verify Docker storage (${error.message}); skipping the optional Crawl4AI image pull.`);
+      return false;
+    }
+  }
+
+  if (!hasCrawl4AIResources({
+    availableMemoryBytes: availableMemory,
+    availableDockerStorageBytes: availableDockerStorage,
+    imageCached,
+  })) {
+    if (availableMemory < crawl4aiMinimumMemoryBytes) {
+      log('Crawl4AI needs at least 2 GiB available memory; search snippets remain available.');
+    } else {
+      const minimumStorageGiB = crawl4aiMinimumDockerStorageBytes / (1024 ** 3);
+      log(`Crawl4AI needs at least ${minimumStorageGiB} GiB free Docker storage for its image; search snippets remain available.`);
+    }
+    return false;
+  }
+  return true;
+}
+
+async function ensureCrawl4AI(env, tokenCreated) {
+  if (!env.CRAWL4AI_API_TOKEN) {
+    log('A private Crawl4AI token could not be prepared; page extraction is disabled.');
+    return;
+  }
+  if (spawnSync('docker', ['info'], { stdio: 'ignore' }).status !== 0) {
+    log('Docker is unavailable; page extraction is disabled and SearXNG snippets remain available.');
+    return;
+  }
+
+  let existing = getContainerDetails(crawl4aiContainer);
+  if (existing && existing.image !== crawl4aiImage) {
+    log(`A different container already uses ${crawl4aiContainer}; page extraction is disabled.`);
+    return;
+  }
+  const needsStart = !existing || !existing.running || tokenCreated;
+  const imageCached = spawnSync('docker', ['image', 'inspect', crawl4aiImage], {
+    stdio: 'ignore',
+  }).status === 0;
+  if (needsStart && !canStartCrawl4AI(imageCached)) return;
+  try {
+    if (existing && tokenCreated) {
+      await run('docker', ['container', 'rm', '--force', crawl4aiContainer], { cwd: root });
+      existing = null;
+    }
+    if (existing) {
+      if (!existing.running) await run('docker', ['start', crawl4aiContainer], { cwd: root });
+    } else {
+      if (!(await canBind(11235))) {
+        log('Port 11235 is already in use; page extraction is disabled and search snippets remain available.');
+        return;
+      }
+      await run('docker', crawl4aiContainerArgs(), { cwd: root, env });
+    }
+    await waitForHttp(`${crawl4aiUrl}/health`, null, 'Local Crawl4AI', 60_000);
+    log(`Local Crawl4AI ${crawl4aiImage.split('@')[0]} is ready on loopback.`);
+  } catch (error) {
+    log(`Crawl4AI could not be started; SearXNG snippets remain available: ${error.message}`);
+  }
+}
+
+async function ensureSearXNG(env) {
+  const configuredUrl = (env.HARRY_BOTTER_SEARXNG_URL || searxngUrl).replace(/\/+$/, '');
+  if (configuredUrl !== searxngUrl) {
+    log('Using the configured SearXNG service; local SearXNG startup is skipped.');
+    return;
+  }
+
+  const healthUrl = `${searxngUrl}/search?q=health&format=json`;
+  const dockerAvailable = spawnSync('docker', ['info'], { stdio: 'ignore' }).status === 0;
+  const existing = dockerAvailable ? getContainerDetails(searxngContainer) : null;
+  if (existing && existing.image !== searxngImage && existing.image !== 'searxng/searxng:latest') {
+    log(`A different container already uses ${searxngContainer}; local SearXNG startup is skipped.`);
+    return;
+  }
+  if (existing?.image === 'searxng/searxng:latest') {
+    const pinnedImageAvailable = spawnSync(
+      'docker',
+      ['image', 'inspect', searxngImage],
+      { stdio: 'ignore' },
+    ).status === 0;
+    if (!pinnedImageAvailable) {
+      try {
+        await run('docker', ['pull', searxngImage], { cwd: root });
+      } catch (error) {
+        if (!existing.running) {
+          try {
+            await run('docker', ['start', searxngContainer], { cwd: root });
+          } catch (startError) {
+            log(`Pinned SearXNG is unavailable and the previous container could not be restarted: ${startError.message}`);
+            return;
+          }
+        }
+        log(`Pinned SearXNG is unavailable; retaining the previous local service: ${error.message}`);
+        return;
+      }
+    }
+    log('Replacing the previous floating SearXNG container with the pinned image.');
+    try {
+      await run('docker', ['container', 'rm', '--force', searxngContainer], { cwd: root });
+    } catch (error) {
+      log(`The previous SearXNG container could not be replaced: ${error.message}`);
+      return;
+    }
+  } else if (existing?.image === searxngImage) {
+    try {
+      if (!existing.running) await run('docker', ['start', searxngContainer], { cwd: root });
+      await waitForHttp(healthUrl, null, 'Local SearXNG', 30_000);
+      log('Local pinned SearXNG is ready.');
+    } catch (error) {
+      log(`SearXNG could not be started; the app will continue without live search: ${error.message}`);
+    }
+    return;
+  }
+  if (await serviceIsReady(healthUrl)) {
+    log('A local SearXNG service is already responding; reusing it.');
+    return;
+  }
+  if (!dockerAvailable) {
+    log('Docker is unavailable; live web search will remain disabled until SearXNG is started.');
+    return;
+  }
+  try {
+    mkdirSync(searxngRuntimeDir, { recursive: true });
+    const settingsPath = path.join(searxngRuntimeDir, 'settings.yml');
+    if (!existsSync(settingsPath)) {
+      const secret = randomBytes(32).toString('hex');
+      writeFileSync(settingsPath, searxngSettings(secret), { mode: 0o600 });
+    }
+    await run('docker', searxngContainerArgs(settingsPath), { cwd: root });
+    await waitForHttp(healthUrl, null, 'Local SearXNG', 30_000);
+    log(`Local SearXNG ${searxngImage.split('@')[0]} is ready at ${searxngUrl}.`);
+  } catch (error) {
+    log(`SearXNG could not be started; the app will continue without live search: ${error.message}`);
+  }
+}
+
 process.on('SIGINT', () => shutdown());
 process.on('SIGTERM', () => shutdown());
 
 try {
-  const config = { ...loadLocalConfig(), ...process.env };
+  let crawl4aiCredentials = { token: '', created: false };
+  try {
+    crawl4aiCredentials = createCrawl4AIToken();
+  } catch (error) {
+    log(`Crawl4AI credentials could not be prepared; page extraction is disabled: ${error.message}`);
+  }
+  const config = {
+    ...loadLocalConfig(),
+    ...process.env,
+    CRAWL4AI_API_TOKEN: crawl4aiCredentials.token,
+  };
   const env = serviceEnvironment(config);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) {
     throw new Error('UNI_EDU_PORT must be an integer between 1024 and 65535.');
@@ -518,6 +744,12 @@ try {
   const ollamaSetup = ensureOllama(env).catch((error) => {
     log(`Local model setup failed; text generation may be unavailable: ${error.message}`);
   });
+  void ensureSearXNG(env).catch((error) => {
+    log(`SearXNG setup failed; the app will continue without live search: ${error.message}`);
+  });
+  void ensureCrawl4AI(env, crawl4aiCredentials.created).catch((error) => {
+    log(`Crawl4AI setup failed; SearXNG snippets remain available: ${error.message}`);
+  });
 
   if (devMode) {
     log('Starting the Vite development frontend...');
@@ -573,7 +805,7 @@ try {
       ? `Ready. Open http://localhost:${vitePort}/?try=harry-botter and sign in as a teacher.`
       : `Ready. Open http://localhost:${port}/?try=harry-botter and sign in as a teacher.`,
   );
-  log('Services started by this launcher will remain available while npm start is running. Press Ctrl+C to stop those services.');
+  log('Services started by this launcher will remain available while this launcher is running. Press Ctrl+C to stop those services.');
   setInterval(() => {}, 60_000);
 } catch (error) {
   console.error(`[Harry Botter] Startup failed: ${error.message}`);

@@ -134,7 +134,7 @@ These are shared conversation settings, not agent-specific prompt conveniences. 
 - Base should allow for specific databases to be added to help callibrate chatbot these should be persistently saved on the robot's backend. These can be specific policies, school context, or information. 
 - Provide persistent, teacher-shared behavior sections for persona, role, curriculum/content boundaries, IB/ELL support, safeguarding, information use/privacy, school context, and spoken personality. Each section has editable supplemental guidance and can have separately attributed documents.
 - Scope documents by section, optional agent, and optional IB year. Keep source, owner, permission-confirmation timestamp, review date, content digest, and update version with each document; retrieval must exclude expired sources and disclose the section/source used.
-- Changes to sections or documents must affect the next draft without model training. The common system safety policy remains fixed and higher priority than editable settings, agent instructions, and references. The current retrieval is bounded keyword matching, not an accuracy guarantee or fine-tuning process.
+- Changes to sections or documents must affect the next draft without model training. The common system safety policy remains fixed and higher priority than editable settings, agent instructions, and references. Retrieval uses bounded BM25-style lexical ranking over scoped, review-current excerpts; this is not a vector index, accuracy guarantee, or fine-tuning process.
 
 Keep the base model separate from an agent profile. An agent profile should define:
 
@@ -342,7 +342,7 @@ This roadmap turns the repositories already collected in `ai-agent/research/` an
 ### Teacher configuration and draft review update — 2026-11-16
 
 - Added two persistent built-in profiles (general and debate) plus teacher-only shared create/update/delete for custom profiles. The common system prompt remains service-owned; per-profile instructions and generation settings are bounded and cannot replace that shared policy. All agents currently use the same local model provider/model.
-- Added a teacher-only, backend-database knowledge library shared across teacher accounts. It accepts UTF-8 `.txt`/`.md` content up to 100 KB with required source, owner, permission confirmation, stage scope, agent scope, and review date; it records a SHA-256 digest and supports retrieval, editing/replacement, and deletion. The shared library is limited to 100 documents and 10 MB total. Student accounts cannot access it. Only relevant documents matching the selected agent/stage and not past their review date contribute up to three bounded excerpts to a draft. The response returns source metadata for display. This is bounded keyword retrieval, not a vector index or a verification of source accuracy.
+- Added a teacher-only, backend-database knowledge library shared across teacher accounts. It accepts UTF-8 `.txt`/`.md` content up to 100 KB with required source, owner, permission confirmation, stage scope, agent scope, and review date; it records a SHA-256 digest and supports retrieval, editing/replacement, and deletion. The shared library is limited to 100 documents and 10 MB total. Student accounts cannot access it. Only relevant documents matching the selected agent/stage and not past their review date contribute bounded excerpts to a draft. The response returns source metadata for display. Retrieval is lexical ranking, not a vector index or a verification of source accuracy.
 - Added teacher UI for profile editing and creation, local reference upload/edit/deletion, and stage/tone selection. Teachers can inspect and revise reference content and provenance; a replaced document's digest is recomputed, and changes apply to subsequent drafts. Agent and knowledge changes are stored in the shared local application database; chat history remains temporary in-page state.
 - Added edit, regenerate, and dismiss actions for text drafts. Regeneration uses the originating user turn and earlier chat context; drafts remain clearly separate from user messages and are never automatically spoken. No licensed TTS or voice playback adapter is selected.
 - Strengthened prompt construction to keep common school-safety/stage/identity rules above teacher-authored instructions and to label uploaded excerpts as untrusted reference data. This prompt policy is not a technical child-safety guarantee and the preview remains teacher-only.
@@ -401,12 +401,17 @@ This roadmap turns the repositories already collected in `ai-agent/research/` an
 
 ### Research-folder audit and selected components
 
-The [research-folder audit](./ai-voice-research-audit.md) inventories all 44
-top-level research snapshots and records dispositions for each. The snapshots
-are not live upstream audits; their internal Git revision is not a verified
-upstream pin. Project software licenses do not establish the licenses or
-suitability of bundled model weights, voices, or other assets. Re-check exact
-source, dependency, model, voice, and nested-license notices at deployment.
+The [research-folder audit](./ai-voice-research-audit.md) inventories all 47
+top-level research folders and records a disposition for each. `SOURCES.tsv`
+contains upstream commit IDs for 45; Crawl4AI and SearXNG still lack recorded
+upstream snapshot commits. The optional web-research runtime now uses pinned
+Crawl4AI 0.9.5 and SearXNG 2026.11.21 Docker image digests; those image pins
+do not establish the exact commits of the separately checked-in research
+snapshots. The inventory is not a complete upstream source audit, and
+product-level tests are not upstream acceptance tests. Project software
+licenses do not establish the licenses or suitability of bundled model
+weights, voices, or other assets. Re-check exact source, dependency, model,
+voice, and nested-license notices at deployment.
 
 | Candidate | Checked-in project license and relevant evidence | Current disposition |
 |---|---|---|
@@ -532,7 +537,7 @@ dependency.
 
 ### Later product directions — gated by V1 evidence
 
-- **Richer educator tools:** session deletion is implemented; session export and improved retrieval ranking remain future work. The educator-reviewed policy/source proposal workflow is implemented, but it does not verify claims or resolve conflicts automatically. Section guidance, category-scoped documents, stage/agent scoping, shared storage, and the five teacher-preview tone presets remain subject to educator review.
+- **Richer educator tools:** session deletion, owner-scoped title editing, and user-confirmed plain-text export are implemented. Export includes conversation text and available citations, downloads only to the user's device, and does not include raw audio, session IDs, or credentials. BM25-style lexical ranking is implemented for approved, in-scope, review-current context, but semantic retrieval and retrieval quality evaluation remain future work. The educator-reviewed policy/source proposal workflow is implemented, but it does not verify claims or resolve conflicts automatically. Section guidance, category-scoped documents, stage/agent scoping, shared storage, and the five teacher-preview tone presets remain subject to educator review.
 - **Additional language and interaction styles:** evaluate additional languages only after educators review quality, age suitability, and safety in that language.
 - **Assisted debate participation:** after reliable manual-playback use, investigate a mode that recommends when to contribute but still requires educator approval. Autonomous interjection remains a separate decision and is not implied by response drafting.
 - **Camera and robot capability:** consider camera context and movement only as separately scoped projects with explicit consent, permissions, safety architecture, and physical acceptance tests. They are not extensions that may be enabled by an agent prompt or uploaded knowledge file.
@@ -594,7 +599,7 @@ Record measured results and unresolved limitations before enabling the optional 
 - Which G1 microphone and speaker interfaces are supported by the exact target image, and are they currently used by Uni-EDU or another service?
 - Should the first usable interface be a local desktop/web panel, the Uni-EDU Studio UI, or both after the standalone prototype?
 - What latency and transcription/diarization quality are acceptable for a classroom debate?
-- Confirmed: teacher conversation text persists in the local app database until manually cleared or deleted by its owner; raw audio is never retained. Privacy review remains required, and export, encryption at rest, and school-level retention governance are not implemented.
+- Confirmed: teacher conversation text persists in the local app database until manually cleared or deleted by its owner; raw audio is never retained. User-confirmed local text export is implemented. Privacy review remains required; encryption at rest and school-level retention governance are not implemented.
 - Which Early Years/PYP/MYP/DP stages and subject contexts will be supported first, and what stage-specific topic boundaries and local safeguarding process should educators approve?
 - Which licensed TTS voice and non-identifying voice qualities are appropriate for Harry Botter?
 - Which Changchun American International School materials may be used as approved context, who owns updates, and how frequently must local copies be reviewed?
@@ -611,3 +616,35 @@ For every Codespace change that affects this project:
 - Update phase status and exit criteria only when evidence supports the change; report actual test/hardware results and remaining gaps.
 - Preserve the local-first, child-safety, manual-speech-approval, and no-motion boundaries unless a deliberate scope change is reviewed and documented.
 - When a repository/component is added, removed, replaced, or directly modified, update the candidate/adaptation record and applicable license/attribution notes.
+
+### Research-stack runtime verification — 2026-11-23
+
+- Reopened the research inventory beyond its original README/manifest screening. The detailed folder disposition and product-path evidence are recorded in `docs/ai-voice-research-audit.md`; repository snapshots remain references, not runtime dependencies.
+- Updated the active voice-service context retrieval from raw keyword counts to BM25-style lexical ranking with term rarity, chunk-length normalization, and a bounded metadata relevance boost. Permission confirmation, stage/agent scope, review-date filtering, excerpt limits, and attribution are preserved. Removed a second unused backend knowledge scan; the voice service's synchronized context store is the actual retrieval path. Focused tests confirm focused rare-term passages rank above repetition of a generic query term, and stopword-only queries return no context. This ranking does not establish accuracy, authority, or truth.
+- Bootstrapped pip in the existing Python 3.12 voice environment and installed the configured CPU audio extra. The local cache now contains Whisper `tiny.en` and Kokoro weights. The running app reports the local Qwen3 0.6B chat model, transcription, Kokoro speech generation, and WebSocket streaming available.
+- Verification: 21 voice API tests, 21 local-model-client tests, 7 streaming/VAD/speaker-tracker tests, 7 live-research/backend-forwarding tests, and 2 Ollama installer tests passed. Live checks verified SearXNG results, Crawl4AI extraction, a Qwen draft with source links, offline Whisper loading, a synthetic Kokoro-to-Whisper round trip, and the audio-stream start/stop lifecycle.
+- Replaced in-process web crawling with the authenticated Crawl4AI Docker API. The launcher uses a locally generated bearer token, loopback-only publication, and pinned image digests for Crawl4AI 0.9.5 and SearXNG 2026.11.21. It skips an uncached Crawl4AI image when available memory is below 2 GiB or free Docker storage below 4 GiB. Search results still use SearXNG snippets whenever Docker, the crawler, or network enrichment is unavailable; if SearXNG is also unavailable, normal local chat continues without web context. Focused API and launcher-configuration tests cover the authenticated request, bounded extraction response, and optional fallback.
+- The earlier live SearXNG/Crawl4AI search smoke check used the former in-process crawler and does not prove that the new Docker API can complete a live crawl. The pinned image manifests were verified and the new transport/fallback behavior passed mocked tests. This host had about 3 GiB of free Docker storage and 1.3 GiB of available memory, so the optional crawler image was not pulled; container startup and live page extraction remain to be verified on a sufficiently provisioned Docker host.
+- Resource limitation: the Codespace has 7.8 GiB RAM and no swap; a separate duplicate Kokoro process was terminated while the managed voice service was running, although managed-service synthesis succeeded. Keep model work serialized; no larger Gemma model was downloaded or benchmarked.
+- The streaming speaker assignment is a small session-local spectral heuristic, not validated diarization. Passing synthetic tests does not establish real-speaker accuracy. Physical microphone/speaker/G1 acceptance, noisy-room and human multi-speaker evaluation, full upstream test suites for all 47 research folders, educator approvals, and student-readiness review remain incomplete.
+- Source-level follow-up ran 28 focused tests from the standalone `gemma4-agent` snapshot (8 backend, 10 agent-loop, 10 local-tool cases); model/grounding calls were mocked, so this is not a Gemma quality benchmark. The selected Crawl4AI transport now uses the checked-in Docker server's redirect-aware DNS-pinning egress proxy, and the auto-managed SearXNG image is digest-pinned. These changes do not mean the research snapshot commits are recorded, all upstream suites passed, or the complete 47-folder audit is exhaustive.
+
+### Anonymous transcript speaker correction — 2026-11-23
+
+- Added teacher-only per-turn correction for anonymous `Speaker N` labels on saved streaming transcripts when group mode is selected. Corrections persist through the existing owner-scoped conversation endpoint; the API rejects labels that do not use the anonymous format.
+- This adapts the VoxNovel speaker-editor interaction only. No VoxNovel source code, dependencies, audio identity features, or batch-book workflow were copied. The current automatic speaker labels remain a provisional session-local spectral heuristic, not validated diarization.
+- The label does not change transcript text or model context and cannot encode a person's name through the product API. Failure to save restores the previous visible label and uses the existing conversation-storage error.
+- This UI/data-integrity improvement does not complete real-speaker quality, educator/privacy, microphone, or G1 acceptance. Student use remains unapproved.
+- Focused anonymous-label API persistence/rejection test and ESLint passed. The full API suite has one separate stale expectation for session settings (it omits the already-supported participant-mode fields). The Playwright UI test could not reach its Vite server (`ERR_CONNECTION_REFUSED`), and the production build was terminated after module transformation (exit 143); browser behavior and full production build remain unverified here.
+
+### Teacher conversation renaming — 2026-11-23
+
+- Adapted the Gemma voice-agent's conversation rename affordance to Harry Botter's existing teacher-owned local session list. A teacher can edit a title in the UI; the API trims and bounds it, verifies session ownership, and persists the custom-title marker so subsequent message saves do not replace the chosen name. Existing auto-generated titles continue to work for sessions that have not been renamed.
+- No source code, identity flow, cloud service, model, or dependency was copied from the unlicensed Gemma voice-agent snapshot. Its UI was inspected statically; the demo was not launched because its documented setup requires a dedicated Gemma 4 31B GPU service.
+- A focused backend regression covers title normalization, owner isolation, blank-title rejection, and persistence after later message updates. ESLint and the production build validate the UI code. Playwright could not reach its configured frontend; a direct production-browser attempt hit the app's G1 arm-model runtime error before the control could be exercised, so interactive browser behavior remains unverified. This addition does not resolve the broader audit's documented limitation that the full suites and UIs of all 47 snapshots were not run.
+
+### Teacher conversation export — 2026-11-23
+
+- Added an explicit confirmation before downloading a selected teacher conversation as plain text. The export contains the title, stage/tone/agent context, message roles, anonymous transcript labels, and available citations; it omits session IDs, credentials, and raw audio. The file is created in the browser and is not sent to another service.
+- The confirmation warns teachers that exported text may contain sensitive information and should be reviewed before sharing. Export remains disabled for empty conversations and while a conversation is changing, drafting, or in a voice session.
+- A Node test verifies output attribution/citation formatting and safe filenames. ESLint and the production build validate the UI. Physical-device, privacy/retention, educator, and classroom acceptance remain outstanding.

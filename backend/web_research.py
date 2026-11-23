@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import html
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -15,10 +15,13 @@ from urllib.parse import urlsplit
 import httpx
 
 DEFAULT_SEARXNG_URL = "http://127.0.0.1:8080"
+DEFAULT_CRAWL4AI_URL = "http://127.0.0.1:11235"
 MAX_RESULTS = 3
 MAX_EXCERPT_CHARS = 2_000
 MAX_QUERY_CHARS = 500
+MAX_CRAWL_RESPONSE_BYTES = 1_000_000
 SEARXNG_TIMEOUT = httpx.Timeout(connect=1.5, read=3, write=2, pool=1)
+CRAWL4AI_TIMEOUT = httpx.Timeout(connect=1.5, read=4, write=2, pool=1)
 
 logger = logging.getLogger(__name__)
 
@@ -98,23 +101,51 @@ def _public_http_url(value: object) -> bool:
     return bool(addresses) and all(address.is_global for address in addresses)
 
 
-async def _crawl_results(results: list[dict[str, str]]) -> dict[str, str]:
-    from crawl4ai import AsyncWebCrawler
-
+def _crawl_results(results: list[dict[str, str]]) -> dict[str, str]:
+    token = os.environ.get("CRAWL4AI_API_TOKEN", "").strip()
+    if not token:
+        logger.info("Crawl4AI is not configured; using SearXNG snippets.")
+        return {}
     extracted: dict[str, str] = {}
-    async with AsyncWebCrawler() as crawler:
+    with httpx.Client(timeout=CRAWL4AI_TIMEOUT, trust_env=False) as client:
         for item in results[:2]:
             try:
-                page = await asyncio.wait_for(
-                    crawler.arun(url=item["url"]),
-                    timeout=5,
+                body = bytearray()
+                with client.stream(
+                    "POST",
+                    f"{DEFAULT_CRAWL4AI_URL}/crawl",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "urls": [item["url"]],
+                        "crawler_config": {
+                            "cache_mode": "bypass",
+                            "page_timeout": 3500,
+                            "word_count_threshold": 0,
+                        },
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    for chunk in response.iter_bytes():
+                        body.extend(chunk)
+                        if len(body) > MAX_CRAWL_RESPONSE_BYTES:
+                            raise ValueError("Crawl4AI response exceeded the size limit.")
+                payload = json.loads(body)
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning(
+                    "Crawl4AI enrichment failed; using the search snippet (%s).",
+                    type(exc).__name__,
                 )
-            except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
-                logger.warning("Crawl4AI could not crawl a search result: %s", exc)
                 continue
-            markdown = getattr(page, "markdown", "")
+            page_results = payload.get("results") if isinstance(payload, dict) else None
+            page = page_results[0] if isinstance(page_results, list) and page_results else None
+            if not isinstance(page, dict) or page.get("success") is not True:
+                logger.info("Crawl4AI returned no usable page; using the search snippet.")
+                continue
+            markdown = page.get("markdown")
+            if isinstance(markdown, dict):
+                markdown = markdown.get("fit_markdown") or markdown.get("raw_markdown")
             text = _plain_text(markdown)
-            if getattr(page, "success", False) and text:
+            if text:
                 extracted[item["url"]] = text
     return extracted
 
@@ -165,14 +196,7 @@ def search_current_web(text: str) -> list[dict[str, str]]:
     if not results:
         return []
 
-    try:
-        crawled = asyncio.run(asyncio.wait_for(_crawl_results(results), timeout=8))
-    except (ImportError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
-        logger.info("Crawl4AI enrichment is unavailable; using search snippets: %s", exc)
-        crawled = {}
-    except Exception as exc:
-        logger.warning("Crawl4AI enrichment failed; using search snippets: %s", exc)
-        crawled = {}
+    crawled = _crawl_results(results)
 
     retrieved_date = datetime.now(timezone.utc).date().isoformat()
     return [

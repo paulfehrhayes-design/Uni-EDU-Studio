@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  buildConversationTextExport,
+  conversationExportFilename,
+} from '../utils/harryBotterConversationExport.js';
 
 const SESSION_STORAGE_KEY = 'edu-classroom-session';
 const MAX_KNOWLEDGE_BYTES = 100_000;
@@ -42,6 +46,10 @@ const LEARNING_LEVELS = [
   'DP 1',
   'DP 2',
 ];
+const ANONYMOUS_SPEAKER_LABELS = Array.from(
+  { length: 6 },
+  (_, index) => `Speaker ${index + 1}`,
+);
 
 function getMicrophoneAccessErrorMessage(error) {
   if (error?.name === 'NotAllowedError' || error?.name === 'SecurityError') {
@@ -158,7 +166,11 @@ export default function HarryBotterTry() {
   const [selectedSessionId, setSelectedSessionId] = useState('');
   const [isLoadingSessions, setIsLoadingSessions] = useState(false);
   const [isChangingSession, setIsChangingSession] = useState(false);
+  const [isEditingSessionTitle, setIsEditingSessionTitle] = useState(false);
+  const [sessionTitleDraft, setSessionTitleDraft] = useState('');
+  const [isSavingSessionTitle, setIsSavingSessionTitle] = useState(false);
   const [sessionError, setSessionError] = useState('');
+  const [isSavingSpeakerLabel, setIsSavingSpeakerLabel] = useState(false);
   const [safeguardingAlerts, setSafeguardingAlerts] = useState([]);
   const [safeguardingAlertError, setSafeguardingAlertError] = useState('');
   const [editingDraftIndex, setEditingDraftIndex] = useState(null);
@@ -207,6 +219,7 @@ export default function HarryBotterTry() {
   const voiceTranscriptQueueRef = useRef([]);
   const voiceTranscriptProcessingRef = useRef(false);
   const chatMessagesRef = useRef(chatMessages);
+  const chatLogRef = useRef(null);
   const selectedSessionIdRef = useRef(selectedSessionId);
   const isGeneratingDraftRef = useRef(isGeneratingDraft);
   const activeTtsVoice = ttsVoice || speechStatus?.speech_generation?.voice || 'af_heart';
@@ -220,6 +233,15 @@ export default function HarryBotterTry() {
     && ['general', behaviorSectionDraft.section_id].includes(document.section_id)
     && (!document.learning_level || (learningLevel && document.learning_level === learningLevel))
     && (!document.agent_id || document.agent_id === selectedAgentId)
+  ));
+  const availableSpeakerLabels = Array.from(new Set([
+    ...ANONYMOUS_SPEAKER_LABELS,
+    ...chatMessages
+      .filter((message) => message.role === 'user' && message.messageSource === 'streaming_transcription')
+      .map((message) => message.speakerLabel)
+      .filter((label) => typeof label === 'string' && /^Speaker [1-9]\d*$/.test(label)),
+  ])).sort((left, right) => (
+    Number(left.slice('Speaker '.length)) - Number(right.slice('Speaker '.length))
   ));
   chatMessagesRef.current = chatMessages;
   selectedSessionIdRef.current = selectedSessionId;
@@ -520,6 +542,7 @@ export default function HarryBotterTry() {
     chatMessagesRef.current = messages;
     setSelectedSessionId(sessionId);
     selectedSessionIdRef.current = sessionId;
+    setIsEditingSessionTitle(false);
     const settings = result.session.settings;
     if (settings) {
       setLearningLevel(settings.learning_level || '');
@@ -623,6 +646,84 @@ export default function HarryBotterTry() {
     }
   }, [teacherSession]);
 
+  const updateTranscriptSpeakerLabel = async (messageId, selectedLabel) => {
+    if (
+      isSavingSpeakerLabel
+      || isVoiceSessionActive
+      || isChangingSession
+      || isGeneratingDraft
+    ) return;
+    const speakerLabel = selectedLabel || null;
+    if (speakerLabel && !availableSpeakerLabels.includes(speakerLabel)) {
+      setSessionError('Choose an available anonymous speaker label.');
+      return;
+    }
+    const currentMessages = chatMessagesRef.current;
+    const transcript = currentMessages.find((message) => message.messageId === messageId);
+    if (
+      !transcript
+      || transcript.role !== 'user'
+      || transcript.messageSource !== 'streaming_transcription'
+      || transcript.speakerLabel === speakerLabel
+    ) return;
+    const previousLabel = transcript.speakerLabel || null;
+    const nextMessages = currentMessages.map((message) => (
+      message.messageId === messageId ? { ...message, speakerLabel } : message
+    ));
+    setChatMessages(nextMessages);
+    chatMessagesRef.current = nextMessages;
+    setIsSavingSpeakerLabel(true);
+    try {
+      const saved = await saveConversationMessages(selectedSessionIdRef.current, nextMessages);
+      if (!saved) {
+        const revertedMessages = chatMessagesRef.current.map((message) => (
+          message.messageId === messageId
+            ? { ...message, speakerLabel: previousLabel }
+            : message
+        ));
+        setChatMessages(revertedMessages);
+        chatMessagesRef.current = revertedMessages;
+      }
+    } finally {
+      setIsSavingSpeakerLabel(false);
+    }
+  };
+
+  const renderTranscriptSpeakerControl = (message, index) => {
+    if (
+      participantMode !== 'group'
+      || message.role !== 'user'
+      || message.messageSource !== 'streaming_transcription'
+    ) return null;
+    return (
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <label className="flex items-center gap-2 text-xs font-medium text-slate-600">
+          Anonymous speaker label
+          <select
+            aria-label={`Anonymous speaker label for transcript ${index + 1}`}
+            value={message.speakerLabel || ''}
+            onChange={(event) => void updateTranscriptSpeakerLabel(message.messageId, event.target.value)}
+            disabled={
+              isSavingSpeakerLabel
+              || isVoiceSessionActive
+              || isChangingSession
+              || isGeneratingDraft
+            }
+            className="rounded-lg border border-slate-300 bg-white px-2 py-1"
+          >
+            <option value="">Unassigned</option>
+            {availableSpeakerLabels.map((label) => (
+              <option key={label} value={label}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <span className="text-xs text-slate-500">
+          Session-only label; it does not identify a person.
+        </span>
+      </div>
+    );
+  };
+
   const createConversation = async (whileChanging = false) => {
     if (!teacherSession?.token || (isChangingSession && !whileChanging)) return;
     setIsChangingSession(true);
@@ -657,6 +758,90 @@ export default function HarryBotterTry() {
     }
   };
 
+  const beginRenamingConversation = () => {
+    const selectedSession = teacherSessions.find(
+      (session) => session.session_id === selectedSessionIdRef.current,
+    );
+    if (!selectedSession) return;
+    setSessionTitleDraft(selectedSession.title || 'New conversation');
+    setIsEditingSessionTitle(true);
+    setSessionError('');
+  };
+
+  const renameConversation = async () => {
+    const sessionId = selectedSessionIdRef.current;
+    if (!sessionId || !teacherSession?.token || isSavingSessionTitle) return;
+    setIsSavingSessionTitle(true);
+    setSessionError('');
+    try {
+      const response = await fetch(`/api/harry-botter/sessions/${sessionId}/title`, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${teacherSession.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ title: sessionTitleDraft }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not rename the conversation.');
+      if (result.session?.session_id !== sessionId || typeof result.session.title !== 'string') {
+        throw new Error('The conversation service returned an invalid title.');
+      }
+      setTeacherSessions((sessions) => sessions.map((session) => (
+        session.session_id === sessionId
+          ? {
+            ...session,
+            title: result.session.title,
+            updated_at: result.session.updated_at || session.updated_at,
+          }
+          : session
+      )));
+      setIsEditingSessionTitle(false);
+    } catch (error) {
+      setSessionError(error.message || 'Could not rename the conversation.');
+    } finally {
+      setIsSavingSessionTitle(false);
+    }
+  };
+
+  const cancelRenamingConversation = () => {
+    setIsEditingSessionTitle(false);
+    setSessionTitleDraft('');
+  };
+
+  const exportConversation = () => {
+    const sessionId = selectedSessionIdRef.current;
+    const session = teacherSessions.find((item) => item.session_id === sessionId);
+    if (!session || chatMessages.length === 0) return;
+    if (!window.confirm(
+      'Export this conversation text and its citations to a file on this device? Review the file before sharing; it may contain sensitive information.',
+    )) return;
+
+    try {
+      const content = buildConversationTextExport({
+        title: session.title,
+        exportedAt: new Date().toISOString(),
+        learningLevel,
+        tone,
+        agentName: agents.find((agent) => agent.agent_id === selectedAgentId)?.display_name
+          || selectedAgentId,
+        messages: chatMessages,
+      });
+      const fileUrl = window.URL.createObjectURL(
+        new Blob([content], { type: 'text/plain;charset=utf-8' }),
+      );
+      const link = document.createElement('a');
+      link.href = fileUrl;
+      link.download = conversationExportFilename(session.title);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(fileUrl), 0);
+    } catch (error) {
+      setSessionError(`Conversation export failed: ${error.message || 'could not create the file.'}`);
+    }
+  };
+
   const deleteConversation = async () => {
     if (!selectedSessionIdRef.current || !teacherSession?.token || isChangingSession) return;
     if (!window.confirm('Delete this saved conversation and its text history? This cannot be undone.')) return;
@@ -676,6 +861,7 @@ export default function HarryBotterTry() {
       chatMessagesRef.current = [];
       setSelectedSessionId('');
       selectedSessionIdRef.current = '';
+      setIsEditingSessionTitle(false);
       if (remaining.length > 0) {
         await loadConversation(remaining[0].session_id);
       } else {
@@ -774,6 +960,11 @@ export default function HarryBotterTry() {
     }, 3_000);
     return () => window.clearInterval(timer);
   }, [teacherSession, refreshSafeguardingAlerts]);
+
+  useEffect(() => {
+    const chatLog = chatLogRef.current;
+    if (chatLog) chatLog.scrollTop = chatLog.scrollHeight;
+  }, [chatMessages, isGeneratingDraft, chatError]);
 
   const speakDraftOnG1 = async (text) => {
     if (isSendingG1Speech || draftOutput !== 'g1' || g1RobotStatus?.capabilities?.audio !== true) return;
@@ -2185,7 +2376,7 @@ export default function HarryBotterTry() {
         <section className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-sm text-amber-950">
           <h2 className="font-semibold">Voice conversations use explicit, visible routes</h2>
           <p className="mt-1">
-            In voice mode, the browser sends temporary 16 kHz microphone frames through the teacher-authenticated backend to local voice activity detection and Whisper. Each recognized turn creates a reviewable draft using the configured loopback model or explicitly configured private-network model; no hosted model is used. Spoken replies are synthesized locally and require you to press Play. Speaker diarization is not implemented; voice activity stops explicitly playing browser speech when a new turn begins.
+            In voice mode, the browser sends temporary 16 kHz microphone frames through the teacher-authenticated backend to local voice activity detection and Whisper. Each recognized turn creates a reviewable draft using the configured loopback model or explicitly configured private-network model; no hosted model is used. Spoken replies are synthesized locally and require you to press Play. Speaker labels are provisional session-local spectral groupings, not validated diarization or identity recognition. In group mode, you can correct labels on individual transcripts; voice activity stops explicitly playing browser speech when a new turn begins.
           </p>
           <p className="mt-2">
             Embedded VS Code or Codespaces previews may block microphone access. A webpage cannot open or change browser permission settings, so use a full browser tab to manage this permission.
@@ -2361,7 +2552,7 @@ export default function HarryBotterTry() {
                     disabled={isLoadingSessions || isChangingSession}
                     className="rounded-lg border border-slate-300 bg-white px-3 py-2"
                   >
-                    {['Speaker 1', 'Speaker 2', 'Speaker 3', 'Speaker 4', 'Speaker 5', 'Speaker 6'].map((label) => (
+                    {ANONYMOUS_SPEAKER_LABELS.map((label) => (
                       <option key={label} value={label}>{label}</option>
                     ))}
                   </select>
@@ -2449,7 +2640,7 @@ export default function HarryBotterTry() {
                 onChange={(event) => void selectConversation(event.target.value)}
                 disabled={
                   isLoadingSessions || isChangingSession || isGeneratingDraft
-                  || isVoiceSessionActive || isStartingVoiceSession
+                  || isVoiceSessionActive || isStartingVoiceSession || isEditingSessionTitle
                 }
                 className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2"
               >
@@ -2465,7 +2656,7 @@ export default function HarryBotterTry() {
               onClick={() => void createConversation()}
               disabled={
                 isLoadingSessions || isChangingSession || isGeneratingDraft
-                || isVoiceSessionActive || isStartingVoiceSession
+                || isVoiceSessionActive || isStartingVoiceSession || isEditingSessionTitle
               }
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-60"
             >
@@ -2477,14 +2668,74 @@ export default function HarryBotterTry() {
               disabled={
                 !selectedSessionId || isLoadingSessions || isChangingSession || isGeneratingDraft
                 || isVoiceSessionActive || isStartingVoiceSession
+                || isEditingSessionTitle || isSavingSessionTitle
               }
               className="rounded-lg border border-red-300 px-3 py-2 text-sm font-semibold text-red-700 hover:bg-red-50 disabled:opacity-60"
             >
               Delete conversation
             </button>
+            {isEditingSessionTitle ? (
+              <>
+                <label className="sr-only" htmlFor="saved-conversation-title">
+                  Conversation title
+                </label>
+                <input
+                  id="saved-conversation-title"
+                  aria-label="Conversation title"
+                  value={sessionTitleDraft}
+                  onChange={(event) => setSessionTitleDraft(event.target.value)}
+                  maxLength={80}
+                  disabled={isSavingSessionTitle}
+                  className="min-w-40 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                />
+                <button
+                  type="button"
+                  onClick={() => void renameConversation()}
+                  disabled={
+                    isSavingSessionTitle || isChangingSession || isGeneratingDraft
+                    || isVoiceSessionActive || isStartingVoiceSession
+                  }
+                  className="rounded-lg border border-blue-300 px-3 py-2 text-sm font-semibold text-blue-800 hover:bg-blue-50 disabled:opacity-60"
+                >
+                  Save name
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelRenamingConversation}
+                  disabled={isSavingSessionTitle}
+                  className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-60"
+                >
+                  Cancel rename
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={beginRenamingConversation}
+                disabled={
+                  !selectedSessionId || isLoadingSessions || isChangingSession || isGeneratingDraft
+                  || isVoiceSessionActive || isStartingVoiceSession
+                }
+                className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-60"
+              >
+                Rename conversation
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={exportConversation}
+              disabled={
+                !selectedSessionId || chatMessages.length === 0 || isLoadingSessions
+                || isChangingSession || isGeneratingDraft || isVoiceSessionActive
+                || isStartingVoiceSession || isEditingSessionTitle
+              }
+              className="rounded-lg border border-emerald-300 px-3 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50 disabled:opacity-60"
+            >
+              Export conversation
+            </button>
           </div>
           <p className="text-xs text-slate-500">
-            Text history is stored in the local app database for this teacher until deleted. Only this teacher account can access it; raw audio is never retained.
+            Text history is stored in the local app database for this teacher until deleted. Only this teacher account can access it; raw audio is never retained. Export downloads text and citations to this device only.
           </p>
           {sessionError && <p role="alert" className="text-sm text-red-700">{sessionError}</p>}
         </section>
@@ -2734,7 +2985,11 @@ export default function HarryBotterTry() {
             )}
           </section>
 
-          <div className="max-h-96 space-y-3 overflow-y-auto rounded-lg border border-slate-200 p-4">
+          <div
+            ref={chatLogRef}
+            aria-label="Chat messages"
+            className="max-h-96 space-y-3 overflow-y-auto rounded-lg border border-slate-200 p-4"
+          >
             {chatMessages.length === 0 && (
               <p className="text-sm text-slate-500">Type a message or record a voice turn for local transcription.</p>
             )}
@@ -2750,6 +3005,7 @@ export default function HarryBotterTry() {
                       ? 'Stage required'
                       : `AI draft${message.model ? ` · ${message.model}` : ''}${message.route === 'network' ? ' · private Wi-Fi' : message.route === 'local' ? ' · local' : ''}`}
                 </p>
+                {renderTranscriptSpeakerControl(message, index)}
                 {editingDraftIndex === index ? (
                   <div className="mt-2 space-y-2">
                     <textarea
@@ -3246,7 +3502,11 @@ export default function HarryBotterTry() {
             <p className="text-xs leading-relaxed text-slate-500">
               Microphone frames remain temporary in browser memory and are sent only to the loopback speech service through the authenticated backend. The service uses VAD to segment utterances and clears each segment after transcription. Audio is not stored; transcripts are saved as text in this teacher-only conversation until deleted.
             </p>
-            <div className="max-h-96 space-y-3 overflow-y-auto rounded-lg border border-slate-200 p-4">
+            <div
+              ref={chatLogRef}
+              aria-label="Chat messages"
+              className="max-h-96 space-y-3 overflow-y-auto rounded-lg border border-slate-200 p-4"
+            >
               {chatMessages.length === 0 && (
                 <p className="text-sm text-slate-500">Start the microphone and speak to create a local transcript and draft.</p>
               )}
@@ -3260,6 +3520,7 @@ export default function HarryBotterTry() {
                       ? (message.speakerLabel ? `${message.speakerLabel} · Recognized transcript` : 'Recognized transcript')
                       : 'AI draft'}
                   </p>
+                  {renderTranscriptSpeakerControl(message, index)}
                   <p className="mt-1 whitespace-pre-wrap">{message.content}</p>
                   {Number.isFinite(message.transcriptToDraftMs) && (
                     <p className="mt-1 text-xs text-slate-500">

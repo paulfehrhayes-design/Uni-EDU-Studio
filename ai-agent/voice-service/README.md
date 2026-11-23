@@ -205,13 +205,15 @@ models at startup and has no cloud fallback. `HF_HUB_OFFLINE=1` prevents
 Hugging Face network access after the explicit warm-up step.
 
 For the integrated application, run `npm start` from the repository root. This
-launches the voice service and authenticated backend together. `npm run dev`
-starts only the Vite frontend and does not start the backend or voice service.
-The launcher checks the complete audio dependency set and warms speech models. If
-audio package installation or model download fails, it reports the error and
-continues with typing chat when the local model server is available; microphone
-streaming and generated speech remain unavailable until setup succeeds.
-Read the launcher output when a status says the AI service is unavailable.
+launches the backend, voice service, and local Ollama server together, installs
+the default model when needed, and warms it before reporting the app ready.
+`npm run dev` starts the same services with the Vite development frontend.
+`npm run dev:frontend` starts only Vite and requires the backend and AI services
+to be started separately. On the first launch, Ollama and its model require
+internet access to install; later launches reuse the local installation. If
+model setup fails, the app remains available but reports that AI chat is
+unavailable. Audio package installation or model download failures are also
+reported and do not prevent typing chat when Ollama is ready.
 
 The teacher AI draft chat lists models currently installed on the configured
 loopback or private Wi-Fi OpenAI-compatible servers. **Use selected model**
@@ -222,21 +224,25 @@ changes the model for the running voice-service process; set
 ### Optional live web research
 
 Current-information questions (for example, those asking for the latest news,
-today's weather, or current prices) can use a locally running SearXNG instance.
-Set `HARRY_BOTTER_SEARXNG_URL=http://127.0.0.1:8080` in
-`.env.harry-botter.local`; the URL may also use a trusted private-network IP.
-SearXNG must have JSON search output enabled. The app does not start or install
-SearXNG automatically. Use the SearXNG setup files under
-`ai-agent/research/searxng/` and keep its service bound to localhost or a trusted
-private network.
+today's weather, or current prices) use SearXNG when it is available. The app
+manager starts a local SearXNG container on `127.0.0.1:8080` when Docker is
+available, generates a private settings file under the ignored
+`.searxng-runtime/` directory, and enables JSON search. Set
+`HARRY_BOTTER_SEARXNG_URL` in `.env.harry-botter.local` to use another local or
+trusted private-network instance; configuring another URL skips local container
+startup.
 
-The backend uses SearXNG result snippets when available. It also enriches up to
-two results with Crawl4AI when Crawl4AI is installed in the backend's Python
-environment and its browser runtime is ready. Crawl4AI is optional; missing
-packages, an unavailable browser, SearXNG, or internet connection only disables
-live references for that request and does not prevent normal chat. To install
-Crawl4AI, follow its setup instructions in `ai-agent/research/crawl4ai/`; the
-app never installs either research project at startup.
+The app manager also tries to install Crawl4AI from
+`ai-agent/research/crawl4ai/` into the backend's Python environment when that
+checkout exists, and installs the Playwright Chromium browser when needed.
+These setup steps are optional: install, browser, Docker, SearXNG, or internet
+failures are logged and do not prevent normal chat. The backend uses SearXNG
+result snippets when available and enriches up to two results with Crawl4AI
+when its package and browser runtime are ready.
+On Linux hosts missing Chromium system libraries, install them with
+`sudo python -m playwright install-deps chromium` in the same Python environment
+used by the backend. The launcher checks whether Chromium can actually start
+and falls back to SearXNG snippets when it cannot.
 
 Live searching is limited to queries that appear to ask for current information.
 The query is sent to the configured SearXNG instance, which may forward it to

@@ -535,6 +535,126 @@ class HarryBotterAPITests(unittest.TestCase):
             404,
         )
 
+    def test_teacher_can_rename_owned_session_and_title_survives_message_updates(self):
+        created = self.client.post(
+            "/api/harry-botter/sessions",
+            headers=self.teacher_headers,
+        )
+        session_id = created.json()["session"]["session_id"]
+        title_url = f"/api/harry-botter/sessions/{session_id}/title"
+
+        renamed = self.client.put(
+            title_url,
+            headers=self.teacher_headers,
+            json={"title": "  Evaporation   lesson  "},
+        )
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()["session"]["title"], "Evaporation lesson")
+
+        other_teacher = self.client.put(
+            title_url,
+            headers={"Authorization": "Bearer ai-other-teacher-token"},
+            json={"title": "Not yours"},
+        )
+        self.assertEqual(other_teacher.status_code, 404)
+        blank_title = self.client.put(
+            title_url,
+            headers=self.teacher_headers,
+            json={"title": "   "},
+        )
+        self.assertEqual(blank_title.status_code, 422)
+
+        saved = self.client.put(
+            f"/api/harry-botter/sessions/{session_id}/messages",
+            headers=self.teacher_headers,
+            json={
+                "messages": [
+                    {
+                        "messageId": "renamed-session-turn",
+                        "role": "user",
+                        "content": "Explain evaporation.",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["session"]["title"], "Evaporation lesson")
+        listed = self.client.get(
+            "/api/harry-botter/sessions",
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(listed.json()["sessions"][0]["title"], "Evaporation lesson")
+
+    def test_existing_session_schema_gains_custom_title_marker(self):
+        conn = server.get_db_connection()
+        try:
+            conn.execute("ALTER TABLE harry_botter_sessions DROP COLUMN title_is_custom")
+            server.initialize_harry_botter_schema(conn)
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(harry_botter_sessions)")
+            }
+        finally:
+            conn.close()
+        self.assertIn("title_is_custom", columns)
+
+    def test_session_transcript_speaker_labels_are_anonymous_and_persist(self):
+        created = self.client.post(
+            "/api/harry-botter/sessions",
+            headers=self.teacher_headers,
+        )
+        session_id = created.json()["session"]["session_id"]
+        response = self.client.put(
+            f"/api/harry-botter/sessions/{session_id}/messages",
+            headers=self.teacher_headers,
+            json={
+                "messages": [
+                    {
+                        "messageId": "transcript-1",
+                        "role": "user",
+                        "content": "A recognized turn.",
+                        "messageSource": "streaming_transcription",
+                        "speakerLabel": "Speaker 2",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        restored = self.client.get(
+            f"/api/harry-botter/sessions/{session_id}",
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(
+            restored.json()["session"]["messages"][0]["speakerLabel"],
+            "Speaker 2",
+        )
+        conn = server.get_db_connection()
+        try:
+            turn = conn.execute(
+                "SELECT speaker_label FROM harry_botter_transcript_turns WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(turn["speaker_label"], "Speaker 2")
+
+        rejected = self.client.put(
+            f"/api/harry-botter/sessions/{session_id}/messages",
+            headers=self.teacher_headers,
+            json={
+                "messages": [
+                    {
+                        "messageId": "transcript-1",
+                        "role": "user",
+                        "content": "A recognized turn.",
+                        "messageSource": "streaming_transcription",
+                        "speakerLabel": "Student Name",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(rejected.status_code, 422)
+
     def test_legacy_conversation_json_is_backfilled_into_explicit_records(self):
         created = self.client.post(
             "/api/harry-botter/sessions",

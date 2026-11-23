@@ -1,11 +1,13 @@
 """Persistent mirror of educator-managed Harry Botter database context."""
 
+import json
+import math
 import os
 import re
 import sqlite3
+from collections import Counter
 from datetime import date
 from pathlib import Path
-import json
 
 
 class ContextStore:
@@ -153,13 +155,17 @@ class ContextStore:
         limit: int = 10,
         excerpt_chars: int = 4_000,
     ) -> list[dict]:
+        stop_words = {"the", "and", "for", "with", "that", "this", "from", "what", "how"}
         terms = {
             term
             for term in re.findall(r"[a-z0-9]{3,}", text.casefold())
-            if term not in {"the", "and", "for", "with", "that", "this", "from", "what", "how"}
+            if term not in stop_words
         }
+        if not terms or limit <= 0 or excerpt_chars <= 0:
+            return []
+
         today = date.today().isoformat()
-        ranked: list[tuple[int, str, str, dict]] = []
+        candidates: list[tuple[dict, str, int, Counter, set[str]]] = []
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT data_json FROM documents"
@@ -179,25 +185,73 @@ class ContextStore:
                 str(document.get(key, ""))
                 for key in ("title", "source", "owner", "intended_use", "section_id")
             ).casefold()
+            metadata_terms = set(re.findall(r"[a-z0-9]{3,}", metadata))
             chunks = re.split(r"\n\s*\n+", document.get("text", ""))
             for chunk_index, chunk in enumerate(chunks):
                 chunk = " ".join(chunk.split())
                 if len(chunk) < 40:
                     continue
-                score = sum(metadata.count(term) * 3 for term in terms)
-                score += sum(chunk.casefold().count(term) for term in terms)
-                if score:
-                    ranked.append((score, document["title"].casefold(), str(chunk_index), {
-                        "title": document["title"],
-                        "source": document["source"],
-                        "owner": document["owner"],
-                        "intended_use": document["intended_use"],
-                        "section_id": document["section_id"],
-                        "section_title": document.get("section_title", "General reference"),
-                        "review_date": document.get("review_date") or "",
-                        "excerpt": chunk[:excerpt_chars],
-                    }))
-        ranked.sort(key=lambda item: (-item[0], item[1], int(item[2])))
+                chunk_terms = Counter(re.findall(r"[a-z0-9]{3,}", chunk.casefold()))
+                candidates.append(
+                    (document, chunk, chunk_index, chunk_terms, metadata_terms)
+                )
+
+        if not candidates:
+            return []
+
+        document_frequency = {
+            term: sum(term in candidate[3] for candidate in candidates)
+            for term in terms
+        }
+        average_length = max(
+            sum(sum(candidate[3].values()) for candidate in candidates) / len(candidates),
+            1,
+        )
+        corpus_size = len(candidates)
+        k1 = 1.2
+        length_normalization = 0.75
+        ranked: list[tuple[float, str, int, dict]] = []
+        for document, chunk, chunk_index, frequencies, metadata_terms in candidates:
+            chunk_length = max(sum(frequencies.values()), 1)
+            score = 0.0
+            for term in terms:
+                frequency = frequencies.get(term, 0)
+                if not frequency and term not in metadata_terms:
+                    continue
+                term_document_frequency = document_frequency[term]
+                inverse_document_frequency = math.log(
+                    1
+                    + (corpus_size - term_document_frequency + 0.5)
+                    / (term_document_frequency + 0.5)
+                )
+                if frequency:
+                    score += inverse_document_frequency * (
+                        frequency * (k1 + 1)
+                        / (
+                            frequency
+                            + k1
+                            * (
+                                1
+                                - length_normalization
+                                + length_normalization * chunk_length / average_length
+                            )
+                        )
+                    )
+                if term in metadata_terms:
+                    score += inverse_document_frequency * 2
+            if not score:
+                continue
+            ranked.append((score, document["title"].casefold(), chunk_index, {
+                "title": document["title"],
+                "source": document["source"],
+                "owner": document["owner"],
+                "intended_use": document["intended_use"],
+                "section_id": document["section_id"],
+                "section_title": document.get("section_title", "General reference"),
+                "review_date": document.get("review_date") or "",
+                "excerpt": chunk[:excerpt_chars],
+            }))
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
         results = []
         seen: set[tuple[str, str]] = set()
         for _, _, _, result in ranked:

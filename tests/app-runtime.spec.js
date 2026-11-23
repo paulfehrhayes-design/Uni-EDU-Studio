@@ -4044,10 +4044,16 @@ test('Harry Botter restores a stored teacher session without exposing the sign-i
   )).toBe(true);
 });
 
-test('Harry Botter restores and persists owner-only conversation text', async ({ page }) => {
+test('Harry Botter restores conversations and persists anonymous speaker corrections', async ({ page }) => {
   const writes = [];
   const sessionId = 'teacher-session-1';
-  const savedMessages = [{ role: 'user', content: 'Earlier question.' }];
+  const savedMessages = [{
+    messageId: 'earlier-transcript',
+    role: 'user',
+    content: 'Earlier question.',
+    messageSource: 'streaming_transcription',
+    speakerLabel: 'Speaker 1',
+  }];
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-harry-botter-history-token',
@@ -4072,7 +4078,18 @@ test('Harry Botter restores and persists owner-only conversation text', async ({
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
-          session: { session_id: sessionId, title: 'Earlier question.', messages: savedMessages },
+          session: {
+            session_id: sessionId,
+            title: 'Earlier question.',
+            messages: savedMessages,
+            settings: {
+              agent_id: 'general',
+              learning_level: '',
+              tone: 'Formal',
+              participant_mode: 'group',
+              speaker_assignment_mode: 'adaptive',
+            },
+          },
         }),
       });
       return;
@@ -4138,15 +4155,19 @@ test('Harry Botter restores and persists owner-only conversation text', async ({
 
   await page.goto('/?try=harry-botter');
   await expect(page.getByText('Earlier question.', { exact: true })).toBeVisible();
+  await page.getByLabel('Anonymous speaker label for transcript 1').selectOption('Speaker 2');
+  await expect.poll(() => writes.length).toBe(1);
+  expect(writes[0].messages[0].speakerLabel).toBe('Speaker 2');
   await page.getByPlaceholder('Ask Harry Botter a question…').fill('Explain evaporation.');
   await page.getByRole('button', { name: 'Generate local draft' }).click();
   await expect(page.getByText('Water evaporates when it changes from liquid to gas.')).toBeVisible();
-  await expect.poll(() => writes.length).toBe(2);
-  expect(writes[1].messages.map((message) => [message.role, message.content])).toEqual([
+  await expect.poll(() => writes.length).toBe(3);
+  expect(writes[2].messages.map((message) => [message.role, message.content])).toEqual([
     ['user', 'Earlier question.'],
     ['user', 'Explain evaporation.'],
     ['assistant', 'Water evaporates when it changes from liquid to gas.'],
   ]);
+  expect(writes[2].messages[0].speakerLabel).toBe('Speaker 2');
 });
 
 test('Harry Botter saves shared behavior sections and requires approval for school guidance', async ({ page }) => {
@@ -4542,7 +4563,10 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
         session: {
           session_id: 'voice-config-session',
           title: 'New conversation',
-          messages: [],
+          messages: Array.from({ length: 12 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'assistant',
+            content: `Earlier conversation message ${index + 1}. `.repeat(8),
+          })),
         },
       },
       '/api/harry-botter/config': { agents: [generalAgent()], knowledge: [], sections: [] },
@@ -4581,16 +4605,22 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
   await expect(page.getByTestId('current-browser-voice')).toContainText('qwen3_youthful_south_london');
   await page.getByPlaceholder('Ask Harry Botter a question…').fill('Explain evaporation.');
   await page.getByRole('button', { name: 'Generate local draft' }).click();
-  await expect(page.getByText('Water changes into vapor when it evaporates.')).toBeVisible();
-  await page.getByRole('button', { name: 'Prepare spoken reply' }).click();
+  const latestDraft = page.getByLabel('Chat messages').locator('article').last();
+  await expect(latestDraft.getByText('Water changes into vapor when it evaporates.')).toBeVisible();
+  const chatLog = page.getByLabel('Chat messages');
+  await expect.poll(() => chatLog.evaluate((element) => (
+    element.scrollTop + element.clientHeight >= element.scrollHeight - 1
+  ))).toBe(true);
+  await latestDraft.getByRole('button', { name: 'Prepare spoken reply' }).click();
   await expect.poll(() => speechPayloads.length).toBe(2);
   expect(speechPayloads[1]).toEqual({
     text: 'Water changes into vapor when it evaporates.',
     speed: 1.15,
     voice: 'qwen3_youthful_south_london',
   });
-  const speakOnG1 = page.getByRole('button', { name: 'Speak this draft on G1' });
-  await expect(speakOnG1).toBeDisabled();
+  const g1ButtonBeforeConnection = page.locator('[aria-label="Chat messages"]:visible article').last()
+    .getByRole('button', { name: 'Speak this draft on G1' });
+  await expect(g1ButtonBeforeConnection).toBeDisabled();
   g1AudioConnected = true;
   await page.getByRole('button', { name: 'Refresh G1 status' }).click();
   await expect(page.getByTestId('g1-chat-routing')).toContainText('G1 audio capability connected');
@@ -4598,6 +4628,8 @@ test('Harry Botter requires auditioning a voice before applying it', async ({ pa
   await expect(page.getByLabel('Microphone')).toBeVisible();
   await page.getByLabel('Voice reply destination').selectOption('g1');
   await page.getByLabel('G1 speaker ID').selectOption('1');
+  const speakOnG1 = page.locator('[aria-label="Chat messages"]:visible article').last()
+    .getByRole('button', { name: 'Speak this draft on G1' });
   await expect(speakOnG1).toBeEnabled();
   await speakOnG1.click();
   await expect.poll(() => g1SpeakPayload).toBeTruthy();
