@@ -11,7 +11,7 @@
   "portsAttributes": {
     "5179": {
       "label": "Uni-EDU Studio",
-      "onAutoForward": "notify"
+      "onAutoForward": "openBrowser"
     }
   }
 }

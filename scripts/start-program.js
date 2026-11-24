@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   statfsSync,
   writeFileSync,
 } from 'node:fs';
@@ -56,6 +57,14 @@ let shuttingDown = false;
 
 function log(message) {
   console.log(`[Harry Botter] ${message}`);
+}
+
+function appUrl(appPort) {
+  const codespaceName = process.env.CODESPACE_NAME;
+  if (codespaceName && /^[a-z0-9-]+$/.test(codespaceName)) {
+    return `https://${codespaceName}-${appPort}.app.github.dev`;
+  }
+  return `http://localhost:${appPort}`;
 }
 
 function loadLocalConfig() {
@@ -137,11 +146,24 @@ function startProcess(binary, args, options = {}) {
     }
     const label = options.label || path.basename(binary);
     const delayMs = options.restartDelayMs || 2_000;
-    console.error(
-      `[Harry Botter] ${label} exited unexpectedly (${signal || code}). Restarting it in ${delayMs / 1000} seconds.`,
-    );
-    const timer = setTimeout(() => {
-      if (!shuttingDown) startProcess(binary, args, { ...options, restartDelayMs: Math.min(delayMs * 2, 30_000) });
+    console.error(serviceKey === 'ollama'
+      ? `[Harry Botter] ${label} exited unexpectedly (${signal || code}). Checking for an existing server before restarting.`
+      : `[Harry Botter] ${label} exited unexpectedly (${signal || code}). Restarting it in ${delayMs / 1000} seconds.`);
+    const timer = setTimeout(async () => {
+      if (shuttingDown) return;
+      if (serviceKey === 'ollama') {
+        if (await serviceIsReady(options.healthUrl)) {
+          log('Ollama is already running; reusing it.');
+          return;
+        }
+        if (!(await canBind(11434))) {
+          console.error(
+            '[Harry Botter] Ollama port 11434 is occupied by a server that is not responding; not starting a duplicate.',
+          );
+          return;
+        }
+      }
+      startProcess(binary, args, { ...options, restartDelayMs: Math.min(delayMs * 2, 30_000) });
     }, delayMs);
     timer.unref();
   });
@@ -242,8 +264,14 @@ function findPython() {
     path.join(voiceDir, '.venv', windows ? 'Scripts/python.exe' : 'bin/python'),
   ];
   for (const candidate of venvPaths) {
+    if (!existsSync(candidate)) continue;
+    const pipCheck = spawnSync(
+      candidate,
+      ['-m', 'pip', '--version'],
+      { stdio: 'ignore' },
+    );
     if (
-      existsSync(candidate)
+      pipCheck.status === 0
       && isSupportedPythonVersion(getPythonVersion(candidate))
     ) {
       return { binary: candidate, isVenv: true };
@@ -273,7 +301,17 @@ async function ensureVoicePython() {
   let python = existing.binary;
   if (!existing.isVenv) {
     const venv = path.join(root, '.venv-audio312');
-    await run(python, ['-m', 'venv', venv]);
+    if (existsSync(venv)) rmSync(venv, { recursive: true, force: true });
+    const venvResult = spawnSync(python, ['-m', 'venv', venv], { stdio: 'ignore' });
+    if (venvResult.status !== 0) {
+      if (spawnSync('virtualenv', ['--version'], { stdio: 'ignore' }).status !== 0) {
+        throw new Error(
+          'Could not create the voice Python environment. Install Python 3.10-3.13 '
+          + 'with working venv support or virtualenv, then retry.',
+        );
+      }
+      await run('virtualenv', ['--python', python, venv]);
+    }
     python = path.join(venv, windows ? 'Scripts/python.exe' : 'bin/python');
   }
   const packages = spawnSync(
@@ -304,6 +342,18 @@ async function ensureOllama(env) {
     return;
   }
 
+  const tagsUrl = `${ollamaUrl}/api/tags`;
+  const getOllamaServer = async () => {
+    try {
+      return await fetchJson(tagsUrl);
+    } catch {
+      if (await canBind(11434)) return null;
+      log('Ollama port 11434 is already occupied; waiting for its API instead of starting another server.');
+      await waitForService(tagsUrl, null, 'Existing Ollama', 30_000);
+      return fetchJson(tagsUrl);
+    }
+  };
+
   let ollamaCli = spawnSync('ollama', ['--version'], { stdio: 'ignore' }).status === 0
     ? 'ollama'
     : null;
@@ -319,24 +369,25 @@ async function ensureOllama(env) {
     }
   };
 
-  let server = null;
-  try {
-    server = await fetchJson(`${ollamaUrl}/api/tags`);
-  } catch {
+  let server = await getOllamaServer();
+  if (!server) {
     if (!(await installOllamaCli())) return;
+    server = await getOllamaServer();
+  }
+  if (!server) {
     log('Starting the local Ollama server...');
     const child = startProcess(ollamaCli, ['serve'], {
       label: 'Ollama',
       serviceKey: 'ollama',
-      healthUrl: `${ollamaUrl}/api/tags`,
+      healthUrl: tagsUrl,
       env: {
         ...env,
         OLLAMA_HOST: '127.0.0.1:11434',
         OLLAMA_NO_CLOUD: '1',
       },
     });
-    await waitForService(`${ollamaUrl}/api/tags`, child, 'Ollama');
-    server = await fetchJson(`${ollamaUrl}/api/tags`);
+    await waitForService(tagsUrl, child, 'Ollama');
+    server = await fetchJson(tagsUrl);
   }
 
   const selectedModel = env.HARRY_BOTTER_LOCAL_MODEL || localModel;
@@ -436,7 +487,7 @@ async function ensureBackendPython() {
   for (const binary of candidates) {
     const check = spawnSync(
       binary,
-      ['-c', 'import fastapi, httpx, pydantic, uvicorn'],
+      ['-c', 'import fastapi, httpx, pydantic, uvicorn, websockets'],
       { stdio: 'ignore' },
     );
     if (check.status === 0) return binary;
@@ -692,13 +743,14 @@ try {
       cwd: root,
       env: {
         ...env,
+        UNI_EDU_LAUNCHER_MANAGED: '1',
         UNI_EDU_BACKEND_ONLY: '1',
         UNI_EDU_PORT: String(port),
       },
     });
     await waitForService(backendUrl, backend, 'Uni-EDU backend');
   }
-  log(`Uni-EDU app is available at http://localhost:${port}; preparing local AI services.`);
+  log(`Uni-EDU app is available at ${appUrl(port)}; preparing local AI services.`);
 
   const voiceHealthUrl = `http://127.0.0.1:${voicePort}/api/v1/health`;
   const voiceAlreadyRunning = await requireFreePortOrReadyService(voicePort, voiceHealthUrl, 'Harry Botter voice service');
@@ -806,8 +858,8 @@ try {
 
   log(
     devMode
-      ? `Ready. Open http://localhost:${vitePort}/?try=harry-botter and sign in as a teacher.`
-      : `Ready. Open http://localhost:${port}/?try=harry-botter and sign in as a teacher.`,
+      ? `Ready. Open ${appUrl(vitePort)}/?try=harry-botter and sign in as a teacher.`
+      : `Ready. Open ${appUrl(port)}/?try=harry-botter and sign in as a teacher.`,
   );
   log('Services started by this launcher will remain available while this launcher is running. Press Ctrl+C to stop those services.');
   setInterval(() => {}, 60_000);

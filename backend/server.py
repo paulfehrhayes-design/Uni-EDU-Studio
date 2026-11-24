@@ -6382,6 +6382,19 @@ def find_available_port(start_port: int = 5179, max_tries: int = 20) -> int:
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 if __name__ == "__main__":
+    if os.getenv("UNI_EDU_LAUNCHER_MANAGED") != "1":
+        project_root = Path(__file__).resolve().parent.parent
+        npm = "npm.cmd" if os.name == "nt" else "npm"
+        try:
+            result = subprocess.run(
+                [npm, "start"],
+                cwd=project_root,
+                check=False,
+            )
+        except KeyboardInterrupt:
+            raise SystemExit(130) from None
+        raise SystemExit(result.returncode)
+
     import uvicorn
 
     preferred_port = int(os.getenv("UNI_EDU_PORT", "5179"))

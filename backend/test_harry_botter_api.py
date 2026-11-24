@@ -1,13 +1,17 @@
+import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from websockets.sync.server import serve
 
 import harry_botter_api
 import g1_robot
@@ -946,6 +950,20 @@ class HarryBotterAPITests(unittest.TestCase):
         self.assertEqual(captured["path"], "/api/v1/model/select")
         self.assertEqual(captured["payload"], {"route": "local", "model": "qwen3:1.7b"})
 
+    def test_unavailable_local_ai_service_error_is_not_misreported_as_voice_chat(self):
+        with patch.object(harry_botter_api.httpx, "Client") as client_factory:
+            client_factory.return_value.__enter__.return_value.request.side_effect = (
+                httpx.ConnectError("Connection refused")
+            )
+            with self.assertRaises(HTTPException) as raised:
+                harry_botter_api._voice_request("POST", "/api/v1/policy-review", json_payload={})
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail,
+            "Harry Botter local AI service is unavailable. Check that the local service is running.",
+        )
+
     def test_model_status_proxy_uses_bounded_timeout(self):
         captured = {}
 
@@ -1128,13 +1146,66 @@ class HarryBotterAPITests(unittest.TestCase):
         )
         for subprotocols, expected_code in cases:
             with self.subTest(expected_code=expected_code):
-                with self.assertRaises(WebSocketDisconnect) as disconnect:
-                    with self.client.websocket_connect(
-                        "/api/harry-botter/stream",
-                        subprotocols=subprotocols,
-                    ) as websocket:
+                with self.client.websocket_connect(
+                    "/api/harry-botter/stream",
+                    subprotocols=subprotocols,
+                ) as websocket:
+                    error = websocket.receive_json()
+                    self.assertEqual(error["code"], "authentication_required")
+                    with self.assertRaises(WebSocketDisconnect) as disconnect:
                         websocket.receive_json()
                 self.assertEqual(disconnect.exception.code, expected_code)
+
+    def test_authenticated_audio_stream_proxies_to_the_local_voice_service(self):
+        def audio_handler(connection):
+            start = json.loads(connection.recv(timeout=2))
+            connection.send(json.dumps({
+                "type": "ready",
+                "session_id": start["session_id"],
+                "sample_rate": 16_000,
+                "frame_samples": 320,
+            }))
+            control = json.loads(connection.recv(timeout=2))
+            if control == {"type": "stop"}:
+                connection.send(json.dumps({
+                    "type": "stopped",
+                    "session_id": start["session_id"],
+                }))
+
+        upstream = serve(
+            audio_handler,
+            "127.0.0.1",
+            0,
+            subprotocols=["harry-botter-audio-v1"],
+            compression=None,
+        )
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.object(
+                harry_botter_api,
+                "VOICE_STREAM_URL",
+                f"ws://127.0.0.1:{upstream.socket.getsockname()[1]}/api/v1/audio-stream",
+            ):
+                with self.client.websocket_connect(
+                    "/api/harry-botter/stream",
+                    subprotocols=["edu-auth.ai-teacher-token"],
+                ) as websocket:
+                    websocket.send_json({
+                        "type": "start",
+                        "session_id": "authenticated-stream-test",
+                        "sample_rate": 16_000,
+                        "format": "pcm_s16le_mono",
+                        "participant_mode": "individual",
+                        "current_speaker": None,
+                        "speaker_assignment_mode": "selected",
+                    })
+                    self.assertEqual(websocket.receive_json()["type"], "ready")
+                    websocket.send_json({"type": "stop"})
+                    self.assertEqual(websocket.receive_json()["type"], "stopped")
+        finally:
+            upstream.shutdown()
+            thread.join(timeout=3)
 
 
 if __name__ == "__main__":

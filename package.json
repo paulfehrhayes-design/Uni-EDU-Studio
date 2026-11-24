@@ -4,7 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "prestart": "node scripts/ensure-node-dependencies.js",
     "start": "node scripts/start-program.js",
+    "predev": "node scripts/ensure-node-dependencies.js",
     "dev": "UNI_EDU_DEV=1 node scripts/start-program.js",
     "dev:frontend": "vite",
     "build": "vite build",

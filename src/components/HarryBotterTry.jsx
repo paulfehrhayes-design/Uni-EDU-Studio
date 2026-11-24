@@ -151,6 +151,9 @@ export default function HarryBotterTry() {
   const [modelSelectionError, setModelSelectionError] = useState('');
   const [speechStatus, setSpeechStatus] = useState(null);
   const [g1RobotStatus, setG1RobotStatus] = useState(null);
+  const [g1Interface, setG1Interface] = useState('');
+  const [isConnectingG1, setIsConnectingG1] = useState(false);
+  const [g1ConnectionError, setG1ConnectionError] = useState('');
   const [draftOutput, setDraftOutput] = useState('browser');
   const [g1SpeakerId, setG1SpeakerId] = useState('0');
   const [isSendingG1Speech, setIsSendingG1Speech] = useState(false);
@@ -479,6 +482,40 @@ export default function HarryBotterTry() {
       setG1RobotStatus({ error: error.message || 'Could not check the G1 audio connection.' });
     }
   }, [teacherSession]);
+
+  const connectG1 = useCallback(async () => {
+    if (!teacherSession?.token || isConnectingG1) return;
+    setIsConnectingG1(true);
+    setG1ConnectionError('');
+    try {
+      const response = await fetch('/api/robot/connect', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${teacherSession.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(g1Interface.trim() ? { interface: g1Interface.trim() } : {}),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Could not connect the G1.');
+      if (result.status !== 'connected' || result.capabilities?.locomotion !== true) {
+        throw new Error('The G1 backend did not confirm a usable SDK connection.');
+      }
+      setG1RobotStatus({
+        status: 'connected',
+        interface: result.interface,
+        sdkAvailable: true,
+        capabilities: result.capabilities,
+        running: false,
+      });
+      await checkG1AudioStatus(teacherSession);
+    } catch (error) {
+      setG1ConnectionError(error.message || 'Could not connect the G1.');
+      await checkG1AudioStatus(teacherSession);
+    } finally {
+      setIsConnectingG1(false);
+    }
+  }, [checkG1AudioStatus, g1Interface, isConnectingG1, teacherSession]);
 
   const loadConfiguration = useCallback(async (session = teacherSession) => {
     if (!session?.token) return;
@@ -2283,6 +2320,9 @@ export default function HarryBotterTry() {
     setTeacherSession(null);
     setModelStatus(null);
     setG1RobotStatus(null);
+    setG1Interface('');
+    setIsConnectingG1(false);
+    setG1ConnectionError('');
     setDraftOutput('browser');
     setG1SpeechStatus('');
     setG1SpeechError('');
@@ -2917,14 +2957,37 @@ export default function HarryBotterTry() {
                   Approved text is sent through the authenticated G1 audio speech service.
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => void checkG1AudioStatus()}
-                className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-sm font-semibold text-emerald-900"
-              >
-                Refresh G1 status
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-emerald-950">
+                  Ethernet interface
+                  <input
+                    aria-label="G1 Ethernet interface"
+                    value={g1Interface}
+                    onChange={(event) => setG1Interface(event.target.value)}
+                    placeholder="Backend default"
+                    className="w-36 rounded-lg border border-emerald-300 bg-white px-3 py-2"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void connectG1()}
+                  disabled={isConnectingG1 || g1RobotStatus?.sdkAvailable === true}
+                  className="rounded-lg bg-emerald-700 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {isConnectingG1 ? 'Connecting…' : g1RobotStatus?.sdkAvailable === true ? 'G1 connected' : 'Connect G1'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void checkG1AudioStatus()}
+                  className="rounded-lg border border-emerald-300 bg-white px-3 py-2 text-sm font-semibold text-emerald-900"
+                >
+                  Refresh G1 status
+                </button>
+              </div>
             </div>
+            {g1ConnectionError && (
+              <p role="alert" className="text-sm text-red-700">{g1ConnectionError}</p>
+            )}
             <div className="flex flex-wrap items-center gap-4">
               <label className="flex items-center gap-2 text-sm font-medium text-emerald-950">
                 Chat reply destination
@@ -2959,20 +3022,17 @@ export default function HarryBotterTry() {
             </div>
             <p role="status" aria-live="polite" className="text-sm text-emerald-950">
               {g1AudioConnected
-                ? 'G1 audio capability connected. Select G1 and use “Speak this draft on G1” on the reply you approve.'
+                ? `G1 SDK and audio connected${g1RobotStatus.interface ? ` on ${g1RobotStatus.interface}` : ''}. Select G1 and use “Speak this draft on G1” on the reply you approve.`
                 : g1RobotStatus?.error
                   ? `G1 connection status could not be checked. ${g1RobotStatus.error}`
                   : g1RobotStatus
-                    ? 'G1 audio capability is not connected. The G1 route remains visible here, but sending is disabled until the robot connects.'
+                    ? `G1 audio capability is not connected. ${g1RobotStatus.status === 'connected' ? 'The SDK is connected, but audio capability is unavailable.' : 'The G1 SDK is disconnected.'} The G1 route remains visible here, but sending is disabled until SDK audio is available.`
                     : 'Checking G1 audio capability…'}
             </p>
-            {!g1AudioConnected && (
-              <p className="text-sm text-emerald-950">
-                To connect it, open{' '}
-                <a href="/" className="font-semibold underline">Uni-EDU Studio</a>
-                {' '}and use the teacher Robot connection panel. Return to this preview after the G1 connects.
-              </p>
-            )}
+            <p className="text-xs text-slate-600">
+              Connection requests run on the authenticated Python backend host. The browser cannot directly connect over DDS.
+              An optional interface overrides the backend default; leave it blank to use UNITREE_INTERFACE (typically eth0).
+            </p>
             <p className="text-xs text-emerald-900">
               G1 uses its own speaker voice; the browser voice setting only affects browser playback.
               No reply is sent automatically, and this route does not use the robot microphone.
@@ -3419,7 +3479,7 @@ export default function HarryBotterTry() {
                 {draftOutput === 'g1'
                   ? g1AudioConnected
                     ? 'Your selected device microphone is used for listening. Review each draft and press “Speak this draft on G1” to send it to the robot speaker.'
-                    : 'Your selected device microphone is used for listening. Connect G1 audio in Uni-EDU Studio before sending approved drafts to its speaker.'
+                    : 'Your selected device microphone is used for listening. Connect G1 in the chat output section before sending approved drafts to its speaker.'
                   : 'Your selected device microphone is used for listening. Approved replies play through the browser or selected local speaker.'}
               </p>
               {!g1AudioConnected && draftOutput === 'g1' && (
@@ -3808,7 +3868,7 @@ export default function HarryBotterTry() {
                       <fieldset className="space-y-2 rounded-lg border border-slate-200 p-3">
                         <legend className="px-1 text-sm font-semibold">Review approved references</legend>
                         <p className="text-sm text-slate-600">
-                          Generate an educator-review proposal from up to three in-scope references. Only the first 2,500 characters of each reference are sent to the configured model. This does not change policy or save guidance.
+                          Generate an educator-review proposal from up to three in-scope references. Only the first 2,500 characters of each reference are sent to the configured local text model. This does not change policy or save guidance, start a voice conversation, or request microphone access.
                         </p>
                         {eligiblePolicyDocuments.length === 0 ? (
                           <p className="text-sm text-slate-500">No current, approved references match this section, stage, and agent.</p>
