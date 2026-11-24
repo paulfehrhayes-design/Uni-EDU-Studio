@@ -690,7 +690,11 @@ try {
       serviceKey: 'backend',
       healthUrl: backendUrl,
       cwd: root,
-      env: { ...env, UNI_EDU_PORT: String(port) },
+      env: {
+        ...env,
+        UNI_EDU_BACKEND_ONLY: '1',
+        UNI_EDU_PORT: String(port),
+      },
     });
     await waitForService(backendUrl, backend, 'Uni-EDU backend');
   }

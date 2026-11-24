@@ -18,6 +18,23 @@ app = server.app
 
 
 class ServerClassroomTests(unittest.TestCase):
+    def test_codespaces_python_entrypoint_starts_the_complete_npm_launcher(self):
+        with patch.dict(os.environ, {"CODESPACES": "true"}, clear=True), \
+                patch.object(server.os, "execvp") as execvp:
+            server._launch_codespaces_application()
+
+        execvp.assert_called_once_with("npm", ["npm", "start"])
+
+    def test_codespaces_managed_backend_does_not_restart_the_npm_launcher(self):
+        with patch.dict(
+            os.environ,
+            {"CODESPACES": "true", "UNI_EDU_BACKEND_ONLY": "1"},
+            clear=True,
+        ), patch.object(server.os, "execvp") as execvp:
+            server._launch_codespaces_application()
+
+        execvp.assert_not_called()
+
     def test_duet_service_connect_is_teacher_only(self):
         with self.assertRaises(HTTPException) as raised:
             server.duet_connect({"role": "student"})

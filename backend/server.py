@@ -22,6 +22,23 @@ from pathlib import Path
 from typing import Dict, List, Optional, Literal
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
+
+def _launch_codespaces_application() -> None:
+    if (
+        os.environ.get("CODESPACES", "").lower() != "true"
+        or os.environ.get("UNI_EDU_BACKEND_ONLY") == "1"
+    ):
+        return
+    try:
+        os.execvp("npm", ["npm", "start"])
+    except OSError as error:
+        raise SystemExit(f"Could not start the Codespaces application with npm start: {error}") from error
+
+
+if __name__ == "__main__":
+    _launch_codespaces_application()
+
+
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware

@@ -57,6 +57,12 @@ services, then serves the React frontend on Vite at `http://localhost:5173`.
 Use `npm run dev:frontend` only for a frontend-only process when another complete
 application stack is already running.
 
+In GitHub Codespaces, `python3 backend/server.py` hands off to this complete
+`npm start` launcher, so it starts the frontend, backend, and AI services
+together. The Codespace runs this command automatically on start; open the
+forwarded **Uni-EDU Studio** port (5179). This Codespaces handoff does not apply
+on the G1 host, which continues to use the installed `uni-edu-studio.service`.
+
 The default local model is Qwen3 0.6B. Speech recognition and speech generation use
 the locally cached Whisper tiny.en and Kokoro models. Model files are stored
 under the Git-ignored `ai-agent/voice-service/models/` folder. The first run
