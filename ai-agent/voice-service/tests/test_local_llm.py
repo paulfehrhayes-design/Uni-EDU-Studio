@@ -117,7 +117,7 @@ class LocalOpenAIClientTests(unittest.TestCase):
         method, path, payload, base_url = requests[0]
         self.assertEqual((method, path, base_url), ("POST", "api/chat", "http://127.0.0.1:11434"))
         self.assertFalse(payload["think"])
-        self.assertEqual(payload["keep_alive"], "10m")
+        self.assertEqual(payload["keep_alive"], "1h")
         self.assertEqual(payload["options"]["num_predict"], 500)
 
     def test_model_warmup_never_uses_the_optional_network_route(self) -> None:

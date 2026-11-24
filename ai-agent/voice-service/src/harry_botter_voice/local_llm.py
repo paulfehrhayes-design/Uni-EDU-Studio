@@ -361,7 +361,7 @@ class LocalOpenAIClient:
                             "messages": messages,
                             "stream": False,
                             "think": False,
-                            "keep_alive": "10m",
+                            "keep_alive": "1h",
                             "options": {
                                 "temperature": temperature,
                                 "num_predict": max_tokens,

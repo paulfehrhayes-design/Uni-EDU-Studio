@@ -3884,6 +3884,102 @@ test('teacher commissioning controls stay disabled when the backend feature gate
   expect(startRequests).toEqual([]);
 });
 
+test('Harry Botter provides a teacher-only G1 connection control without motion commands', async ({ page }) => {
+  const robotRequests = [];
+  const apiRequests = [];
+  let robotStatus = {
+    status: 'disconnected',
+    interface: null,
+    sdkAvailable: false,
+    capabilities: { locomotion: false, armActions: false, audio: false },
+  };
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-harry-botter-g1-token',
+      user: { role: 'teacher', username: 'teacher-g1' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    apiRequests.push({ method: request.method(), path });
+    if (path === '/api/robot/status') {
+      robotRequests.push({ method: 'GET', path });
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(robotStatus),
+      });
+      return;
+    }
+    if (path === '/api/robot/connect') {
+      const payload = request.postDataJSON();
+      robotRequests.push({ method: 'POST', path, payload });
+      robotStatus = {
+        status: 'connected',
+        interface: payload.interface || 'eth0',
+        sdkAvailable: true,
+        capabilities: { locomotion: true, armActions: true, audio: true },
+        running: false,
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(robotStatus),
+      });
+      return;
+    }
+    const responses = {
+      '/api/harry-botter/model-status': { status: 'ready', route: 'local', model: 'test-local-model' },
+      '/api/harry-botter/speech-status': { speech_generation: { available: false } },
+      '/api/harry-botter/sessions': {
+        sessions: [{ session_id: 'g1-connection-session', title: 'New conversation' }],
+      },
+      '/api/harry-botter/sessions/g1-connection-session': {
+        session: {
+          session_id: 'g1-connection-session',
+          title: 'New conversation',
+          messages: [],
+        },
+      },
+      '/api/harry-botter/config': {
+        agents: [{
+          agent_id: 'general',
+          display_name: 'General',
+          purpose: 'General conversation',
+          instructions: '',
+          generation_temperature: 0.4,
+          generation_max_tokens: 500,
+          is_builtin: true,
+        }],
+        knowledge: [],
+        sections: [],
+      },
+      '/api/harry-botter/alerts': { alerts: [] },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(responses[path] || {}),
+    });
+  });
+
+  await page.goto('/?try=harry-botter');
+  await expect(page.getByRole('heading', { name: 'Harry Botter' })).toBeVisible();
+  await expect(page.getByText('G1 audio capability is not connected.', { exact: false }).first()).toBeVisible();
+  await page.getByLabel('G1 Ethernet interface').fill('eth4');
+  await page.getByRole('button', { name: 'Connect G1', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'G1 connected' })).toBeDisabled();
+  await expect(page.getByText(/G1 SDK and audio connected on eth4/)).toBeVisible();
+
+  expect(robotRequests.some((request) => (
+    request.method === 'POST'
+    && request.path === '/api/robot/connect'
+    && request.payload.interface === 'eth4'
+  ))).toBe(true);
+  expect(apiRequests.some(({ path }) => ['/api/run', '/api/stop', '/api/robot/disconnect'].includes(path))).toBe(false);
+});
+
 test('Harry Botter shows the private model route and local fallback', async ({ page }) => {
   let useFallback = false;
   let selectedModel = '';
@@ -4364,6 +4460,10 @@ test('Harry Botter keeps policy review as an unsaved teacher-approved proposal',
   };
   const policyReviewRequest = [];
   const sectionUpdates = [];
+  const voiceConnections = [];
+  page.on('websocket', (socket) => {
+    if (socket.url().includes('/api/harry-botter/stream')) voiceConnections.push(socket.url());
+  });
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-harry-botter-policy-review-token',
@@ -4451,6 +4551,7 @@ test('Harry Botter keeps policy review as an unsaved teacher-approved proposal',
   await page.getByRole('button', { name: 'Generate review proposal' }).click();
   await expect(page.getByText('The school approval status needs confirmation.')).toBeVisible();
   await expect(page.getByText(/Does this apply to every IB stage/)).toBeVisible();
+  expect(voiceConnections).toEqual([]);
   expect(policyReviewRequest).toEqual([{
     section_id: 'persona',
     document_ids: ['approved-policy-reference'],

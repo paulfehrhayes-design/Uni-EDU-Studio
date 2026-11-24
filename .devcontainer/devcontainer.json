@@ -1,12 +1,11 @@
 {
   "image": "mcr.microsoft.com/devcontainers/universal:2",
-  "postCreateCommand": "npm ci --prefer-offline --no-audit --no-fund",
-  "postStartCommand": "nohup npm start > /tmp/uni-edu-studio.log 2>&1 < /dev/null &",
+  "postStartCommand": "nohup python backend/server.py > /tmp/uni-edu-studio.log 2>&1 < /dev/null &",
   "forwardPorts": [5179],
   "portsAttributes": {
     "5179": {
       "label": "Uni-EDU Studio",
-      "onAutoForward": "notify"
+      "onAutoForward": "openBrowser"
     }
   }
 }

@@ -1410,7 +1410,7 @@ def _voice_request(
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503,
-            detail="Harry Botter voice service is unavailable. Check that the local service is running.",
+            detail="Harry Botter local AI service is unavailable. Check that the local service is running.",
         ) from exc
     if response.is_error:
         raise _upstream_error(response)
@@ -2913,24 +2913,33 @@ def create_harry_botter_router(
 
     @router.websocket("/api/harry-botter/stream")
     async def stream_audio(websocket: WebSocket) -> None:
+        import inspect
+
         from websockets.asyncio.client import connect
         from websockets.exceptions import ConnectionClosed
+
+        async def reject_auth(code: int, message: str) -> None:
+            await websocket.accept()
+            await websocket.send_json(
+                {"type": "error", "code": "authentication_required", "message": message}
+            )
+            await websocket.close(code=code)
 
         subprotocols = websocket.scope.get("subprotocols", [])
         auth_values = [value[len("edu-auth.") :] for value in subprotocols if value.startswith("edu-auth.")]
         if len(auth_values) != 1:
-            await websocket.close(code=4401)
+            await reject_auth(4401, "Sign in again with a teacher account to use voice chat.")
             return
         user = get_user_from_token(auth_values[0])
         if not user:
-            await websocket.close(code=4401)
+            await reject_auth(4401, "Your sign-in has expired. Sign in again to use voice chat.")
             return
         if user.get("role") != "teacher":
-            await websocket.close(code=4403)
+            await reject_auth(4403, "A teacher account is required to use voice chat.")
             return
         origin = websocket.headers.get("origin")
         if origin and urlsplit(origin).netloc != websocket.headers.get("host"):
-            await websocket.close(code=4403)
+            await reject_auth(4403, "The voice connection origin could not be verified.")
             return
         await websocket.accept()
 
@@ -2958,13 +2967,14 @@ def create_harry_botter_router(
                     await websocket.send_text(message)
 
         try:
-            async with connect(
-                VOICE_STREAM_URL,
-                subprotocols=["harry-botter-audio-v1"],
-                proxy=None,
-                open_timeout=5,
-                max_size=16_000,
-            ) as upstream:
+            connect_options = {
+                "subprotocols": ["harry-botter-audio-v1"],
+                "open_timeout": 5,
+                "max_size": 16_000,
+            }
+            if "proxy" in inspect.signature(connect).parameters:
+                connect_options["proxy"] = None
+            async with connect(VOICE_STREAM_URL, **connect_options) as upstream:
                 browser_task = asyncio.create_task(relay_to_service(upstream))
                 service_task = asyncio.create_task(relay_to_browser(upstream))
                 tasks = {browser_task, service_task}
