@@ -165,11 +165,11 @@ class ServerClassroomTests(unittest.TestCase):
                 include_dir / "FSM" / "State_RLBase.h",
                 include_dir / "FSM" / "FSMState.h",
                 include_dir / "FSM" / "CtrlFSM.h",
-                include_dir / "Types.h",
                 include_dir / "unitree_joystick_dsl.hpp",
-                include_dir / "DuetCommandGateway.h",
                 include_dir / "duet_command_gateway.h",
                 include_dir / "isaaclab" / "envs" / "mdp" / "observations" / "observations.h",
+                controller / "include" / "Types.h",
+                controller / "include" / "DuetCommandGateway.h",
                 controller / "src" / "State_RLBase.cpp",
                 controller / "src" / "DuetCommandGateway.cpp",
             )

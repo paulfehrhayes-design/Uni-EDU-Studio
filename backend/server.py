@@ -1209,6 +1209,40 @@ def stop_duet_controller_service() -> dict:
 
 
 def _validate_duet_handoff_build(controller_dir: Path) -> None:
+    binary = controller_dir / "build" / "g1_ctrl"
+    deploy_include = controller_dir.parents[1] / "include"
+    sources = (
+        controller_dir / "CMakeLists.txt",
+        controller_dir / "main.cpp",
+        deploy_include / "FSM" / "State_Handoff.h",
+        deploy_include / "FSM" / "State_FixStand.h",
+        deploy_include / "FSM" / "State_RLBase.h",
+        deploy_include / "FSM" / "FSMState.h",
+        deploy_include / "FSM" / "CtrlFSM.h",
+        controller_dir / "include" / "Types.h",
+        deploy_include / "unitree_joystick_dsl.hpp",
+        controller_dir / "include" / "DuetCommandGateway.h",
+        deploy_include / "duet_command_gateway.h",
+        deploy_include / "isaaclab" / "envs" / "mdp" / "observations" / "observations.h",
+        controller_dir / "src" / "State_RLBase.cpp",
+        controller_dir / "src" / "DuetCommandGateway.cpp",
+    )
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise DuetControllerError(
+            "The DUET controller binary is missing or not executable. Run the G1 setup installer to build it."
+        )
+    try:
+        newest_source = max(source.stat().st_mtime_ns for source in sources)
+        binary_mtime = binary.stat().st_mtime_ns
+    except OSError as error:
+        raise DuetControllerError(f"Could not verify the DUET no-command handoff build: {error}") from error
+    if binary_mtime < newest_source:
+        raise DuetControllerError(
+            "The DUET controller binary predates one or more current handoff, "
+            "handheld-mapping, or motion-gateway sources. Rebuild it on the G1 host "
+            "with `python3 backend/duet_setup.py --prepare`, then retry Connect. "
+            "No controller was started."
+        )
     try:
         try:
             from .duet_build import verify_handoff_build
