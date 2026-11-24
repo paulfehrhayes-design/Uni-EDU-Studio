@@ -135,15 +135,16 @@ The G1 installer enables this user service and configures it to start after boot
 After the one-time installation, the app, backend, and voice service start
 automatically; do not run a separate `npm start` on the G1.
 
-In GitHub Codespaces, frontend dependencies are installed when the container is
-created, and `python3 backend/server.py` launches the complete application
+In GitHub Codespaces, the devcontainer provides Python 3.12 and Node.js 22,
+and frontend dependencies are installed when the container is created.
+`python3 backend/server.py` launches the complete application
 automatically each time the Codespace starts. Running that command manually
 also starts the `npm start` application manager. Open the forwarded
 **Uni-EDU Studio** port (5179) from the Ports panel. The G1 itself continues to
 use the installed `uni-edu-studio.service`.
-If automatic startup was configured after this Codespace was created, run
-**Dev Containers: Rebuild Container** once to apply it. The first launch can
-take several minutes while local AI dependencies and models are prepared.
+After changing the devcontainer configuration, run
+**Dev Containers: Rebuild Container** to apply it. The first launch can take
+several minutes while local AI dependencies and models are prepared.
 
 For a source checkout outside Codespaces or the installed G1 service, use the
 same complete one-command launcher from the project root:

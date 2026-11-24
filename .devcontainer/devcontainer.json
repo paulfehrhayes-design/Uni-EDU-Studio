@@ -1,5 +1,10 @@
 {
-  "image": "mcr.microsoft.com/devcontainers/universal:2",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    }
+  },
   "postCreateCommand": "npm ci --prefer-offline --no-audit --no-fund",
   "postStartCommand": "nohup python3 backend/server.py > /tmp/uni-edu-studio.log 2>&1 < /dev/null &",
   "forwardPorts": [5179],
