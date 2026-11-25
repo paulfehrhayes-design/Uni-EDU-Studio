@@ -19,8 +19,8 @@ import {
   DEFAULT_CAMERA_YAW, getCameraHorizontalFocusOffset, getCameraPanDirection, getCameraPanTargetOffset,
 } from '../sim/cameraNavigation';
 
-const G1_SHELL_COLOR = 0xd7d9dc;
-const G1_DARK_COMPONENT_COLOR = 0x202225;
+const G1_SHELL_COLOR = 0xc9cdd1;
+const G1_DARK_COMPONENT_COLOR = 0x111315;
 const G1_DARK_MESH_NAMES = new Set([
   'pelvis',
   'left_hip_pitch_link',
@@ -43,7 +43,7 @@ const JOINT_AXES = {
   left_wrist_roll: 'y', right_wrist_roll: 'y',
 };
 
-function material(color, metalness = 0.35, roughness = 0.42) {
+function material(color, metalness = 0.5, roughness = 0.36) {
   return new THREE.MeshStandardMaterial({ color, metalness, roughness });
 }
 
@@ -185,7 +185,7 @@ function createRobot() {
   robot.scale.setScalar(0.45);
   const dark = G1_DARK_COMPONENT_COLOR;
   const light = G1_SHELL_COLOR;
-  const accent = 0x19b5fe;
+  const accent = 0x20dfff;
   const joints = {};
   const register = (name, parent, position = [0, 0, 0]) => {
     const group = new THREE.Group();

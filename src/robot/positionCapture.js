@@ -38,3 +38,43 @@ export function selectPositionCapturePose(snapshot, requiredFrameId = null) {
     source: pose.source,
   };
 }
+
+export function scheduleNextPositionCaptureSample(scheduledAt, completedAt, intervalMs) {
+  return scheduledAt <= completedAt
+    ? completedAt + intervalMs
+    : scheduledAt;
+}
+
+export function summarizePositionCaptureSensorUpdates(readings, timestampKey) {
+  if (!Array.isArray(readings) || typeof timestampKey !== 'string') {
+    throw new TypeError('Sensor rate summary requires readings and a timestamp key.');
+  }
+
+  const seenTimestamps = new Set();
+  const uniqueReadings = [];
+  let repeatedReads = 0;
+  for (const reading of readings) {
+    const timestamp = reading?.[timestampKey];
+    if (typeof timestamp !== 'string' || !timestamp || !Number.isFinite(reading.elapsed_ms)) {
+      throw new TypeError('Sensor rate readings must include timestamps and elapsed times.');
+    }
+    if (seenTimestamps.has(timestamp)) {
+      repeatedReads += 1;
+    } else {
+      seenTimestamps.add(timestamp);
+      uniqueReadings.push(reading);
+    }
+  }
+
+  const firstElapsed = uniqueReadings[0]?.elapsed_ms;
+  const lastElapsed = uniqueReadings.at(-1)?.elapsed_ms;
+  const spanMs = uniqueReadings.length > 1 ? lastElapsed - firstElapsed : 0;
+  return {
+    distinct_samples: uniqueReadings.length,
+    repeated_reads: repeatedReads,
+    observed_update_rate_hz: spanMs > 0
+      ? Number(((uniqueReadings.length - 1) * 1000 / spanMs).toFixed(2))
+      : 0,
+    unique_timestamps: uniqueReadings.map((reading) => reading[timestampKey]),
+  };
+}

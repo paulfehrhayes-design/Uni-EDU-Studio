@@ -316,7 +316,7 @@ test('teacher captures DUET command series with full-body pose telemetry', async
   await page.goto('/');
   await page.getByRole('button', { name: 'Open app settings' }).click();
   await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
-  await expect(page.getByText('Ready to capture odom → pelvis pose and all 23 measured joints.')).toBeVisible();
+  await expect(page.getByText('Ready to capture odom → pelvis tf2 pose and all 23 measured joints.')).toBeVisible();
   await page.getByRole('textbox', { name: 'Position capture name' }).fill('Measured walk and turn');
   await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
   await page.getByRole('button', { name: 'Run & capture position' }).click();
@@ -334,6 +334,101 @@ test('teacher captures DUET command series with full-body pose telemetry', async
   expect(savedPayloads[0].frames[0].pose.frame_id).toBe('odom');
   await page.getByRole('button', { name: 'Preview', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toHaveCount(0);
+});
+
+test('teacher rate sweep tests ten polling rates during a bounded DUET walk cycle and exports results', async ({ page }) => {
+  test.setTimeout(90000);
+  const apiRequests = [];
+  let poseReadCount = 0;
+  let jointReadCount = 0;
+  let sweepCode = '';
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-rate-sweep-token',
+      user: { role: 'teacher', username: 'teacher-rate-sweep-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    apiRequests.push(`${request.method()} ${path}`);
+    let body = {};
+    if (path === '/api/duet/status') {
+      body = {
+        status: 'connected',
+        connected: true,
+        ready: true,
+        controlLease: true,
+        motionOwner: 'duet',
+        motionActive: false,
+        programActive: false,
+        robotModel: 'Unitree G1 EDU 23-DOF',
+        capabilities: ['base_velocity', 'arm_targets', 'arm_feedback'],
+        measuredJoints: Array(10).fill(0),
+      };
+    } else if (path === '/api/robot/pose') {
+      poseReadCount += 1;
+      body = freshPoseSnapshot();
+      body.poses[0].timestamp = new Date(Date.parse('2026-11-12T00:00:00Z') + poseReadCount * 10).toISOString();
+      body.poses[0].x = poseReadCount * 0.001;
+    } else if (path === '/api/robot/joint-state') {
+      jointReadCount += 1;
+      body = freshJointState();
+      body.received_at = new Date(Date.parse('2026-11-12T00:00:00Z') + jointReadCount * 5).toISOString();
+      body.positions_rad[0] = jointReadCount * 0.001;
+    } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
+      body = { recordings: [] };
+    } else if (path === '/api/duet/run') {
+      sweepCode = request.postDataJSON().code;
+      setTimeout(() => {
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ status: 'completed', commandsExecuted: 20, armTelemetry: [] }),
+        });
+      }, 20000);
+      return;
+    } else if (path === '/api/classroom/safe-mode') {
+      body = { enabled: false };
+    } else if (path === '/api/classroom/simulation-visibility') {
+      body = { show_simulation: true };
+    } else if (path === '/api/classroom/sidebar-settings') {
+      body = { locked_panels: [], configured: true };
+    } else if (path === '/api/classroom/me') {
+      body = { data_revision: 0 };
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
+  await expect(page.getByText('Ready to capture odom → pelvis tf2 pose and all 23 measured joints.')).toBeVisible();
+  await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
+  await page.getByRole('button', { name: 'Run sensor-rate sweep' }).click();
+  await expect(page.getByRole('button', { name: 'Preview sweep report' })).toBeVisible({ timeout: 30000 });
+
+  expect(sweepCode).toContain('for _ in range(10):');
+  expect(sweepCode).toContain('duet.walk(1)');
+  expect(sweepCode).toContain('duet.backward(1)');
+  expect(apiRequests.filter((request) => request === 'POST /api/duet/run')).toHaveLength(1);
+  await page.getByRole('button', { name: 'Preview sweep report' }).click();
+  const reportPreview = page.getByRole('dialog', { name: 'File preview: g1-sensor-rate-sweep.json' });
+  const report = JSON.parse(await reportPreview.locator('pre').textContent());
+  expect(report.commanded_motion).toBe(true);
+  expect(report.phases).toHaveLength(10);
+  expect(report.phases.at(-1).target_rate_hz).toBe(200);
+  expect(report.readings[0].joint_positions_rad).toHaveLength(23);
+  await page.getByRole('button', { name: 'Close preview' }).click({ force: true });
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export sweep report JSON' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe('g1-sensor-rate-sweep.json');
 });
 
 test('teacher captures legacy command series with pose and all 23 joint samples', async ({ page }) => {
@@ -394,7 +489,7 @@ test('teacher captures legacy command series with pose and all 23 joint samples'
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Open app settings' }).click();
-  await expect(page.getByText('Ready to capture odom → pelvis pose and all 23 measured joints.')).toBeVisible();
+  await expect(page.getByText('Ready to capture odom → pelvis tf2 pose and all 23 measured joints.')).toBeVisible();
   const recordButton = page.getByRole('button', { name: 'Run & capture position' });
   await expect(recordButton).toBeDisabled();
   await page.getByRole('textbox', { name: 'Position capture name' }).fill('Legacy walk and turn');
@@ -411,13 +506,26 @@ test('teacher captures legacy command series with pose and all 23 joint samples'
   expect(savedPayloads[0].frames.length).toBeGreaterThanOrEqual(2);
   expect(savedPayloads[0].frames[0].joints).toHaveLength(23);
   expect(savedPayloads[0].frames[0].pose.frame_id).toBe('odom');
+  await page.getByRole('button', { name: 'Preview JSON' }).click();
+  const recordingPreview = page.getByRole('dialog', { name: 'File preview: Legacy_walk_and_turn.json' });
+  await expect(recordingPreview.locator('pre')).toContainText('"measurement_source": "ros:/joint_states"');
+  await expect(recordingPreview.locator('pre')).toContainText('"base_frame": "pelvis"');
+  await page.getByRole('button', { name: 'Close preview' }).click({ force: true });
+  const [singleDownload] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export JSON' }).click(),
+  ]);
+  expect(singleDownload.suggestedFilename()).toBe('Legacy_walk_and_turn.json');
+  await page.getByRole('button', { name: 'Preview all JSON' }).click();
+  const collectionPreview = page.getByRole('dialog', { name: 'File preview: g1-recorded-motions.json' });
+  await expect(collectionPreview.locator('pre')).toContainText('"format": "uni-edu-studio/g1-motion-recordings"');
+  await expect(collectionPreview.locator('pre')).toContainText('"recorded_dof": 23');
+  await page.getByRole('button', { name: 'Close preview' }).click({ force: true });
   const [download] = await Promise.all([
     page.waitForEvent('download'),
     page.getByRole('button', { name: 'Export all JSON' }).click(),
   ]);
   expect(download.suggestedFilename()).toBe('g1-recorded-motions.json');
-  await page.getByRole('button', { name: 'Preview', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toHaveCount(0);
 });
 
 test('only teachers can hide the simulation from Settings', async ({ page }) => {

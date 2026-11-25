@@ -171,6 +171,16 @@ function downloadJson(content, filename) {
   const link = document.createElement('a');
   link.href = objectUrl;
   link.download = filename;
-  link.click();
-  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+  link.style.position = 'fixed';
+  link.style.left = '-10000px';
+  link.style.top = '0';
+  document.body.append(link);
+  try {
+    link.click();
+  } finally {
+    window.setTimeout(() => {
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    }, 1000);
+  }
 }

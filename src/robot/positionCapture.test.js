@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { selectPositionCapturePose } from './positionCapture.js';
+import {
+  scheduleNextPositionCaptureSample,
+  selectPositionCapturePose,
+  summarizePositionCaptureSensorUpdates,
+} from './positionCapture.js';
 
 const makePose = (frame_id, overrides = {}) => ({
   ready: true,
@@ -52,4 +56,25 @@ test('capture rejects stale or malformed pose data instead of inventing a positi
     }),
     /invalid or stale/,
   );
+});
+
+test('capture sampling does not burst after slow telemetry requests', () => {
+  assert.equal(scheduleNextPositionCaptureSample(110, 125, 10), 135);
+  assert.equal(scheduleNextPositionCaptureSample(140, 125, 10), 140);
+});
+
+test('sensor-rate summary counts distinct source timestamps and repeated reads', () => {
+  const summary = summarizePositionCaptureSensorUpdates([
+    { elapsed_ms: 0, timestamp: 't0' },
+    { elapsed_ms: 5, timestamp: 't0' },
+    { elapsed_ms: 10, timestamp: 't10' },
+    { elapsed_ms: 20, timestamp: 't20' },
+  ], 'timestamp');
+
+  assert.deepEqual(summary, {
+    distinct_samples: 3,
+    repeated_reads: 1,
+    observed_update_rate_hz: 100,
+    unique_timestamps: ['t0', 't10', 't20'],
+  });
 });
