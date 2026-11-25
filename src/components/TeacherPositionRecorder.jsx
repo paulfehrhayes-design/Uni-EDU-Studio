@@ -22,7 +22,9 @@ const MAX_CAPTURE_SAMPLES = 30001;
 const MAX_JOINT_SAMPLE_AGE_MS = 250;
 const RATE_SWEEP_TARGETS_HZ = [10, 20, 30, 40, 50, 60, 80, 100, 150, 200];
 const RATE_SWEEP_PHASE_SECONDS = 2;
-const RATE_SWEEP_TIMEOUT_SECONDS = 30;
+const RATE_SWEEP_PHASE_MAX_SECONDS = 8;
+const RATE_SWEEP_MAX_ATTEMPTS = 2;
+const RATE_SWEEP_TIMEOUT_SECONDS = 120;
 
 function isDuetReady(status) {
   return status?.ready === true
@@ -87,8 +89,8 @@ function defaultCommand(controllerVersion) {
 
 function rateSweepCommand(controllerVersion) {
   return controllerVersion === 'duet'
-    ? 'for _ in range(10):\n    duet.walk(1)\n    duet.backward(1)'
-    : 'for i in range(10):\n    robot.walktime(1)\n    robot.backwardtime(1)';
+    ? 'duet.walk(1)\nduet.backward(1)'
+    : 'robot.walktime(1)\nrobot.backwardtime(1)';
 }
 
 function wait(milliseconds) {
@@ -281,140 +283,196 @@ export default function TeacherPositionRecorder({
 
       const startedAt = performance.now();
       const startedAtIso = new Date().toISOString();
-      const phaseDurationMs = RATE_SWEEP_PHASE_SECONDS * 1000;
       const phaseReadings = RATE_SWEEP_TARGETS_HZ.map(() => []);
+      const phaseAttemptCounts = RATE_SWEEP_TARGETS_HZ.map(() => 0);
       const readings = [];
+      const runResults = [];
       let frameId = null;
       let baseFrame = null;
-      let runSettled = false;
-      let runResult = null;
-      let runError = null;
-      let samplingError = null;
+      let sweepError = null;
       let stopError = null;
       let timeoutReached = false;
-      let nextRequestAt = startedAt;
-      let activePhaseIndex = -1;
 
       setConfirmClearArea(false);
-      setMessage('Rate sweep started: 10 bounded one-second forward/backward cycles, testing each target rate.');
-      const runPromise = connection.run(captureProgram.code).then(
-        (result) => {
-          runResult = result;
-        },
-        (error) => {
-          runError = error;
-        },
-      ).finally(() => {
-        runSettled = true;
-      });
-
-      while (!runSettled) {
-        const elapsed = performance.now() - startedAt;
-        if (elapsed >= RATE_SWEEP_TIMEOUT_SECONDS * 1000) {
-          timeoutReached = true;
-          break;
-        }
-        await wait(Math.min(
-          Math.max(0, nextRequestAt - performance.now()),
-          RATE_SWEEP_TIMEOUT_SECONDS * 1000 - elapsed,
-        ));
-        if (runSettled) break;
-
-        const requestStartedAt = performance.now();
-        const requestElapsed = requestStartedAt - startedAt;
-        if (requestElapsed >= RATE_SWEEP_TIMEOUT_SECONDS * 1000) {
-          timeoutReached = true;
-          break;
-        }
-        const phaseIndex = Math.min(
-          Math.floor(requestElapsed / phaseDurationMs),
-          RATE_SWEEP_TARGETS_HZ.length - 1,
-        );
+      setMessage(`Rate sweep started: each of the ${RATE_SWEEP_TARGETS_HZ.length} rates gets its own bounded movement cycle, with one retry if readings are insufficient.`);
+      for (let phaseIndex = 0; phaseIndex < RATE_SWEEP_TARGETS_HZ.length; phaseIndex += 1) {
         const targetHz = RATE_SWEEP_TARGETS_HZ[phaseIndex];
-        if (phaseIndex !== activePhaseIndex) {
-          activePhaseIndex = phaseIndex;
-          setMessage(`Rate sweep ${phaseIndex + 1}/${RATE_SWEEP_TARGETS_HZ.length}: testing ${targetHz} Hz.`);
+        setMessage(`Rate sweep ${phaseIndex + 1}/${RATE_SWEEP_TARGETS_HZ.length}: testing ${targetHz} Hz.`);
+        let phaseMeasurable = false;
+
+        for (let attemptIndex = 0; attemptIndex < RATE_SWEEP_MAX_ATTEMPTS; attemptIndex += 1) {
+          if (performance.now() - startedAt >= RATE_SWEEP_TIMEOUT_SECONDS * 1000) {
+            timeoutReached = true;
+            break;
+          }
+          phaseAttemptCounts[phaseIndex] += 1;
+          const attemptStartedAt = performance.now();
+          const attemptReadings = [];
+          let runSettled = false;
+          let runResult = null;
+          let runError = null;
+          let attemptError = null;
+          let phaseTimeoutReached = false;
+          let nextRequestAt = attemptStartedAt;
+          const runPromise = connection.run(captureProgram.code).then(
+            (result) => {
+              runResult = result;
+            },
+            (error) => {
+              runError = error;
+            },
+          ).finally(() => {
+            runSettled = true;
+          });
+
+          while (true) {
+            const now = performance.now();
+            const elapsed = now - attemptStartedAt;
+            if (performance.now() - startedAt >= RATE_SWEEP_TIMEOUT_SECONDS * 1000) {
+              timeoutReached = true;
+              break;
+            }
+            if (elapsed >= RATE_SWEEP_PHASE_MAX_SECONDS * 1000) {
+              phaseTimeoutReached = true;
+              break;
+            }
+            const minimumWindowElapsed = elapsed >= RATE_SWEEP_PHASE_SECONDS * 1000;
+            phaseMeasurable = summarizePositionCaptureSensorUpdates(
+              attemptReadings,
+              'pose_timestamp',
+            ).distinct_samples >= 2 && summarizePositionCaptureSensorUpdates(
+              attemptReadings,
+              'joint_timestamp',
+            ).distinct_samples >= 2;
+            if (runSettled && minimumWindowElapsed && phaseMeasurable) break;
+
+            await wait(Math.max(0, nextRequestAt - performance.now()));
+            if (
+              performance.now() - startedAt >= RATE_SWEEP_TIMEOUT_SECONDS * 1000
+              || performance.now() - attemptStartedAt >= RATE_SWEEP_PHASE_MAX_SECONDS * 1000
+            ) {
+              if (performance.now() - attemptStartedAt >= RATE_SWEEP_PHASE_MAX_SECONDS * 1000) {
+                phaseTimeoutReached = true;
+              }
+              continue;
+            }
+            const requestStartedAt = performance.now();
+            try {
+              const [poseSnapshot, jointSample] = await Promise.all([
+                connection.pose(),
+                connection.jointState(),
+              ]);
+              const observedAt = performance.now();
+              const pose = selectPositionCapturePose(poseSnapshot, frameId);
+              if (frameId === null) {
+                frameId = pose.frame_id;
+                baseFrame = pose.base_frame;
+              }
+              if (pose.base_frame !== baseFrame) {
+                throw new Error('The TF base frame changed during the rate sweep.');
+              }
+              if (!hasCompleteG1JointSample(jointSample)) {
+                throw new Error('Fresh, complete 23-joint ROS telemetry is unavailable.');
+              }
+              if (
+                typeof jointSample.received_at !== 'string'
+                || !Number.isFinite(new Date(jointSample.received_at).getTime())
+              ) {
+                throw new Error('The ROS joint-state sample has no valid source timestamp.');
+              }
+              const reading = {
+                phase_index: phaseIndex,
+                attempt_index: attemptIndex,
+                target_rate_hz: targetHz,
+                elapsed_ms: Number((observedAt - startedAt).toFixed(3)),
+                request_duration_ms: Number((observedAt - requestStartedAt).toFixed(3)),
+                pose_timestamp: pose.timestamp,
+                pose_frame_id: pose.frame_id,
+                pose_age_ms: pose.age_ms,
+                pose_x: pose.x,
+                pose_y: pose.y,
+                pose_z: pose.z,
+                pose_yaw_rad: pose.yaw_rad,
+                joint_timestamp: jointSample.received_at,
+                joint_age_ms: jointSample.age_ms,
+                joint_positions_rad: [...jointSample.positions_rad],
+              };
+              readings.push(reading);
+              attemptReadings.push(reading);
+              nextRequestAt = requestStartedAt + 1000 / targetHz;
+            } catch (sampleError) {
+              attemptError = sampleError;
+              break;
+            }
+          }
+
+          phaseReadings[phaseIndex] = attemptReadings;
+          const attemptSummary = summarizePositionCaptureSensorUpdates(
+            attemptReadings,
+            'pose_timestamp',
+          );
+          phaseMeasurable = attemptSummary.distinct_samples >= 2
+            && summarizePositionCaptureSensorUpdates(
+              attemptReadings,
+              'joint_timestamp',
+            ).distinct_samples >= 2;
+
+          if (!runSettled && (attemptError || timeoutReached || phaseTimeoutReached || runError)) {
+            setIsStopping(true);
+            setMessage(attemptError
+              ? 'Sensor feedback failed; requesting a robot stop and preserving the partial rate report.'
+              : phaseTimeoutReached
+                ? 'A rate phase exceeded its 8-second safeguard; requesting a robot stop.'
+                : 'Rate sweep exceeded its 120-second safeguard; requesting a robot stop.');
+            try {
+              await connection.stop();
+            } catch (requestError) {
+              stopError = requestError;
+            } finally {
+              setIsStopping(false);
+            }
+          }
+          await runPromise;
+          if (runError) {
+            sweepError = runError.message;
+            break;
+          }
+          runResults.push(runResult);
+          if (runResult?.status !== 'completed') {
+            sweepError = `Robot movement ended with status ${runResult?.status || 'unknown'}.`;
+            break;
+          }
+          if (phaseMeasurable || timeoutReached || stopError) break;
+          if (attemptError && attemptIndex === RATE_SWEEP_MAX_ATTEMPTS - 1) {
+            sweepError = attemptError.message;
+          }
         }
 
-        try {
-          const [poseSnapshot, jointSample] = await Promise.all([
-            connection.pose(),
-            connection.jointState(),
-          ]);
-          const observedAt = performance.now();
-          const pose = selectPositionCapturePose(poseSnapshot, frameId);
-          if (frameId === null) {
-            frameId = pose.frame_id;
-            baseFrame = pose.base_frame;
-          }
-          if (pose.base_frame !== baseFrame) {
-            throw new Error('The TF base frame changed during the rate sweep.');
-          }
-          if (!hasCompleteG1JointSample(jointSample)) {
-            throw new Error('Fresh, complete 23-joint ROS telemetry is unavailable.');
-          }
-          if (
-            typeof jointSample.received_at !== 'string'
-            || !Number.isFinite(new Date(jointSample.received_at).getTime())
-          ) {
-            throw new Error('The ROS joint-state sample has no valid source timestamp.');
-          }
-          const reading = {
-            phase_index: phaseIndex,
-            target_rate_hz: targetHz,
-            elapsed_ms: Number((observedAt - startedAt).toFixed(3)),
-            request_duration_ms: Number((observedAt - requestStartedAt).toFixed(3)),
-            pose_timestamp: pose.timestamp,
-            pose_frame_id: pose.frame_id,
-            pose_age_ms: pose.age_ms,
-            pose_x: pose.x,
-            pose_y: pose.y,
-            pose_z: pose.z,
-            pose_yaw_rad: pose.yaw_rad,
-            joint_timestamp: jointSample.received_at,
-            joint_age_ms: jointSample.age_ms,
-            joint_positions_rad: [...jointSample.positions_rad],
-          };
-          readings.push(reading);
-          phaseReadings[phaseIndex].push(reading);
-          nextRequestAt = requestStartedAt + 1000 / targetHz;
-        } catch (sampleError) {
-          samplingError = sampleError;
-          break;
-        }
+        if (sweepError || timeoutReached || stopError) break;
       }
-
-      if (!runSettled && (samplingError || timeoutReached)) {
-        setIsStopping(true);
-        setMessage(samplingError
-          ? 'Sensor feedback failed; requesting a robot stop and preserving the partial rate report.'
-          : 'Rate sweep exceeded its 30-second safeguard; requesting a robot stop.');
-        try {
-          await connection.stop();
-        } catch (requestError) {
-          stopError = requestError;
-        } finally {
-          setIsStopping(false);
-        }
-      }
-      await runPromise;
 
       const elapsedMs = performance.now() - startedAt;
       const phases = RATE_SWEEP_TARGETS_HZ.map((targetHz, index) => ({
         ...summarizeRateSweepPhase(phaseReadings[index], targetHz),
+        attempts: phaseAttemptCounts[index],
         movement: 'forward 1 s, then backward 1 s',
       }));
-      const safetyInterventions = runResult?.safetyInterventions || [];
-      const complete = runResult?.status === 'completed'
+      const safetyInterventions = runResults.flatMap((result) => result?.safetyInterventions || []);
+      const complete = !sweepError
+        && !timeoutReached
+        && !stopError
+        && phaseAttemptCounts.every((attemptCount) => attemptCount > 0)
         && safetyInterventions.length === 0
         && phases.every((phase) => phase.measurable);
-      const failure = samplingError?.message
-        || runError?.message
+      const failure = sweepError
         || (safetyInterventions.length
           ? 'A safety intervention changed the commanded movement.'
           : null)
         || (stopError ? `Robot stop request failed: ${stopError.message}` : null)
-        || (timeoutReached ? 'The 30-second sweep safeguard was reached.' : null);
+        || (timeoutReached ? 'The 120-second sweep safeguard was reached.' : null)
+        || (phases.some((phase) => !phase.measurable)
+          ? 'One or more rates did not produce two distinct pose and joint samples after retrying.'
+          : null);
       const report = {
         format: 'uni-edu-studio/g1-sensor-rate-sweep',
         version: 1,
@@ -422,13 +480,13 @@ export default function TeacherPositionRecorder({
         controller_version: controllerVersion,
         commanded_motion: true,
         movement_program: captureProgram.code,
-        movement_cycle_count: 10,
+        movement_cycle_count: runResults.length,
         movement_cycle_duration_s: 2,
         physical_movement_verified: false,
         elapsed_ms: Number(elapsedMs.toFixed(3)),
         successful_reads: readings.length,
         joint_names: G1_MODEL_INFO.joints,
-        run_status: runResult?.status || (runError ? 'failed' : 'unknown'),
+        run_status: complete ? 'completed' : runResults.at(-1)?.status || 'incomplete',
         safety_interventions: safetyInterventions,
         status: complete ? 'complete' : 'incomplete',
         failure,
@@ -747,11 +805,26 @@ export default function TeacherPositionRecorder({
       <p role="status" aria-live="polite" className="mt-2 text-xs font-medium text-slate-700">
         {readinessMessage}
       </p>
+      {error && <p role="alert" className="mt-2 text-xs font-semibold text-red-700">{error}</p>}
+      <label className="mt-3 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs leading-5 text-amber-950">
+        <input
+          type="checkbox"
+          aria-label="Confirm robot workspace is clear"
+          checked={confirmClearArea}
+          onChange={(event) => setConfirmClearArea(event.target.checked)}
+          disabled={isStarting || isCapturing || isStopping || isMeasuringRates}
+          className="mt-1 h-4 w-4 shrink-0 accent-amber-700"
+        />
+        <span>
+          I have cleared the robot&apos;s travel area, will supervise this physical movement, and have the emergency stop accessible.
+          The robot moves when I select Run &amp; capture or Run sensor-rate sweep. The sweep walks forward for one second, then backward for one second at each test rate, repeating a cycle once if needed.
+        </span>
+      </label>
       <div className="mt-3 rounded-lg border border-cyan-200 bg-white p-3">
         <h4 className="text-xs font-semibold text-slate-800">Temporary sensor-rate sweep</h4>
         <p className="mt-1 text-[11px] leading-4 text-slate-600">
-          Runs ten one-second forward/backward cycles, testing 10–200 Hz while the robot moves.
-          The full sweep takes about 20 seconds and requires clear space, supervision, and an accessible emergency stop.
+          Tests 10–200 Hz in separate one-second forward/backward movement cycles, retrying a rate once if readings are insufficient.
+          It normally takes about 20 seconds; slow sensor responses can extend it. Clear space, supervision, and an accessible emergency stop are required.
         </p>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <button
@@ -762,6 +835,12 @@ export default function TeacherPositionRecorder({
           >
             {isMeasuringRates ? 'Running rate sweep…' : 'Run sensor-rate sweep'}
           </button>
+          {!confirmClearArea && (
+            <span className="text-[11px] text-amber-900">Confirm the workspace is clear above to enable the sweep.</span>
+          )}
+          {!isReady && (
+            <span className="text-[11px] text-slate-600">{readinessMessage}</span>
+          )}
           {rateDiagnostic && (
             <>
               <button
@@ -817,20 +896,6 @@ export default function TeacherPositionRecorder({
             className="mt-1 w-full resize-y rounded-md border border-cyan-200 bg-white px-3 py-2 font-mono text-xs"
           />
         </label>
-        <label className="flex items-start gap-2 text-xs leading-5 text-amber-950">
-          <input
-            type="checkbox"
-            aria-label="Confirm robot workspace is clear"
-            checked={confirmClearArea}
-            onChange={(event) => setConfirmClearArea(event.target.checked)}
-            disabled={isStarting || isCapturing || isStopping || isMeasuringRates}
-            className="mt-1 h-4 w-4 shrink-0 accent-amber-700"
-          />
-          <span>
-            I have cleared the robot&apos;s travel area, will supervise this physical movement, and have the emergency stop accessible.
-            The robot moves when I select Run &amp; capture or Run sensor-rate sweep. The sweep walks forward for one second and backward for one second at each of ten test rates.
-          </span>
-        </label>
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="submit"
@@ -857,7 +922,6 @@ export default function TeacherPositionRecorder({
         Legacy Stop robot stops locomotion but cannot cancel an accepted arm preset. A stop acknowledgement does not verify physical immobility.
         Fresh odometry/localization and all 23 ROS joint values are required; missing or stale feedback discards the capture.
       </p>
-      {error && <p role="alert" className="mt-2 text-xs text-red-700">{error}</p>}
       {message && <p role="status" className="mt-2 text-xs text-emerald-800">{message}</p>}
       <div className="mt-4 border-t border-cyan-200 pt-3">
         <div className="flex flex-wrap items-center justify-between gap-2">

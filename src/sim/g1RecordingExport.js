@@ -78,7 +78,7 @@ function isValidBasePose(pose) {
     && pose.age_ms <= 1000
     && typeof pose.timestamp === 'string'
     && Number.isFinite(new Date(pose.timestamp).getTime())
-    && pose.source === 'tf2';
+    && ['tf2', 'odometry'].includes(pose.source);
 }
 
 export function buildG1MotionRecordingExport(recording) {

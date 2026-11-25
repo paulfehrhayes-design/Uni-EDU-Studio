@@ -24,6 +24,7 @@ try:
         registered_arm_obstacle,
         registered_base_obstacle,
     )
+    from .velocity_slew import configured_velocity_slew_limits, slew_velocity
 except ImportError:
     from lidar_distance import DistanceSensorError, distance_sensor_status, get_front_distance_sample, get_rear_distance_sample
     from safe_mode import (
@@ -33,6 +34,7 @@ except ImportError:
         registered_arm_obstacle,
         registered_base_obstacle,
     )
+    from velocity_slew import configured_velocity_slew_limits, slew_velocity
 
 _client = None
 _arm_client = None
@@ -874,6 +876,10 @@ def _move(
     if _client is None:
         raise HTTPException(status_code=409, detail="Connect the G1 SDK before running a robot program.")
     try:
+        slew_limits = configured_velocity_slew_limits()
+    except ValueError as error:
+        raise HTTPException(status_code=503, detail=f"Invalid G1 velocity slew configuration: {error}") from error
+    try:
         if safe_mode:
             initial_obstacle = _safe_mode_movement_obstacle(
                 vx, vy, vyaw, safe_mode_stop_margin_m, min(seconds, 0.2)
@@ -881,28 +887,43 @@ def _move(
             if initial_obstacle:
                 _log_event("safe_mode_motion_stopped", **initial_obstacle)
                 return initial_obstacle
-        _sdk_result(
-            _client.SetVelocity(vx, vy, vyaw, _CONTINUOUS_MOVE_DURATION),
-            "SetVelocity",
-        )
         deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
+        previous_velocity = (0.0, 0.0, 0.0)
+        previous_update = time.monotonic()
+        refresh_interval = _SAFE_MODE_POLL_INTERVAL_SECONDS if safe_mode else 0.05
+        while True:
             if _stop_requested.is_set():
                 break
+            now = time.monotonic()
+            moving = now < deadline
             if safe_mode:
+                checked_velocity = (vx, vy, vyaw) if moving else previous_velocity
                 obstacle = _safe_mode_movement_obstacle(
-                    vx,
-                    vy,
-                    vyaw,
+                    *checked_velocity,
                     safe_mode_stop_margin_m,
-                    min(0.2, max(0, deadline - time.monotonic())),
+                    min(0.2, max(0.05, deadline - now)),
                 )
                 if obstacle:
                     _log_event("safe_mode_motion_stopped", **obstacle)
                     return obstacle
+            target_velocity = (vx, vy, vyaw) if moving else (0.0, 0.0, 0.0)
+            current_velocity = slew_velocity(
+                previous_velocity,
+                target_velocity,
+                min(refresh_interval, max(0.0, now - previous_update)),
+                slew_limits,
+            )
+            _sdk_result(
+                _client.SetVelocity(*current_velocity, _CONTINUOUS_MOVE_DURATION),
+                "SetVelocity",
+            )
+            previous_velocity = current_velocity
+            previous_update = now
+            if not moving and current_velocity == (0.0, 0.0, 0.0):
+                break
             time.sleep(min(
-                _SAFE_MODE_POLL_INTERVAL_SECONDS if safe_mode else 0.05,
-                max(0, deadline - time.monotonic()),
+                refresh_interval,
+                max(0, deadline - now) if moving else 0.05,
             ))
     except DistanceSensorError as error:
         _log_event("safe_mode_sensor_failed", error=str(error))

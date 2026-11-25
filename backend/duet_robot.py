@@ -25,6 +25,7 @@ try:
         registered_arm_obstacle,
         registered_base_obstacle,
     )
+    from .velocity_slew import VelocitySlewLimits, configured_velocity_slew_limits, slew_velocity
 except ImportError:
     from lidar_distance import (
         DistanceSensorError,
@@ -38,6 +39,7 @@ except ImportError:
         registered_arm_obstacle,
         registered_base_obstacle,
     )
+    from velocity_slew import VelocitySlewLimits, configured_velocity_slew_limits, slew_velocity
 
 DUET_ROBOT_MODEL = "g1_23dof"
 DUET_PROTOCOL = "uni-edu-duet-v1"
@@ -1771,6 +1773,7 @@ def execute_program(
     safe_mode_stop_margin_m: float = SAFE_MODE_STOP_MARGIN_METERS,
 ) -> dict:
     commands = parse_duet_program(code)
+    slew_limits: VelocitySlewLimits | None = None
     if commissioning:
         _require_commissioning_enabled()
     else:
@@ -1828,6 +1831,29 @@ def execute_program(
 
         active_arm_command: dict | None = None
         auto_return_deadline: float | None = None
+        current_base_velocity = (0.0, 0.0, 0.0)
+
+        def send_slewed_move(
+            target: tuple[float, float, float],
+            elapsed_seconds: float,
+        ) -> dict:
+            nonlocal current_base_velocity, slew_limits
+            if slew_limits is None:
+                try:
+                    slew_limits = configured_velocity_slew_limits()
+                except ValueError as error:
+                    raise DuetControllerError(f"Invalid G1 velocity slew configuration: {error}") from error
+            current_base_velocity = slew_velocity(
+                current_base_velocity,
+                target,
+                min(COMMAND_REFRESH_SECONDS, elapsed_seconds),
+                slew_limits,
+            )
+            request = (
+                f"MOVE {current_base_velocity[0]:.6f} {current_base_velocity[1]:.6f} "
+                f"{current_base_velocity[2]:.6f} {COMMAND_LEASE_MS}"
+            )
+            return _validate_controller_status(_gateway_request(request))
 
         def send_arm_command(arm_command: dict, lease_ms: int | None = None) -> dict:
             if arm_command.get("type") == "arm_pose":
@@ -1995,9 +2021,10 @@ def execute_program(
             return None
 
         def stop_active_safe_mode_command(reason: str, command_type: str) -> None:
-            nonlocal active_arm_command
+            nonlocal active_arm_command, current_base_velocity
             _stop_gateway_leases()
             active_arm_command = None
+            current_base_velocity = (0.0, 0.0, 0.0)
             intervention = {
                 "command": command_type,
                 "status": "stopped",
@@ -2079,40 +2106,49 @@ def execute_program(
                 continue
             if command["type"] == "move":
                 deadline = time.monotonic() + command["duration_s"]
+                previous_update = time.monotonic()
                 safety_interrupted = False
-                while time.monotonic() < deadline:
+                while True:
                     if _stop_requested.is_set():
                         break
                     if auto_return_deadline is not None and time.monotonic() >= auto_return_deadline:
                         reset_arms()
+                    now = time.monotonic()
+                    moving = now < deadline
+                    if not moving and current_base_velocity == (0.0, 0.0, 0.0):
+                        break
                     if safe_mode:
                         reason = active_safe_mode_block_reason(
-                            command["vx_mps"],
-                            command["vy_mps"],
-                            command["yaw_rate_rps"],
+                            command["vx_mps"] if moving else current_base_velocity[0],
+                            command["vy_mps"] if moving else current_base_velocity[1],
+                            command["yaw_rate_rps"] if moving else current_base_velocity[2],
                             active_arm_command is not None,
                         )
                         if reason:
                             stop_active_safe_mode_command(reason, command["type"])
                             safety_interrupted = True
                             break
-                    request = (
-                        f"MOVE {command['vx_mps']:.6f} {command['vy_mps']:.6f} "
-                        f"{command['yaw_rate_rps']:.6f} {COMMAND_LEASE_MS}"
+                    target_velocity = (
+                        (command["vx_mps"], command["vy_mps"], command["yaw_rate_rps"])
+                        if moving else (0.0, 0.0, 0.0)
                     )
-                    status = _validate_controller_status(_gateway_request(request))
+                    status = send_slewed_move(
+                        target_velocity,
+                        max(0.0, now - previous_update),
+                    )
+                    previous_update = now
                     if status.get("control_lease") is not True or status.get("ready") is not True:
                         raise DuetControllerError("DUET control lease or controller readiness was lost during motion.")
                     expected_motion = any(
                         abs(value) > 0.001
-                        for value in (command["vx_mps"], command["vy_mps"], command["yaw_rate_rps"])
+                        for value in current_base_velocity
                     )
                     if status.get("motion_active") is not expected_motion:
                         raise DuetControllerError(
                             "DUET gateway did not confirm the requested base velocity state."
                         )
                     refresh_arm_command()
-                    remaining = deadline - time.monotonic()
+                    remaining = deadline - now if moving else COMMAND_REFRESH_SECONDS
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
                 if safety_interrupted:
@@ -2132,6 +2168,7 @@ def execute_program(
 
                 started_at = time.monotonic()
                 move_deadline = started_at + movement["duration_s"]
+                previous_update = started_at
                 persistent_hold = any(
                     item.get("type") == "arm_target_hold" and item.get("until_reset")
                     for item in arm_commands
@@ -2147,7 +2184,11 @@ def execute_program(
                 pose_index = 0
                 next_pose_at = started_at + arm_durations[0]
                 safety_interrupted = False
-                while time.monotonic() < max(move_deadline, arm_deadline):
+                while True:
+                    now = time.monotonic()
+                    moving = now < move_deadline
+                    if now >= max(move_deadline, arm_deadline) and current_base_velocity == (0.0, 0.0, 0.0):
+                        break
                     if _stop_requested.is_set():
                         _stop_gateway_command()
                         break
@@ -2163,7 +2204,6 @@ def execute_program(
                             safety_interrupted = True
                             break
 
-                    now = time.monotonic()
                     while pose_index + 1 < len(arm_commands) and now >= next_pose_at:
                         pose_index += 1
                         next_arm = arm_commands[pose_index]
@@ -2171,31 +2211,24 @@ def execute_program(
                         status = send_arm_command(next_arm)
                         next_pose_at += arm_durations[pose_index]
 
-                    now = time.monotonic()
-                    moving = now < move_deadline
-                    velocity = movement if moving else {
-                        "vx_mps": 0.0,
-                        "vy_mps": 0.0,
-                        "yaw_rate_rps": 0.0,
-                    }
-                    request = (
-                        f"MOVE {velocity['vx_mps']:.6f} {velocity['vy_mps']:.6f} "
-                        f"{velocity['yaw_rate_rps']:.6f} {COMMAND_LEASE_MS}"
+                    target_velocity = (
+                        (movement["vx_mps"], movement["vy_mps"], movement["yaw_rate_rps"])
+                        if moving else (0.0, 0.0, 0.0)
                     )
-                    status = _validate_controller_status(_gateway_request(request))
+                    status = send_slewed_move(
+                        target_velocity,
+                        max(0.0, now - previous_update),
+                    )
+                    previous_update = now
                     if status.get("control_lease") is not True or status.get("ready") is not True:
                         raise DuetControllerError(
                             "DUET control lease or controller readiness was lost during concurrent execution."
                         )
                     if now < arm_deadline:
                         refresh_arm_command()
-                    expected_motion = moving and any(
+                    expected_motion = any(
                         abs(value) > 0.001
-                        for value in (
-                            movement["vx_mps"],
-                            movement["vy_mps"],
-                            movement["yaw_rate_rps"],
-                        )
+                        for value in current_base_velocity
                     )
                     if status.get("motion_active") is not expected_motion:
                         expectation = "active" if expected_motion else "inactive"
@@ -2216,7 +2249,11 @@ def execute_program(
 
                     now = time.monotonic()
                     deadline = max(move_deadline, arm_deadline)
-                    next_deadline = min(deadline, now + COMMAND_REFRESH_SECONDS)
+                    next_deadline = (
+                        min(deadline, now + COMMAND_REFRESH_SECONDS)
+                        if now < deadline
+                        else now + COMMAND_REFRESH_SECONDS
+                    )
                     if now < move_deadline:
                         next_deadline = min(next_deadline, move_deadline)
                     if pose_index + 1 < len(arm_commands) and arm_durations[pose_index + 1] > 0:
@@ -2258,32 +2295,38 @@ def execute_program(
                 arm_deadline = started_at + command["arm_duration_s"]
                 send_arm_command(arm_command)
 
+                previous_update = started_at
                 safety_interrupted = False
-                while time.monotonic() < move_deadline:
+                while True:
                     if _stop_requested.is_set():
+                        break
+                    now = time.monotonic()
+                    moving = now < move_deadline
+                    if not moving and current_base_velocity == (0.0, 0.0, 0.0):
                         break
                     if safe_mode:
                         reason = active_safe_mode_block_reason(
-                            command["vx_mps"],
-                            command["vy_mps"],
-                            command["yaw_rate_rps"],
+                            command["vx_mps"] if moving else current_base_velocity[0],
+                            command["vy_mps"] if moving else current_base_velocity[1],
+                            command["yaw_rate_rps"] if moving else current_base_velocity[2],
                             True,
                         )
                         if reason:
                             stop_active_safe_mode_command(reason, command["type"])
                             safety_interrupted = True
                             break
-                    request = (
-                        f"MOVE {command['vx_mps']:.6f} {command['vy_mps']:.6f} "
-                        f"{command['yaw_rate_rps']:.6f} {COMMAND_LEASE_MS}"
+                    target_velocity = (
+                        (command["vx_mps"], command["vy_mps"], command["yaw_rate_rps"])
+                        if moving else (0.0, 0.0, 0.0)
                     )
-                    status = _validate_controller_status(_gateway_request(request))
+                    status = send_slewed_move(
+                        target_velocity,
+                        max(0.0, now - previous_update),
+                    )
+                    previous_update = now
                     if status.get("control_lease") is not True or status.get("ready") is not True:
                         raise DuetControllerError("DUET control lease or controller readiness was lost during concurrent motion.")
-                    expected_motion = any(
-                        abs(value) > 0.001
-                        for value in (command["vx_mps"], command["vy_mps"], command["yaw_rate_rps"])
-                    )
+                    expected_motion = any(abs(value) > 0.001 for value in current_base_velocity)
                     if status.get("motion_active") is not expected_motion:
                         raise DuetControllerError("DUET gateway did not confirm the requested concurrent base velocity.")
                     if status.get("arm_targets_active") is not True:
@@ -2291,7 +2334,7 @@ def execute_program(
                     if status.get("external_arm_active") is True:
                         raise DuetControllerError("An external rt/arm_targets stream became active during concurrent movement.")
                     refresh_arm_command()
-                    remaining = move_deadline - time.monotonic()
+                    remaining = move_deadline - now if moving else COMMAND_REFRESH_SECONDS
                     if remaining > 0 and _stop_requested.wait(min(COMMAND_REFRESH_SECONDS, remaining)):
                         break
                 if safety_interrupted:

@@ -527,7 +527,11 @@ class G1RobotProgramTests(unittest.TestCase):
         ):
             result = g1_robot.execute_robot_program('robot.sidestep("left")', safe_mode=True)
 
-        self.assertEqual(client.velocities[0][1], 0.2)
+        movement_velocities = [values[1] for values in client.velocities[:-1]]
+        self.assertLess(movement_velocities[0], 0.001)
+        self.assertGreater(max(movement_velocities), 0.0)
+        self.assertLessEqual(max(movement_velocities), 0.2)
+        self.assertEqual(client.velocities[-1][:3], (0.0, 0.0, 0.0))
         self.assertEqual(result.get("safetyInterventions", []), [])
 
     def test_motion_values_are_bounded(self):
@@ -808,7 +812,7 @@ class G1RobotProgramTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandValidationError, "expanded commands"):
             parse_robot_program('robot.stand()\n' * 401)
 
-    def test_motion_is_held_continuously_until_stop(self):
+    def test_motion_ramps_up_and_down_before_the_existing_stop_command(self):
         class FakeLocoClient:
             def __init__(self):
                 self.calls = []
@@ -818,21 +822,31 @@ class G1RobotProgramTests(unittest.TestCase):
                 return 0
 
         client = FakeLocoClient()
+        clock = {"now": 0.0}
+
+        def advance_clock(seconds):
+            clock["now"] += seconds
+
         original_client = g1_robot._client
         g1_robot._client = client
         try:
-            with patch.object(g1_robot.time, "sleep"):
+            with patch.object(g1_robot.time, "monotonic", side_effect=lambda: clock["now"]), patch.object(
+                g1_robot.time, "sleep", side_effect=advance_clock
+            ):
                 g1_robot._move(0.4, 0, 0, 0.25)
         finally:
             g1_robot._client = original_client
 
-        self.assertEqual(
-            client.calls,
-            [
-                ("SetVelocity", 0.4, 0, 0, g1_robot._CONTINUOUS_MOVE_DURATION),
-                ("SetVelocity", 0.0, 0.0, 0.0, 1.0),
-            ],
-        )
+        movement_calls = client.calls[:-1]
+        forward_velocities = [call[1] for call in movement_calls]
+        self.assertEqual(client.calls[-1], ("SetVelocity", 0.0, 0.0, 0.0, 1.0))
+        self.assertEqual(movement_calls[0][1:4], (0.0, 0.0, 0.0))
+        self.assertGreater(max(forward_velocities), 0.0)
+        self.assertLess(max(forward_velocities), 0.4)
+        peak_index = forward_velocities.index(max(forward_velocities))
+        self.assertEqual(forward_velocities, sorted(forward_velocities[:peak_index + 1], reverse=False)
+                         + sorted(forward_velocities[peak_index + 1:], reverse=True))
+        self.assertTrue(all(call[4] == g1_robot._CONTINUOUS_MOVE_DURATION for call in movement_calls))
 
     def test_robot_program_dispatches_stand_and_locomotion_commands(self):
         class FakeLocoClient:

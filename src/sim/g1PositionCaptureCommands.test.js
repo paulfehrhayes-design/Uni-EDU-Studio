@@ -52,14 +52,14 @@ test('DUET position capture accepts bounded base and arm commands', () => {
   );
 });
 
-test('rate-sweep movement programs are bounded forward/backward loops on both controllers', () => {
+test('rate-sweep movement cycles are bounded forward/backward commands on both controllers', () => {
   const legacy = validateLegacyPositionCapture(
     'G1 sensor-rate sweep',
-    'for i in range(10):\n    robot.walktime(1)\n    robot.backwardtime(1)',
+    'robot.walktime(1)\nrobot.backwardtime(1)',
   );
   const duet = validateDuetPositionCapture(
     'G1 sensor-rate sweep',
-    'for _ in range(10):\n    duet.walk(1)\n    duet.backward(1)',
+    'duet.walk(1)\nduet.backward(1)',
   );
 
   assert.equal(legacy.usesLocomotion, true);

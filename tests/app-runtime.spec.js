@@ -337,11 +337,12 @@ test('teacher captures DUET command series with full-body pose telemetry', async
 });
 
 test('teacher rate sweep tests ten polling rates during a bounded DUET walk cycle and exports results', async ({ page }) => {
-  test.setTimeout(90000);
+  test.setTimeout(180000);
   const apiRequests = [];
   let poseReadCount = 0;
   let jointReadCount = 0;
-  let sweepCode = '';
+  const sweepCodes = [];
+  let injectStaleJointSample = true;
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-rate-sweep-token',
@@ -376,18 +377,15 @@ test('teacher rate sweep tests ten polling rates during a bounded DUET walk cycl
       body = freshJointState();
       body.received_at = new Date(Date.parse('2026-11-12T00:00:00Z') + jointReadCount * 5).toISOString();
       body.positions_rad[0] = jointReadCount * 0.001;
+      if (sweepCodes.length === 5 && injectStaleJointSample) {
+        body.age_ms = 1000;
+        injectStaleJointSample = false;
+      }
     } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
       body = { recordings: [] };
     } else if (path === '/api/duet/run') {
-      sweepCode = request.postDataJSON().code;
-      setTimeout(() => {
-        route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({ status: 'completed', commandsExecuted: 20, armTelemetry: [] }),
-        });
-      }, 20000);
-      return;
+      sweepCodes.push(request.postDataJSON().code);
+      body = { status: 'completed', commandsExecuted: 2, armTelemetry: [] };
     } else if (path === '/api/classroom/safe-mode') {
       body = { enabled: false };
     } else if (path === '/api/classroom/simulation-visibility') {
@@ -408,19 +406,25 @@ test('teacher rate sweep tests ten polling rates during a bounded DUET walk cycl
   await page.getByRole('button', { name: 'Open app settings' }).click();
   await page.getByRole('checkbox', { name: 'Enable DUET version two' }).check();
   await expect(page.getByText('Ready to capture odom → pelvis tf2 pose and all 23 measured joints.')).toBeVisible();
+  const sweepButton = page.getByRole('button', { name: 'Run sensor-rate sweep' });
+  await expect(sweepButton).toBeDisabled();
+  await expect(page.getByText('Confirm the workspace is clear above to enable the sweep.')).toBeVisible();
   await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
-  await page.getByRole('button', { name: 'Run sensor-rate sweep' }).click();
-  await expect(page.getByRole('button', { name: 'Preview sweep report' })).toBeVisible({ timeout: 30000 });
+  await expect(sweepButton).toBeEnabled();
+  await sweepButton.click();
+  await expect(page.getByRole('button', { name: 'Preview sweep report' })).toBeVisible({ timeout: 150000 });
 
-  expect(sweepCode).toContain('for _ in range(10):');
-  expect(sweepCode).toContain('duet.walk(1)');
-  expect(sweepCode).toContain('duet.backward(1)');
-  expect(apiRequests.filter((request) => request === 'POST /api/duet/run')).toHaveLength(1);
+  expect(sweepCodes).toHaveLength(11);
+  expect(sweepCodes.every((code) => code === 'duet.walk(1)\nduet.backward(1)')).toBe(true);
+  expect(apiRequests.filter((request) => request === 'POST /api/duet/run')).toHaveLength(11);
   await page.getByRole('button', { name: 'Preview sweep report' }).click();
   const reportPreview = page.getByRole('dialog', { name: 'File preview: g1-sensor-rate-sweep.json' });
   const report = JSON.parse(await reportPreview.locator('pre').textContent());
   expect(report.commanded_motion).toBe(true);
+  expect(report.status).toBe('complete');
   expect(report.phases).toHaveLength(10);
+  expect(report.phases.every((phase) => phase.measurable)).toBe(true);
+  expect(report.phases[4].attempts).toBe(2);
   expect(report.phases.at(-1).target_rate_hz).toBe(200);
   expect(report.readings[0].joint_positions_rad).toHaveLength(23);
   await page.getByRole('button', { name: 'Close preview' }).click({ force: true });

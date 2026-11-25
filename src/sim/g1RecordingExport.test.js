@@ -122,6 +122,31 @@ test('DUET position calibration exports all 23 ROS-measured joints', () => {
   assert.equal(exported.frames[1].positions_rad[22], 0.22);
 });
 
+test('position calibration export accepts direct odometry pose samples', () => {
+  const pose = {
+    frame_id: 'odom',
+    base_frame: 'pelvis',
+    x: 0.4,
+    y: -0.2,
+    z: 0,
+    yaw_rad: 0.25,
+    timestamp: '2026-03-01T10:00:00Z',
+    age_ms: 15,
+    source: 'odometry',
+  };
+  const exported = buildG1MotionRecordingExport(makeRecording({
+    capture_type: 'position_calibration',
+    joint_names: [...G1_MODEL_INFO.joints],
+    frames: [
+      { time: 0, joints: Array(23).fill(0), pose },
+      { time: 0.1, joints: Array(23).fill(0.1), pose: { ...pose, x: 0.5 } },
+    ],
+  }));
+
+  assert.equal(exported.frames[0].base_pose.source, 'odometry');
+  assert.equal(exported.frames[1].base_pose.x_m, 0.5);
+});
+
 test('position calibration exports support the 100 Hz five-minute sample limit', () => {
   const pose = {
     frame_id: 'odom',

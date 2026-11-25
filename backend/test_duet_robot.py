@@ -409,7 +409,10 @@ class DuetProgramValidationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertGreaterEqual(reset_times[0] - gesture_start_times[0], 22.0)
-        move_index = next(index for index, request in enumerate(requests) if request.startswith("MOVE 0.120000"))
+        move_index = next(
+            index for index, request in enumerate(requests)
+            if request.startswith("MOVE ") and any(float(value) != 0 for value in request.split()[1:4])
+        )
         reset_index = requests.index("RESET_ARMS")
         self.assertLess(move_index, reset_index)
         self.assertTrue(wait_durations)
@@ -1000,7 +1003,7 @@ class DuetOwnershipTests(unittest.TestCase):
                 "points": [],
             },
         }
-        samples = iter([clear, obstacle])
+        samples = iter([clear, clear, obstacle])
         clock = {"now": 0.0}
         requests = []
 
@@ -1009,7 +1012,8 @@ class DuetOwnershipTests(unittest.TestCase):
             if request == "STATUS" or request == "STOP":
                 return status
             if request.startswith("MOVE "):
-                return moving
+                has_velocity = any(float(value) != 0 for value in request.split()[1:4])
+                return {**status, "motion_active": has_velocity}
             raise AssertionError(f"Unexpected gateway request: {request}")
 
         def wait_and_advance(duration):
@@ -1036,7 +1040,7 @@ class DuetOwnershipTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["safetyInterventions"][0]["status"], "stopped")
-        self.assertIn("MOVE 0.150000 0.000000 0.000000 250", requests)
+        self.assertIn("MOVE 0.030000 0.000000 0.000000 250", requests)
         self.assertEqual(requests.count("STOP"), 1)
 
     def test_safe_mode_stops_duet_arm_lease_mid_action_when_obstacle_enters_bubble(self):
@@ -1415,19 +1419,18 @@ class DuetOwnershipTests(unittest.TestCase):
                 return status
             if request.startswith("ARM_TARGETS "):
                 return targets_active
-            if request.startswith("MOVE 0 0 0 "):
-                return targets_active
             if request.startswith("MOVE "):
-                return {**targets_active, "motion_active": True}
+                moving = any(float(value) != 0 for value in request.split()[1:4])
+                return {**targets_active, "motion_active": moving}
             if request == "RESET_ARMS":
                 return status
             raise AssertionError(f"Unexpected gateway request: {request}")
 
         clock = {"now": 0.0}
 
-        def advance_clock():
-            clock["now"] += 0.05
-            return clock["now"]
+        def wait_and_advance(duration):
+            clock["now"] += duration
+            return False
 
         with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
             duet_robot, "_require_hardware_acceptance"
@@ -1436,9 +1439,9 @@ class DuetOwnershipTests(unittest.TestCase):
             "_gateway_request",
             side_effect=gateway_response,
         ) as gateway_request, patch.object(
-            duet_robot.time, "monotonic", side_effect=advance_clock
+            duet_robot.time, "monotonic", side_effect=lambda: clock["now"]
         ), patch.object(
-            duet_robot._stop_requested, "wait", return_value=False
+            duet_robot._stop_requested, "wait", side_effect=wait_and_advance
         ):
             result = duet_robot.execute_program(
                 'duet.move_and_arm(0.15, 0, 0, 0.2, "forward", 1)'
@@ -1449,7 +1452,7 @@ class DuetOwnershipTests(unittest.TestCase):
         requests = [request.args[0] for request in gateway_request.call_args_list]
         self.assertEqual(requests[0], "STATUS")
         self.assertTrue(requests[1].startswith("ARM_TARGETS 250 "))
-        self.assertIn("MOVE 0.150000 0.000000 0.000000 250", requests)
+        self.assertIn("MOVE 0.030000 0.000000 0.000000 250", requests)
         self.assertIn("MOVE 0 0 0 250", requests)
         self.assertEqual(requests[-1], "RESET_ARMS")
 
@@ -1511,9 +1514,63 @@ class DuetOwnershipTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["commandsExecuted"], 1)
         self.assertTrue(any(request.startswith("ARM_TARGETS 250 ") for request in requests))
-        self.assertIn("MOVE 0.150000 0.000000 0.000000 250", requests)
+        self.assertIn("MOVE 0.030000 0.000000 0.000000 250", requests)
         self.assertIn("MOVE 0.000000 0.000000 0.000000 250", requests)
         self.assertEqual(requests[-1], "RESET_ARMS")
+
+    def test_consecutive_moves_ramp_to_zero_before_reversing(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop"],
+        }
+        clock = {"now": 0.0}
+        requests = []
+
+        def gateway_response(request):
+            requests.append(request)
+            if request == "STATUS" or request == "STOP":
+                return status
+            if request.startswith("MOVE "):
+                velocity = tuple(float(value) for value in request.split()[1:4])
+                return {**status, "motion_active": any(abs(value) > 0.001 for value in velocity)}
+            raise AssertionError(f"Unexpected gateway request: {request}")
+
+        def wait_and_advance(duration):
+            clock["now"] += duration
+            return False
+
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", side_effect=gateway_response
+        ), patch.object(
+            duet_robot.time, "monotonic", side_effect=lambda: clock["now"]
+        ), patch.object(
+            duet_robot._stop_requested, "wait", side_effect=wait_and_advance
+        ):
+            duet_robot.execute_program(
+                "duet.move(0.1, 0, 0, 0.5)\n"
+                "duet.move(-0.1, 0, 0, 0.5)"
+            )
+
+        velocities = [
+            float(request.split()[1])
+            for request in requests
+            if request.startswith("MOVE ")
+        ]
+        last_forward = max(index for index, value in enumerate(velocities) if value > 0)
+        first_reverse = min(index for index, value in enumerate(velocities) if value < 0)
+        self.assertEqual(velocities[last_forward + 1], 0.0)
+        self.assertGreater(first_reverse, last_forward)
+        first_reverse_request = next(index for index, request in enumerate(requests) if request.startswith("MOVE -"))
+        self.assertLess(requests.index("STOP"), first_reverse_request)
 
     def test_move_and_arm_stops_if_controller_drops_either_motion_lease(self):
         status = {
@@ -1538,7 +1595,7 @@ class DuetOwnershipTests(unittest.TestCase):
             "_gateway_request",
             side_effect=[status, targets_active, arm_expired, status, status],
         ) as gateway_request, patch.object(
-            duet_robot.time, "monotonic", side_effect=[0.0, 0.0, 0.2, 2.0]
+            duet_robot.time, "monotonic", side_effect=[0.0, 0.05, 0.1, 2.0]
         ), patch.object(
             duet_robot._stop_requested, "wait", return_value=False
         ):
