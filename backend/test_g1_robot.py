@@ -35,12 +35,15 @@ class G1RobotProgramTests(unittest.TestCase):
                 return 0
 
         fake = FakeLoco()
-        with patch.object(g1_robot, "_client", fake), patch.object(g1_robot, "_run_lock") as run_lock:
+        with patch.object(g1_robot, "_client", fake), patch.object(g1_robot, "_run_lock") as run_lock, \
+                patch.object(g1_robot, "_navigation_velocity", (0.0, 0.0, 0.0)), \
+                patch.object(g1_robot, "_navigation_velocity_updated_at", None), \
+                patch.object(g1_robot.time, "monotonic", return_value=1.0):
             run_lock.locked.return_value = False
             result = g1_robot.navigation_set_velocity(0.15, -0.2)
             stopped = g1_robot.stop_navigation_velocity()
         self.assertEqual(result["status"], "accepted")
-        self.assertEqual(fake.commands[0], ("SetVelocity", (0.15, 0.0, -0.2, 0.25)))
+        self.assertEqual(fake.commands[0], ("SetVelocity", (0.03, 0.0, -0.06, 0.25)))
         self.assertEqual(fake.commands[1], ("StopMove",))
         self.assertTrue(stopped["stop_request_accepted"])
         self.assertFalse(stopped["physical_stop_verified"])
@@ -49,6 +52,33 @@ class G1RobotProgramTests(unittest.TestCase):
             run_lock.locked.return_value = False
             with self.assertRaisesRegex(HTTPException, "bounded SDK limits"):
                 g1_robot.navigation_set_velocity(0.21, 0.0)
+
+    def test_navigation_velocity_reversal_slews_through_zero_before_reversing(self):
+        class FakeLoco:
+            def __init__(self):
+                self.commands = []
+
+            def GetFsmId(self):
+                return 0, 500
+
+            def SetVelocity(self, *args):
+                self.commands.append(args)
+                return 0
+
+        fake = FakeLoco()
+        clock = {"now": 1.0}
+        with patch.object(g1_robot, "_client", fake), patch.object(g1_robot, "_run_lock") as run_lock, \
+                patch.object(g1_robot, "_navigation_velocity", (0.0, 0.0, 0.0)), \
+                patch.object(g1_robot, "_navigation_velocity_updated_at", None), \
+                patch.object(g1_robot.time, "monotonic", side_effect=lambda: clock["now"]):
+            run_lock.locked.return_value = False
+            g1_robot.navigation_set_velocity(0.15, 0.0)
+            clock["now"] += 0.1
+            g1_robot.navigation_set_velocity(-0.15, 0.0)
+            clock["now"] += 0.1
+            g1_robot.navigation_set_velocity(-0.15, 0.0)
+
+        self.assertEqual([command[0] for command in fake.commands], [0.03, 0.0, -0.03])
 
     def test_connection_log_creates_private_session_file(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
@@ -99,7 +129,11 @@ class G1RobotProgramTests(unittest.TestCase):
         original_client = g1_robot._client
         g1_robot._client = client
         try:
-            with patch.object(g1_robot, "_move") as move:
+            with patch.object(
+                g1_robot,
+                "_move",
+                return_value=(None, (0.0, 0.0, 0.0)),
+            ) as move:
                 result = g1_robot.execute_robot_program("robot.turn_around_180()")
             self.assertEqual(move.call_count, 1)
             self.assertEqual(move.call_args.args[:3], (0, 0, 0.6))
@@ -848,6 +882,54 @@ class G1RobotProgramTests(unittest.TestCase):
                          + sorted(forward_velocities[peak_index + 1:], reverse=True))
         self.assertTrue(all(call[4] == g1_robot._CONTINUOUS_MOVE_DURATION for call in movement_calls))
 
+    def test_consecutive_compatible_commands_keep_velocity_without_boundary_stop(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.calls = []
+
+            def GetFsmId(self):
+                return 0, 500
+
+            def SetVelocity(self, vx, vy, vyaw, duration):
+                self.calls.append((clock["now"], vx, vy, vyaw, duration))
+                return 0
+
+        clock = {"now": 0.0}
+        client = FakeLocoClient()
+
+        def advance_clock(seconds):
+            clock["now"] += seconds
+
+        original_client = g1_robot._client
+        g1_robot._client = client
+        try:
+            with patch.object(g1_robot.time, "monotonic", side_effect=lambda: clock["now"]), patch.object(
+                g1_robot.time, "sleep", side_effect=advance_clock
+            ):
+                result = g1_robot.execute_robot_program(
+                    "for _ in range(3):\n"
+                    "    robot.walktime(0.5)\n"
+                    "robot.backwardtime(0.5)"
+                )
+        finally:
+            g1_robot._client = original_client
+
+        self.assertEqual(result["commandsExecuted"], 4)
+        for boundary in (0.5, 1.0):
+            first_call_after_boundary = next(call for call in client.calls if call[0] >= boundary)
+            self.assertGreater(first_call_after_boundary[1], 0.0)
+        moving_calls = client.calls[:-1]
+        last_positive_index = max(index for index, call in enumerate(moving_calls) if call[1] > 0)
+        first_zero_after_start = next(
+            index for index, call in enumerate(moving_calls[1:], start=1) if call[1:4] == (0.0, 0.0, 0.0)
+        )
+        self.assertGreater(first_zero_after_start, last_positive_index)
+        first_reverse = next(
+            index for index, call in enumerate(moving_calls) if call[1] < 0
+        )
+        self.assertGreater(first_reverse, first_zero_after_start)
+        self.assertEqual(client.calls[-1][1:4], (0.0, 0.0, 0.0))
+
     def test_robot_program_dispatches_stand_and_locomotion_commands(self):
         class FakeLocoClient:
             def __init__(self):
@@ -866,8 +948,11 @@ class G1RobotProgramTests(unittest.TestCase):
         original_client = g1_robot._client
         g1_robot._client = client
         moves = []
+        def fake_move(*args, **kwargs):
+            moves.append(args)
+            return None, (0.0, 0.0, 0.0)
         try:
-            with patch.object(g1_robot, "_move", side_effect=lambda *args: moves.append(args)):
+            with patch.object(g1_robot, "_move", side_effect=fake_move):
                 result = g1_robot.execute_robot_program(
                     'robot.stand()\nrobot.walk(2)\nrobot.turn("right", 90)'
                 )
@@ -920,8 +1005,11 @@ class G1RobotProgramTests(unittest.TestCase):
         original_client = g1_robot._client
         g1_robot._client = FakeLocoClient()
         moves = []
+        def fake_move(*args, **kwargs):
+            moves.append(args)
+            return None, (0.0, 0.0, 0.0)
         try:
-            with patch.object(g1_robot, "_move", side_effect=lambda *args: moves.append(args)):
+            with patch.object(g1_robot, "_move", side_effect=fake_move):
                 g1_robot.execute_robot_program('robot.sidestep("right", 3)')
         finally:
             g1_robot._client = original_client
@@ -999,8 +1087,11 @@ class G1RobotProgramTests(unittest.TestCase):
         original_client = g1_robot._client
         g1_robot._client = FakeLocoClient()
         moves = []
+        def fake_move(*args, **kwargs):
+            moves.append(args)
+            return None, (0.0, 0.0, 0.0)
         try:
-            with patch.object(g1_robot, "_move", side_effect=lambda *args: moves.append(args)):
+            with patch.object(g1_robot, "_move", side_effect=fake_move):
                 result = g1_robot.execute_robot_program("robot.slowwalktime(0.5)")
         finally:
             g1_robot._client = original_client

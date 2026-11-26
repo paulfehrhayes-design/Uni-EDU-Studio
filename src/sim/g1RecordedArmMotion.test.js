@@ -72,7 +72,7 @@ test('DUET position captures preview all 23 joints and measured base travel', ()
     frames: [
       { time: 0, joints: Array(23).fill(0), pose },
       {
-        time: 300,
+        time: 1800,
         joints: Array.from({ length: 23 }, (_, index) => index / 100),
         pose: { ...pose, x: 2, y: 4, yaw_rad: 0 },
       },
@@ -84,7 +84,7 @@ test('DUET position captures preview all 23 joints and measured base travel', ()
   assert.ok(Math.abs(frames[1].y) < 1e-12);
   assert.equal(frames[1].heading, -90);
   assert.equal(frames[1].path.length, 2);
-  assert.equal(frames[1].time, 300);
+  assert.equal(frames[1].time, 1800);
 });
 
 test('recorded motion rejects unknown or duplicate joint names', () => {

@@ -30,6 +30,9 @@ class DuetProgramValidationTests(unittest.TestCase):
         }
         stopped = {**moving, "motion_active": False}
         with patch.object(duet_robot, "_run_lock") as run_lock, \
+                patch.object(duet_robot, "_navigation_base_velocity", (0.0, 0.0, 0.0)), \
+                patch.object(duet_robot, "_navigation_velocity_updated_at", None), \
+                patch.object(duet_robot.time, "monotonic", return_value=1.0), \
                 patch.object(duet_robot, "_require_hardware_acceptance") as acceptance, \
                 patch.object(duet_robot, "_gateway_request", return_value=moving) as gateway, \
                 patch.object(duet_robot, "_validate_controller_status", side_effect=lambda value: value):
@@ -37,9 +40,11 @@ class DuetProgramValidationTests(unittest.TestCase):
             result = duet_robot.navigation_move(0.1, -0.2)
         self.assertEqual(result, {"status": "accepted", "lease_ms": duet_robot.COMMAND_LEASE_MS})
         acceptance.assert_called_once_with()
-        gateway.assert_called_once_with("MOVE 0.100000 0 -0.200000 250")
+        gateway.assert_called_once_with("MOVE 0.030000 0.000000 -0.060000 250")
 
-        with patch.object(duet_robot, "_gateway_request", return_value=stopped) as gateway, \
+        with patch.object(duet_robot, "_navigation_base_velocity", (0.03, 0.0, -0.06)), \
+                patch.object(duet_robot, "_navigation_velocity_updated_at", 1.0), \
+                patch.object(duet_robot, "_gateway_request", return_value=stopped) as gateway, \
                 patch.object(duet_robot, "_validate_controller_status", side_effect=lambda value: value):
             result = duet_robot.stop_navigation_motion()
         self.assertEqual(result, {"status": "stopped", "zero_velocity_confirmed": True})
@@ -47,6 +52,41 @@ class DuetProgramValidationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(duet_robot.DuetControllerError, "bounded"):
             duet_robot.navigation_move(0.21, 0.0)
+
+    def test_navigation_velocity_reversal_slews_through_zero_before_reversing(self):
+        moving = {
+            "ready": True,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "motion_active": True,
+            "capabilities": [],
+        }
+        clock = {"now": 1.0}
+        requests = []
+
+        def gateway_response(request):
+            requests.append(request)
+            velocity = tuple(float(value) for value in request.split()[1:4])
+            return {**moving, "motion_active": any(abs(value) > 0.001 for value in velocity)}
+
+        with patch.object(duet_robot, "_run_lock") as run_lock, \
+                patch.object(duet_robot, "_navigation_base_velocity", (0.0, 0.0, 0.0)), \
+                patch.object(duet_robot, "_navigation_velocity_updated_at", None), \
+                patch.object(duet_robot.time, "monotonic", side_effect=lambda: clock["now"]), \
+                patch.object(duet_robot, "_require_hardware_acceptance"), \
+                patch.object(duet_robot, "_gateway_request", side_effect=gateway_response), \
+                patch.object(duet_robot, "_validate_controller_status", side_effect=lambda value: value):
+            run_lock.locked.return_value = False
+            duet_robot.navigation_move(0.15, 0.0)
+            clock["now"] += 0.1
+            duet_robot.navigation_move(-0.15, 0.0)
+            clock["now"] += 0.1
+            duet_robot.navigation_move(-0.15, 0.0)
+
+        self.assertEqual(
+            [tuple(float(value) for value in request.split()[1:4]) for request in requests],
+            [(0.03, 0.0, 0.0), (0.0, 0.0, 0.0), (-0.03, 0.0, 0.0)],
+        )
 
     def test_parser_accepts_bounded_front_and_rear_distance_conditions(self):
         for sensor, operator in (
@@ -1571,6 +1611,60 @@ class DuetOwnershipTests(unittest.TestCase):
         self.assertGreater(first_reverse, last_forward)
         first_reverse_request = next(index for index, request in enumerate(requests) if request.startswith("MOVE -"))
         self.assertLess(requests.index("STOP"), first_reverse_request)
+
+    def test_consecutive_compatible_moves_keep_velocity_without_boundary_stop(self):
+        status = {
+            "protocol": duet_robot.DUET_PROTOCOL,
+            "robot_model": duet_robot.DUET_ROBOT_MODEL,
+            "policy_id": "policy-reviewed-on-robot",
+            "connected": True,
+            "ready": True,
+            "motion_active": False,
+            "control_lease": True,
+            "lowcmd_owner": "duet",
+            "capabilities": ["base_velocity", "wait", "stop"],
+        }
+        clock = {"now": 0.0}
+        requests = []
+
+        def gateway_response(request):
+            requests.append(request)
+            if request in {"STATUS", "STOP"}:
+                return status
+            if request.startswith("MOVE "):
+                velocity = tuple(float(value) for value in request.split()[1:4])
+                return {**status, "motion_active": any(abs(value) > 0.001 for value in velocity)}
+            raise AssertionError(f"Unexpected gateway request: {request}")
+
+        def wait_and_advance(duration):
+            clock["now"] += duration
+            return False
+
+        with patch.dict(os.environ, {"DUET_EXPECTED_POLICY_ID": "policy-reviewed-on-robot"}), patch.object(
+            duet_robot, "_require_hardware_acceptance"
+        ), patch.object(
+            duet_robot, "_gateway_request", side_effect=gateway_response
+        ), patch.object(
+            duet_robot.time, "monotonic", side_effect=lambda: clock["now"]
+        ), patch.object(
+            duet_robot._stop_requested, "wait", side_effect=wait_and_advance
+        ):
+            result = duet_robot.execute_program(
+                "for _ in range(3):\n"
+                "    duet.move(0.1, 0, 0, 0.5)"
+            )
+
+        movement_requests = [request for request in requests if request.startswith("MOVE ")]
+        velocities = [tuple(float(value) for value in request.split()[1:4]) for request in movement_requests]
+        last_positive_index = max(index for index, velocity in enumerate(velocities) if velocity[0] > 0)
+        first_zero_after_start = next(
+            index for index, velocity in enumerate(velocities[1:], start=1)
+            if velocity == (0.0, 0.0, 0.0)
+        )
+        self.assertEqual(result["commandsExecuted"], 3)
+        self.assertGreater(first_zero_after_start, last_positive_index)
+        self.assertIn("MOVE 0.000000 0.000000 0.000000 250", movement_requests)
+        self.assertEqual(requests.count("STOP"), 1)
 
     def test_move_and_arm_stops_if_controller_drops_either_motion_lease(self):
         status = {

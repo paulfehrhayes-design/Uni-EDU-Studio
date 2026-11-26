@@ -532,6 +532,137 @@ test('teacher captures legacy command series with pose and all 23 joint samples'
   expect(download.suggestedFilename()).toBe('g1-recorded-motions.json');
 });
 
+test('teacher explicitly runs isolated and progression calibration batches through recenter checkpoints', async ({ page }) => {
+  test.setTimeout(60000);
+  const savedPayloads = [];
+  const runPrograms = [];
+  const apiRequests = [];
+  await page.addInitScript(() => {
+    localStorage.setItem('edu-classroom-session', JSON.stringify({
+      token: 'teacher-locomotion-calibration-token',
+      user: { role: 'teacher', username: 'teacher-locomotion-calibration-test' },
+    }));
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    apiRequests.push(`${request.method()} ${path}`);
+    let body = {};
+    if (path === '/api/robot/status') {
+      body = {
+        sdkAvailable: true,
+        running: false,
+        status: 'connected',
+        capabilities: { locomotion: true, armActions: true },
+      };
+    } else if (path === '/api/robot/joint-state') {
+      body = freshJointState();
+    } else if (path === '/api/robot/pose') {
+      body = freshPoseSnapshot();
+    } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
+      body = { recordings: [] };
+    } else if (path === '/api/robot/recordings' && request.method() === 'POST') {
+      const payload = request.postDataJSON();
+      savedPayloads.push(payload);
+      body = {
+        recording: {
+          id: 'capture_calibrationtest',
+          ...payload,
+          created_at: '2026-11-12T00:00:00Z',
+        },
+      };
+    } else if (path === '/api/run') {
+      const code = request.postDataJSON().code;
+      runPrograms.push(code);
+      body = { status: 'completed', commandsExecuted: code.split('\n').length };
+    } else if (path === '/api/classroom/safe-mode') {
+      body = { enabled: false };
+    } else if (path === '/api/classroom/simulation-visibility') {
+      body = { show_simulation: false };
+    } else if (path === '/api/classroom/sidebar-settings') {
+      body = { locked_panels: [], configured: true };
+    } else if (path === '/api/classroom/me') {
+      body = { data_revision: 0 };
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open app settings' }).click();
+  await expect(page.getByText('Ready to capture odom → pelvis tf2 pose and all 23 measured joints.')).toBeVisible();
+  const seriesToggle = page.getByRole('checkbox', { name: 'Enable locomotion calibration series' });
+  await expect(seriesToggle).not.toBeChecked();
+  expect(runPrograms).toHaveLength(0);
+  await seriesToggle.check();
+  await page.getByRole('textbox', { name: 'Position capture name' }).fill('Classroom calibration');
+  await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
+  const startButton = page.getByRole('button', { name: 'Run locomotion calibration series' });
+  await expect(startButton).toBeEnabled();
+  await expect(page.getByText(/37 isolated movement trials with a 2-second wait after each, then nine no-wait progression batches/)).toBeVisible();
+  await expect(page.getByText(/odometry alone cannot guarantee a hard workspace boundary/)).toBeVisible();
+  expect(runPrograms).toHaveLength(0);
+  await startButton.click();
+
+  const repeatButton = page.getByRole('button', { name: 'Repeat last batch after recenter' });
+  const continueButton = page.getByRole('button', { name: 'Continue after recenter' });
+  await expect(repeatButton).toBeVisible();
+  await repeatButton.click();
+  await expect.poll(() => runPrograms.length, { timeout: 8000 }).toBe(2);
+  await expect(repeatButton).toBeVisible();
+  for (let checkpoint = 0; checkpoint < 13; checkpoint += 1) {
+    await expect(continueButton).toBeVisible({ timeout: 8000 });
+    await continueButton.click({ timeout: 8000 });
+  }
+  const finishButton = page.getByRole('button', { name: 'Finish and save recording' });
+  await expect(finishButton).toBeVisible();
+  await finishButton.click();
+
+  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(1);
+  expect(runPrograms).toHaveLength(15);
+  expect(runPrograms.map((program) => program.split('\n').length)).toEqual([
+    18, 18, 18, 18, 18, 2, 12, 12, 12, 12, 12, 12, 12, 13, 13,
+  ]);
+  expect(runPrograms.slice(0, 6).every((program) => (
+    program.split('\n').filter((command) => command === 'robot.wait(2)').length
+      === program.split('\n').length / 2
+  ))).toBe(true);
+  expect(runPrograms.slice(6).every((program) => !program.includes('robot.wait'))).toBe(true);
+  expect(runPrograms.flatMap((program) => program.split('\n'))).toHaveLength(202);
+  expect(runPrograms.join('\n')).not.toMatch(/arm_action|hold_arm/);
+  expect(savedPayloads[0].controller_version).toBe('legacy');
+  expect(savedPayloads[0].capture_type).toBe('position_calibration');
+  expect(savedPayloads[0].command).toContain('robot.walk(5)');
+  expect(savedPayloads[0].command).toContain('robot.slowwalktime(5)');
+  expect(savedPayloads[0].command).toContain('robot.slowwalk(5)');
+  expect(savedPayloads[0].command).toContain('robot.fastwalktime(5)');
+  expect(savedPayloads[0].command).toContain('robot.fastwalk(5)');
+  expect(savedPayloads[0].command).toContain('robot.sidestep("right", 5)');
+  expect(savedPayloads[0].command).toContain('robot.turn("left", 90)');
+  expect(savedPayloads[0].command).toContain('robot.turn_around_180()');
+  expect(savedPayloads[0].command).toContain(
+    '# Actual batch run order (including repeats): 1, 1, 2, 3',
+  );
+  expect(savedPayloads[0].joint_names).toEqual(G1_JOINT_NAMES);
+  expect(savedPayloads[0].frames.length).toBeGreaterThanOrEqual(2);
+  expect(savedPayloads[0].frames.every((frame) => frame.joints.length === 23 && frame.pose)).toBe(true);
+  expect(apiRequests.filter((request) => request === 'POST /api/run')).toHaveLength(15);
+  await page.getByRole('button', { name: 'Preview JSON' }).click();
+  const recordingPreview = page.getByRole('dialog', { name: 'File preview: Classroom_calibration.json' });
+  await expect(recordingPreview.locator('pre')).toContainText('"recorded_dof": 23');
+  await expect(recordingPreview.locator('pre')).toContainText('"base_frame": "pelvis"');
+  await expect(recordingPreview.locator('pre')).toContainText('robot.turn_around_180()');
+  await page.getByRole('button', { name: 'Close preview' }).click({ force: true });
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export JSON' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe('Classroom_calibration.json');
+});
+
 test('only teachers can hide the simulation from Settings', async ({ page }) => {
   const visibilityUpdates = [];
   let showSimulation = true;

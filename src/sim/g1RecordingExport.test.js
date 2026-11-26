@@ -147,7 +147,7 @@ test('position calibration export accepts direct odometry pose samples', () => {
   assert.equal(exported.frames[1].base_pose.x_m, 0.5);
 });
 
-test('position calibration exports support the 100 Hz five-minute sample limit', () => {
+test('position calibration exports support the 30 Hz thirty-minute sample limit', () => {
   const pose = {
     frame_id: 'odom',
     base_frame: 'pelvis',
@@ -159,19 +159,26 @@ test('position calibration exports support the 100 Hz five-minute sample limit',
     age_ms: 10,
     source: 'tf2',
   };
-  const frames = Array.from({ length: 30001 }, (_, index) => ({
-    time: index / 100,
+  const frames = Array.from({ length: 54001 }, (_, index) => ({
+    time: index / 30,
     joints: Array(10).fill(0),
     pose,
   }));
   assert.equal(buildG1MotionRecordingExport(makeRecording({
     capture_type: 'position_calibration',
     frames,
-  })).frames.length, 30001);
+  })).frames.length, 54001);
   assert.throws(() => buildG1MotionRecordingExport(makeRecording({
     capture_type: 'position_calibration',
-    frames: [...frames, { time: 300.01, joints: Array(10).fill(0), pose }],
-  })), /2 to 30001 samples/);
+    frames: [...frames, { time: 1800.1, joints: Array(10).fill(0), pose }],
+  })), /2 to 54001 samples/);
+  assert.throws(() => buildG1MotionRecordingExport(makeRecording({
+    capture_type: 'position_calibration',
+    frames: [
+      { time: 0, joints: Array(10).fill(0), pose },
+      { time: 1800.001, joints: Array(10).fill(0), pose },
+    ],
+  })), /sample 2 is invalid/);
 });
 
 test('collection export validates and bundles each recording', () => {

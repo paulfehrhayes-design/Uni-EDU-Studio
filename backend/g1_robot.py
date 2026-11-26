@@ -70,7 +70,10 @@ _SAFE_MODE_POLL_INTERVAL_SECONDS = 0.1
 _NAVIGATION_VELOCITY_LEASE_SECONDS = 0.25
 _NAVIGATION_MAX_LINEAR_VELOCITY = 0.20
 _NAVIGATION_MAX_YAW_RATE = 0.30
+_NAVIGATION_REFRESH_INTERVAL_SECONDS = 0.1
 _navigation_command_lock = threading.Lock()
+_navigation_velocity = (0.0, 0.0, 0.0)
+_navigation_velocity_updated_at: float | None = None
 _POSTURE_TRANSITION_FSM_IDS = {
     "squat_to_stand": 706,
     "lie_to_stand": 702,
@@ -870,15 +873,18 @@ def _move(
     vyaw: float,
     seconds: float,
     *,
+    initial_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    continue_to_next: bool = False,
     safe_mode: bool = False,
     safe_mode_stop_margin_m: float = SAFE_MODE_STOP_MARGIN_METERS,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, tuple[float, float, float]]:
     if _client is None:
         raise HTTPException(status_code=409, detail="Connect the G1 SDK before running a robot program.")
     try:
         slew_limits = configured_velocity_slew_limits()
     except ValueError as error:
         raise HTTPException(status_code=503, detail=f"Invalid G1 velocity slew configuration: {error}") from error
+    preserved_velocity = False
     try:
         if safe_mode:
             initial_obstacle = _safe_mode_movement_obstacle(
@@ -886,9 +892,9 @@ def _move(
             )
             if initial_obstacle:
                 _log_event("safe_mode_motion_stopped", **initial_obstacle)
-                return initial_obstacle
+                return initial_obstacle, (0.0, 0.0, 0.0)
         deadline = time.monotonic() + seconds
-        previous_velocity = (0.0, 0.0, 0.0)
+        previous_velocity = initial_velocity
         previous_update = time.monotonic()
         refresh_interval = _SAFE_MODE_POLL_INTERVAL_SECONDS if safe_mode else 0.05
         while True:
@@ -896,6 +902,11 @@ def _move(
                 break
             now = time.monotonic()
             moving = now < deadline
+            if not moving and (
+                previous_velocity == (0.0, 0.0, 0.0) or continue_to_next
+            ):
+                preserved_velocity = continue_to_next
+                break
             if safe_mode:
                 checked_velocity = (vx, vy, vyaw) if moving else previous_velocity
                 obstacle = _safe_mode_movement_obstacle(
@@ -905,7 +916,7 @@ def _move(
                 )
                 if obstacle:
                     _log_event("safe_mode_motion_stopped", **obstacle)
-                    return obstacle
+                    return obstacle, (0.0, 0.0, 0.0)
             target_velocity = (vx, vy, vyaw) if moving else (0.0, 0.0, 0.0)
             current_velocity = slew_velocity(
                 previous_velocity,
@@ -932,9 +943,11 @@ def _move(
             detail=f"Safe Mode stopped the G1 because live distance sensing failed: {error}",
         ) from error
     finally:
-        _sdk_result(_client.SetVelocity(0.0, 0.0, 0.0, 1.0), "StopMove")
+        if not preserved_velocity:
+            _sdk_result(_client.SetVelocity(0.0, 0.0, 0.0, 1.0), "StopMove")
     if _stop_requested.is_set():
         raise HTTPException(status_code=409, detail="Robot program stopped by teacher.")
+    return None, previous_velocity if preserved_velocity else (0.0, 0.0, 0.0)
 
 
 def _require_locomotion_ready() -> None:
@@ -962,6 +975,7 @@ def _require_locomotion_ready() -> None:
 
 def navigation_set_velocity(vx: float, vyaw: float) -> dict[str, Any]:
     """Send one short, bounded SDK velocity lease for an owned Nav2 operation."""
+    global _navigation_velocity, _navigation_velocity_updated_at
     if (
         not math.isfinite(vx)
         or not math.isfinite(vyaw)
@@ -975,18 +989,42 @@ def navigation_set_velocity(vx: float, vyaw: float) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="An SDK program owns locomotion.")
     with _navigation_command_lock:
         _require_locomotion_ready()
+        now = time.monotonic()
+        elapsed = (
+            _NAVIGATION_REFRESH_INTERVAL_SECONDS
+            if _navigation_velocity_updated_at is None
+            else min(
+                _NAVIGATION_REFRESH_INTERVAL_SECONDS,
+                max(0.0, now - _navigation_velocity_updated_at),
+            )
+        )
+        try:
+            target_velocity = slew_velocity(
+                _navigation_velocity,
+                (vx, 0.0, vyaw),
+                elapsed,
+                configured_velocity_slew_limits(),
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Invalid G1 velocity slew configuration: {error}",
+            ) from error
         try:
             _sdk_result(
-                _client.SetVelocity(vx, 0.0, vyaw, _NAVIGATION_VELOCITY_LEASE_SECONDS),
+                _client.SetVelocity(*target_velocity, _NAVIGATION_VELOCITY_LEASE_SECONDS),
                 "SetVelocity",
             )
         except Exception as error:
             raise HTTPException(status_code=502, detail=f"SDK navigation velocity failed: {error}") from error
+        _navigation_velocity = target_velocity
+        _navigation_velocity_updated_at = now
     return {"status": "accepted", "lease_seconds": _NAVIGATION_VELOCITY_LEASE_SECONDS}
 
 
 def stop_navigation_velocity() -> dict[str, Any]:
     """Request the SDK's existing StopMove and require a successful RPC result."""
+    global _navigation_velocity, _navigation_velocity_updated_at
     if _client is None:
         raise HTTPException(status_code=409, detail="The legacy SDK controller is not connected; stop is unconfirmed.")
     with _navigation_command_lock:
@@ -995,6 +1033,8 @@ def stop_navigation_velocity() -> dict[str, Any]:
         except Exception as error:
             _log_event("safety_stop_failed", error=str(error), source="navigation")
             raise HTTPException(status_code=502, detail=f"SDK navigation stop was not confirmed: {error}") from error
+        _navigation_velocity = (0.0, 0.0, 0.0)
+        _navigation_velocity_updated_at = None
     return {"status": "stopped", "stop_request_accepted": True, "physical_stop_verified": False}
 
 
@@ -1065,6 +1105,7 @@ def execute_robot_program(
     executed_count = 0
     safety_interventions: list[dict[str, Any]] = []
     pending_auto_release: dict[str, Any] | None = None
+    locomotion_velocity = (0.0, 0.0, 0.0)
     try:
         _log_event("program_started", command_count=len(commands), commands=commands)
 
@@ -1176,18 +1217,58 @@ def execute_robot_program(
             if return_to_down:
                 return
 
-        def execute_locomotion(vx: float, vy: float, vyaw: float, duration: float) -> dict[str, Any] | None:
+        def locomotion_target(command: dict[str, Any]) -> tuple[float, float, float] | None:
+            method = command.get("method")
+            if method in {"turn", "turn_around_180"}:
+                yaw = _TURN_RADIANS_PER_SECOND * (1 if command["direction"] == "left" else -1)
+                return 0.0, 0.0, yaw
+            if method == "sidestep":
+                lateral_speed = 0.2 * (1 if command["direction"] == "left" else -1)
+                return 0.0, lateral_speed, 0.0
+            if method in {
+                "walk", "backward", "slowwalk", "fastwalk",
+                "walktime", "backwardtime", "slowwalktime", "fastwalktime",
+            }:
+                speed = (
+                    0.2 if method.startswith("slow")
+                    else 0.8 if method.startswith("fast")
+                    else _FORWARD_METERS_PER_SECOND
+                )
+                if method in {"backward", "backwardtime"}:
+                    speed *= -1
+                return speed, 0.0, 0.0
+            return None
+
+        def execute_locomotion(
+            vx: float,
+            vy: float,
+            vyaw: float,
+            duration: float,
+            *,
+            continue_to_next: bool,
+        ) -> dict[str, Any] | None:
+            nonlocal locomotion_velocity
             if safe_mode:
-                return _move(
+                obstacle, locomotion_velocity = _move(
                     vx,
                     vy,
                     vyaw,
                     duration,
+                    initial_velocity=locomotion_velocity,
+                    continue_to_next=continue_to_next,
                     safe_mode=True,
                     safe_mode_stop_margin_m=float(safe_mode_stop_margin_m),
                 )
-            _move(vx, vy, vyaw, duration)
-            return None
+                return obstacle
+            obstacle, locomotion_velocity = _move(
+                vx,
+                vy,
+                vyaw,
+                duration,
+                initial_velocity=locomotion_velocity,
+                continue_to_next=continue_to_next,
+            )
+            return obstacle
 
         def execute_command(
             command: dict[str, Any],
@@ -1211,6 +1292,16 @@ def execute_robot_program(
             index = executed_count
             _log_event("command_started", index=index, command=command)
             try:
+                current_target = locomotion_target(command)
+                next_target = locomotion_target(next_node) if next_node else None
+                continue_to_next = (
+                    current_target is not None
+                    and next_target is not None
+                    and not any(
+                        current * target < 0
+                        for current, target in zip(current_target, next_target)
+                    )
+                )
                 if method == "stand":
                     _sdk_result(_client.SetFsmId(500), "Start")
                 elif method in _POSTURE_TRANSITION_FSM_IDS:
@@ -1274,6 +1365,7 @@ def execute_robot_program(
                         0,
                         yaw,
                         math.radians(command["degrees"]) / _TURN_RADIANS_PER_SECOND,
+                        continue_to_next=continue_to_next,
                     )
                 elif method == "sidestep":
                     lateral_speed = 0.2 * (1 if command["direction"] == "left" else -1)
@@ -1283,6 +1375,7 @@ def execute_robot_program(
                         lateral_speed,
                         0,
                         command["steps"] * _STEP_METERS / abs(lateral_speed),
+                        continue_to_next=continue_to_next,
                     )
                 else:
                     speed = 0.2 if method.startswith("slow") else 0.8 if method.startswith("fast") else _FORWARD_METERS_PER_SECOND
@@ -1295,6 +1388,7 @@ def execute_robot_program(
                         0,
                         0,
                         duration,
+                        continue_to_next=continue_to_next,
                     )
                     if obstacle:
                         intervention = {

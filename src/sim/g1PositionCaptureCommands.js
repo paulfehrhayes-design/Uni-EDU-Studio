@@ -21,6 +21,8 @@ const LEGACY_CAPTURE_COMMANDS = new Set([
   'walktime',
   'backward',
   'backwardtime',
+  'fastwalk',
+  'fastwalktime',
   'sidestep',
   'slowwalk',
   'slowwalktime',
@@ -36,6 +38,8 @@ const LEGACY_PHYSICAL_COMMANDS = new Set([
   'walktime',
   'backward',
   'backwardtime',
+  'fastwalk',
+  'fastwalktime',
   'sidestep',
   'slowwalk',
   'slowwalktime',
@@ -51,6 +55,8 @@ const LEGACY_LOCOMOTION_COMMANDS = new Set([
   'walktime',
   'backward',
   'backwardtime',
+  'fastwalk',
+  'fastwalktime',
   'sidestep',
   'slowwalk',
   'slowwalktime',
@@ -106,11 +112,12 @@ function validateCommandDuration(seconds) {
 
 function estimateLegacyCommandSeconds(command) {
   const { method, values } = command;
-  if (['walktime', 'backwardtime', 'slowwalktime', 'wait'].includes(method)) {
+  if (['walktime', 'backwardtime', 'slowwalktime', 'fastwalktime', 'wait'].includes(method)) {
     return values[0];
   }
   if (method === 'hold_arm') return values[1];
   if (['walk', 'backward', 'slowwalk'].includes(method)) return values[0] * 2.5;
+  if (method === 'fastwalk') return values[0] * 0.345 / 0.8;
   if (method === 'sidestep') return values[1] * 2.5;
   if (method === 'turn') return values[1] / 6;
   if (method === 'turn_around_180' || method === 'arm_action') return 30;

@@ -239,7 +239,7 @@ class RobotMotionRecordingSaveRequest(BaseModel):
     command: str = Field(max_length=20_000)
     joint_names: List[str]
     captured_at: Optional[datetime] = None
-    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=30001)
+    frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=54001)
 
 
 class DuetCommissioningReviewRequest(BaseModel):
@@ -2515,8 +2515,8 @@ def save_robot_motion_recording_for_user(
     )
     if joint_names != list(expected_joint_names):
         raise HTTPException(status_code=400, detail="Recording joint names do not match the selected controller.")
-    maximum_samples = 30001 if capture_type == "position_calibration" else 601
-    maximum_duration = 300 if capture_type == "position_calibration" else 30
+    maximum_samples = 54001 if capture_type == "position_calibration" else 601
+    maximum_duration = 1800 if capture_type == "position_calibration" else 30
     if not 2 <= len(frames) <= maximum_samples:
         raise HTTPException(
             status_code=400,

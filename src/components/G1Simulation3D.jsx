@@ -21,17 +21,24 @@ import {
 
 const G1_SHELL_COLOR = 0xc9cdd1;
 const G1_DARK_COMPONENT_COLOR = 0x111315;
+const G1_ELBOW_BAND_MIN = -0.005;
+const G1_ELBOW_BAND_MAX = 0.035;
 const G1_DARK_MESH_NAMES = new Set([
   'pelvis',
   'left_hip_pitch_link',
   'right_hip_pitch_link',
+  'left_ankle_pitch_link',
+  'right_ankle_pitch_link',
   'left_ankle_roll_link',
   'right_ankle_roll_link',
+  'left_wrist_roll_link',
+  'right_wrist_roll_link',
   'head_link',
   'logo_link',
   'left_rubber_hand',
   'right_rubber_hand',
 ]);
+const G1_ELBOW_MESH_NAMES = new Set(['left_elbow_link', 'right_elbow_link']);
 
 const JOINT_AXES = {
   left_hip_pitch: 'x', right_hip_pitch: 'x', left_knee: 'x', right_knee: 'x', left_knee_pitch: 'x', right_knee_pitch: 'x',
@@ -179,13 +186,61 @@ function addSegment(parent, start, end, width, color) {
   return mesh;
 }
 
+function addDarkJointCap(parent, radius, depth, position) {
+  const mesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(radius, radius, depth, 20),
+    material(G1_DARK_COMPONENT_COLOR, 0.25, 0.58),
+  );
+  mesh.rotation.z = Math.PI / 2;
+  mesh.position.set(...position);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  parent.add(mesh);
+  return mesh;
+}
+
+function addHeadLed(parent, position, width, height, frontDirection) {
+  const display = new THREE.Group();
+  display.position.set(...position);
+  parent.add(display);
+
+  const cyan = new THREE.MeshBasicMaterial({ color: 0x20dfff, side: THREE.DoubleSide });
+  const glow = new THREE.MeshBasicMaterial({
+    color: 0x20dfff,
+    transparent: true,
+    opacity: 0.12,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const halo = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.08, 8, 48), glow);
+  halo.scale.set(width * 1.03, height * 1.02, 1);
+  display.add(halo);
+
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.045, 8, 48), cyan);
+  ring.scale.set(width, height, 1);
+  ring.position.z = frontDirection * 0.002;
+  display.add(ring);
+
+  const barY = height * 0.18;
+  const bar = new THREE.Mesh(new THREE.BoxGeometry(width * 0.66, 0.008, 0.004), cyan);
+  bar.position.set(0, barY, frontDirection * 0.004);
+  display.add(bar);
+
+  const barCore = new THREE.Mesh(
+    new THREE.BoxGeometry(width * 0.62, 0.003, 0.005),
+    new THREE.MeshBasicMaterial({ color: 0xc653ff, side: THREE.DoubleSide }),
+  );
+  barCore.position.set(0, barY, frontDirection * 0.006);
+  display.add(barCore);
+  return display;
+}
+
 function createRobot() {
   const robot = new THREE.Group();
   robot.name = 'G1-23DoF';
   robot.scale.setScalar(0.45);
   const dark = G1_DARK_COMPONENT_COLOR;
   const light = G1_SHELL_COLOR;
-  const accent = 0x20dfff;
   const joints = {};
   const register = (name, parent, position = [0, 0, 0]) => {
     const group = new THREE.Group();
@@ -208,7 +263,7 @@ function createRobot() {
 
   const head = register('head', torso, [0, 0.95, 0]);
   addBox(head, [0.4, 0.42, 0.38], [0, 0, 0], dark, 0);
-  addBox(head, [0.22, 0.08, 0.04], [0, 0.02, -0.2], accent, 0);
+  addHeadLed(head, [0, 0.02, -0.195], 0.22, 0.28, -1);
 
   const leg = (side, x) => {
     const hipRoll = register(`${side}_hip_roll_joint`, pelvis, [x, -0.02, 0]);
@@ -217,6 +272,9 @@ function createRobot() {
     addSegment(hipPitch, [0, 0, 0], [0, -0.55, 0], 0.13, light);
     const knee = register(`${side}_knee_joint`, hipPitch, [0, -0.55, 0]);
     addSegment(knee, [0, 0, 0], [0, -0.62, 0], 0.12, light);
+    for (const direction of [-1, 1]) {
+      addDarkJointCap(knee, 0.12, 0.045, [direction * 0.12, 0, 0.015]);
+    }
     const anklePitch = register(`${side}_ankle_pitch_joint`, knee, [0, -0.62, 0]);
     const ankleRoll = register(`${side}_ankle_roll_joint`, anklePitch);
     addBox(ankleRoll, [0.24, 0.18, 0.42], [0, -0.12, -0.05], dark, 0);
@@ -231,7 +289,8 @@ function createRobot() {
     const shoulderYaw = register(`${side}_shoulder_yaw_joint`, shoulderRoll);
     addSegment(shoulderYaw, [0, 0, 0], [0, -0.48, 0], 0.1, light);
     const elbow = register(`${side}_elbow_joint`, shoulderYaw, [0, -0.48, 0]);
-    addSegment(elbow, [0, 0, 0], [0, -0.46, 0], 0.085, light);
+    addSegment(elbow, [0, 0, 0], [0, -0.055, 0], 0.085, dark);
+    addSegment(elbow, [0, -0.055, 0], [0, -0.46, 0], 0.085, light);
     const wristRoll = register(`${side}_wrist_roll_joint`, elbow, [0, -0.46, 0]);
     addBox(wristRoll, [0.16, 0.2, 0.2], [0, -0.1, 0], dark, 0);
   };
@@ -483,6 +542,20 @@ async function loadG1MeshRig() {
       const geometry = await loader.loadAsync(`/g1/meshes/${file}`);
       geometry.applyMatrix4(MUJOCO_TO_VIEW);
       geometry.computeVertexNormals();
+      if (G1_ELBOW_MESH_NAMES.has(meshName)) {
+        const positions = geometry.attributes.position;
+        const shellColor = new THREE.Color(0xffffff);
+        const jointColor = new THREE.Color(G1_DARK_COMPONENT_COLOR);
+        const colors = new Float32Array(positions.count * 3);
+        for (let index = 0; index < positions.count; index += 1) {
+          const alongArm = positions.getZ(index);
+          const color = alongArm >= G1_ELBOW_BAND_MIN && alongArm <= G1_ELBOW_BAND_MAX
+            ? jointColor
+            : shellColor;
+          color.toArray(colors, index * 3);
+        }
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      }
       geometryCache.set(meshName, geometry);
     }
     return geometryCache.get(meshName);
@@ -490,12 +563,14 @@ async function loadG1MeshRig() {
 
   const getMaterial = (meshName) => {
     const dark = G1_DARK_MESH_NAMES.has(meshName);
-    const key = dark ? 'dark' : 'light';
+    const elbowJoint = G1_ELBOW_MESH_NAMES.has(meshName);
+    const key = elbowJoint ? 'elbow-joint' : dark ? 'dark' : 'light';
     if (!materialCache.has(key)) {
       materialCache.set(key, new THREE.MeshStandardMaterial({
-        color: dark ? G1_DARK_COMPONENT_COLOR : G1_SHELL_COLOR,
+        color: elbowJoint ? 0xffffff : dark ? G1_DARK_COMPONENT_COLOR : G1_SHELL_COLOR,
         metalness: 0.5,
         roughness: 0.36,
+        vertexColors: elbowJoint,
       }));
     }
     return materialCache.get(key);
@@ -508,6 +583,12 @@ async function loadG1MeshRig() {
     body.quaternion.copy(convertQuaternion(bodyElement.getAttribute('quat')));
     body.userData.baseQuaternion = body.quaternion.clone();
     parent.add(body);
+    const bodyName = bodyElement.getAttribute('name');
+    if (bodyName === 'left_knee_link' || bodyName === 'right_knee_link') {
+      for (const direction of [-1, 1]) {
+        addDarkJointCap(body, 0.045, 0.018, [direction * 0.036, -0.01, 0.015]);
+      }
+    }
 
     const joint = bodyElement.querySelector(':scope > joint');
     if (activeJointNames.has(joint?.getAttribute('name'))) {
@@ -530,6 +611,9 @@ async function loadG1MeshRig() {
       mesh.position.copy(convertPosition(geom.getAttribute('pos')));
       mesh.quaternion.copy(convertQuaternion(geom.getAttribute('quat')));
       body.add(mesh);
+      if (meshName === 'head_link') {
+        addHeadLed(mesh, [0, 0.42, 0.055], 0.085, 0.125, 1);
+      }
     }));
 
     for (const child of bodyElement.querySelectorAll(':scope > body')) {

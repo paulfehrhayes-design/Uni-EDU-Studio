@@ -40,8 +40,8 @@ function validateRecording(recording) {
     throw new Error('Recorded motion joint names do not match the supported G1 model.');
   }
   const frames = recording?.frames;
-  const maximumSamples = captureType === 'position_calibration' ? 30001 : 601;
-  const maximumDuration = captureType === 'position_calibration' ? 300 : 30;
+  const maximumSamples = captureType === 'position_calibration' ? 54001 : 601;
+  const maximumDuration = captureType === 'position_calibration' ? 1800 : 30;
   if (!Array.isArray(frames) || frames.length < 2 || frames.length > maximumSamples) {
     throw new Error(`Recorded motion must contain 2 to ${maximumSamples} samples.`);
   }

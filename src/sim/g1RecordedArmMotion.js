@@ -7,8 +7,8 @@ export function buildG1RecordedMotionFrames(recording) {
   const frames = recording?.frames;
   const captureType = recording?.capture_type ?? 'motion';
   const isPositionCapture = captureType === 'position_calibration';
-  const maximumSeconds = isPositionCapture ? 300 : 30;
-  const maximumSamples = isPositionCapture ? 30001 : 601;
+  const maximumSeconds = isPositionCapture ? 1800 : 30;
+  const maximumSamples = isPositionCapture ? 54001 : 601;
   if (!['motion', 'position_calibration'].includes(captureType)) {
     throw new Error('Recorded motion capture type is unsupported.');
   }

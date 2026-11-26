@@ -1405,6 +1405,43 @@ class ServerClassroomTests(unittest.TestCase):
                     'position_calibration',
                 )
             self.assertEqual(raised.exception.status_code, 400)
+            long_recording = server.save_robot_motion_recording_for_user(
+                'teacher',
+                'Thirty-minute position capture',
+                'legacy',
+                'supervised locomotion series',
+                list(server.G1_JOINT_NAMES),
+                [
+                    frames[0],
+                    server.DuetArmRecordingFrame(
+                        time=1800,
+                        joints=[0.1] * 23,
+                        pose=pose,
+                    ),
+                ],
+                captured_at,
+                'position_calibration',
+            )
+            self.assertEqual(long_recording['frames'][1]['time'], 1800)
+            with self.assertRaises(HTTPException) as too_long:
+                server.save_robot_motion_recording_for_user(
+                    'teacher',
+                    'Overlong position capture',
+                    'legacy',
+                    'supervised locomotion series',
+                    list(server.G1_JOINT_NAMES),
+                    [
+                        frames[0],
+                        server.DuetArmRecordingFrame(
+                            time=1800.001,
+                            joints=[0.1] * 23,
+                            pose=pose,
+                        ),
+                    ],
+                    captured_at,
+                    'position_calibration',
+                )
+            self.assertEqual(too_long.exception.status_code, 400)
             with self.assertRaises(HTTPException) as too_many:
                 server.save_robot_motion_recording_for_user(
                     'teacher',
@@ -1412,7 +1449,7 @@ class ServerClassroomTests(unittest.TestCase):
                     'legacy',
                     '',
                     list(server.G1_JOINT_NAMES),
-                    [frames[0]] * 30002,
+                    [frames[0]] * 54002,
                     captured_at,
                     'position_calibration',
                 )

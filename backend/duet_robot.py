@@ -179,6 +179,9 @@ COMMAND_REFRESH_SECONDS = 0.1
 
 _run_lock = threading.Lock()
 _run_state_lock = threading.Lock()
+_navigation_command_lock = threading.Lock()
+_navigation_base_velocity = (0.0, 0.0, 0.0)
+_navigation_velocity_updated_at: float | None = None
 _stop_requested = threading.Event()
 _commissioning_lock = threading.RLock()
 _commissioning_state: dict | None = None
@@ -680,9 +683,23 @@ def run_commissioning_step(step_index: int) -> dict:
             "code": step["code"],
         })
 
+    def send_commissioning_move(lease_ms: int) -> dict:
+        try:
+            limits = configured_velocity_slew_limits()
+        except ValueError as error:
+            raise DuetControllerError(f"Invalid G1 velocity slew configuration: {error}") from error
+        velocity = slew_velocity(
+            (0.0, 0.0, 0.0),
+            (0.05, 0.0, 0.0),
+            min(COMMAND_REFRESH_SECONDS, lease_ms / 1000),
+            limits,
+        )
+        request = f"MOVE {velocity[0]:.6f} {velocity[1]:.6f} {velocity[2]:.6f} {lease_ms}"
+        return _validate_controller_status(_gateway_request(request))
+
     try:
         if step["category"] == "lease":
-            moving_status = _validate_controller_status(_gateway_request("MOVE 0.05 0 0 100"))
+            moving_status = send_commissioning_move(100)
             if moving_status.get("motion_active") is not True:
                 raise DuetControllerError("Controller did not confirm motion before the 100 ms lease-expiry check.")
             time.sleep(0.35)
@@ -692,7 +709,7 @@ def run_commissioning_step(step_index: int) -> dict:
             _stop_gateway_command()
             test_result = {"status": "completed", "motion_active_after_expiry": False}
         elif step["category"] == "stop":
-            moving_status = _validate_controller_status(_gateway_request("MOVE 0.05 0 0 500"))
+            moving_status = send_commissioning_move(500)
             if moving_status.get("motion_active") is not True:
                 raise DuetControllerError("Controller did not confirm the brief movement before STOP test.")
             stopped_status = _stop_gateway_command()
@@ -2051,6 +2068,7 @@ def execute_program(
             command = pending_commands.pop()
             if _stop_requested.is_set():
                 break
+            next_command = pending_commands[-1] if pending_commands else None
             command_arm_commands = _safe_mode_arm_commands(command)
             if safe_mode and command_arm_commands:
                 arm_block_reason = safe_mode_arm_block_reason()
@@ -2105,6 +2123,30 @@ def execute_program(
                 executed += 1
                 continue
             if command["type"] == "move":
+                next_target_velocity = (
+                    (
+                        next_command["vx_mps"],
+                        next_command["vy_mps"],
+                        next_command["yaw_rate_rps"],
+                    )
+                    if next_command and next_command.get("type") == "move"
+                    else None
+                )
+                continue_base_motion = (
+                    next_target_velocity is not None
+                    and active_arm_command is None
+                    and not any(
+                        current * target < 0
+                        for current, target in zip(
+                            (
+                                command["vx_mps"],
+                                command["vy_mps"],
+                                command["yaw_rate_rps"],
+                            ),
+                            next_target_velocity,
+                        )
+                    )
+                )
                 deadline = time.monotonic() + command["duration_s"]
                 previous_update = time.monotonic()
                 safety_interrupted = False
@@ -2115,7 +2157,10 @@ def execute_program(
                         reset_arms()
                     now = time.monotonic()
                     moving = now < deadline
-                    if not moving and current_base_velocity == (0.0, 0.0, 0.0):
+                    if not moving and (
+                        current_base_velocity == (0.0, 0.0, 0.0)
+                        or continue_base_motion
+                    ):
                         break
                     if safe_mode:
                         reason = active_safe_mode_block_reason(
@@ -2153,11 +2198,12 @@ def execute_program(
                         break
                 if safety_interrupted:
                     continue
-                if active_arm_command and active_arm_command.get("type") != "arm_pose":
-                    _validate_controller_status(_gateway_request(f"MOVE 0 0 0 {COMMAND_LEASE_MS}"))
-                    refresh_arm_command()
-                else:
-                    _stop_gateway_command()
+                if not continue_base_motion:
+                    if active_arm_command and active_arm_command.get("type") != "arm_pose":
+                        _validate_controller_status(_gateway_request(f"MOVE 0 0 0 {COMMAND_LEASE_MS}"))
+                        refresh_arm_command()
+                    else:
+                        _stop_gateway_command()
                 if _stop_requested.is_set():
                     break
             elif command["type"] == "concurrent":
@@ -2586,6 +2632,7 @@ def navigation_move(
     hardware_acceptance_verified: bool = False,
 ) -> dict:
     """Refresh a short DUET base-velocity lease for an owned Nav2 operation."""
+    global _navigation_base_velocity, _navigation_velocity_updated_at
     if (
         not math.isfinite(vx)
         or not math.isfinite(yaw_rate)
@@ -2597,26 +2644,54 @@ def navigation_move(
         _require_hardware_acceptance()
     if _run_lock.locked():
         raise DuetControllerError("A DUET program owns locomotion.")
-    status = _validate_controller_status(
-        _gateway_request(f"MOVE {vx:.6f} 0 {yaw_rate:.6f} {COMMAND_LEASE_MS}")
-    )
-    expected_motion = abs(vx) > 0.001 or abs(yaw_rate) > 0.001
-    if (
-        status.get("ready") is not True
-        or status.get("control_lease") is not True
-        or status.get("lowcmd_owner") != "duet"
-        or status.get("motion_active") is not expected_motion
-    ):
-        raise DuetControllerError("DUET did not confirm the requested navigation velocity lease.")
+    with _navigation_command_lock:
+        now = time.monotonic()
+        elapsed = (
+            COMMAND_REFRESH_SECONDS
+            if _navigation_velocity_updated_at is None
+            else min(
+                COMMAND_REFRESH_SECONDS,
+                max(0.0, now - _navigation_velocity_updated_at),
+            )
+        )
+        try:
+            target_velocity = slew_velocity(
+                _navigation_base_velocity,
+                (vx, 0.0, yaw_rate),
+                elapsed,
+                configured_velocity_slew_limits(),
+            )
+        except ValueError as error:
+            raise DuetControllerError(f"Invalid G1 velocity slew configuration: {error}") from error
+        status = _validate_controller_status(
+            _gateway_request(
+                f"MOVE {target_velocity[0]:.6f} {target_velocity[1]:.6f} "
+                f"{target_velocity[2]:.6f} {COMMAND_LEASE_MS}"
+            )
+        )
+        expected_motion = any(abs(value) > 0.001 for value in target_velocity)
+        if (
+            status.get("ready") is not True
+            or status.get("control_lease") is not True
+            or status.get("lowcmd_owner") != "duet"
+            or status.get("motion_active") is not expected_motion
+        ):
+            raise DuetControllerError("DUET did not confirm the requested navigation velocity lease.")
+        _navigation_base_velocity = target_velocity
+        _navigation_velocity_updated_at = now
     return {"status": "accepted", "lease_ms": COMMAND_LEASE_MS}
 
 
 def stop_navigation_motion() -> dict:
     """Issue DUET's existing STOP and confirm its leased motion is inactive."""
-    status = _stop_gateway_leases()
-    if (
-        status.get("lowcmd_owner") != "duet"
-        or status.get("motion_active") is not False
-    ):
-        raise DuetControllerError("DUET did not confirm stopped navigation motion while it owned lowcmd.")
+    global _navigation_base_velocity, _navigation_velocity_updated_at
+    with _navigation_command_lock:
+        status = _stop_gateway_leases()
+        if (
+            status.get("lowcmd_owner") != "duet"
+            or status.get("motion_active") is not False
+        ):
+            raise DuetControllerError("DUET did not confirm stopped navigation motion while it owned lowcmd.")
+        _navigation_base_velocity = (0.0, 0.0, 0.0)
+        _navigation_velocity_updated_at = None
     return {"status": "stopped", "zero_velocity_confirmed": True}

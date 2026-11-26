@@ -18,11 +18,9 @@ test('legacy position capture accepts a bounded sequence of locomotion and arm c
   );
 });
 
-test('legacy position capture rejects unsafe or unbounded program structures', () => {
-  assert.throws(
-    () => validateLegacyPositionCapture('Fast', 'robot.fastwalk(2)'),
-    /conservative walking and turns/,
-  );
+test('legacy position capture bounds fast walking and rejects unsafe program structures', () => {
+  const boundedFast = validateLegacyPositionCapture('Fast', 'robot.fastwalk(21)');
+  assert.equal(boundedFast.code, 'robot.fastwalk(20)');
   assert.throws(
     () => validateLegacyPositionCapture(
       'Conditional',
@@ -64,6 +62,15 @@ test('rate-sweep movement cycles are bounded forward/backward commands on both c
 
   assert.equal(legacy.usesLocomotion, true);
   assert.equal(duet.usesLocomotion, true);
+});
+
+test('legacy position capture accepts and estimates fast walking in both modes', () => {
+  const capture = validateLegacyPositionCapture(
+    'Fast walk calibration',
+    'robot.fastwalk(5)\nrobot.fastwalktime(5)',
+  );
+
+  assert.equal(capture.usesLocomotion, true);
 });
 
 test('DUET position capture rejects concurrent, persistent, and oversized programs', () => {
