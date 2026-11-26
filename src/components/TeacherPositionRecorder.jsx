@@ -19,6 +19,7 @@ import {
   buildG1LocomotionCalibrationSeries,
   distanceFromCalibrationAnchor,
   executeG1LocomotionCalibrationSeries,
+  getG1CalibrationSectionElapsedSeconds,
   G1_CALIBRATION_RECENTER_TOLERANCE_METERS,
   G1_CALIBRATION_STOP_RADIUS_METERS,
 } from '../sim/g1LocomotionCalibration.js';
@@ -137,6 +138,16 @@ function partialRecordingName(name, recordings, capturedAt) {
   return candidate;
 }
 
+function uniqueRecordingName(name, recordings) {
+  const existingNames = new Set(recordings.map(({ name: recordingName }) => recordingName.toLowerCase()));
+  if (!existingNames.has(name.toLowerCase())) return name;
+  for (let index = 2; ; index += 1) {
+    const suffix = ` (${index})`;
+    const candidate = `${name.slice(0, 40 - suffix.length)}${suffix}`;
+    if (!existingNames.has(candidate.toLowerCase())) return candidate;
+  }
+}
+
 function downloadSensorRateDiagnostic(report) {
   const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -190,6 +201,7 @@ export default function TeacherPositionRecorder({
   controllerVersion,
   onBusyChange,
   onPreview,
+  selectedRecordingId = null,
   blockedByOtherMotion,
 }) {
   const [recordings, setRecordings] = useState([]);
@@ -601,6 +613,7 @@ export default function TeacherPositionRecorder({
         captureBatches = series.batches.map((batch, index) => ({
           ...validateLegacyPositionCapture(name, batch.code),
           label: batch.label,
+          phase: batch.phase,
           code: batch.code,
           index,
         }));
@@ -653,12 +666,15 @@ export default function TeacherPositionRecorder({
         .join(', ');
       return `${captureProgram.code}\n\n# Actual batch run order (including repeats): ${batchOrder}`;
     };
-    const frames = [makePoseAndJointFrame({
-      time: 0,
-      pose: initialPose,
-      positions: firstJointSample.positions,
-    })];
-    setSampleCount(1);
+    const frames = useLocomotionSeries
+      ? []
+      : [makePoseAndJointFrame({
+        time: 0,
+        pose: initialPose,
+        positions: firstJointSample.positions,
+      })];
+    let totalSampleCount = frames.length;
+    setSampleCount(totalSampleCount);
     setConfirmClearArea(false);
     startingRef.current = false;
     setIsStarting(false);
@@ -705,6 +721,7 @@ export default function TeacherPositionRecorder({
           if (!section) {
             section = {
               batch,
+              capturedAt: new Date().toISOString(),
               frames: [],
               runHistory: [],
               saved: false,
@@ -716,12 +733,15 @@ export default function TeacherPositionRecorder({
             ? section.frames.at(-1).time + 0.001
             : 0;
           section.runStartedAt = performance.now();
+          section.runElapsedAtPause = null;
           nextSampleAt = section.runStartedAt + SAMPLE_INTERVAL_MS;
           section.frames.push(makePoseAndJointFrame({
             time: Number(section.runTimeOffset.toFixed(3)),
             pose,
             positions: jointSample.positions,
           }));
+          totalSampleCount += 1;
+          setSampleCount(totalSampleCount);
         },
         waitForContinue: async ({ completed, total, completedBatch, nextBatch }) => {
           const [poseSnapshot, jointSample] = await Promise.all([
@@ -741,6 +761,10 @@ export default function TeacherPositionRecorder({
           if (!addSample(pose, jointSample)) {
             throw new Error('The calibration capture limit was reached at a batch boundary.');
           }
+          activeSeriesSectionRef.current.runElapsedAtPause = getG1CalibrationSectionElapsedSeconds(
+            activeSeriesSectionRef.current,
+            performance.now(),
+          );
           setSeriesCheckpoint({
             completed,
             total,
@@ -761,27 +785,25 @@ export default function TeacherPositionRecorder({
     };
     const addSample = (pose, jointSample) => {
       const elapsed = (performance.now() - startedAt) / 1000;
-      if (elapsed > captureDurationLimitSeconds || frames.length >= MAX_CAPTURE_SAMPLES) {
+      const activeSection = activeSeriesSectionRef.current;
+      const sectionLimitReached = useLocomotionSeries && (
+        !activeSection
+        || activeSection.frames.length >= MAX_CAPTURE_SAMPLES
+        || getG1CalibrationSectionElapsedSeconds(activeSection, performance.now())
+          > captureDurationLimitSeconds
+      );
+      if (
+        sectionLimitReached
+        || (!useLocomotionSeries && elapsed > captureDurationLimitSeconds)
+        || (!useLocomotionSeries && frames.length >= MAX_CAPTURE_SAMPLES)
+      ) {
         captureLimitReached = true;
         return false;
       }
-      const time = Math.max(
-        Number(elapsed.toFixed(3)),
-        frames.at(-1).time + 0.001,
-      );
-      frames.push(makePoseAndJointFrame({
-        time,
-        pose,
-        positions: jointSample.positions,
-      }));
-      if (
-        useLocomotionSeries
-        && activeSeriesSectionRef.current
-        && !checkpointResolverRef.current
-      ) {
+      if (useLocomotionSeries) {
         const section = activeSeriesSectionRef.current;
         const sectionTime = Math.max(
-          section.runTimeOffset + (performance.now() - section.runStartedAt) / 1000,
+          getG1CalibrationSectionElapsedSeconds(section, performance.now()),
           section.frames.at(-1).time + 0.001,
         );
         section.frames.push(makePoseAndJointFrame({
@@ -789,9 +811,20 @@ export default function TeacherPositionRecorder({
           pose,
           positions: jointSample.positions,
         }));
+      } else {
+        const time = Math.max(
+          Number(elapsed.toFixed(3)),
+          frames.at(-1).time + 0.001,
+        );
+        frames.push(makePoseAndJointFrame({
+          time,
+          pose,
+          positions: jointSample.positions,
+        }));
       }
-      setSampleCount(frames.length);
-      if (frames.length >= MAX_CAPTURE_SAMPLES) {
+      totalSampleCount += 1;
+      setSampleCount(totalSampleCount);
+      if (!useLocomotionSeries && frames.length >= MAX_CAPTURE_SAMPLES) {
         captureLimitReached = true;
         return false;
       }
@@ -810,7 +843,8 @@ export default function TeacherPositionRecorder({
           throw new Error('The TF base frame changed while saving a calibration section.');
         }
         const sectionTime = Math.max(
-          section.runTimeOffset + (performance.now() - section.runStartedAt) / 1000,
+          section.runElapsedAtPause
+            ?? getG1CalibrationSectionElapsedSeconds(section, performance.now()),
           section.frames.at(-1)?.time + 0.001 || 0.001,
         );
         section.frames.push(makePoseAndJointFrame({
@@ -824,7 +858,7 @@ export default function TeacherPositionRecorder({
       const sectionName = `${captureProgram.name.slice(0, 40 - sectionNameSuffix.length)}${sectionNameSuffix}`;
       const savedName = partial
         ? partialRecordingName(sectionName, recordings, new Date().toISOString())
-        : sectionName;
+        : uniqueRecordingName(sectionName, recordings);
       const command = `${section.batch.code}\n\n# Actual batch run order (including repeats): ${section.runHistory.join(', ')}`;
       const saved = await connection.saveRecording({
         name: savedName,
@@ -832,7 +866,7 @@ export default function TeacherPositionRecorder({
         capture_type: 'position_calibration',
         command: partial ? `${command}\n\n# Partial recording: ${reason}` : command,
         joint_names: firstJointSample.jointNames,
-        captured_at: capturedAt,
+        captured_at: section.capturedAt,
         frames: section.frames,
       });
       section.saved = true;
@@ -895,8 +929,15 @@ export default function TeacherPositionRecorder({
           await wait(SAMPLE_INTERVAL_MS);
           continue;
         }
-        const remainingMs = captureDurationLimitSeconds * 1000 - (performance.now() - startedAt);
-        if (remainingMs <= 0 || frames.length >= MAX_CAPTURE_SAMPLES) {
+        const activeSection = activeSeriesSectionRef.current;
+        const elapsedSeconds = useLocomotionSeries
+          ? getG1CalibrationSectionElapsedSeconds(activeSection, performance.now())
+          : (performance.now() - startedAt) / 1000;
+        const remainingMs = (captureDurationLimitSeconds - elapsedSeconds) * 1000;
+        const sampleLimitReached = useLocomotionSeries
+          ? activeSection.frames.length >= MAX_CAPTURE_SAMPLES
+          : frames.length >= MAX_CAPTURE_SAMPLES;
+        if (remainingMs <= 0 || sampleLimitReached) {
           captureLimitReached = true;
           break;
         }
@@ -979,7 +1020,10 @@ export default function TeacherPositionRecorder({
           stopError = requestError;
         }
       }
-      if ((performance.now() - startedAt) / 1000 > captureDurationLimitSeconds) {
+      if (
+        !useLocomotionSeries
+        && (performance.now() - startedAt) / 1000 > captureDurationLimitSeconds
+      ) {
         captureLimitReached = true;
       }
       const partialReason = samplingError?.message
@@ -1394,7 +1438,7 @@ export default function TeacherPositionRecorder({
       </form>
       <p className="mt-2 text-[11px] leading-4 text-slate-600">
         Sequential commands and bounded loops are limited to 20 expanded commands and an estimated five minutes.
-        Each calibration-series API batch stays within the capture validator&apos;s 20-command and five-minute estimated-duration limits. The finite series has 14 batches and pauses after each one, with a 30-minute capture ceiling. Each calibration batch is saved separately when you continue, and its own JSON file is downloaded. Repeated runs stay grouped in that batch&apos;s file; the exported command notes its actual run order. Use the saved recordings list to preview or export a section again.
+        Each calibration-series API batch stays within the capture validator&apos;s 20-command and five-minute estimated-duration limits. The finite series has 14 batches and pauses after each one; the 30-minute capture and sample limits apply independently to each section and exclude recenter pauses. Each calibration batch is saved separately when you continue, and its own JSON file is downloaded. Repeated runs stay grouped in that batch&apos;s file; the exported command notes its actual run order. Use Play in simulator on a saved recording to select and play that section.
         Position captures target 30 Hz based on the completed sensor sweep. The temporary sweep tests 10, 20, 30, 40, 50, 60, 80, 100, 150, and 200 Hz with bounded forward/backward movement cycles.
         Calibration series uses only existing Legacy SDK locomotion commands; fast-walk commands are forward-only in the current SDK. Legacy Stop stops locomotion but does not independently verify immobility.
         Fresh odometry/localization and all 23 ROS joint values are required. A series sensor/boundary failure or STOP offers the measured partial capture when at least two valid samples exist.
@@ -1440,9 +1484,11 @@ export default function TeacherPositionRecorder({
                     type="button"
                     onClick={() => onPreview(recording)}
                     disabled={isStarting || isCapturing || isStopping}
+                    aria-label={`Play recording ${recording.name} in simulator`}
+                    aria-pressed={recording.id === selectedRecordingId}
                     className="rounded-md border border-cyan-300 px-2 py-1 text-[11px] font-semibold text-cyan-900 disabled:opacity-50"
                   >
-                    Preview
+                    Play in simulator
                   </button>
                   <button
                     type="button"

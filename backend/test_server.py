@@ -1808,12 +1808,28 @@ class ServerClassroomTests(unittest.TestCase):
                     headers=teacher_headers,
                     json={"item_id": submission["id"]},
                 )
+                server.set_queue_item_status(submission["id"], "paused")
+                paused_retry = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": submission["id"]},
+                )
+                server.set_queue_item_status(submission["id"], "failed")
+                failed_retry = client.post(
+                    "/api/classroom/run-next",
+                    headers=teacher_headers,
+                    json={"item_id": submission["id"]},
+                )
 
         self.assertEqual(first_run.status_code, 200)
         self.assertEqual(second_run.status_code, 200)
+        self.assertEqual(paused_retry.status_code, 200)
+        self.assertEqual(failed_retry.status_code, 200)
         self.assertEqual(first_run.json()["item"]["status"], "completed")
         self.assertEqual(second_run.json()["item"]["status"], "completed")
-        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(paused_retry.json()["item"]["status"], "completed")
+        self.assertEqual(failed_retry.json()["item"]["status"], "completed")
+        self.assertEqual(execute.call_count, 4)
 
     def test_run_next_dispatches_each_project_planner_mode_to_its_executor(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(

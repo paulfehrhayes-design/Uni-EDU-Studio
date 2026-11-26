@@ -8,9 +8,11 @@ import {
   buildG1LocomotionCalibrationSeries,
   distanceFromCalibrationAnchor,
   executeG1LocomotionCalibrationSeries,
+  getG1CalibrationSectionElapsedSeconds,
   G1_CALIBRATION_RECENTER_TOLERANCE_METERS,
   G1_CALIBRATION_STOP_RADIUS_METERS,
 } from './g1LocomotionCalibration.js';
+import { buildG1RecordedMotionFrames } from './g1RecordedArmMotion.js';
 
 test('locomotion calibration is finite, locomotion-only, and divided into bounded SDK batches', () => {
   const series = buildG1LocomotionCalibrationSeries();
@@ -144,6 +146,14 @@ test('local odometry boundary checks require the same frame and enforce conserva
   );
 });
 
+test('section capture time excludes pauses and starts independently for each section', () => {
+  const firstSection = { runTimeOffset: 4, runStartedAt: 1000 };
+  const secondSection = { runTimeOffset: 0, runStartedAt: 3_601_000 };
+
+  assert.equal(getG1CalibrationSectionElapsedSeconds(firstSection, 6000), 9);
+  assert.equal(getG1CalibrationSectionElapsedSeconds(secondSection, 3_606_000), 5);
+});
+
 test('series runner requires each explicit continue and stops without issuing later batches', async () => {
   const { batches } = buildG1LocomotionCalibrationSeries();
   const executions = [];
@@ -272,4 +282,37 @@ test('series pose and full 23-joint samples pass the existing calibration JSON e
   assert.equal(exported.command, code);
   assert.equal(exported.frames[1].positions_rad.length, 23);
   assert.equal(exported.frames[1].base_pose.x_m, 0.02);
+});
+
+test('each saved calibration section can be played as an independent measured motion', () => {
+  const pose = {
+    frame_id: 'odom',
+    base_frame: 'pelvis',
+    x: 0,
+    y: 0,
+    z: 0,
+    yaw_rad: 0,
+    timestamp: '2026-03-01T10:00:00Z',
+    age_ms: 20,
+    source: 'odometry',
+  };
+  const recording = (name, x) => ({
+    name,
+    controller_version: 'legacy',
+    capture_type: 'position_calibration',
+    joint_names: [...G1_MODEL_INFO.joints],
+    frames: [
+      { time: 0, joints: Array(23).fill(0), pose },
+      { time: 0.1, joints: Array(23).fill(0.1), pose: { ...pose, x } },
+    ],
+  });
+  const firstSection = buildG1RecordedMotionFrames(recording('Section 1', 0.1));
+  const secondSection = buildG1RecordedMotionFrames(recording('Section 2', -0.2));
+
+  assert.equal(firstSection.length, 2);
+  assert.equal(secondSection.length, 2);
+  assert.equal(firstSection[0].time, 0);
+  assert.equal(secondSection[0].time, 0);
+  assert.equal(firstSection.at(-1).x, 0.1);
+  assert.equal(secondSection.at(-1).x, -0.2);
 });

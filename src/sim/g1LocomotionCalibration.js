@@ -383,3 +383,7 @@ export function distanceFromCalibrationAnchor(anchor, pose) {
   }
   return Math.hypot(pose.x - anchor.x, pose.y - anchor.y);
 }
+
+export function getG1CalibrationSectionElapsedSeconds(section, now) {
+  return section.runTimeOffset + Math.max(0, now - section.runStartedAt) / 1000;
+}

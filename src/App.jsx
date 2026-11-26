@@ -2309,7 +2309,7 @@ export default function App() {
       setQueueReviewError('Finish the active position capture before starting another robot operation.');
       return;
     }
-    if (!queueReviewItem || !['queued', 'completed'].includes(queueReviewItem.status)) return;
+    if (!queueReviewItem || !['queued', 'completed', 'paused', 'failed'].includes(queueReviewItem.status)) return;
     if (queueReviewItem.planner_request?.planner_mode === PLANNER_PATH_MODES.autonomous
       && !queueReviewNavigationPreview) {
       setQueueReviewError('Preview the autonomous route before approving movement.');
@@ -2399,15 +2399,6 @@ export default function App() {
     } catch (error) {
       setQueueReviewError(`Stop request failed • ${error.message}`);
     }
-  };
-
-  const handleRunNext = async () => {
-    const nextItem = queueItems.find((item) => item.status === 'queued');
-    if (!nextItem) {
-      alert('There are no queued requests to approve.');
-      return;
-    }
-    handleLoadQueueItemForReview(nextItem);
   };
 
   const handleStopCurrent = async () => {
@@ -5920,7 +5911,7 @@ export default function App() {
       ? item.created_at || 'Time unavailable'
       : submittedAt.toLocaleString();
     return (
-      <div key={item.id} className="rounded-lg border border-slate-200 p-2">
+      <div key={item.id} data-testid={`queue-item-${item.id}`} className="rounded-lg border border-slate-200 p-2">
         <div className="flex items-center justify-between gap-2">
           <p className="font-medium text-slate-800 text-sm truncate">{item.name}</p>
           <span className="text-[10px] uppercase bg-slate-100 text-slate-600 rounded-full px-2 py-1">{item.status}</span>
@@ -5957,7 +5948,13 @@ export default function App() {
           onClick={() => handleLoadQueueItemForReview(item)}
           className="mt-2 rounded-md border border-blue-200 px-2 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-50"
         >
-          {item.status === 'completed' ? 'Replay request' : 'Review request'}
+          {item.status === 'queued'
+            ? 'Select to play'
+            : item.status === 'completed'
+              ? 'Select to replay'
+              : ['paused', 'failed'].includes(item.status)
+                ? 'Select to retry'
+              : 'Review request'}
         </button>
         <button onClick={() => handleDeleteQueueItem(item.id)} className="mt-2 ml-3 text-xs text-red-600 hover:text-red-700">Delete</button>
       </div>
@@ -6151,6 +6148,7 @@ export default function App() {
                 controllerVersion={controllerVersion}
                 onBusyChange={setIsPositionCaptureRecording}
                 onPreview={previewRecordedArmMotion}
+                selectedRecordingId={recordedMotionPreview?.id}
                 blockedByOtherMotion={isOtherRobotOperationActive}
               />
               {recordedMotionPreview && (
@@ -7199,11 +7197,13 @@ export default function App() {
                   </>,
                   connectionTabTarget,
                 )}
-                <div className="grid grid-cols-3 gap-2">
-                  <button type="button" onClick={handleRunNext} className="rounded-lg bg-blue-600 px-2 py-2 text-[10px] font-semibold text-white hover:bg-blue-700">Run next</button>
+                <div className="grid grid-cols-2 gap-2">
                   <button type="button" onClick={handleStopCurrent} className="rounded-lg bg-amber-500 px-2 py-2 text-[10px] font-semibold text-slate-950 hover:bg-amber-400">Pause</button>
                   <button type="button" onClick={handleClearQueue} className="rounded-lg bg-red-500 px-2 py-2 text-[10px] font-semibold text-white hover:bg-red-600">Clear queue</button>
                 </div>
+                <p className="text-[10px] text-slate-500">
+                  Select a specific request below to review and play it. Completed requests can be replayed.
+                </p>
               </>
             )}
 
@@ -8645,7 +8645,7 @@ export default function App() {
                           const query = ideCommandSearch.trim().toLocaleLowerCase();
                           const visibleEntries = ideCommandEntries.filter((entry) => (
                             (entry.blockTypes || []).every((type) => !hiddenCommandTypes.includes(type))
-                            && (!query || `${entry.label} ${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query))
+                            && (!query || `${entry.label} ${entry.description}`.toLocaleLowerCase().includes(query))
                           ));
                           const categories = [...new Set(visibleEntries.map((entry) => entry.category))];
                           return categories.map((category) => (
@@ -8657,17 +8657,7 @@ export default function App() {
                                 {visibleEntries.filter((entry) => entry.category === category).map((entry) => (
                                   <div key={entry.key} className="border-t border-slate-700 pt-2">
                                     <span className="block text-slate-200">{entry.label}</span>
-                                    <code className="break-all text-cyan-300">{entry.script}</code>
                                     <p className="mt-1 text-slate-400">{entry.description}</p>
-                                    {controllerVersion === 'legacy' && entry.sdkMethod && (
-                                      <p className="mt-1 text-emerald-300">Unitree SDK: {entry.sdkMethod}</p>
-                                    )}
-                                    {controllerVersion === 'legacy' && entry.method === 'arm_action' && (
-                                      <p className="mt-1 text-amber-300">Stop cannot cancel an arm preset; keep the area clear.</p>
-                                    )}
-                                    {controllerVersion === 'legacy' && entry.adapters && !entry.adapters.simulator && (
-                                      <p className="mt-1 text-amber-300">Hardware only; not simulated.</p>
-                                    )}
                                   </div>
                                 ))}
                               </div>
@@ -8924,6 +8914,11 @@ export default function App() {
               </details>
 
               {queueReviewError && <p role="alert" className="text-xs text-red-300">{queueReviewError}</p>}
+              {['paused', 'failed'].includes(queueReviewItem.status) && (
+                <p className="rounded-md border border-amber-700 bg-amber-950/40 p-2 text-xs text-amber-200">
+                  Retrying starts this submission from the beginning, not from where it stopped. Check the robot’s current position and review the exact command before approving.
+                </p>
+              )}
               {queueReviewStatus && <p role="status" aria-live="polite" className="text-xs text-cyan-200">{queueReviewStatus}</p>}
               {queueReviewItem?.controller_version === 'duet' && renderDuetMotionSaveForm()}
               {queueReviewSavedProject && (
@@ -8964,13 +8959,15 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleApproveQueuedExecution}
-                disabled={isPositionCaptureRecording || isQueueReviewRunning || !['queued', 'completed'].includes(queueReviewItem.status) || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
+                disabled={isPositionCaptureRecording || isQueueReviewRunning || !['queued', 'completed', 'paused', 'failed'].includes(queueReviewItem.status) || (queueReviewPlannerRequest?.planner_mode === PLANNER_PATH_MODES.autonomous && !queueReviewNavigationPreview)}
                 className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isQueueReviewRunning
                   ? 'Starting…'
                   : queueReviewItem.status === 'completed'
                     ? 'Run request again'
+                    : ['paused', 'failed'].includes(queueReviewItem.status)
+                      ? 'Retry request from beginning'
                     : 'Approve & run queued request'}
               </button>
             </footer>

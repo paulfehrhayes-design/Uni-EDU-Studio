@@ -3597,10 +3597,10 @@ def run_next(request: QueueRunRequest, user: dict = Depends(auth_required)):
     try:
         queue = list_queue_items()
         item = next((queued for queued in queue if queued["id"] == request.item_id), None)
-        if not item or item["status"] not in {"queued", "completed"}:
+        if not item or item["status"] not in {"queued", "completed", "paused", "failed"}:
             raise HTTPException(
                 status_code=404,
-                detail="The approved queue item is neither queued nor previously completed.",
+                detail="The approved queue item is not waiting, paused, failed, or previously completed.",
             )
         planner_request = item.get("planner_request") or {}
         if planner_request.get("planner_mode") == "sensor_corrected":
