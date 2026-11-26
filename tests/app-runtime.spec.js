@@ -2753,14 +2753,14 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).toContainText('robot.hold_arm("hands up", 3)');
   await expect(page.locator('pre').filter({ hasText: 'robot.walk(3)' })).toContainText('robot.arm_action("release arm")');
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
-  await expect(page.getByText('Arm preset: Hands Up', { exact: true })).toBeVisible();
-  await expect(page.getByText('Arm preset: Shake Hand', { exact: true })).toBeVisible();
-  await expect(page.getByText('Wait', { exact: true })).toBeVisible();
+  await expect(page.locator('code').filter({ hasText: 'robot.arm_action("hands up")' })).toBeVisible();
+  await expect(page.locator('code').filter({ hasText: 'robot.arm_action("shake hand")' })).toBeVisible();
+  await expect(page.locator('code').filter({ hasText: 'robot.wait(1)' })).toBeVisible();
   await expect(page.getByText('Stand ready to move.')).toBeVisible();
   await expect(page.getByText('Pause for the selected number of seconds.')).toBeVisible();
   await expect(page.getByText('Raise both hands.')).toBeVisible();
   await expect(page.getByText(/“example” is a placeholder app name, not a sound/)).toBeVisible();
-  await expect(page.locator('code')).toHaveCount(0);
+  await expect(page.getByText('Arm preset: Hands Up', { exact: true })).toHaveCount(0);
   await expect(page.getByText(/Unitree SDK:/)).toHaveCount(0);
   await expect(page.getByText(/Hardware only;/)).toHaveCount(0);
   await expect(page.getByText(/Stop cannot cancel an arm preset/)).toHaveCount(0);

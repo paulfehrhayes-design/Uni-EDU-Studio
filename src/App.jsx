@@ -1027,7 +1027,9 @@ export default function App() {
         ...example,
         category: example.category || 'Commands',
         script: example.code,
-        description: example.label,
+        description: DUET_COMMANDS.find((command) => (
+          example.blockTypes?.includes(command.type)
+        ))?.description || example.description || example.label,
         blockTypes: example.blockTypes || [example.blockType],
       }));
     }
@@ -8645,7 +8647,7 @@ export default function App() {
                           const query = ideCommandSearch.trim().toLocaleLowerCase();
                           const visibleEntries = ideCommandEntries.filter((entry) => (
                             (entry.blockTypes || []).every((type) => !hiddenCommandTypes.includes(type))
-                            && (!query || `${entry.label} ${entry.description}`.toLocaleLowerCase().includes(query))
+                            && (!query || `${entry.script} ${entry.description}`.toLocaleLowerCase().includes(query))
                           ));
                           const categories = [...new Set(visibleEntries.map((entry) => entry.category))];
                           return categories.map((category) => (
@@ -8656,7 +8658,7 @@ export default function App() {
                               <div className="mt-2 space-y-2">
                                 {visibleEntries.filter((entry) => entry.category === category).map((entry) => (
                                   <div key={entry.key} className="border-t border-slate-700 pt-2">
-                                    <span className="block text-slate-200">{entry.label}</span>
+                                    <code className="block break-all text-cyan-300">{entry.script}</code>
                                     <p className="mt-1 text-slate-400">{entry.description}</p>
                                   </div>
                                 ))}
