@@ -679,14 +679,14 @@ export function getG1BlocklyCommandBlocks(commands = G1_EXECUTABLE_COMMANDS) {
             message: definition.blockMessage,
           },
           ...[
-            ['left', 'Turn left (110°)'],
-            ['right', 'Turn right (110°)'],
+            ['left', 'Turn left (105°)'],
+            ['right', 'Turn right (105°)'],
           ].map(([fixedTurnDirection, message]) => ({
             ...definition,
-            type: `g1_command_turn_${fixedTurnDirection}_110`,
+            type: `g1_command_turn_${fixedTurnDirection}_105`,
             message,
             args: [],
-            codeTemplate: `robot.turn("${fixedTurnDirection}", 110)\n`,
+            codeTemplate: `robot.turn("${fixedTurnDirection}", 105)\n`,
             fixedTurnDirection,
           })),
         ]

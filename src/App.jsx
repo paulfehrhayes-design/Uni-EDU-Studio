@@ -694,7 +694,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_turn_left',
     message0: 'Turn Left %1°',
-    args0: [{ type: 'field_number', name: 'ANGLE', value: 110, min: 1, max: 360 }],
+    args0: [{ type: 'field_number', name: 'ANGLE', value: 105, min: 1, max: 360 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -703,7 +703,7 @@ const ROBOT_IDE_COMMAND_BLOCKS = [
   {
     type: 'robot_turn_right',
     message0: 'Turn Right %1°',
-    args0: [{ type: 'field_number', name: 'ANGLE', value: 110, min: 1, max: 360 }],
+    args0: [{ type: 'field_number', name: 'ANGLE', value: 105, min: 1, max: 360 }],
     previousStatement: null,
     nextStatement: null,
     colour: 210,
@@ -4955,7 +4955,7 @@ export default function App() {
                 ? `g1_shared_motion_${node.values[0]}`
                 : node.method === 'arm_action'
                   ? getG1BlocklyCommandBlocks().find((definition) => definition.armPreset === node.values[0])?.type || 'g1_command_arm_action'
-                  : node.method === 'turn' && node.values[1] === 110
+                  : node.method === 'turn' && node.values[1] === 105
                     ? getG1BlocklyCommandBlocks().find((definition) => (
                       definition.fixedTurnDirection === node.values[0]
                     ))?.type || `g1_command_${node.method}`

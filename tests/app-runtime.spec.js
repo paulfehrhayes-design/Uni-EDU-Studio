@@ -2726,14 +2726,14 @@ test('student IDE multiline commands render as Blocks and generate code', async 
   expect(blocklyLayout.height).toBeGreaterThan(0);
   await expect(page.getByRole('alert')).toHaveCount(0);
   await page.getByRole('treeitem', { name: 'Walking' }).click();
-  await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Turn left (110°)' })).toBeVisible();
-  await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Turn right (110°)' })).toBeVisible();
+  await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Turn left (105°)' })).toBeVisible();
+  await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Turn right (105°)' })).toBeVisible();
   const walkingBlockTypes = await page.evaluate(() => (
     window.Blockly.getMainWorkspace().getFlyout().getWorkspace()
       .getAllBlocks().map(({ type }) => type)
   ));
-  expect(walkingBlockTypes).toContain('g1_command_turn_left_110');
-  expect(walkingBlockTypes).toContain('g1_command_turn_right_110');
+  expect(walkingBlockTypes).toContain('g1_command_turn_left_105');
+  expect(walkingBlockTypes).toContain('g1_command_turn_right_105');
   expect(walkingBlockTypes).toContain('g1_command_turn');
   await page.getByRole('treeitem', { name: 'Gestures' }).click();
   await expect(page.locator('.blocklyFlyout .blocklyText').filter({ hasText: 'Arm preset: Hands Up' })).toBeVisible();

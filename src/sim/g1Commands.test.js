@@ -19,8 +19,8 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
     [
       ...G1_EXECUTABLE_COMMANDS.filter((command) => command.method !== 'arm_action')
         .slice(0, 12).map((command) => command.blockType),
-      'g1_command_turn_left_110',
-      'g1_command_turn_right_110',
+      'g1_command_turn_left_105',
+      'g1_command_turn_right_105',
       'g1_command_turn_around_180',
       'g1_command_squat_to_stand',
       'g1_command_lie_to_stand',
@@ -59,8 +59,8 @@ test('G1 command catalog emits matching bounded Blockly commands', () => {
       block.args0,
     ]),
     [
-      ['Turn left (110°)', 'robot.turn("left", 110)\n', []],
-      ['Turn right (110°)', 'robot.turn("right", 110)\n', []],
+      ['Turn left (105°)', 'robot.turn("left", 105)\n', []],
+      ['Turn right (105°)', 'robot.turn("right", 105)\n', []],
     ],
   );
   assert.ok(G1_COMMANDS.some((command) => command.method === 'hold_arm'));
