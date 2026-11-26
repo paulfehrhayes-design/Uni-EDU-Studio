@@ -537,6 +537,9 @@ test('teacher explicitly runs isolated and progression calibration batches throu
   const savedPayloads = [];
   const runPrograms = [];
   const apiRequests = [];
+  const sensorRequestCount = () => apiRequests.filter((request) => (
+    request === 'GET /api/robot/pose' || request === 'GET /api/robot/joint-state'
+  )).length;
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-locomotion-calibration-token',
@@ -613,7 +616,13 @@ test('teacher explicitly runs isolated and progression calibration batches throu
   await repeatButton.click();
   await expect.poll(() => runPrograms.length, { timeout: 8000 }).toBe(2);
   await expect(repeatButton).toBeVisible();
-  for (let checkpoint = 0; checkpoint < 13; checkpoint += 1) {
+  const sensorRequestsAtPause = sensorRequestCount();
+  await page.waitForTimeout(200);
+  expect(sensorRequestCount()).toBe(sensorRequestsAtPause);
+  await continueButton.click({ timeout: 8000 });
+  await expect.poll(() => runPrograms.length, { timeout: 8000 }).toBe(3);
+  expect(sensorRequestCount()).toBeGreaterThan(sensorRequestsAtPause);
+  for (let checkpoint = 0; checkpoint < 12; checkpoint += 1) {
     await expect(continueButton).toBeVisible({ timeout: 8000 });
     await continueButton.click({ timeout: 8000 });
   }

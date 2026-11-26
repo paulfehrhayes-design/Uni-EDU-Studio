@@ -672,6 +672,7 @@ export default function TeacherPositionRecorder({
     let samplingError = null;
     let captureLimitReached = false;
     let stopError = null;
+    let nextSampleAt = startedAt + SAMPLE_INTERVAL_MS;
     const executeCaptureProgram = async () => {
       if (!captureBatches) return connection.run(captureProgram.code);
       return executeG1LocomotionCalibrationSeries({
@@ -704,7 +705,6 @@ export default function TeacherPositionRecorder({
           if (!section) {
             section = {
               batch,
-              startedAt: performance.now(),
               frames: [],
               runHistory: [],
               saved: false,
@@ -712,11 +712,13 @@ export default function TeacherPositionRecorder({
             seriesSectionsRef.current[index] = section;
           }
           activeSeriesSectionRef.current = section;
-          const elapsed = section.frames.length
-            ? Math.max((performance.now() - section.startedAt) / 1000, section.frames.at(-1).time + 0.001)
+          section.runTimeOffset = section.frames.length
+            ? section.frames.at(-1).time + 0.001
             : 0;
+          section.runStartedAt = performance.now();
+          nextSampleAt = section.runStartedAt + SAMPLE_INTERVAL_MS;
           section.frames.push(makePoseAndJointFrame({
-            time: Number(elapsed.toFixed(3)),
+            time: Number(section.runTimeOffset.toFixed(3)),
             pose,
             positions: jointSample.positions,
           }));
@@ -746,8 +748,8 @@ export default function TeacherPositionRecorder({
             nextLabel: nextBatch?.label ?? null,
           });
           setMessage(nextBatch
-            ? `Batch ${completed}/${total} complete. Recenter, then choose Repeat last batch or Continue.`
-            : `Final batch ${completed}/${total} complete. Choose Repeat last batch or Finish and save.`);
+            ? `Batch ${completed}/${total} complete. Pose and joint scanning is paused. Recenter, then choose Repeat last batch or Continue.`
+            : `Final batch ${completed}/${total} complete. Pose and joint scanning is paused. Choose Repeat last batch or Finish and save.`);
           const action = await new Promise((resolve) => {
             checkpointResolverRef.current = resolve;
           });
@@ -779,7 +781,7 @@ export default function TeacherPositionRecorder({
       ) {
         const section = activeSeriesSectionRef.current;
         const sectionTime = Math.max(
-          (performance.now() - section.startedAt) / 1000,
+          section.runTimeOffset + (performance.now() - section.runStartedAt) / 1000,
           section.frames.at(-1).time + 0.001,
         );
         section.frames.push(makePoseAndJointFrame({
@@ -808,7 +810,7 @@ export default function TeacherPositionRecorder({
           throw new Error('The TF base frame changed while saving a calibration section.');
         }
         const sectionTime = Math.max(
-          (performance.now() - section.startedAt) / 1000,
+          section.runTimeOffset + (performance.now() - section.runStartedAt) / 1000,
           section.frames.at(-1)?.time + 0.001 || 0.001,
         );
         section.frames.push(makePoseAndJointFrame({
@@ -885,8 +887,14 @@ export default function TeacherPositionRecorder({
     });
 
     try {
-      let nextSampleAt = startedAt + SAMPLE_INTERVAL_MS;
       while (!runSettled) {
+        if (
+          useLocomotionSeries
+          && (!activeSeriesSectionRef.current || checkpointResolverRef.current)
+        ) {
+          await wait(SAMPLE_INTERVAL_MS);
+          continue;
+        }
         const remainingMs = captureDurationLimitSeconds * 1000 - (performance.now() - startedAt);
         if (remainingMs <= 0 || frames.length >= MAX_CAPTURE_SAMPLES) {
           captureLimitReached = true;
@@ -894,6 +902,12 @@ export default function TeacherPositionRecorder({
         }
         await wait(Math.min(Math.max(0, nextSampleAt - performance.now()), remainingMs));
         if (runSettled) break;
+        if (
+          useLocomotionSeries
+          && (!activeSeriesSectionRef.current || checkpointResolverRef.current)
+        ) {
+          continue;
+        }
         nextSampleAt += SAMPLE_INTERVAL_MS;
         try {
           const poseRequest = connection.pose();
@@ -992,7 +1006,7 @@ export default function TeacherPositionRecorder({
       }
 
       const elapsed = (performance.now() - startedAt) / 1000;
-      if (!captureLimitReached && elapsed <= captureDurationLimitSeconds) {
+      if (!useLocomotionSeries && !captureLimitReached && elapsed <= captureDurationLimitSeconds) {
         try {
           const [poseSnapshot, finalJointSample] = await Promise.all([
             connection.pose(),
@@ -1225,7 +1239,7 @@ export default function TeacherPositionRecorder({
         />
         <span>
           <strong>Opt in to the finite Legacy SDK locomotion calibration series.</strong>
-          {' '}It runs 37 isolated movement trials with a 2-second wait after each, then nine no-wait progression batches (110 commands). Batches 6-9 test repeated timed, step, slow-walk, and fast-walk progressions as well as mixed transitions. Separate turn-only and sidestep-only progressions alternate left and right; additional batches interleave turns/sidesteps with forward and backward travel. Values top out at 5 seconds/steps and 90° turns, plus the 180° turn-around. No arm commands are included. After each batch, repeat it after recentering or continue; Continue saves that section as its own recording and JSON file before starting the next batch. After the final batch, finish and save its section. STOP remains available.
+          {' '}It runs 37 isolated movement trials with a 2-second wait after each, then nine no-wait progression batches (110 commands). Batches 6-9 test repeated timed, step, slow-walk, and fast-walk progressions as well as mixed transitions. Separate turn-only and sidestep-only progressions alternate left and right; additional batches interleave turns/sidesteps with forward and backward travel. Values top out at 5 seconds/steps and 90° turns, plus the 180° turn-around. No arm commands are included. Pose and joint scanning pauses when each batch finishes. After recentering, Continue saves that section as its own recording and JSON file, then starts scanning for the next batch. After the final batch, finish and save its section. STOP remains available.
           {controllerVersion !== 'legacy' && ' This uses existing step-based SDK mappings and is unavailable for DUET.'}
         </span>
       </label>
