@@ -566,7 +566,7 @@ test('teacher explicitly runs isolated and progression calibration batches throu
       savedPayloads.push(payload);
       body = {
         recording: {
-          id: 'capture_calibrationtest',
+          id: `capture_calibrationtest_${savedPayloads.length}`,
           ...payload,
           created_at: '2026-11-12T00:00:00Z',
         },
@@ -617,11 +617,11 @@ test('teacher explicitly runs isolated and progression calibration batches throu
     await expect(continueButton).toBeVisible({ timeout: 8000 });
     await continueButton.click({ timeout: 8000 });
   }
-  const finishButton = page.getByRole('button', { name: 'Finish and save recording' });
+  const finishButton = page.getByRole('button', { name: 'Finish and save section' });
   await expect(finishButton).toBeVisible();
   await finishButton.click();
 
-  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(1);
+  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(14);
   expect(runPrograms).toHaveLength(15);
   expect(runPrograms.map((program) => program.split('\n').length)).toEqual([
     18, 18, 18, 18, 18, 2, 12, 12, 12, 12, 12, 12, 12, 13, 13,
@@ -635,32 +635,47 @@ test('teacher explicitly runs isolated and progression calibration batches throu
   expect(runPrograms.join('\n')).not.toMatch(/arm_action|hold_arm/);
   expect(savedPayloads[0].controller_version).toBe('legacy');
   expect(savedPayloads[0].capture_type).toBe('position_calibration');
-  expect(savedPayloads[0].command).toContain('robot.walk(5)');
-  expect(savedPayloads[0].command).toContain('robot.slowwalktime(5)');
-  expect(savedPayloads[0].command).toContain('robot.slowwalk(5)');
-  expect(savedPayloads[0].command).toContain('robot.fastwalktime(5)');
-  expect(savedPayloads[0].command).toContain('robot.fastwalk(5)');
-  expect(savedPayloads[0].command).toContain('robot.sidestep("right", 5)');
-  expect(savedPayloads[0].command).toContain('robot.turn("left", 90)');
-  expect(savedPayloads[0].command).toContain('robot.turn_around_180()');
+  expect(new Set(savedPayloads.map(({ name }) => name)).size).toBe(14);
+  expect(savedPayloads.map(({ name }) => name)).toEqual([
+    'Classroom calibration - 01 Isolated',
+    'Classroom calibration - 02 Isolated',
+    'Classroom calibration - 03 Isolated',
+    'Classroom calibration - 04 Isolated',
+    'Classroom calibration - 05 Isolated',
+    'Classroom calibration - 06 Progression',
+    'Classroom calibration - 07 Progression',
+    'Classroom calibration - 08 Progression',
+    'Classroom calibration - 09 Progression',
+    'Classroom calibration - 10 Progression',
+    'Classroom calibration - 11 Progression',
+    'Classroom calibration - 12 Progression',
+    'Classroom calibration - 13 Progression',
+    'Classroom calibration - 14 Progression',
+  ]);
+  expect(savedPayloads[0].command).toContain('robot.walktime(1)');
   expect(savedPayloads[0].command).toContain(
-    '# Actual batch run order (including repeats): 1, 1, 2, 3',
+    '# Actual batch run order (including repeats): 1, 1',
   );
-  expect(savedPayloads[0].joint_names).toEqual(G1_JOINT_NAMES);
-  expect(savedPayloads[0].frames.length).toBeGreaterThanOrEqual(2);
-  expect(savedPayloads[0].frames.every((frame) => frame.joints.length === 23 && frame.pose)).toBe(true);
+  expect(savedPayloads[13].command).toContain('robot.turn_around_180()');
+  for (const payload of savedPayloads) {
+    expect(payload.controller_version).toBe('legacy');
+    expect(payload.capture_type).toBe('position_calibration');
+    expect(payload.joint_names).toEqual(G1_JOINT_NAMES);
+    expect(payload.frames.length).toBeGreaterThanOrEqual(2);
+    expect(payload.frames.every((frame) => frame.joints.length === 23 && frame.pose)).toBe(true);
+  }
   expect(apiRequests.filter((request) => request === 'POST /api/run')).toHaveLength(15);
-  await page.getByRole('button', { name: 'Preview JSON' }).click();
-  const recordingPreview = page.getByRole('dialog', { name: 'File preview: Classroom_calibration.json' });
+  await page.getByRole('button', { name: 'Preview JSON' }).first().click();
+  const recordingPreview = page.getByRole('dialog', { name: 'File preview: Classroom_calibration_-_01_Isolated.json' });
   await expect(recordingPreview.locator('pre')).toContainText('"recorded_dof": 23');
   await expect(recordingPreview.locator('pre')).toContainText('"base_frame": "pelvis"');
-  await expect(recordingPreview.locator('pre')).toContainText('robot.turn_around_180()');
+  await expect(recordingPreview.locator('pre')).toContainText('robot.walktime(1)');
   await page.getByRole('button', { name: 'Close preview' }).click({ force: true });
   const [download] = await Promise.all([
     page.waitForEvent('download'),
-    page.getByRole('button', { name: 'Export JSON' }).click(),
+    page.getByRole('button', { name: 'Export JSON' }).first().click(),
   ]);
-  expect(download.suggestedFilename()).toBe('Classroom_calibration.json');
+  expect(download.suggestedFilename()).toBe('Classroom_calibration_-_01_Isolated.json');
 });
 
 test('only teachers can hide the simulation from Settings', async ({ page }) => {
@@ -1507,6 +1522,7 @@ test('teacher can review and rerun a completed queued request', async ({ page })
     name: 'student-route',
     student: 'student1',
     status: 'queued',
+    created_at: '2026-11-25T18:30:00+00:00',
     controller_version: 'legacy',
     code: 'robot.walktime(1)',
     planner_request: {
@@ -1528,6 +1544,17 @@ test('teacher can review and rerun a completed queued request', async ({ page })
       selectedPlannerVariant: 'initial',
     },
   };
+  const newSubmission = {
+    id: 'queued-new-submission',
+    name: 'new-student-work',
+    student: 'student2',
+    status: 'queued',
+    created_at: '2026-11-25T18:31:00+00:00',
+    controller_version: 'legacy',
+    code: 'robot.stand()',
+  };
+  let queueRequests = 0;
+  let showNewSubmission = false;
   await page.addInitScript(() => {
     localStorage.setItem('edu-classroom-session', JSON.stringify({
       token: 'teacher-review-token',
@@ -1547,9 +1574,17 @@ test('teacher can review and rerun a completed queued request', async ({ page })
       });
       return;
     }
+    if (path === '/api/classroom/queue') {
+      queueRequests += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ items: [queuedItem, ...(showNewSubmission ? [newSubmission] : [])] }),
+      });
+      return;
+    }
     const responses = {
       '/api/classroom/codes': { codes: [] },
-      '/api/classroom/queue': { items: [queuedItem] },
       '/api/classroom/users': { users: [{ username: 'teacher', role: 'teacher' }] },
       '/api/classroom/status': { status: 'idle' },
       '/api/classroom/projects/all': { projects: [] },
@@ -1566,8 +1601,14 @@ test('teacher can review and rerun a completed queued request', async ({ page })
 
   await page.goto('/');
   await page.getByRole('button', { name: 'IDE', exact: true }).click();
+  const previousQueueRequests = queueRequests;
   await page.getByRole('button', { name: 'Open queue' }).click();
-  await page.getByRole('button', { name: 'Review request' }).click();
+  await expect.poll(() => queueRequests).toBeGreaterThan(previousQueueRequests);
+  const unplayedSection = page.getByRole('region', { name: 'Yet to be played' });
+  await expect(unplayedSection.getByText('Submitted')).toBeVisible();
+  showNewSubmission = true;
+  await expect(page.getByText('new-student-work', { exact: true })).toBeVisible({ timeout: 7000 });
+  await unplayedSection.getByRole('button', { name: 'Review request' }).first().click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByText('Exact command preview')).toBeVisible();
   await expect(dialog.getByText('robot.walktime(1)', { exact: true }).first()).toBeVisible();
@@ -1578,6 +1619,7 @@ test('teacher can review and rerun a completed queued request', async ({ page })
 
   await dialog.getByRole('button', { name: 'Approve & run queued request' }).click();
   await expect(dialog.getByRole('button', { name: 'Run request again' })).toBeEnabled();
+  await expect(page.getByRole('region', { name: 'Played' }).getByRole('button', { name: 'Replay request' })).toBeVisible();
   await dialog.getByRole('button', { name: 'Run request again' }).click();
   await expect.poll(() => runRequests).toEqual([
     { item_id: queuedItem.id },

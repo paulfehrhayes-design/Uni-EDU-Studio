@@ -350,7 +350,7 @@ export async function executeG1LocomotionCalibrationSeries({
     const batch = batches[index];
     while (true) {
       if (shouldStop()) return { status: 'stopped' };
-      onBatchStart(batch, index, batches.length);
+      await onBatchStart(batch, index, batches.length);
       const result = await runBatch(batch);
       if (result?.status !== 'completed') return result;
       if (shouldStop()) return { status: 'stopped' };

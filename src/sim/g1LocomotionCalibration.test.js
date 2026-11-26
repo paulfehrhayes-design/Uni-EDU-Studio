@@ -199,6 +199,32 @@ test('series runner repeats only the selected batch and can finish at the final 
   ]);
 });
 
+test('series runner waits for section recording setup before starting each batch', async () => {
+  const { batches } = buildG1LocomotionCalibrationSeries();
+  const events = [];
+  let activeIndex = -1;
+  const result = await executeG1LocomotionCalibrationSeries({
+    batches: batches.slice(0, 2),
+    onBatchStart: async (batch, index) => {
+      activeIndex = index;
+      events.push(`setup:${index}`);
+      await Promise.resolve();
+      events.push(`ready:${index}`);
+    },
+    runBatch: async () => {
+      events.push(`run:${activeIndex}`);
+      return { status: 'completed' };
+    },
+    waitForContinue: async () => 'continue',
+  });
+
+  assert.deepEqual(result, { status: 'completed' });
+  assert.deepEqual(events, [
+    'setup:0', 'ready:0', 'run:0',
+    'setup:1', 'ready:1', 'run:1',
+  ]);
+});
+
 test('series runner halts on a failed batch and does not retry it automatically', async () => {
   const { batches } = buildG1LocomotionCalibrationSeries();
   const executions = [];

@@ -19,24 +19,18 @@ import {
   DEFAULT_CAMERA_YAW, getCameraHorizontalFocusOffset, getCameraPanDirection, getCameraPanTargetOffset,
 } from '../sim/cameraNavigation';
 
-const G1_SHELL_COLOR = 0xc9cdd1;
-const G1_DARK_COMPONENT_COLOR = 0x111315;
+const G1_SHELL_COLOR = 0xbfc2c5;
+const G1_DARK_COMPONENT_COLOR = 0x17191b;
 const G1_ELBOW_BAND_MIN = -0.005;
 const G1_ELBOW_BAND_MAX = 0.035;
 const G1_DARK_MESH_NAMES = new Set([
   'pelvis',
   'left_hip_pitch_link',
   'right_hip_pitch_link',
-  'left_ankle_pitch_link',
-  'right_ankle_pitch_link',
   'left_ankle_roll_link',
   'right_ankle_roll_link',
-  'left_wrist_roll_link',
-  'right_wrist_roll_link',
   'head_link',
   'logo_link',
-  'left_rubber_hand',
-  'right_rubber_hand',
 ]);
 const G1_ELBOW_MESH_NAMES = new Set(['left_elbow_link', 'right_elbow_link']);
 
@@ -228,7 +222,7 @@ function addHeadLed(parent, position, width, height, frontDirection) {
 
   const barCore = new THREE.Mesh(
     new THREE.BoxGeometry(width * 0.62, 0.003, 0.005),
-    new THREE.MeshBasicMaterial({ color: 0xc653ff, side: THREE.DoubleSide }),
+    new THREE.MeshBasicMaterial({ color: 0x9af7ff, side: THREE.DoubleSide }),
   );
   barCore.position.set(0, barY, frontDirection * 0.006);
   display.add(barCore);
@@ -262,13 +256,15 @@ function createRobot() {
   addBox(torso, [0.4, 0.3, 0.42], [0, 0.76, 0], light, 0);
 
   const head = register('head', torso, [0, 0.95, 0]);
-  addBox(head, [0.4, 0.42, 0.38], [0, 0, 0], dark, 0);
+  addBox(head, [0.4, 0.42, 0.38], [0, 0, 0], light, 0);
+  addBox(head, [0.24, 0.28, 0.018], [0, 0.02, -0.195], dark, 0.08);
   addHeadLed(head, [0, 0.02, -0.195], 0.22, 0.28, -1);
 
   const leg = (side, x) => {
     const hipRoll = register(`${side}_hip_roll_joint`, pelvis, [x, -0.02, 0]);
     const hipYaw = register(`${side}_hip_yaw_joint`, hipRoll);
     const hipPitch = register(`${side}_hip_pitch_joint`, hipYaw);
+    addDarkJointCap(hipPitch, 0.12, 0.04, [0, 0.02, 0]);
     addSegment(hipPitch, [0, 0, 0], [0, -0.55, 0], 0.13, light);
     const knee = register(`${side}_knee_joint`, hipPitch, [0, -0.55, 0]);
     addSegment(knee, [0, 0, 0], [0, -0.62, 0], 0.12, light);
@@ -276,6 +272,7 @@ function createRobot() {
       addDarkJointCap(knee, 0.12, 0.045, [direction * 0.12, 0, 0.015]);
     }
     const anklePitch = register(`${side}_ankle_pitch_joint`, knee, [0, -0.62, 0]);
+    addBox(anklePitch, [0.24, 0.14, 0.28], [0, -0.08, 0], light, 0.04);
     const ankleRoll = register(`${side}_ankle_roll_joint`, anklePitch);
     addBox(ankleRoll, [0.24, 0.18, 0.42], [0, -0.12, -0.05], dark, 0);
     addBox(ankleRoll, [0.3, 0.1, 0.54], [0, -0.22, -0.1], light, 0);
@@ -544,7 +541,7 @@ async function loadG1MeshRig() {
       geometry.computeVertexNormals();
       if (G1_ELBOW_MESH_NAMES.has(meshName)) {
         const positions = geometry.attributes.position;
-        const shellColor = new THREE.Color(0xffffff);
+        const shellColor = new THREE.Color(G1_SHELL_COLOR);
         const jointColor = new THREE.Color(G1_DARK_COMPONENT_COLOR);
         const colors = new Float32Array(positions.count * 3);
         for (let index = 0; index < positions.count; index += 1) {

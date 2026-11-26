@@ -1760,6 +1760,25 @@ export default function App() {
   }, [session, classroomDataReady, refreshClassroomData, sceneObjectsKey, robotConnection, apiFetch]);
 
   useEffect(() => {
+    if (!session?.token || session.user.role !== 'teacher' || !isQueueOpen) return undefined;
+    let active = true;
+    const refreshQueueItems = async () => {
+      try {
+        const { items } = await apiFetch('/api/classroom/queue');
+        if (active) setQueueItems(items || []);
+      } catch (error) {
+        console.error('Failed to refresh teacher queue:', error);
+      }
+    };
+    void refreshQueueItems();
+    const timer = window.setInterval(refreshQueueItems, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [session, isQueueOpen, apiFetch]);
+
+  useEffect(() => {
     if (controllerVersion !== 'duet' || !isDuetProgramActive) return undefined;
     let active = true;
     const refreshDuetExecutionStatus = async () => {
@@ -5895,6 +5914,56 @@ export default function App() {
 
   if (!isBlocklyLoaded) return <div className="flex h-screen items-center justify-center bg-gray-50 flex-col gap-4"><Loader2 className="animate-spin text-blue-600" size={48} /><p className="text-gray-500 font-medium">{UI_TEXT.en.loading}</p></div>;
 
+  const renderQueueItem = (item) => {
+    const submittedAt = new Date(item.created_at);
+    const submittedAtLabel = Number.isNaN(submittedAt.getTime())
+      ? item.created_at || 'Time unavailable'
+      : submittedAt.toLocaleString();
+    return (
+      <div key={item.id} className="rounded-lg border border-slate-200 p-2">
+        <div className="flex items-center justify-between gap-2">
+          <p className="font-medium text-slate-800 text-sm truncate">{item.name}</p>
+          <span className="text-[10px] uppercase bg-slate-100 text-slate-600 rounded-full px-2 py-1">{item.status}</span>
+        </div>
+        <p className="text-xs text-slate-500 mt-1">
+          by {item.student} • {item.controller_version === 'duet' ? 'DUET v2' : 'legacy SDK'}
+        </p>
+        <p className="mt-1 text-[10px] text-slate-500">
+          Submitted <time dateTime={item.created_at || undefined}>{submittedAtLabel}</time>
+        </p>
+        {item.planner_request && (
+          <p className="mt-1 text-[10px] font-semibold text-cyan-800">
+            Planner request • {PLANNER_MODE_LABELS[item.planner_request.planner_mode] || item.planner_request.planner_mode}
+            {item.planner_request.navigation
+              ? ` • ${item.planner_request.navigation.waypoints.length} Nav2 goal(s) • map ${item.planner_request.navigation.map_id} ${item.planner_request.navigation.version}`
+              : ` • ${(item.planner_request.planner_waypoints || []).length} grid waypoint(s)`}
+          </p>
+        )}
+        <details className="mt-2 rounded-md bg-slate-50 p-2">
+          <summary className="cursor-pointer text-[10px] font-semibold text-blue-700">
+            Review exact command preview
+          </summary>
+          <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-900 p-2 text-[10px] text-slate-100">
+            {item.code || '(No SDK/DUET commands yet; review the requested planner goals below.)'}
+          </pre>
+          {item.planner_request && (
+            <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-100 p-2 text-[10px] text-slate-700">
+              {JSON.stringify(item.planner_request, null, 2)}
+            </pre>
+          )}
+        </details>
+        <button
+          type="button"
+          onClick={() => handleLoadQueueItemForReview(item)}
+          className="mt-2 rounded-md border border-blue-200 px-2 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-50"
+        >
+          {item.status === 'completed' ? 'Replay request' : 'Review request'}
+        </button>
+        <button onClick={() => handleDeleteQueueItem(item.id)} className="mt-2 ml-3 text-xs text-red-600 hover:text-red-700">Delete</button>
+      </div>
+    );
+  };
+
   return (
     <div className="flex h-dvh flex-col bg-gray-50 text-gray-800 font-sans relative overflow-hidden">
       
@@ -7140,45 +7209,31 @@ export default function App() {
 
             {currentUser.role === 'teacher' && (
               <>
-                {queueItems.length === 0 ? <p className="text-sm text-slate-500">No student jobs queued.</p> : queueItems.map((item) => (
-                  <div key={item.id} className="rounded-lg border border-slate-200 p-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="font-medium text-slate-800 text-sm truncate">{item.name}</p>
-                      <span className="text-[10px] uppercase bg-slate-100 text-slate-600 rounded-full px-2 py-1">{item.status}</span>
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">
-                      by {item.student} • {item.controller_version === 'duet' ? 'DUET v2' : 'legacy SDK'}
-                    </p>
-                    {item.planner_request && (
-                      <p className="mt-1 text-[10px] font-semibold text-cyan-800">
-                        Planner request • {PLANNER_MODE_LABELS[item.planner_request.planner_mode] || item.planner_request.planner_mode}
-                        {item.planner_request.navigation
-                          ? ` • ${item.planner_request.navigation.waypoints.length} Nav2 goal(s) • map ${item.planner_request.navigation.map_id} ${item.planner_request.navigation.version}`
-                          : ` • ${(item.planner_request.planner_waypoints || []).length} grid waypoint(s)`}
-                      </p>
-                    )}
-                    <details className="mt-2 rounded-md bg-slate-50 p-2">
-                      <summary className="cursor-pointer text-[10px] font-semibold text-blue-700">
-                        Review exact command preview
-                      </summary>
-                      <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-900 p-2 text-[10px] text-slate-100">
-                        {item.code || '(No SDK/DUET commands yet; review the requested planner goals below.)'}
-                      </pre>
-                      {item.planner_request && (
-                        <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-100 p-2 text-[10px] text-slate-700">
-                          {JSON.stringify(item.planner_request, null, 2)}
-                        </pre>
-                      )}
-                    </details>
-                    <button
-                      type="button"
-                      onClick={() => handleLoadQueueItemForReview(item)}
-                      className="mt-2 rounded-md border border-blue-200 px-2 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-50"
-                    >
-                      Review request
-                    </button>
-                    <button onClick={() => handleDeleteQueueItem(item.id)} className="mt-2 text-xs text-red-600 hover:text-red-700">Delete</button>
-                  </div>
+                {[
+                  {
+                    title: 'Yet to be played',
+                    items: queueItems.filter((item) => item.status === 'queued'),
+                    emptyMessage: 'No requests waiting to be played.',
+                  },
+                  {
+                    title: 'Played',
+                    items: queueItems.filter((item) => item.status === 'completed'),
+                    emptyMessage: 'No requests have been played yet.',
+                  },
+                  {
+                    title: 'In progress or paused',
+                    items: queueItems.filter((item) => !['queued', 'completed'].includes(item.status)),
+                    emptyMessage: 'No requests are in progress or paused.',
+                  },
+                ].map((section) => (
+                  <section key={section.title} aria-label={section.title} className="space-y-2">
+                    <h4 className="text-xs font-semibold text-slate-700">
+                      {section.title} <span className="text-slate-400">({section.items.length})</span>
+                    </h4>
+                    {section.items.length
+                      ? section.items.map(renderQueueItem)
+                      : <p className="text-xs text-slate-500">{section.emptyMessage}</p>}
+                  </section>
                 ))}
               </>
             )}
