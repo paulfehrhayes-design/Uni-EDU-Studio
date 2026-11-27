@@ -75,6 +75,7 @@ _NAVIGATION_VELOCITY_LEASE_SECONDS = 0.25
 _NAVIGATION_MAX_LINEAR_VELOCITY = 0.20
 _NAVIGATION_MAX_YAW_RATE = 0.30
 _NAVIGATION_REFRESH_INTERVAL_SECONDS = 0.1
+_RPC_CLIENT_API_TIMEOUT = 3104
 _navigation_command_lock = threading.Lock()
 _navigation_velocity = (0.0, 0.0, 0.0)
 _navigation_velocity_updated_at: float | None = None
@@ -990,13 +991,24 @@ def _require_locomotion_ready() -> None:
     if _client is None:
         raise HTTPException(status_code=409, detail="Connect the G1 SDK before running a robot program.")
     try:
-        response = _client.GetFsmId()
+        for attempt in range(2):
+            response = _client.GetFsmId()
+            if not isinstance(response, tuple) or len(response) != 2:
+                raise RuntimeError("G1 GetFsmId returned an invalid response; locomotion command was not sent.")
+            result, fsm_id = response
+            if result == _RPC_CLIENT_API_TIMEOUT and attempt == 0:
+                _log_event("locomotion_fsm_probe_timeout_retry", error_code=result)
+                time.sleep(0.1)
+                continue
+            if result == _RPC_CLIENT_API_TIMEOUT:
+                raise RuntimeError(
+                    "G1 SDK GetFsmId timed out twice (RPC error 3104); "
+                    "no locomotion command was sent. Check the SDK network/controller connection and reconnect."
+                )
+            _sdk_result(result, "GetFsmId")
+            break
     except Exception as error:
         raise RuntimeError(f"Could not verify G1 locomotion mode before walking: {error}") from error
-    if not isinstance(response, tuple) or len(response) != 2:
-        raise RuntimeError("G1 GetFsmId returned an invalid response; locomotion command was not sent.")
-    result, fsm_id = response
-    _sdk_result(result, "GetFsmId")
     if isinstance(fsm_id, bool) or not isinstance(fsm_id, int):
         raise RuntimeError("G1 GetFsmId returned an invalid FSM ID; locomotion command was not sent.")
     if fsm_id != 500:

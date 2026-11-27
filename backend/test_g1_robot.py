@@ -1288,6 +1288,53 @@ class G1RobotProgramTests(unittest.TestCase):
         finally:
             g1_robot._client, g1_robot._arm_client = original_clients
 
+    def test_locomotion_fsm_probe_retries_one_sdk_timeout_before_allowing_motion(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.responses = [(3104, None), (0, 500)]
+
+            def GetFsmId(self):
+                return self.responses.pop(0)
+
+        original_client = g1_robot._client
+        client = FakeLocoClient()
+        g1_robot._client = client
+        try:
+            with patch.object(g1_robot.time, "sleep") as sleep, patch.object(
+                g1_robot, "_move", return_value=(None, (0.0, 0.0, 0.0))
+            ) as move:
+                result = g1_robot.execute_robot_program("robot.walktime(0.1)")
+            sleep.assert_called_once_with(0.1)
+            self.assertEqual(client.responses, [])
+            self.assertEqual(result["commandsExecuted"], 1)
+            move.assert_called_once()
+        finally:
+            g1_robot._client = original_client
+
+    def test_locomotion_remains_blocked_after_repeated_sdk_fsm_timeouts(self):
+        class FakeLocoClient:
+            def __init__(self):
+                self.calls = 0
+
+            def GetFsmId(self):
+                self.calls += 1
+                return 3104, None
+
+        original_client = g1_robot._client
+        client = FakeLocoClient()
+        g1_robot._client = client
+        try:
+            with patch.object(g1_robot.time, "sleep"), patch.object(g1_robot, "_move") as move:
+                with self.assertRaises(HTTPException) as raised:
+                    g1_robot.execute_robot_program("robot.walktime(0.1)")
+            self.assertEqual(client.calls, 2)
+            self.assertEqual(raised.exception.status_code, 502)
+            self.assertIn("timed out twice", raised.exception.detail)
+            self.assertIn("no locomotion command was sent", raised.exception.detail)
+            move.assert_not_called()
+        finally:
+            g1_robot._client = original_client
+
     def test_stop_during_arm_action_spacing_does_not_claim_to_cancel_arm(self):
         class FakeLocoClient:
             def StopMove(self):

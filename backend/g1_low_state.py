@@ -12,6 +12,7 @@ except ImportError:
     from ros.g1_joint_state import JOINT_MOTOR_INDICES
 
 LOW_STATE_MAX_AGE_MS = 250
+LOW_STATE_CACHE_INTERVAL_SECONDS = 0.1
 
 
 def _finite_vector(values: Any, label: str) -> list[float]:
@@ -66,8 +67,18 @@ class G1LowStateCache:
         self._received_monotonic: float | None = None
         self._received_at: str | None = None
         self._error: str | None = None
+        self._last_processed_monotonic: float | None = None
 
     def update(self, message: Any) -> None:
+        received_monotonic = time.monotonic()
+        with self._lock:
+            if (
+                self._last_processed_monotonic is not None
+                and received_monotonic - self._last_processed_monotonic
+                < LOW_STATE_CACHE_INTERVAL_SECONDS
+            ):
+                return
+            self._last_processed_monotonic = received_monotonic
         try:
             sample = extract_g1_low_state(message)
         except (AttributeError, TypeError, ValueError) as error:
@@ -76,7 +87,7 @@ class G1LowStateCache:
             return
         with self._lock:
             self._sample = sample
-            self._received_monotonic = time.monotonic()
+            self._received_monotonic = received_monotonic
             self._received_at = datetime.now(timezone.utc).isoformat()
             self._error = None
 

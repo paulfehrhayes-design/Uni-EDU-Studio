@@ -56,6 +56,19 @@ class G1LowStateTests(unittest.TestCase):
         cache.mark_unavailable("subscriber failed")
         self.assertEqual(cache.snapshot()["reason"], "subscriber failed")
 
+    def test_cache_processes_high_rate_updates_at_ten_hz(self):
+        cache = G1LowStateCache()
+        messages = [low_state_message() for _ in range(3)]
+        messages[1].motor_state[0].q = 100.0
+        messages[2].motor_state[0].q = 200.0
+        with patch("g1_low_state.time.monotonic", side_effect=[1.0, 1.05, 1.11, 1.12]):
+            for message in messages:
+                cache.update(message)
+            snapshot = cache.snapshot()
+
+        self.assertEqual(snapshot["status"], "available")
+        self.assertEqual(snapshot["motor_state"][0]["q"], 200.0)
+
     def test_joint_mapping_uses_the_verified_ros_motor_indices(self):
         self.assertEqual(
             G1LowStateCache.joint_mapping(),
