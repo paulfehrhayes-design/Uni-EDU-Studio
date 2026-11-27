@@ -1,5 +1,4 @@
 export const G1_CALIBRATION_STOP_RADIUS_METERS = 3;
-export const G1_CALIBRATION_RECENTER_TOLERANCE_METERS = 0.75;
 
 const isolatedMovementTests = [
   {
@@ -336,38 +335,6 @@ export function buildG1LocomotionCalibrationSeries() {
   };
 }
 
-export async function executeG1LocomotionCalibrationSeries({
-  batches,
-  runBatch,
-  waitForContinue,
-  shouldStop = () => false,
-  onBatchStart = () => {},
-}) {
-  if (!Array.isArray(batches) || typeof runBatch !== 'function' || typeof waitForContinue !== 'function') {
-    throw new TypeError('Calibration series execution requires bounded batches and explicit run/continue handlers.');
-  }
-  for (let index = 0; index < batches.length; index += 1) {
-    const batch = batches[index];
-    while (true) {
-      if (shouldStop()) return { status: 'stopped' };
-      await onBatchStart(batch, index, batches.length);
-      const result = await runBatch(batch);
-      if (result?.status !== 'completed') return result;
-      if (shouldStop()) return { status: 'stopped' };
-      const action = await waitForContinue({
-        completed: index + 1,
-        total: batches.length,
-        completedBatch: batch,
-        nextBatch: batches[index + 1] ?? null,
-      });
-      if (action === 'repeat') continue;
-      if (action !== 'continue') return { status: 'stopped' };
-      break;
-    }
-  }
-  return { status: 'completed' };
-}
-
 export function distanceFromCalibrationAnchor(anchor, pose) {
   if (
     !anchor
@@ -379,7 +346,7 @@ export function distanceFromCalibrationAnchor(anchor, pose) {
     || !Number.isFinite(pose.x)
     || !Number.isFinite(pose.y)
   ) {
-    throw new Error('The local pose frame changed or is invalid; stop the calibration series.');
+    throw new Error('The local pose frame changed or is invalid; stop the calibration section.');
   }
   return Math.hypot(pose.x - anchor.x, pose.y - anchor.y);
 }

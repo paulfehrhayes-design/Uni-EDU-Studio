@@ -1242,7 +1242,15 @@ export default function App() {
       ...(options.headers || {}),
     };
 
-    const res = await fetch(url, { ...options, headers });
+    let res;
+    try {
+      res = await fetch(url, { ...options, headers });
+    } catch (requestError) {
+      if (requestError instanceof TypeError) {
+        throw new Error(`Network request to ${url} failed: ${requestError.message}. Check that the studio backend is reachable.`);
+      }
+      throw requestError;
+    }
     const text = await res.text();
     const data = text ? JSON.parse(text) : {};
 

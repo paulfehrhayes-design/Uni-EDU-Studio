@@ -7,9 +7,7 @@ import { G1_MODEL_INFO } from './g1ModelRuntime.js';
 import {
   buildG1LocomotionCalibrationSeries,
   distanceFromCalibrationAnchor,
-  executeG1LocomotionCalibrationSeries,
   getG1CalibrationSectionElapsedSeconds,
-  G1_CALIBRATION_RECENTER_TOLERANCE_METERS,
   G1_CALIBRATION_STOP_RADIUS_METERS,
 } from './g1LocomotionCalibration.js';
 import { buildG1RecordedMotionFrames } from './g1RecordedArmMotion.js';
@@ -139,7 +137,6 @@ test('local odometry boundary checks require the same frame and enforce conserva
     distanceFromCalibrationAnchor(anchor, { ...anchor, x: 3, y: 1 }) - Math.sqrt(13),
   ) < 1e-12);
   assert.equal(G1_CALIBRATION_STOP_RADIUS_METERS, 3);
-  assert.equal(G1_CALIBRATION_RECENTER_TOLERANCE_METERS, 0.75);
   assert.throws(
     () => distanceFromCalibrationAnchor(anchor, { ...anchor, frame_id: 'map' }),
     /frame changed/,
@@ -154,104 +151,7 @@ test('section capture time excludes pauses and starts independently for each sec
   assert.equal(getG1CalibrationSectionElapsedSeconds(secondSection, 3_606_000), 5);
 });
 
-test('series runner requires each explicit continue and stops without issuing later batches', async () => {
-  const { batches } = buildG1LocomotionCalibrationSeries();
-  const executions = [];
-  let checkpointCount = 0;
-  const result = await executeG1LocomotionCalibrationSeries({
-    batches,
-    runBatch: async (batch) => {
-      executions.push(batch.label);
-      return { status: 'completed' };
-    },
-    waitForContinue: async ({ completed, nextBatch }) => {
-      checkpointCount += 1;
-      assert.equal(completed, checkpointCount);
-      assert.equal(nextBatch.label, batches[checkpointCount].label);
-      return checkpointCount < 2 ? 'continue' : 'stop';
-    },
-  });
-
-  assert.deepEqual(result, { status: 'stopped' });
-  assert.deepEqual(executions, batches.slice(0, 2).map(({ label }) => label));
-  assert.equal(checkpointCount, 2);
-});
-
-test('series runner repeats only the selected batch and can finish at the final checkpoint', async () => {
-  const { batches } = buildG1LocomotionCalibrationSeries();
-  const selectedBatches = batches.slice(0, 2);
-  const executions = [];
-  let repeatedFirstBatch = false;
-  const result = await executeG1LocomotionCalibrationSeries({
-    batches: selectedBatches,
-    runBatch: async (batch) => {
-      executions.push(batch.label);
-      return { status: 'completed' };
-    },
-    waitForContinue: async ({ completed, nextBatch }) => {
-      if (completed === 1 && !repeatedFirstBatch) {
-        repeatedFirstBatch = true;
-        assert.equal(nextBatch.label, selectedBatches[1].label);
-        return 'repeat';
-      }
-      if (completed === 2) {
-        assert.equal(nextBatch, null);
-      }
-      return 'continue';
-    },
-  });
-
-  assert.deepEqual(result, { status: 'completed' });
-  assert.deepEqual(executions, [
-    selectedBatches[0].label,
-    selectedBatches[0].label,
-    selectedBatches[1].label,
-  ]);
-});
-
-test('series runner waits for section recording setup before starting each batch', async () => {
-  const { batches } = buildG1LocomotionCalibrationSeries();
-  const events = [];
-  let activeIndex = -1;
-  const result = await executeG1LocomotionCalibrationSeries({
-    batches: batches.slice(0, 2),
-    onBatchStart: async (batch, index) => {
-      activeIndex = index;
-      events.push(`setup:${index}`);
-      await Promise.resolve();
-      events.push(`ready:${index}`);
-    },
-    runBatch: async () => {
-      events.push(`run:${activeIndex}`);
-      return { status: 'completed' };
-    },
-    waitForContinue: async () => 'continue',
-  });
-
-  assert.deepEqual(result, { status: 'completed' });
-  assert.deepEqual(events, [
-    'setup:0', 'ready:0', 'run:0',
-    'setup:1', 'ready:1', 'run:1',
-  ]);
-});
-
-test('series runner halts on a failed batch and does not retry it automatically', async () => {
-  const { batches } = buildG1LocomotionCalibrationSeries();
-  const executions = [];
-  const result = await executeG1LocomotionCalibrationSeries({
-    batches,
-    runBatch: async (batch) => {
-      executions.push(batch.label);
-      return { status: 'stopped' };
-    },
-    waitForContinue: async () => assert.fail('No checkpoint follows a failed batch.'),
-  });
-
-  assert.deepEqual(result, { status: 'stopped' });
-  assert.deepEqual(executions, [batches[0].label]);
-});
-
-test('series pose and full 23-joint samples pass the existing calibration JSON export schema', () => {
+test('calibration section pose and full 23-joint samples pass the export schema', () => {
   const { code } = buildG1LocomotionCalibrationSeries();
   const pose = {
     frame_id: 'odom',

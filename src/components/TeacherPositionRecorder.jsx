@@ -18,9 +18,7 @@ import {
 import {
   buildG1LocomotionCalibrationSeries,
   distanceFromCalibrationAnchor,
-  executeG1LocomotionCalibrationSeries,
   getG1CalibrationSectionElapsedSeconds,
-  G1_CALIBRATION_RECENTER_TOLERANCE_METERS,
   G1_CALIBRATION_STOP_RADIUS_METERS,
 } from '../sim/g1LocomotionCalibration.js';
 
@@ -125,14 +123,16 @@ function makePoseAndJointFrame({ time, pose, positions }) {
   return { time, joints: [...positions], pose };
 }
 
-function partialRecordingName(name, recordings, capturedAt) {
+function partialRecordingName(name, recordings, capturedAt, preservedSuffix = '') {
   const timestamp = capturedAt.replace(/\D/g, '').slice(0, 14);
   let suffix = ` (partial ${timestamp})`;
-  let candidate = `${name.slice(0, 40 - suffix.length)}${suffix}`;
+  let baseNameLength = Math.max(0, 40 - suffix.length - preservedSuffix.length);
+  let candidate = `${name.slice(0, baseNameLength)}${preservedSuffix}${suffix}`;
   let index = 2;
   while (recordings.some((recording) => recording.name.toLowerCase() === candidate.toLowerCase())) {
     suffix = ` (partial ${timestamp} ${index})`;
-    candidate = `${name.slice(0, 40 - suffix.length)}${suffix}`;
+    baseNameLength = Math.max(0, 40 - suffix.length - preservedSuffix.length);
+    candidate = `${name.slice(0, baseNameLength)}${preservedSuffix}${suffix}`;
     index += 1;
   }
   return candidate;
@@ -212,25 +212,21 @@ export default function TeacherPositionRecorder({
   const [code, setCode] = useState(() => defaultCommand(controllerVersion));
   const [confirmClearArea, setConfirmClearArea] = useState(false);
   const [useLocomotionSeries, setUseLocomotionSeries] = useState(false);
+  const [selectedCalibrationBatchIndex, setSelectedCalibrationBatchIndex] = useState(0);
   const [isStarting, setIsStarting] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isMeasuringRates, setIsMeasuringRates] = useState(false);
-  const [seriesCheckpoint, setSeriesCheckpoint] = useState(null);
-  const [seriesProgress, setSeriesProgress] = useState(null);
+  const [selectedSectionProgress, setSelectedSectionProgress] = useState(null);
   const [sampleCount, setSampleCount] = useState(0);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [filePreview, setFilePreview] = useState(null);
   const [rateDiagnostic, setRateDiagnostic] = useState(null);
   const startingRef = useRef(false);
-  const checkpointResolverRef = useRef(null);
   const seriesAnchorRef = useRef(null);
-  const seriesBatchRunHistoryRef = useRef([]);
   const seriesSectionsRef = useRef([]);
   const activeSeriesSectionRef = useRef(null);
-  const saveSeriesSectionRef = useRef(null);
-  const seriesStopRequestedRef = useRef(false);
   const stopAttemptedRef = useRef(false);
   const stopFailureRef = useRef(null);
 
@@ -577,15 +573,10 @@ export default function TeacherPositionRecorder({
     setError('');
     setMessage('');
     setSampleCount(0);
-    setSeriesCheckpoint(null);
-    setSeriesProgress(null);
-    checkpointResolverRef.current = null;
+    setSelectedSectionProgress(null);
     seriesAnchorRef.current = null;
-    seriesBatchRunHistoryRef.current = [];
     seriesSectionsRef.current = [];
     activeSeriesSectionRef.current = null;
-    saveSeriesSectionRef.current = null;
-    seriesStopRequestedRef.current = false;
     stopAttemptedRef.current = false;
     stopFailureRef.current = null;
     if (!confirmClearArea) {
@@ -607,19 +598,19 @@ export default function TeacherPositionRecorder({
     try {
       if (useLocomotionSeries) {
         if (controllerVersion !== 'legacy') {
-          throw new Error('The step-based calibration series is available only through the validated Legacy SDK command mappings.');
+          throw new Error('The selected section is available only through the validated Legacy SDK command mappings.');
         }
-        const series = buildG1LocomotionCalibrationSeries();
-        captureBatches = series.batches.map((batch, index) => ({
+        const batch = buildG1LocomotionCalibrationSeries().batches[selectedCalibrationBatchIndex];
+        captureBatches = [{
           ...validateLegacyPositionCapture(name, batch.code),
           label: batch.label,
           phase: batch.phase,
           code: batch.code,
-          index,
-        }));
+          index: selectedCalibrationBatchIndex,
+        }];
         captureProgram = {
           name: captureBatches[0].name,
-          code: series.code,
+          code: captureBatches[0].code,
           usesLocomotion: true,
         };
       } else {
@@ -661,10 +652,7 @@ export default function TeacherPositionRecorder({
     const capturedAt = new Date().toISOString();
     const getRecordingCommand = () => {
       if (!useLocomotionSeries) return captureProgram.code;
-      const batchOrder = seriesBatchRunHistoryRef.current
-        .map(({ batchNumber }) => batchNumber)
-        .join(', ');
-      return `${captureProgram.code}\n\n# Actual batch run order (including repeats): ${batchOrder}`;
+      return `${captureProgram.code}\n\n# Calibration section: ${captureBatches[0].label}`;
     };
     const frames = useLocomotionSeries
       ? []
@@ -679,9 +667,11 @@ export default function TeacherPositionRecorder({
     startingRef.current = false;
     setIsStarting(false);
     setIsCapturing(true);
-    setSeriesProgress(useLocomotionSeries ? { current: 1, total: captureBatches.length } : null);
+    setSelectedSectionProgress(useLocomotionSeries
+      ? { current: selectedCalibrationBatchIndex + 1, total: buildG1LocomotionCalibrationSeries().batches.length }
+      : null);
     setMessage(useLocomotionSeries
-      ? 'Locomotion calibration started. Each batch will stop for an operator pause, with the option to repeat or continue.'
+      ? `Starting selected calibration section: ${captureBatches[0].label}.`
       : `Running the approved ${controllerVersion === 'duet' ? 'DUET' : 'legacy SDK'} sequence while recording pose and all 23 joints.`);
 
     let runSettled = false;
@@ -689,99 +679,51 @@ export default function TeacherPositionRecorder({
     let captureLimitReached = false;
     let stopError = null;
     let nextSampleAt = startedAt + SAMPLE_INTERVAL_MS;
+    const prepareCaptureSection = async (batch) => {
+      setMessage(`Preparing selected calibration section: ${batch.label}.`);
+      let section = seriesSectionsRef.current[batch.index];
+      const [poseSnapshot, jointSample] = await Promise.all([
+        withTimeout(connection.pose(), CALIBRATION_SENSOR_TIMEOUT_MS, 'Pose telemetry'),
+        withTimeout(readJointSample(connection), CALIBRATION_SENSOR_TIMEOUT_MS, 'Joint telemetry'),
+      ]);
+      const pose = selectPositionCapturePose(poseSnapshot, initialPose.frame_id);
+      if (pose.base_frame !== initialPose.base_frame) {
+        throw new Error('The TF base frame changed before a calibration section.');
+      }
+      if (
+        jointSample.jointNames.length !== firstJointSample.jointNames.length
+        || jointSample.jointNames.some((joint, jointIndex) => joint !== firstJointSample.jointNames[jointIndex])
+      ) {
+        throw new Error('The measured joint layout changed before a calibration section.');
+      }
+      if (!section) {
+        section = {
+          batch,
+          capturedAt: new Date().toISOString(),
+          frames: [],
+          saved: false,
+        };
+        seriesSectionsRef.current[batch.index] = section;
+      }
+      activeSeriesSectionRef.current = section;
+      section.runTimeOffset = section.frames.length
+        ? section.frames.at(-1).time + 0.001
+        : 0;
+      section.runStartedAt = performance.now();
+      nextSampleAt = section.runStartedAt + SAMPLE_INTERVAL_MS;
+      section.frames.push(makePoseAndJointFrame({
+        time: Number(section.runTimeOffset.toFixed(3)),
+        pose,
+        positions: jointSample.positions,
+      }));
+      totalSampleCount += 1;
+      setSampleCount(totalSampleCount);
+    };
     const executeCaptureProgram = async () => {
       if (!captureBatches) return connection.run(captureProgram.code);
-      return executeG1LocomotionCalibrationSeries({
-        batches: captureBatches,
-        runBatch: async (batch) => {
-          seriesBatchRunHistoryRef.current.push({ batchNumber: batch.index + 1 });
-          const section = seriesSectionsRef.current[batch.index];
-          if (section) section.runHistory.push(batch.index + 1);
-          return connection.run(batch.code);
-        },
-        shouldStop: () => seriesStopRequestedRef.current,
-        onBatchStart: async (batch, index, total) => {
-          setSeriesProgress({ current: index + 1, total });
-          setMessage(`Locomotion batch ${index + 1}/${total}: ${batch.label}. Stay at the stop and supervise.`);
-          let section = seriesSectionsRef.current[index];
-          const [poseSnapshot, jointSample] = await Promise.all([
-            withTimeout(connection.pose(), CALIBRATION_SENSOR_TIMEOUT_MS, 'Pose telemetry'),
-            withTimeout(readJointSample(connection), CALIBRATION_SENSOR_TIMEOUT_MS, 'Joint telemetry'),
-          ]);
-          const pose = selectPositionCapturePose(poseSnapshot, initialPose.frame_id);
-          if (pose.base_frame !== initialPose.base_frame) {
-            throw new Error('The TF base frame changed before a calibration batch.');
-          }
-          if (
-            jointSample.jointNames.length !== firstJointSample.jointNames.length
-            || jointSample.jointNames.some((joint, jointIndex) => joint !== firstJointSample.jointNames[jointIndex])
-          ) {
-            throw new Error('The measured joint layout changed before a calibration batch.');
-          }
-          if (!section) {
-            section = {
-              batch,
-              capturedAt: new Date().toISOString(),
-              frames: [],
-              runHistory: [],
-              saved: false,
-            };
-            seriesSectionsRef.current[index] = section;
-          }
-          activeSeriesSectionRef.current = section;
-          section.runTimeOffset = section.frames.length
-            ? section.frames.at(-1).time + 0.001
-            : 0;
-          section.runStartedAt = performance.now();
-          section.runElapsedAtPause = null;
-          nextSampleAt = section.runStartedAt + SAMPLE_INTERVAL_MS;
-          section.frames.push(makePoseAndJointFrame({
-            time: Number(section.runTimeOffset.toFixed(3)),
-            pose,
-            positions: jointSample.positions,
-          }));
-          totalSampleCount += 1;
-          setSampleCount(totalSampleCount);
-        },
-        waitForContinue: async ({ completed, total, completedBatch, nextBatch }) => {
-          const [poseSnapshot, jointSample] = await Promise.all([
-            withTimeout(connection.pose(), CALIBRATION_SENSOR_TIMEOUT_MS, 'Pose telemetry'),
-            withTimeout(readJointSample(connection), CALIBRATION_SENSOR_TIMEOUT_MS, 'Joint telemetry'),
-          ]);
-          const pose = selectPositionCapturePose(poseSnapshot, initialPose.frame_id);
-          if (pose.base_frame !== initialPose.base_frame) {
-            throw new Error('The TF base frame changed at the end of a calibration batch.');
-          }
-          if (
-            jointSample.jointNames.length !== firstJointSample.jointNames.length
-            || jointSample.jointNames.some((joint, jointIndex) => joint !== firstJointSample.jointNames[jointIndex])
-          ) {
-            throw new Error('The measured joint layout changed at the end of a calibration batch.');
-          }
-          if (!addSample(pose, jointSample)) {
-            throw new Error('The calibration capture limit was reached at a batch boundary.');
-          }
-          activeSeriesSectionRef.current.runElapsedAtPause = getG1CalibrationSectionElapsedSeconds(
-            activeSeriesSectionRef.current,
-            performance.now(),
-          );
-          setSeriesCheckpoint({
-            completed,
-            total,
-            completedLabel: completedBatch.label,
-            nextLabel: nextBatch?.label ?? null,
-          });
-          setMessage(nextBatch
-            ? `Batch ${completed}/${total} complete. Pose and joint scanning is paused. Recenter, then choose Repeat last batch or Continue.`
-            : `Final batch ${completed}/${total} complete. Pose and joint scanning is paused. Choose Repeat last batch or Finish and save.`);
-          const action = await new Promise((resolve) => {
-            checkpointResolverRef.current = resolve;
-          });
-          checkpointResolverRef.current = null;
-          setSeriesCheckpoint(null);
-          return action;
-        },
-      });
+      const batch = captureBatches[0];
+      await prepareCaptureSection(batch);
+      return connection.run(batch.code);
     };
     const addSample = (pose, jointSample) => {
       const elapsed = (performance.now() - startedAt) / 1000;
@@ -856,10 +798,11 @@ export default function TeacherPositionRecorder({
       const sectionIndex = section.batch.index + 1;
       const sectionNameSuffix = ` - ${String(sectionIndex).padStart(2, '0')} ${section.batch.phase === 'isolated' ? 'Isolated' : 'Progression'}`;
       const sectionName = `${captureProgram.name.slice(0, 40 - sectionNameSuffix.length)}${sectionNameSuffix}`;
+      const partialSectionSuffix = ` - ${String(sectionIndex).padStart(2, '0')}${section.batch.phase === 'isolated' ? 'I' : 'P'}`;
       const savedName = partial
-        ? partialRecordingName(sectionName, recordings, new Date().toISOString())
+        ? partialRecordingName(captureProgram.name, recordings, new Date().toISOString(), partialSectionSuffix)
         : uniqueRecordingName(sectionName, recordings);
-      const command = `${section.batch.code}\n\n# Actual batch run order (including repeats): ${section.runHistory.join(', ')}`;
+      const command = `${section.batch.code}\n\n# Calibration section: ${section.batch.label}`;
       const saved = await connection.saveRecording({
         name: savedName,
         controller_version: controllerVersion,
@@ -880,7 +823,6 @@ export default function TeacherPositionRecorder({
       }
       return saved.recording;
     };
-    saveSeriesSectionRef.current = saveActiveSeriesSection;
     const savePartialCapture = async (reason) => {
       if (useLocomotionSeries) {
         const saved = await saveActiveSeriesSection({ partial: true, reason });
@@ -924,7 +866,7 @@ export default function TeacherPositionRecorder({
       while (!runSettled) {
         if (
           useLocomotionSeries
-          && (!activeSeriesSectionRef.current || checkpointResolverRef.current)
+          && !activeSeriesSectionRef.current
         ) {
           await wait(SAMPLE_INTERVAL_MS);
           continue;
@@ -945,7 +887,7 @@ export default function TeacherPositionRecorder({
         if (runSettled) break;
         if (
           useLocomotionSeries
-          && (!activeSeriesSectionRef.current || checkpointResolverRef.current)
+          && !activeSeriesSectionRef.current
         ) {
           continue;
         }
@@ -967,7 +909,7 @@ export default function TeacherPositionRecorder({
             const distance = distanceFromCalibrationAnchor(seriesAnchorRef.current, pose);
             if (distance >= G1_CALIBRATION_STOP_RADIUS_METERS) {
               throw new Error(
-                `Odometry reached the ${G1_CALIBRATION_STOP_RADIUS_METERS} m local stop radius; the calibration series was halted.`,
+                `Odometry reached the ${G1_CALIBRATION_STOP_RADIUS_METERS} m local stop radius; the calibration section was halted.`,
               );
             }
           }
@@ -990,20 +932,15 @@ export default function TeacherPositionRecorder({
       }
 
       if (!runSettled && (samplingError || captureLimitReached)) {
-        const waitingAtCheckpoint = Boolean(checkpointResolverRef.current);
-        if (useLocomotionSeries) seriesStopRequestedRef.current = true;
-        checkpointResolverRef.current?.('stop');
         setIsStopping(true);
         setMessage(samplingError
           ? 'Sensor feedback or the odometry boundary check failed; stopping and preserving partial calibration data.'
           : `${captureDurationLimitSeconds / 60}-minute capture safeguard reached; stopping and preserving partial calibration data.`);
         try {
-          if (!waitingAtCheckpoint) {
-            stopAttemptedRef.current = true;
-            await (useLocomotionSeries
-              ? withTimeout(connection.stop(), CALIBRATION_STOP_TIMEOUT_MS, 'Robot stop request')
-              : connection.stop());
-          }
+          stopAttemptedRef.current = true;
+          await (useLocomotionSeries
+            ? withTimeout(connection.stop(), CALIBRATION_STOP_TIMEOUT_MS, 'Robot stop request')
+            : connection.stop());
         } catch (requestError) {
           stopError = requestError;
         } finally {
@@ -1031,7 +968,11 @@ export default function TeacherPositionRecorder({
         || (result?.status === 'stopped' ? 'Stopped by the operator.' : '')
         || (captureLimitReached ? `The ${captureDurationLimitSeconds / 60}-minute capture limit was reached.` : '');
       if (useLocomotionSeries && partialReason) {
-        await savePartialCapture(partialReason);
+        try {
+          await savePartialCapture(partialReason);
+        } catch (saveError) {
+          throw new Error(`${partialReason} The partial section could not be saved: ${saveError.message}`);
+        }
         return;
       }
       if (runError) throw runError;
@@ -1086,8 +1027,8 @@ export default function TeacherPositionRecorder({
         }
       }
       if (useLocomotionSeries) {
-        setName('');
-        setMessage('Calibration series complete. Each section was saved as its own recording and JSON file.');
+        const saved = await saveActiveSeriesSection();
+        setMessage(`Calibration section saved as "${saved.name}" with ${saved.frames.length} measured samples.`);
         return;
       }
       if (frames.length < 2) {
@@ -1115,22 +1056,12 @@ export default function TeacherPositionRecorder({
     } finally {
       setIsCapturing(false);
       setIsStopping(false);
-      saveSeriesSectionRef.current = null;
     }
   };
 
   const handleStopRobot = async () => {
     setIsStopping(true);
     setError('');
-    if (useLocomotionSeries) seriesStopRequestedRef.current = true;
-    if (checkpointResolverRef.current) {
-      checkpointResolverRef.current('stop');
-      checkpointResolverRef.current = null;
-      setSeriesCheckpoint(null);
-      setMessage('Calibration series stopped at the operator checkpoint. No robot command was active; partial data will be saved.');
-      setIsStopping(false);
-      return;
-    }
     try {
       stopAttemptedRef.current = true;
       const result = await (useLocomotionSeries
@@ -1141,52 +1072,13 @@ export default function TeacherPositionRecorder({
         : isMeasuringRates
           ? 'Robot stop was acknowledged; the sweep will preserve the partial rate report.'
           : useLocomotionSeries
-            ? 'Stop was sent to the active batch; the series will preserve partial pose and joint data.'
+            ? 'Stop was sent to the active section; partial pose and joint data will be preserved.'
             : 'Robot stop was acknowledged by the controller. Recording continues until the command ends.');
     } catch (requestError) {
       if (useLocomotionSeries) stopFailureRef.current = requestError;
       setError(`Robot stop failed: ${requestError.message}`);
     } finally {
       setIsStopping(false);
-    }
-  };
-
-  const handleSeriesCheckpointAction = async (action) => {
-    if (!seriesCheckpoint || !checkpointResolverRef.current || !seriesAnchorRef.current) return;
-    try {
-      const pose = selectPositionCapturePose(
-        await withTimeout(
-          connection.pose(),
-          CALIBRATION_SENSOR_TIMEOUT_MS,
-          'Pose telemetry',
-        ),
-        seriesAnchorRef.current.frame_id,
-      );
-      if (!checkpointResolverRef.current || !seriesCheckpoint) return;
-      if (pose.base_frame !== seriesAnchorRef.current.base_frame) {
-        throw new Error('The TF base frame changed during the pause.');
-      }
-      const distance = distanceFromCalibrationAnchor(seriesAnchorRef.current, pose);
-      if (distance >= G1_CALIBRATION_STOP_RADIUS_METERS) {
-        throw new Error(`The robot is outside the ${G1_CALIBRATION_STOP_RADIUS_METERS} m local stop radius.`);
-      }
-      if (distance > G1_CALIBRATION_RECENTER_TOLERANCE_METERS) {
-        throw new Error('Return the robot to within 0.75 m of its marked starting point before continuing.');
-      }
-      setError('');
-      setMessage(action === 'repeat'
-        ? `Recenter confirmed by local odometry. Repeating batch ${seriesCheckpoint.completed}/${seriesCheckpoint.total}.`
-        : `Recenter confirmed by local odometry. Starting batch ${seriesCheckpoint.completed + 1}/${seriesCheckpoint.total}.`);
-      if (action === 'continue') {
-        setMessage(seriesCheckpoint.completed === seriesCheckpoint.total
-          ? 'Recenter confirmed by local odometry. Saving this section and finishing.'
-          : `Recenter confirmed by local odometry. Saving section ${seriesCheckpoint.completed} and starting the next batch.`);
-        await saveSeriesSectionRef.current?.();
-      }
-      activeSeriesSectionRef.current = null;
-      checkpointResolverRef.current(action);
-    } catch (requestError) {
-      setError(`Cannot ${action === 'repeat' ? 'repeat the batch' : 'continue calibration'}: ${requestError.message}`);
     }
   };
 
@@ -1266,7 +1158,7 @@ export default function TeacherPositionRecorder({
         />
         <span>
           I have cleared a 10 m × 10 m work area, placed the robot near its center, will supervise the physical movement, and have the emergency stop accessible.
-          Odometry will stop the series at a conservative 3 m radius from its starting pose, but odometry alone cannot guarantee a hard workspace boundary.
+          Odometry will stop each section at a conservative 3 m radius from its starting pose, but odometry alone cannot guarantee a hard workspace boundary.
           The robot moves only after I explicitly select a run button.
         </span>
       </label>
@@ -1275,34 +1167,29 @@ export default function TeacherPositionRecorder({
       }`}>
         <input
           type="checkbox"
-          aria-label="Enable locomotion calibration series"
+          aria-label="Enable independent locomotion calibration sections"
           checked={useLocomotionSeries}
           onChange={(event) => setUseLocomotionSeries(event.target.checked)}
           disabled={controllerVersion !== 'legacy' || isStarting || isCapturing || isStopping || isMeasuringRates}
           className="mt-1 h-4 w-4 shrink-0 accent-cyan-800"
         />
         <span>
-          <strong>Opt in to the finite Legacy SDK locomotion calibration series.</strong>
-          {' '}It runs 37 isolated movement trials with a 2-second wait after each, then nine no-wait progression batches (110 commands). Batches 6-9 test repeated timed, step, slow-walk, and fast-walk progressions as well as mixed transitions. Separate turn-only and sidestep-only progressions alternate left and right; additional batches interleave turns/sidesteps with forward and backward travel. Values top out at 5 seconds/steps and 90° turns, plus the 180° turn-around. No arm commands are included. Pose and joint scanning pauses when each batch finishes. After recentering, Continue saves that section as its own recording and JSON file, then starts scanning for the next batch. After the final batch, finish and save its section. STOP remains available.
+          <strong>Enable independent Legacy SDK locomotion calibration sections.</strong>
+          {' '}The 14 sections cover 37 isolated trials and nine progression groups (110 commands total). Select and run one section at a time; it records and saves only that section. No automatic progression or continue step is involved.
           {controllerVersion !== 'legacy' && ' This uses existing step-based SDK mappings and is unavailable for DUET.'}
         </span>
       </label>
       {useLocomotionSeries && (
         <div className="mt-2 rounded-lg border border-cyan-200 bg-white p-3 text-[11px] leading-4 text-slate-600">
           <p>
-            The 3 m radial odometry cutoff leaves a nominal 2 m margin only when the robot actually starts centered in the stated 10 m × 10 m area. Localization error, drift, robot footprint, obstacles, and braking distance are not covered by that estimate; stay supervised and use the physical emergency stop if needed.
+            Each run has its own 3 m radial odometry cutoff from the starting pose. Localization error, drift, robot footprint, obstacles, and braking distance are not covered; supervise and keep the physical emergency stop accessible.
           </p>
           <p className="mt-1">
-            Hide the 3D simulator while this physical series runs to keep sensor polling responsive; use the saved recording afterward to compare motion in the simulator.
+            Only the selected section runs and starts measuring from the robot's current pose. No return-to-start distance is required; confirm the workspace is safe before each run.
           </p>
-          {seriesProgress && isCapturing && (
+          {selectedSectionProgress && isCapturing && (
             <p className="mt-1 font-semibold text-cyan-900">
-              Batch {seriesProgress.current}/{seriesProgress.total}
-              {seriesCheckpoint
-                ? seriesCheckpoint.nextLabel
-                  ? ` complete · next: ${seriesCheckpoint.nextLabel}`
-                  : ' complete · ready to finish'
-                : ' in progress'}
+              Section {selectedSectionProgress.current}/{selectedSectionProgress.total} in progress
             </p>
           )}
         </div>
@@ -1373,14 +1260,27 @@ export default function TeacherPositionRecorder({
         <label className="block text-xs font-semibold text-slate-700">
           Validated {controllerLabel} command sequence
           {useLocomotionSeries ? (
-            <ol className="mt-1 list-decimal space-y-1 rounded-md border border-cyan-200 bg-white px-8 py-2 font-mono text-[11px] font-normal">
-              {buildG1LocomotionCalibrationSeries().batches.map((batch) => (
-                <li key={batch.label}>
-                  <span className="font-sans font-semibold">{batch.label}: </span>
-                  {batch.code.split('\n').join(' → ')}
-                </li>
-              ))}
-            </ol>
+            <div className="mt-1 space-y-2 rounded-md border border-cyan-200 bg-white p-3">
+              <label className="block font-sans text-xs font-semibold">
+                Calibration section
+                <select
+                  aria-label="Calibration section to run"
+                  value={selectedCalibrationBatchIndex}
+                  onChange={(event) => setSelectedCalibrationBatchIndex(Number(event.target.value))}
+                  disabled={isStarting || isCapturing || isMeasuringRates}
+                  className="mt-1 w-full rounded-md border border-cyan-200 bg-white px-2 py-2"
+                >
+                  {buildG1LocomotionCalibrationSeries().batches.map((batch, index) => (
+                    <option key={batch.label} value={index}>
+                      {String(index + 1).padStart(2, '0')} · {batch.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="font-mono text-[11px] font-normal">
+                {buildG1LocomotionCalibrationSeries().batches[selectedCalibrationBatchIndex].code.split('\n').join(' → ')}
+              </p>
+            </div>
           ) : (
             <textarea
               aria-label="Calibration command sequence"
@@ -1400,30 +1300,8 @@ export default function TeacherPositionRecorder({
             disabled={!isReady || isLoading || isStarting || isCapturing || isStopping || isMeasuringRates || !name.trim() || !confirmClearArea || (useLocomotionSeries && controllerVersion !== 'legacy')}
             className="rounded-lg bg-cyan-800 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {isStarting ? 'Checking robot and sensors…' : isCapturing ? `Running & capturing · ${sampleCount} samples` : useLocomotionSeries ? 'Run locomotion calibration series' : 'Run & capture position'}
+            {isStarting ? 'Checking robot and sensors…' : isCapturing ? `Running & capturing · ${sampleCount} samples` : useLocomotionSeries ? 'Run selected calibration section' : 'Run & capture position'}
           </button>
-          {seriesCheckpoint && (
-            <>
-              <button
-                type="button"
-                onClick={() => handleSeriesCheckpointAction('repeat')}
-                disabled={isStopping}
-                className="rounded-lg border border-amber-500 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-950 disabled:opacity-50"
-              >
-                Repeat last batch after recenter
-              </button>
-              <button
-                type="button"
-                onClick={() => handleSeriesCheckpointAction('continue')}
-                disabled={isStopping}
-                className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
-              >
-                {seriesCheckpoint.completed === seriesCheckpoint.total
-                  ? 'Finish and save section'
-                  : 'Continue after recenter'}
-              </button>
-            </>
-          )}
           {(isCapturing || isMeasuringRates) && (
             <button
               type="button"
@@ -1431,17 +1309,17 @@ export default function TeacherPositionRecorder({
               disabled={isStopping}
               className="rounded-lg bg-red-700 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
             >
-              {isStopping ? 'Stopping…' : isMeasuringRates ? 'Stop rate sweep' : seriesCheckpoint ? 'Stop series' : useLocomotionSeries ? 'Stop series' : 'Stop robot'}
+              {isStopping ? 'Stopping…' : isMeasuringRates ? 'Stop rate sweep' : useLocomotionSeries ? 'Stop section' : 'Stop robot'}
             </button>
           )}
         </div>
       </form>
       <p className="mt-2 text-[11px] leading-4 text-slate-600">
         Sequential commands and bounded loops are limited to 20 expanded commands and an estimated five minutes.
-        Each calibration-series API batch stays within the capture validator&apos;s 20-command and five-minute estimated-duration limits. The finite series has 14 batches and pauses after each one; the 30-minute capture and sample limits apply independently to each section and exclude recenter pauses. Each calibration batch is saved separately when you continue, and its own JSON file is downloaded. Repeated runs stay grouped in that batch&apos;s file; the exported command notes its actual run order. Use Play in simulator on a saved recording to select and play that section.
+        Each calibration section runs independently with one API command and is saved as its own recording and JSON file. Select any section to run or rerun it; reruns receive unique names.
         Position captures target 30 Hz based on the completed sensor sweep. The temporary sweep tests 10, 20, 30, 40, 50, 60, 80, 100, 150, and 200 Hz with bounded forward/backward movement cycles.
-        Calibration series uses only existing Legacy SDK locomotion commands; fast-walk commands are forward-only in the current SDK. Legacy Stop stops locomotion but does not independently verify immobility.
-        Fresh odometry/localization and all 23 ROS joint values are required. A series sensor/boundary failure or STOP offers the measured partial capture when at least two valid samples exist.
+        Selected sections use only existing Legacy SDK locomotion commands; fast-walk commands are forward-only in the current SDK. Legacy Stop stops locomotion but does not independently verify immobility.
+        Fresh odometry/localization and all 23 ROS joint values are required. A sensor/boundary failure or STOP offers the measured partial section when at least two valid samples exist.
       </p>
       {message && <p role="status" className="mt-2 text-xs text-emerald-800">{message}</p>}
       <div className="mt-4 border-t border-cyan-200 pt-3">
