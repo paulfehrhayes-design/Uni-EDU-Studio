@@ -68,6 +68,50 @@ function validateRecording(recording) {
   return jointNames;
 }
 
+function exportLowStateSample(sample, frameIndex) {
+  if (sample === undefined || sample === null) return null;
+  const validVector = (values) => Array.isArray(values)
+    && values.length === 3
+    && values.every(Number.isFinite);
+  if (
+    typeof sample.timestamp !== 'string'
+    || !Number.isFinite(new Date(sample.timestamp).getTime())
+    || !Number.isFinite(sample.age_ms)
+    || sample.age_ms < 0
+    || sample.age_ms > 250
+    || !Number.isInteger(sample.motor_count)
+    || !Array.isArray(sample.motor_state)
+    || sample.motor_state.length !== sample.motor_count
+    || sample.motor_state.some((motor, index) => (
+      motor?.index !== index
+      || !Number.isFinite(motor.q)
+      || !Number.isFinite(motor.dq)
+      || !Number.isFinite(motor.tau_est)
+    ))
+    || !validVector(sample.imu_state?.rpy)
+    || !validVector(sample.imu_state?.gyroscope)
+    || !validVector(sample.imu_state?.accelerometer)
+  ) {
+    throw new Error(`Recorded Unitree LowState sample ${frameIndex + 1} is invalid.`);
+  }
+  return {
+    timestamp: normalizeCaptureTime(sample.timestamp),
+    age_ms: sample.age_ms,
+    motor_count: sample.motor_count,
+    motor_state: sample.motor_state.map((motor) => ({
+      index: motor.index,
+      q_rad: motor.q,
+      dq_rad_s: motor.dq,
+      tau_est_nm: motor.tau_est,
+    })),
+    imu_state: {
+      rpy_rad: [...sample.imu_state.rpy],
+      gyroscope_rad_s: [...sample.imu_state.gyroscope],
+      accelerometer_m_s2: [...sample.imu_state.accelerometer],
+    },
+  };
+}
+
 function isValidBasePose(pose) {
   return typeof pose?.frame_id === 'string'
     && pose.frame_id.length > 0
@@ -107,12 +151,24 @@ export function buildG1MotionRecordingExport(recording) {
         joint_position: 'radians',
         base_position: 'meters',
         base_yaw: 'radians',
+        ...(recording.low_state_metadata ? {
+          low_state_motor_position: 'radians',
+          low_state_motor_velocity: 'radians_per_second',
+          low_state_estimated_motor_torque: 'newton_meters',
+          imu_rpy: 'radians',
+          imu_gyroscope: 'radians_per_second',
+          imu_accelerometer: 'meters_per_second_squared',
+        } : {}),
       }
       : { time: 'seconds', joint_position: 'radians' },
+    ...(recording.low_state_metadata
+      ? { low_state_capture: recording.low_state_metadata }
+      : {}),
     captured_at: normalizeCaptureTime(recording.captured_at || recording.created_at),
-    frames: recording.frames.map((frame) => ({
+    frames: recording.frames.map((frame, index) => ({
       time_s: frame.time,
       positions_rad: [...frame.joints],
+      ...(frame.low_state ? { low_state: exportLowStateSample(frame.low_state, index) } : {}),
       ...(frame.pose ? {
         base_pose: {
           frame_id: frame.pose.frame_id,

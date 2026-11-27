@@ -542,6 +542,9 @@ test('teacher can select and run calibration sections independently', async ({ p
   const apiRequests = [];
   const pageErrors = [];
   let failNextRun = false;
+  let displaceNextRun = false;
+  let simulateDisplacement = false;
+  let lowStateAvailable = true;
   page.on('pageerror', (pageError) => pageErrors.push(pageError.message));
   await page.route('**/api/**', async (route) => {
     const request = route.request();
@@ -562,8 +565,38 @@ test('teacher can select and run calibration sections independently', async ({ p
       };
     } else if (path === '/api/robot/joint-state') {
       body = freshJointState();
+    } else if (path === '/api/robot/low-state') {
+      body = lowStateAvailable
+        ? {
+          status: 'available',
+          source: 'unitree_sdk2py:rt/lowstate',
+          received_at: '2026-11-12T00:00:00.010Z',
+          age_ms: 10,
+          motor_count: 27,
+          motor_state: Array.from({ length: 27 }, (_, index) => ({
+            index,
+            q: index / 10,
+            dq: index / 100,
+            tau_est: index / 1000,
+          })),
+          imu_state: {
+            rpy: [0.1, 0.2, 0.3],
+            gyroscope: [0.4, 0.5, 0.6],
+            accelerometer: [0.7, 0.8, 0.9],
+          },
+          motor_joint_mapping: G1_JOINT_NAMES.map((joint_name, index) => ({
+            joint_name,
+            motor_index: index < 13 ? index : index < 18 ? index + 2 : index + 4,
+          })),
+        }
+        : {
+          status: 'unavailable',
+          reason: 'Unitree LowState subscriber is not receiving messages.',
+          motor_joint_mapping: [],
+        };
     } else if (path === '/api/robot/pose') {
       body = freshPoseSnapshot();
+      if (simulateDisplacement) body.poses[0].x = 4;
     } else if (path === '/api/robot/recordings' && request.method() === 'GET') {
       body = { recordings: savedPayloads.map((recording, index) => ({
         id: `capture_calibrationtest_${index + 1}`,
@@ -583,6 +616,12 @@ test('teacher can select and run calibration sections independently', async ({ p
     } else if (path === '/api/run') {
       const code = request.postDataJSON().code;
       runPrograms.push(code);
+      if (displaceNextRun) {
+        displaceNextRun = false;
+        simulateDisplacement = true;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        simulateDisplacement = false;
+      }
       if (failNextRun) {
         failNextRun = false;
         await route.abort('failed');
@@ -627,6 +666,9 @@ test('teacher can select and run calibration sections independently', async ({ p
   expect(savedPayloads[0].name).toBe('Classroom calibration - 09 Progression');
   expect(savedPayloads[0].command).toContain(batches[8].code);
   expect(savedPayloads[0].frames.every((frame) => frame.joints.length === 23 && frame.pose)).toBe(true);
+  expect(savedPayloads[0].low_state_metadata.status).toBe('recorded');
+  expect(savedPayloads[0].low_state_metadata.sample_count).toBeGreaterThan(0);
+  expect(savedPayloads[0].frames.some((frame) => frame.low_state?.imu_state?.rpy.length === 3)).toBe(true);
 
   await sectionSelect.selectOption('4');
   await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
@@ -637,15 +679,34 @@ test('teacher can select and run calibration sections independently', async ({ p
   expect(savedPayloads).toHaveLength(2);
   expect(apiRequests.filter((request) => request === 'POST /api/run')).toHaveLength(2);
 
-  failNextRun = true;
+  displaceNextRun = true;
   await sectionSelect.selectOption('6');
+  await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
+  await runSelectedSection.click();
+  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(3);
+  expect(savedPayloads[2].name).toBe('Classroom calibration - 07 Progression');
+  expect(savedPayloads[2].frames.some((frame) => frame.pose.x > 3)).toBe(true);
+
+  failNextRun = true;
+  await sectionSelect.selectOption('7');
   await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
   await runSelectedSection.click();
   await expect(page.locator('[role="alert"]').filter({ hasText: 'Calibration stopped early:' }))
     .toContainText('Network request to /api/run failed:');
-  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(3);
-  expect(savedPayloads[2].name).toContain(' - 07P (partial');
-  expect(runPrograms).toEqual([batches[8].code, batches[4].code, batches[6].code]);
+  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(4);
+  expect(savedPayloads[3].name).toContain(' - 08P (partial');
+  expect(runPrograms).toEqual([batches[8].code, batches[4].code, batches[6].code, batches[7].code]);
+
+  lowStateAvailable = false;
+  await sectionSelect.selectOption('0');
+  await page.getByRole('checkbox', { name: 'Confirm robot workspace is clear' }).check();
+  await runSelectedSection.click();
+  await expect.poll(() => savedPayloads.length, { timeout: 8000 }).toBe(5);
+  expect(savedPayloads[4].low_state_metadata.status).toBe('unavailable');
+  expect(savedPayloads[4].low_state_metadata.sample_count).toBe(0);
+  expect(savedPayloads[4].low_state_metadata.failed_polls).toBeGreaterThan(0);
+  expect(savedPayloads[4].frames.every((frame) => !frame.low_state)).toBe(true);
+  await expect(page.getByText(/Unitree LowState unavailable; ROS pose\/joint capture was saved/)).toBeVisible();
 
   await page.getByRole('button', {
     name: 'Play recording Classroom calibration - 09 Progression in simulator',

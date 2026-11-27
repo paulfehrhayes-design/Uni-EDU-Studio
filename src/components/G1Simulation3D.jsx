@@ -19,8 +19,8 @@ import {
   DEFAULT_CAMERA_YAW, getCameraHorizontalFocusOffset, getCameraPanDirection, getCameraPanTargetOffset,
 } from '../sim/cameraNavigation';
 
-const G1_SHELL_COLOR = 0xbfc2c5;
-const G1_DARK_COMPONENT_COLOR = 0x17191b;
+const G1_SHELL_COLOR = 0xd0d2d4;
+const G1_DARK_COMPONENT_COLOR = 0x121416;
 const G1_ELBOW_BAND_MIN = -0.005;
 const G1_ELBOW_BAND_MAX = 0.035;
 const G1_DARK_MESH_NAMES = new Set([
@@ -31,6 +31,8 @@ const G1_DARK_MESH_NAMES = new Set([
   'right_ankle_roll_link',
   'head_link',
   'logo_link',
+  'left_rubber_hand',
+  'right_rubber_hand',
 ]);
 const G1_ELBOW_MESH_NAMES = new Set(['left_elbow_link', 'right_elbow_link']);
 
@@ -44,7 +46,7 @@ const JOINT_AXES = {
   left_wrist_roll: 'y', right_wrist_roll: 'y',
 };
 
-function material(color, metalness = 0.5, roughness = 0.36) {
+function material(color, metalness = 0.28, roughness = 0.38) {
   return new THREE.MeshStandardMaterial({ color, metalness, roughness });
 }
 
@@ -246,8 +248,8 @@ function createRobot() {
   };
 
   const pelvis = register('pelvis', robot, [0, 1.65, 0]);
-  addBox(pelvis, [0.72, 0.42, 0.42], [0, 0, 0], dark, 0);
-  addBox(pelvis, [0.48, 0.12, 0.48], [0, 0.26, 0], light, 0);
+  addBox(pelvis, [0.72, 0.42, 0.42], [0, 0, 0], light, 0);
+  addBox(pelvis, [0.48, 0.12, 0.48], [0, 0.26, 0], dark, 0);
 
   const waistYaw = register('waist_yaw_joint', pelvis, [0, 0.28, 0]);
   const torso = new THREE.Group();
@@ -256,8 +258,7 @@ function createRobot() {
   addBox(torso, [0.4, 0.3, 0.42], [0, 0.76, 0], light, 0);
 
   const head = register('head', torso, [0, 0.95, 0]);
-  addBox(head, [0.4, 0.42, 0.38], [0, 0, 0], light, 0);
-  addBox(head, [0.24, 0.28, 0.018], [0, 0.02, -0.195], dark, 0.08);
+  addBox(head, [0.4, 0.42, 0.38], [0, 0, 0], dark, 0);
   addHeadLed(head, [0, 0.02, -0.195], 0.22, 0.28, -1);
 
   const leg = (side, x) => {
@@ -268,14 +269,13 @@ function createRobot() {
     addSegment(hipPitch, [0, 0, 0], [0, -0.55, 0], 0.13, light);
     const knee = register(`${side}_knee_joint`, hipPitch, [0, -0.55, 0]);
     addSegment(knee, [0, 0, 0], [0, -0.62, 0], 0.12, light);
-    for (const direction of [-1, 1]) {
-      addDarkJointCap(knee, 0.12, 0.045, [direction * 0.12, 0, 0.015]);
-    }
+    const inwardDirection = x < 0 ? 1 : -1;
+    addDarkJointCap(knee, 0.12, 0.045, [inwardDirection * 0.12, 0, 0.015]);
     const anklePitch = register(`${side}_ankle_pitch_joint`, knee, [0, -0.62, 0]);
     addBox(anklePitch, [0.24, 0.14, 0.28], [0, -0.08, 0], light, 0.04);
     const ankleRoll = register(`${side}_ankle_roll_joint`, anklePitch);
     addBox(ankleRoll, [0.24, 0.18, 0.42], [0, -0.12, -0.05], dark, 0);
-    addBox(ankleRoll, [0.3, 0.1, 0.54], [0, -0.22, -0.1], light, 0);
+    addBox(ankleRoll, [0.3, 0.1, 0.54], [0, -0.22, -0.1], dark, 0);
   };
   leg('left', -0.24);
   leg('right', 0.24);
@@ -565,8 +565,8 @@ async function loadG1MeshRig() {
     if (!materialCache.has(key)) {
       materialCache.set(key, new THREE.MeshStandardMaterial({
         color: elbowJoint ? 0xffffff : dark ? G1_DARK_COMPONENT_COLOR : G1_SHELL_COLOR,
-        metalness: 0.5,
-        roughness: 0.36,
+        metalness: 0.28,
+        roughness: 0.38,
         vertexColors: elbowJoint,
       }));
     }
@@ -582,9 +582,8 @@ async function loadG1MeshRig() {
     parent.add(body);
     const bodyName = bodyElement.getAttribute('name');
     if (bodyName === 'left_knee_link' || bodyName === 'right_knee_link') {
-      for (const direction of [-1, 1]) {
-        addDarkJointCap(body, 0.045, 0.018, [direction * 0.036, -0.01, 0.015]);
-      }
+      const inwardDirection = bodyName === 'left_knee_link' ? -1 : 1;
+      addDarkJointCap(body, 0.045, 0.018, [inwardDirection * 0.036, -0.01, 0.015]);
     }
 
     const joint = bodyElement.querySelector(':scope > joint');
@@ -873,12 +872,12 @@ export default function G1Simulation3D({ code, simulatorState, controllerVersion
     rendererRef.current = renderer;
     sceneRef.current = scene;
 
-    scene.add(new THREE.HemisphereLight(0x9fd8ff, 0x152234, 2.2));
+    scene.add(new THREE.HemisphereLight(0xe4e9ee, 0x25282c, 2.2));
     const key = new THREE.DirectionalLight(0xffffff, 3.2);
     key.position.set(4, 8, 5);
     key.castShadow = true;
     scene.add(key);
-    const rim = new THREE.PointLight(0x22d3ee, 16, 12);
+    const rim = new THREE.PointLight(0xdce6ed, 4, 12);
     rim.position.set(-4, 3, -3);
     scene.add(rim);
 

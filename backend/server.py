@@ -37,6 +37,7 @@ try:
         execute_robot_program,
         navigation_set_velocity,
         parse_robot_program,
+        robot_low_state,
         robot_status,
         stop_navigation_velocity,
         stop_robot,
@@ -97,6 +98,7 @@ except ImportError:
         execute_robot_program,
         navigation_set_velocity,
         parse_robot_program,
+        robot_low_state,
         robot_status,
         stop_navigation_velocity,
         stop_robot,
@@ -221,10 +223,46 @@ class RobotPoseSample(BaseModel):
     source: Literal["tf2", "odometry"]
 
 
+class G1LowStateMotorSample(BaseModel):
+    index: int = Field(ge=0, le=63)
+    q: float
+    dq: float
+    tau_est: float
+
+
+class G1LowStateImuSample(BaseModel):
+    rpy: List[float] = Field(min_length=3, max_length=3)
+    gyroscope: List[float] = Field(min_length=3, max_length=3)
+    accelerometer: List[float] = Field(min_length=3, max_length=3)
+
+
+class G1LowStateSample(BaseModel):
+    timestamp: datetime
+    age_ms: float = Field(ge=0, le=250)
+    motor_count: int = Field(ge=27, le=64)
+    motor_state: List[G1LowStateMotorSample] = Field(min_length=27, max_length=64)
+    imu_state: G1LowStateImuSample
+
+
+class G1LowStateJointMapping(BaseModel):
+    joint_name: str = Field(min_length=1, max_length=128)
+    motor_index: int = Field(ge=0, le=63)
+
+
+class G1LowStateCaptureMetadata(BaseModel):
+    source: Literal["unitree_sdk2py:rt/lowstate"]
+    status: Literal["recorded", "partial", "unavailable"]
+    sample_count: int = Field(ge=0, le=54001)
+    failed_polls: int = Field(ge=0, le=54001)
+    reason: Optional[str] = Field(default=None, max_length=500)
+    motor_joint_mapping: List[G1LowStateJointMapping] = Field(max_length=23)
+
+
 class DuetArmRecordingFrame(BaseModel):
     time: float
     joints: List[float]
     pose: Optional[RobotPoseSample] = None
+    low_state: Optional[G1LowStateSample] = None
 
 
 class DuetArmRecordingSaveRequest(BaseModel):
@@ -240,6 +278,7 @@ class RobotMotionRecordingSaveRequest(BaseModel):
     joint_names: List[str]
     captured_at: Optional[datetime] = None
     frames: List[DuetArmRecordingFrame] = Field(min_length=2, max_length=54001)
+    low_state_metadata: Optional[G1LowStateCaptureMetadata] = None
 
 
 class DuetCommissioningReviewRequest(BaseModel):
@@ -1692,6 +1731,7 @@ def init_db():
             frames TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             captured_at TEXT NOT NULL DEFAULT '',
+            low_state_metadata TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (username, recording_id),
             UNIQUE (username, name)
         )
@@ -1723,6 +1763,10 @@ def init_db():
     if "captured_at" not in recording_columns:
         conn.execute(
             "ALTER TABLE duet_arm_recordings ADD COLUMN captured_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "low_state_metadata" not in recording_columns:
+        conn.execute(
+            "ALTER TABLE duet_arm_recordings ADD COLUMN low_state_metadata TEXT NOT NULL DEFAULT '{}'"
         )
     conn.execute(
         """
@@ -2455,7 +2499,7 @@ def list_robot_motion_recordings_for_user(
     if controller_version:
         rows = conn.execute(
             """
-            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type, low_state_metadata
             FROM duet_arm_recordings
             WHERE username = ? AND controller_version = ?
             ORDER BY name COLLATE NOCASE, recording_id
@@ -2465,7 +2509,7 @@ def list_robot_motion_recordings_for_user(
     else:
         rows = conn.execute(
             """
-            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
+            SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type, low_state_metadata
             FROM duet_arm_recordings
             WHERE username = ?
             ORDER BY name COLLATE NOCASE, recording_id
@@ -2484,6 +2528,7 @@ def list_robot_motion_recordings_for_user(
             "command": row["command"],
             "joint_names": json.loads(row["joint_names"]),
             "capture_type": row["capture_type"],
+            "low_state_metadata": json.loads(row["low_state_metadata"]) or None,
         }
         for row in rows
     ]
@@ -2502,6 +2547,7 @@ def save_robot_motion_recording_for_user(
     frames: list[DuetArmRecordingFrame],
     captured_at: datetime | None = None,
     capture_type: str = "motion",
+    low_state_metadata: G1LowStateCaptureMetadata | None = None,
 ) -> dict:
     normalized_name = _validate_duet_motion_name(name)
     if controller_version not in {"legacy", "duet"}:
@@ -2523,7 +2569,26 @@ def save_robot_motion_recording_for_user(
             detail=f"A {capture_type.replace('_', ' ')} recording must contain 2 to {maximum_samples} joint samples.",
         )
 
+    expected_low_state_mapping = [
+        {"joint_name": name, "motor_index": index}
+        for name, index in JOINT_MOTOR_INDICES
+    ]
+    if low_state_metadata is not None:
+        if controller_version != "legacy" or capture_type != "position_calibration":
+            raise HTTPException(
+                status_code=400,
+                detail="Unitree LowState samples are supported only in Legacy position calibration recordings.",
+            )
+        supplied_mapping = [
+            item.model_dump() for item in low_state_metadata.motor_joint_mapping
+        ]
+        if supplied_mapping not in ([], expected_low_state_mapping):
+            raise HTTPException(status_code=400, detail="Unitree LowState joint-to-motor mapping is invalid.")
+        if low_state_metadata.sample_count > 0 and supplied_mapping != expected_low_state_mapping:
+            raise HTTPException(status_code=400, detail="Recorded Unitree LowState samples require a verified motor mapping.")
+
     validated_frames = []
+    low_state_sample_count = 0
     previous_time = -1.0
     pose_frame_id = None
     pose_base_frame = None
@@ -2555,6 +2620,30 @@ def save_robot_motion_recording_for_user(
             "time": frame.time,
             "joints": frame.joints,
         })
+        if frame.low_state is not None:
+            if controller_version != "legacy" or capture_type != "position_calibration":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unitree LowState samples are supported only in Legacy position calibration recordings.",
+                )
+            if low_state_metadata is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unitree LowState samples require capture metadata.",
+                )
+            sample = frame.low_state
+            if (
+                sample.timestamp.tzinfo is None
+                or sample.timestamp.utcoffset() is None
+                or sample.motor_count != len(sample.motor_state)
+                or [motor.index for motor in sample.motor_state] != list(range(sample.motor_count))
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Position calibration sample {index + 1} has invalid Unitree LowState measurements.",
+                )
+            validated_frames[-1]["low_state"] = sample.model_dump(mode="json")
+            low_state_sample_count += 1
         if capture_type == "position_calibration" and frame.pose is None:
             raise HTTPException(
                 status_code=400,
@@ -2595,6 +2684,23 @@ def save_robot_motion_recording_for_user(
             }
         previous_time = frame.time
 
+    if low_state_metadata is not None:
+        if low_state_sample_count != low_state_metadata.sample_count:
+            raise HTTPException(
+                status_code=400,
+                detail="Unitree LowState metadata sample count does not match the recorded samples.",
+            )
+        expected_status = (
+            "unavailable" if low_state_sample_count == 0
+            else "partial" if low_state_metadata.failed_polls > 0
+            else "recorded"
+        )
+        if low_state_metadata.status != expected_status:
+            raise HTTPException(
+                status_code=400,
+                detail="Unitree LowState capture status does not match its recorded samples.",
+            )
+
     if validated_frames[0]["time"] != 0:
         raise HTTPException(status_code=400, detail="The first recording sample must start at time zero.")
     capture_time = captured_at or datetime.now(timezone.utc)
@@ -2621,8 +2727,8 @@ def save_robot_motion_recording_for_user(
     conn.execute(
         """
         INSERT INTO duet_arm_recordings
-            (recording_id, username, name, frames, controller_version, command, joint_names, captured_at, capture_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (recording_id, username, name, frames, controller_version, command, joint_names, captured_at, capture_type, low_state_metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             recording_id,
@@ -2634,12 +2740,17 @@ def save_robot_motion_recording_for_user(
             json.dumps(joint_names, separators=(",", ":")),
             captured_at_text,
             capture_type,
+            json.dumps(
+                {} if low_state_metadata is None else low_state_metadata.model_dump(mode="json"),
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
         ),
     )
     conn.commit()
     row = conn.execute(
         """
-        SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type
+        SELECT recording_id, name, frames, created_at, captured_at, controller_version, command, joint_names, capture_type, low_state_metadata
         FROM duet_arm_recordings
         WHERE username = ? AND recording_id = ?
         """,
@@ -2656,6 +2767,7 @@ def save_robot_motion_recording_for_user(
         "command": row["command"],
         "joint_names": json.loads(row["joint_names"]),
         "capture_type": row["capture_type"],
+        "low_state_metadata": json.loads(row["low_state_metadata"]) or None,
     }
 
 
@@ -4347,6 +4459,13 @@ def get_robot_status(response: Response, user: dict = Depends(auth_required)):
     return {**status, "distanceSensor": distance_sensor_status()}
 
 
+@app.get("/api/robot/low-state")
+def get_robot_low_state(response: Response, user: dict = Depends(auth_required)):
+    _require_teacher(user)
+    response.headers["Cache-Control"] = "no-store, no-cache, max-age=0"
+    return robot_low_state()
+
+
 @app.get("/api/robot/joint-state")
 def get_robot_joint_state(response: Response, user: dict = Depends(auth_required)):
     _require_teacher(user)
@@ -4841,6 +4960,7 @@ def create_robot_motion_recording(
         request.frames,
         request.captured_at,
         request.capture_type,
+        request.low_state_metadata,
     )
     return {"recording": recording}
 

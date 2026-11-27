@@ -6,9 +6,7 @@ import { buildG1MotionRecordingExport } from './g1RecordingExport.js';
 import { G1_MODEL_INFO } from './g1ModelRuntime.js';
 import {
   buildG1LocomotionCalibrationSeries,
-  distanceFromCalibrationAnchor,
   getG1CalibrationSectionElapsedSeconds,
-  G1_CALIBRATION_STOP_RADIUS_METERS,
 } from './g1LocomotionCalibration.js';
 import { buildG1RecordedMotionFrames } from './g1RecordedArmMotion.js';
 
@@ -129,18 +127,6 @@ test('locomotion calibration is finite, locomotion-only, and divided into bounde
     'robot.backward(1)',
     'robot.turn_around_180()',
   ]);
-});
-
-test('local odometry boundary checks require the same frame and enforce conservative limits', () => {
-  const anchor = { frame_id: 'odom', base_frame: 'pelvis', x: 1, y: -2 };
-  assert.ok(Math.abs(
-    distanceFromCalibrationAnchor(anchor, { ...anchor, x: 3, y: 1 }) - Math.sqrt(13),
-  ) < 1e-12);
-  assert.equal(G1_CALIBRATION_STOP_RADIUS_METERS, 3);
-  assert.throws(
-    () => distanceFromCalibrationAnchor(anchor, { ...anchor, frame_id: 'map' }),
-    /frame changed/,
-  );
 });
 
 test('section capture time excludes pauses and starts independently for each section', () => {

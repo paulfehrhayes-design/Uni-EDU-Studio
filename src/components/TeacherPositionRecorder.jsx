@@ -17,9 +17,7 @@ import {
 } from '../robot/positionCapture.js';
 import {
   buildG1LocomotionCalibrationSeries,
-  distanceFromCalibrationAnchor,
   getG1CalibrationSectionElapsedSeconds,
-  G1_CALIBRATION_STOP_RADIUS_METERS,
 } from '../sim/g1LocomotionCalibration.js';
 
 const SAMPLE_INTERVAL_MS = 1000 / 30;
@@ -27,8 +25,10 @@ const MAX_CAPTURE_SECONDS = 300;
 const MAX_LOCOMOTION_SERIES_SECONDS = 1800;
 const MAX_CAPTURE_SAMPLES = 54001;
 const MAX_JOINT_SAMPLE_AGE_MS = 250;
+const LOW_STATE_SAMPLE_INTERVAL_MS = 100;
 const CALIBRATION_SENSOR_TIMEOUT_MS = 1500;
 const CALIBRATION_STOP_TIMEOUT_MS = 5000;
+const LOW_STATE_REQUEST_TIMEOUT_MS = 500;
 const RATE_SWEEP_TARGETS_HZ = [10, 20, 30, 40, 50, 60, 80, 100, 150, 200];
 const RATE_SWEEP_PHASE_SECONDS = 2;
 const RATE_SWEEP_PHASE_MAX_SECONDS = 8;
@@ -119,8 +119,120 @@ function withTimeout(promise, milliseconds, label) {
   ]).finally(() => window.clearTimeout(timeoutId));
 }
 
-function makePoseAndJointFrame({ time, pose, positions }) {
-  return { time, joints: [...positions], pose };
+function makePoseAndJointFrame({ time, pose, positions, lowState = null }) {
+  return {
+    time,
+    joints: [...positions],
+    pose,
+    ...(lowState ? { low_state: lowState } : {}),
+  };
+}
+
+function normalizeLowStateResponse(response) {
+  const mapping = Array.isArray(response?.motor_joint_mapping)
+    ? response.motor_joint_mapping
+    : [];
+  const validMapping = mapping.length === G1_MODEL_INFO.joints.length
+    && mapping.every((entry, index) => (
+      entry?.joint_name === G1_MODEL_INFO.joints[index]
+      && entry.motor_index === (index < 13 ? index : index < 18 ? index + 2 : index + 4)
+    ))
+    && new Set(mapping.map(({ motor_index: motorIndex }) => motorIndex)).size === mapping.length;
+  const verifiedMapping = validMapping ? mapping : [];
+  if (response?.status !== 'available') {
+    return {
+      status: 'unavailable',
+      reason: typeof response?.reason === 'string' && response.reason
+        ? response.reason
+        : 'Unitree LowState telemetry is unavailable.',
+      motorJointMapping: verifiedMapping,
+    };
+  }
+  const motorState = response.motor_state;
+  const imuState = response.imu_state;
+  const validVector = (values) => Array.isArray(values)
+    && values.length === 3
+    && values.every(Number.isFinite);
+  if (
+    typeof response.received_at !== 'string'
+    || !Number.isFinite(new Date(response.received_at).getTime())
+    || !Number.isFinite(response.age_ms)
+    || response.age_ms < 0
+    || response.age_ms > MAX_JOINT_SAMPLE_AGE_MS
+    || !Number.isInteger(response.motor_count)
+    || !Array.isArray(motorState)
+    || motorState.length !== response.motor_count
+    || motorState.some((motor, index) => (
+      motor?.index !== index
+      || !Number.isFinite(motor.q)
+      || !Number.isFinite(motor.dq)
+      || !Number.isFinite(motor.tau_est)
+    ))
+    || !validVector(imuState?.rpy)
+    || !validVector(imuState?.gyroscope)
+    || !validVector(imuState?.accelerometer)
+    || !validMapping
+  ) {
+    return {
+      status: 'unavailable',
+      reason: 'Unitree LowState telemetry response is incomplete or invalid.',
+      motorJointMapping: [],
+    };
+  }
+  return {
+    status: 'available',
+    source: 'unitree_sdk2py:rt/lowstate',
+    receivedAt: response.received_at,
+    ageMs: response.age_ms,
+    motorCount: response.motor_count,
+    motorState: motorState.map(({ index, q, dq, tau_est: tauEst }) => ({
+      index,
+      q,
+      dq,
+      tau_est: tauEst,
+    })),
+    imuState: {
+      rpy: [...imuState.rpy],
+      gyroscope: [...imuState.gyroscope],
+      accelerometer: [...imuState.accelerometer],
+    },
+    motorJointMapping: verifiedMapping,
+  };
+}
+
+async function readOptionalLowState(connection, enabled) {
+  if (!enabled) return null;
+  if (typeof connection.lowState !== 'function') {
+    return {
+      status: 'unavailable',
+      reason: 'This robot connection does not provide Unitree LowState telemetry.',
+      motorJointMapping: [],
+    };
+  }
+  try {
+    return normalizeLowStateResponse(await withTimeout(
+      connection.lowState(),
+      LOW_STATE_REQUEST_TIMEOUT_MS,
+      'Unitree LowState telemetry',
+    ));
+  } catch (requestError) {
+    return {
+      status: 'unavailable',
+      reason: requestError.message,
+      motorJointMapping: [],
+    };
+  }
+}
+
+function lowStateSampleForFrame(sample) {
+  if (!sample || sample.status !== 'available') return null;
+  return {
+    timestamp: sample.receivedAt,
+    age_ms: sample.ageMs,
+    motor_count: sample.motorCount,
+    motor_state: sample.motorState,
+    imu_state: sample.imuState,
+  };
 }
 
 function partialRecordingName(name, recordings, capturedAt, preservedSuffix = '') {
@@ -224,7 +336,6 @@ export default function TeacherPositionRecorder({
   const [filePreview, setFilePreview] = useState(null);
   const [rateDiagnostic, setRateDiagnostic] = useState(null);
   const startingRef = useRef(false);
-  const seriesAnchorRef = useRef(null);
   const seriesSectionsRef = useRef([]);
   const activeSeriesSectionRef = useRef(null);
   const stopAttemptedRef = useRef(false);
@@ -574,7 +685,6 @@ export default function TeacherPositionRecorder({
     setMessage('');
     setSampleCount(0);
     setSelectedSectionProgress(null);
-    seriesAnchorRef.current = null;
     seriesSectionsRef.current = [];
     activeSeriesSectionRef.current = null;
     stopAttemptedRef.current = false;
@@ -595,6 +705,7 @@ export default function TeacherPositionRecorder({
     let initialStatus;
     let initialPose;
     let firstJointSample;
+    let firstLowStateSample;
     try {
       if (useLocomotionSeries) {
         if (controllerVersion !== 'legacy') {
@@ -631,13 +742,14 @@ export default function TeacherPositionRecorder({
       ) {
         throw new Error('The selected controller does not report locomotion capability for this command sequence.');
       }
-      const [poseSnapshot, jointSample] = await Promise.all([
+      const [poseSnapshot, jointSample, lowStateSample] = await Promise.all([
         connection.pose(),
         readJointSample(connection),
+        readOptionalLowState(connection, controllerVersion === 'legacy'),
       ]);
       initialPose = selectPositionCapturePose(poseSnapshot);
       firstJointSample = jointSample;
-      if (useLocomotionSeries) seriesAnchorRef.current = initialPose;
+      firstLowStateSample = lowStateSample;
     } catch (startError) {
       setError(`Position capture could not start: ${startError.message}`);
       startingRef.current = false;
@@ -660,6 +772,7 @@ export default function TeacherPositionRecorder({
         time: 0,
         pose: initialPose,
         positions: firstJointSample.positions,
+        lowState: lowStateSampleForFrame(firstLowStateSample),
       })];
     let totalSampleCount = frames.length;
     setSampleCount(totalSampleCount);
@@ -679,8 +792,93 @@ export default function TeacherPositionRecorder({
     let captureLimitReached = false;
     let stopError = null;
     let nextSampleAt = startedAt + SAMPLE_INTERVAL_MS;
+    const lowStateCapture = controllerVersion === 'legacy' ? {
+      status: 'unavailable',
+      sample_count: 0,
+      failed_polls: 0,
+      reason: null,
+      motor_joint_mapping: [],
+    } : null;
+    let latestLowStateSample = null;
+    let lastRecordedLowStateTimestamp = null;
+    let lowStateHasSample = false;
+    let lowStateRequestInFlight = false;
+    let nextLowStateRequestAt = startedAt + LOW_STATE_SAMPLE_INTERVAL_MS;
+    let lowStatePollPromise = Promise.resolve();
+    const acceptLowStateResponse = (sample) => {
+      if (!lowStateCapture || !sample) return;
+      if (sample.motorJointMapping.length) {
+        lowStateCapture.motor_joint_mapping = sample.motorJointMapping;
+      }
+      latestLowStateSample = sample;
+      if (sample.status === 'available') {
+        if (!lowStateHasSample) lowStateCapture.reason = null;
+        lowStateHasSample = true;
+      } else {
+        lowStateCapture.failed_polls += 1;
+        if (!lowStateCapture.reason) lowStateCapture.reason = sample.reason;
+      }
+    };
+    if (lowStateCapture && firstLowStateSample) {
+      acceptLowStateResponse(firstLowStateSample);
+      if (!useLocomotionSeries && firstLowStateSample.status === 'available') {
+        lowStateCapture.sample_count = 1;
+        lastRecordedLowStateTimestamp = firstLowStateSample.receivedAt;
+      }
+    }
+    const getLowStateMetadata = () => {
+      if (!lowStateCapture) return null;
+      const status = lowStateCapture.sample_count === 0
+        ? 'unavailable'
+        : lowStateCapture.failed_polls > 0 ? 'partial' : 'recorded';
+      return {
+        source: 'unitree_sdk2py:rt/lowstate',
+        status,
+        sample_count: lowStateCapture.sample_count,
+        failed_polls: lowStateCapture.failed_polls,
+        reason: status === 'recorded' ? null : String(lowStateCapture.reason
+          || 'No fresh Unitree LowState measurements were received during this capture.').slice(0, 500),
+        motor_joint_mapping: lowStateCapture.motor_joint_mapping,
+      };
+    };
+    const pollLowState = (force = false) => {
+      if (
+        !lowStateCapture
+        || lowStateRequestInFlight
+        || (!force && performance.now() < nextLowStateRequestAt)
+      ) {
+        return lowStatePollPromise;
+      }
+      lowStateRequestInFlight = true;
+      nextLowStateRequestAt = performance.now() + LOW_STATE_SAMPLE_INTERVAL_MS;
+      lowStatePollPromise = readOptionalLowState(connection, true)
+        .then(acceptLowStateResponse)
+        .catch((requestError) => acceptLowStateResponse({
+          status: 'unavailable',
+          reason: requestError.message,
+          motorJointMapping: [],
+        }))
+        .finally(() => {
+          lowStateRequestInFlight = false;
+        });
+      return lowStatePollPromise;
+    };
+    const takeLowStateSample = () => {
+      if (
+        !lowStateCapture
+        || !latestLowStateSample
+        || latestLowStateSample.status !== 'available'
+        || latestLowStateSample.receivedAt === lastRecordedLowStateTimestamp
+      ) {
+        return null;
+      }
+      lastRecordedLowStateTimestamp = latestLowStateSample.receivedAt;
+      lowStateCapture.sample_count += 1;
+      return lowStateSampleForFrame(latestLowStateSample);
+    };
     const prepareCaptureSection = async (batch) => {
       setMessage(`Preparing selected calibration section: ${batch.label}.`);
+      await pollLowState(true);
       let section = seriesSectionsRef.current[batch.index];
       const [poseSnapshot, jointSample] = await Promise.all([
         withTimeout(connection.pose(), CALIBRATION_SENSOR_TIMEOUT_MS, 'Pose telemetry'),
@@ -715,6 +913,7 @@ export default function TeacherPositionRecorder({
         time: Number(section.runTimeOffset.toFixed(3)),
         pose,
         positions: jointSample.positions,
+        lowState: takeLowStateSample(),
       }));
       totalSampleCount += 1;
       setSampleCount(totalSampleCount);
@@ -725,7 +924,7 @@ export default function TeacherPositionRecorder({
       await prepareCaptureSection(batch);
       return connection.run(batch.code);
     };
-    const addSample = (pose, jointSample) => {
+    const addSample = (pose, jointSample, lowState = null) => {
       const elapsed = (performance.now() - startedAt) / 1000;
       const activeSection = activeSeriesSectionRef.current;
       const sectionLimitReached = useLocomotionSeries && (
@@ -752,6 +951,7 @@ export default function TeacherPositionRecorder({
           time: Number(sectionTime.toFixed(3)),
           pose,
           positions: jointSample.positions,
+          lowState,
         }));
       } else {
         const time = Math.max(
@@ -762,6 +962,7 @@ export default function TeacherPositionRecorder({
           time,
           pose,
           positions: jointSample.positions,
+          lowState,
         }));
       }
       totalSampleCount += 1;
@@ -793,6 +994,7 @@ export default function TeacherPositionRecorder({
           time: Number(sectionTime.toFixed(3)),
           pose,
           positions: jointSample.positions,
+          lowState: takeLowStateSample(),
         }));
       }
       const sectionIndex = section.batch.index + 1;
@@ -811,6 +1013,7 @@ export default function TeacherPositionRecorder({
         joint_names: firstJointSample.jointNames,
         captured_at: section.capturedAt,
         frames: section.frames,
+        low_state_metadata: getLowStateMetadata(),
       });
       section.saved = true;
       setRecordings((current) => [...current, saved.recording].sort(
@@ -831,7 +1034,13 @@ export default function TeacherPositionRecorder({
         }
         const stopFailure = stopError || stopFailureRef.current;
         setError(`Calibration stopped early: ${reason}${stopFailure ? ` Stop request also failed: ${stopFailure.message}` : ''}`);
-        setMessage(`Partial calibration section saved as "${saved.name}" with ${saved.frames.length} pose and joint samples.`);
+        const lowStateMetadata = getLowStateMetadata();
+        const lowStateSummary = lowStateMetadata?.status === 'recorded'
+          ? ` ${lowStateMetadata.sample_count} Unitree LowState samples were recorded.`
+          : lowStateMetadata
+            ? ` Unitree LowState was ${lowStateMetadata.status}; ROS pose/joint capture was preserved. ${lowStateMetadata.reason}`
+            : '';
+        setMessage(`Partial calibration section saved as "${saved.name}" with ${saved.frames.length} pose and joint samples.${lowStateSummary}`);
         return;
       }
       if (frames.length < 2) {
@@ -847,6 +1056,7 @@ export default function TeacherPositionRecorder({
         joint_names: firstJointSample.jointNames,
         captured_at: capturedAt,
         frames,
+        low_state_metadata: getLowStateMetadata(),
       });
       setRecordings((current) => [...current, saved.recording].sort(
         (left, right) => left.name.localeCompare(right.name),
@@ -864,6 +1074,7 @@ export default function TeacherPositionRecorder({
 
     try {
       while (!runSettled) {
+        pollLowState();
         if (
           useLocomotionSeries
           && !activeSeriesSectionRef.current
@@ -905,21 +1116,13 @@ export default function TeacherPositionRecorder({
           if (pose.base_frame !== initialPose.base_frame) {
             throw new Error('The TF base frame changed during capture; no recording was saved.');
           }
-          if (useLocomotionSeries) {
-            const distance = distanceFromCalibrationAnchor(seriesAnchorRef.current, pose);
-            if (distance >= G1_CALIBRATION_STOP_RADIUS_METERS) {
-              throw new Error(
-                `Odometry reached the ${G1_CALIBRATION_STOP_RADIUS_METERS} m local stop radius; the calibration section was halted.`,
-              );
-            }
-          }
           if (
             jointSample.jointNames.length !== firstJointSample.jointNames.length
             || jointSample.jointNames.some((joint, index) => joint !== firstJointSample.jointNames[index])
           ) {
             throw new Error('The measured joint layout changed during capture; no recording was saved.');
           }
-          if (!addSample(pose, jointSample)) break;
+          if (!addSample(pose, jointSample, takeLowStateSample())) break;
         } catch (sampleError) {
           samplingError = sampleError;
           break;
@@ -934,7 +1137,7 @@ export default function TeacherPositionRecorder({
       if (!runSettled && (samplingError || captureLimitReached)) {
         setIsStopping(true);
         setMessage(samplingError
-          ? 'Sensor feedback or the odometry boundary check failed; stopping and preserving partial calibration data.'
+          ? 'Sensor feedback failed; stopping and preserving partial calibration data.'
           : `${captureDurationLimitSeconds / 60}-minute capture safeguard reached; stopping and preserving partial calibration data.`);
         try {
           stopAttemptedRef.current = true;
@@ -957,6 +1160,7 @@ export default function TeacherPositionRecorder({
           stopError = requestError;
         }
       }
+      await pollLowState(true);
       if (
         !useLocomotionSeries
         && (performance.now() - startedAt) / 1000 > captureDurationLimitSeconds
@@ -1001,14 +1205,6 @@ export default function TeacherPositionRecorder({
           if (finalPose.base_frame !== initialPose.base_frame) {
             throw new Error('The TF base frame changed during capture.');
           }
-          if (useLocomotionSeries) {
-            const distance = distanceFromCalibrationAnchor(seriesAnchorRef.current, finalPose);
-            if (distance >= G1_CALIBRATION_STOP_RADIUS_METERS) {
-              throw new Error(
-                `Final odometry reached the ${G1_CALIBRATION_STOP_RADIUS_METERS} m local stop radius.`,
-              );
-            }
-          }
           if (
             finalJointSample.jointNames.length !== firstJointSample.jointNames.length
             || finalJointSample.jointNames.some(
@@ -1017,7 +1213,7 @@ export default function TeacherPositionRecorder({
           ) {
             throw new Error('The measured joint layout changed during capture.');
           }
-          addSample(finalPose, finalJointSample);
+          addSample(finalPose, finalJointSample, takeLowStateSample());
         } catch (finalSampleError) {
           if (useLocomotionSeries) {
             await savePartialCapture(finalSampleError.message);
@@ -1028,7 +1224,13 @@ export default function TeacherPositionRecorder({
       }
       if (useLocomotionSeries) {
         const saved = await saveActiveSeriesSection();
-        setMessage(`Calibration section saved as "${saved.name}" with ${saved.frames.length} measured samples.`);
+        const lowStateMetadata = getLowStateMetadata();
+        const lowStateSummary = lowStateMetadata?.status === 'recorded'
+          ? ` ${lowStateMetadata.sample_count} Unitree LowState samples recorded.`
+          : lowStateMetadata
+            ? ` Unitree LowState unavailable; ROS pose/joint capture was saved. ${lowStateMetadata.reason}`
+            : '';
+        setMessage(`Calibration section saved as "${saved.name}" with ${saved.frames.length} measured samples.${lowStateSummary}`);
         return;
       }
       if (frames.length < 2) {
@@ -1043,13 +1245,20 @@ export default function TeacherPositionRecorder({
         joint_names: firstJointSample.jointNames,
         captured_at: capturedAt,
         frames,
+        low_state_metadata: getLowStateMetadata(),
       });
       setRecordings((current) => [...current, saved.recording].sort(
         (left, right) => left.name.localeCompare(right.name),
       ));
       setName('');
+      const lowStateMetadata = getLowStateMetadata();
+      const lowStateSummary = lowStateMetadata?.status === 'recorded'
+        ? ` ${lowStateMetadata.sample_count} Unitree LowState samples recorded.`
+        : lowStateMetadata
+          ? ` Unitree LowState was ${lowStateMetadata.status}; ROS pose/joint capture was saved. ${lowStateMetadata.reason}`
+          : '';
       setMessage(
-        `Saved ${frames.length} pose and joint samples${result.status === 'stopped' ? ' from the stopped movement' : ''}${captureLimitReached ? ` (${captureDurationLimitSeconds / 60}-minute safety limit reached)` : ''}.`,
+        `Saved ${frames.length} pose and joint samples${result.status === 'stopped' ? ' from the stopped movement' : ''}${captureLimitReached ? ` (${captureDurationLimitSeconds / 60}-minute safety limit reached)` : ''}.${lowStateSummary}`,
       );
     } catch (captureError) {
       setError(`Position capture failed: ${captureError.message}`);
@@ -1157,8 +1366,8 @@ export default function TeacherPositionRecorder({
           className="mt-1 h-4 w-4 shrink-0 accent-amber-700"
         />
         <span>
-          I have cleared a 10 m × 10 m work area, placed the robot near its center, will supervise the physical movement, and have the emergency stop accessible.
-          Odometry will stop each section at a conservative 3 m radius from its starting pose, but odometry alone cannot guarantee a hard workspace boundary.
+          I have cleared a 10 m × 10 m work area, placed the robot in a safe position, will supervise the physical movement, and have the emergency stop accessible.
+          Odometry is recorded for analysis, not used as a workspace boundary or automatic stop. Keep the robot within a safe area throughout the run.
           The robot moves only after I explicitly select a run button.
         </span>
       </label>
@@ -1182,7 +1391,7 @@ export default function TeacherPositionRecorder({
       {useLocomotionSeries && (
         <div className="mt-2 rounded-lg border border-cyan-200 bg-white p-3 text-[11px] leading-4 text-slate-600">
           <p>
-            Each run has its own 3 m radial odometry cutoff from the starting pose. Localization error, drift, robot footprint, obstacles, and braking distance are not covered; supervise and keep the physical emergency stop accessible.
+            Odometry does not automatically stop a section based on distance traveled. Stay within the clear workspace throughout the run; localization error, drift, robot footprint, obstacles, and braking distance require physical supervision.
           </p>
           <p className="mt-1">
             Only the selected section runs and starts measuring from the robot's current pose. No return-to-start distance is required; confirm the workspace is safe before each run.

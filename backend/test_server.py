@@ -1455,6 +1455,143 @@ class ServerClassroomTests(unittest.TestCase):
                 )
             self.assertEqual(too_many.exception.status_code, 400)
 
+    def test_low_state_recording_persists_samples_and_allows_unavailable_telemetry(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            server, 'DB_PATH', os.path.join(temp_dir, 'classroom.db')
+        ):
+            server.init_db()
+            captured_at = server.datetime.now(server.timezone.utc)
+            pose = server.RobotPoseSample(
+                frame_id='odom',
+                base_frame='pelvis',
+                x=0.1,
+                y=0.2,
+                z=0.0,
+                yaw_rad=0.4,
+                timestamp=captured_at,
+                age_ms=20,
+                source='odometry',
+            )
+            sample = server.G1LowStateSample(
+                timestamp=captured_at,
+                age_ms=10,
+                motor_count=27,
+                motor_state=[
+                    server.G1LowStateMotorSample(
+                        index=index,
+                        q=float(index),
+                        dq=float(index + 1),
+                        tau_est=float(index + 2),
+                    )
+                    for index in range(27)
+                ],
+                imu_state=server.G1LowStateImuSample(
+                    rpy=[0.1, 0.2, 0.3],
+                    gyroscope=[0.4, 0.5, 0.6],
+                    accelerometer=[0.7, 0.8, 0.9],
+                ),
+            )
+            frames = [
+                server.DuetArmRecordingFrame(
+                    time=0,
+                    joints=[0.0] * 23,
+                    pose=pose,
+                    low_state=sample,
+                ),
+                server.DuetArmRecordingFrame(
+                    time=0.1,
+                    joints=[0.1] * 23,
+                    pose=pose.model_copy(update={'x': 0.2}),
+                ),
+            ]
+            metadata = server.G1LowStateCaptureMetadata(
+                source='unitree_sdk2py:rt/lowstate',
+                status='recorded',
+                sample_count=1,
+                failed_polls=0,
+                motor_joint_mapping=[
+                    server.G1LowStateJointMapping(joint_name=name, motor_index=index)
+                    for name, index in server.JOINT_MOTOR_INDICES
+                ],
+            )
+            saved = server.save_robot_motion_recording_for_user(
+                'teacher',
+                'LowState capture',
+                'legacy',
+                'supervised movement',
+                list(server.G1_JOINT_NAMES),
+                frames,
+                captured_at,
+                'position_calibration',
+                metadata,
+            )
+
+            self.assertEqual(saved['low_state_metadata']['sample_count'], 1)
+            self.assertEqual(saved['frames'][0]['low_state']['motor_state'][26]['tau_est'], 28.0)
+            self.assertEqual(
+                server.list_robot_motion_recordings_for_user('teacher')[0]['frames'][0]['low_state']['imu_state']['rpy'],
+                [0.1, 0.2, 0.3],
+            )
+
+            unavailable = server.G1LowStateCaptureMetadata(
+                source='unitree_sdk2py:rt/lowstate',
+                status='unavailable',
+                sample_count=0,
+                failed_polls=3,
+                reason='No fresh LowState messages were received.',
+                motor_joint_mapping=[],
+            )
+            unavailable_frames = [
+                frames[0].model_copy(update={'low_state': None}),
+                frames[1],
+            ]
+            unavailable_saved = server.save_robot_motion_recording_for_user(
+                'teacher',
+                'ROS capture without LowState',
+                'legacy',
+                'supervised movement',
+                list(server.G1_JOINT_NAMES),
+                unavailable_frames,
+                captured_at,
+                'position_calibration',
+                unavailable,
+            )
+            self.assertEqual(unavailable_saved['low_state_metadata']['status'], 'unavailable')
+            self.assertEqual(unavailable_saved['low_state_metadata']['motor_joint_mapping'], [])
+
+            invalid_metadata = metadata.model_copy(update={
+                'motor_joint_mapping': [],
+            })
+            with self.assertRaises(HTTPException) as raised:
+                server.save_robot_motion_recording_for_user(
+                    'teacher',
+                    'Unmapped LowState capture',
+                    'legacy',
+                    'supervised movement',
+                    list(server.G1_JOINT_NAMES),
+                    frames,
+                    captured_at,
+                    'position_calibration',
+                    invalid_metadata,
+                )
+            self.assertEqual(raised.exception.status_code, 400)
+
+    def test_low_state_endpoint_is_teacher_only_and_disables_caching(self):
+        response = server.Response()
+        unavailable = {
+            'status': 'unavailable',
+            'reason': 'Waiting for Unitree telemetry.',
+            'motor_joint_mapping': [],
+        }
+        with patch.object(server, 'robot_low_state', return_value=unavailable):
+            result = server.get_robot_low_state(response, {'role': 'teacher'})
+
+        self.assertEqual(result, unavailable)
+        self.assertEqual(response.headers['Cache-Control'], 'no-store, no-cache, max-age=0')
+        with self.assertRaises(HTTPException) as raised:
+            server.get_robot_low_state(server.Response(), {'role': 'student'})
+        self.assertEqual(raised.exception.status_code, 403)
+
     def test_sensor_status_and_discovery_are_teacher_only(self):
         client = TestClient(app)
         teacher = client.post(

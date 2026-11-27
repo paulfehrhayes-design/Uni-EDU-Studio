@@ -1,5 +1,3 @@
-export const G1_CALIBRATION_STOP_RADIUS_METERS = 3;
-
 const isolatedMovementTests = [
   {
     label: 'Timed forward 1 second',
@@ -333,22 +331,6 @@ export function buildG1LocomotionCalibrationSeries() {
     batches,
     code: batches.map((batch) => batch.code).join('\n\n'),
   };
-}
-
-export function distanceFromCalibrationAnchor(anchor, pose) {
-  if (
-    !anchor
-    || !pose
-    || anchor.frame_id !== pose.frame_id
-    || anchor.base_frame !== pose.base_frame
-    || !Number.isFinite(anchor.x)
-    || !Number.isFinite(anchor.y)
-    || !Number.isFinite(pose.x)
-    || !Number.isFinite(pose.y)
-  ) {
-    throw new Error('The local pose frame changed or is invalid; stop the calibration section.');
-  }
-  return Math.hypot(pose.x - anchor.x, pose.y - anchor.y);
 }
 
 export function getG1CalibrationSectionElapsedSeconds(section, now) {

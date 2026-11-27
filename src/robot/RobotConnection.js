@@ -66,6 +66,10 @@ export class SdkRobotConnection {
     return this.request('/api/robot/joint-state', { cache: 'no-store' });
   }
 
+  async lowState() {
+    return this.request('/api/robot/low-state', { cache: 'no-store' });
+  }
+
   async pose() {
     return this.request('/api/robot/pose', { cache: 'no-store' });
   }

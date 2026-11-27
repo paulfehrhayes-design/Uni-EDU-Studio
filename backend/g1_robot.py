@@ -16,6 +16,7 @@ from typing import Any
 from fastapi import HTTPException
 
 try:
+    from .g1_low_state import G1LowStateCache
     from .lidar_distance import DistanceSensorError, distance_sensor_status, get_front_distance_sample, get_rear_distance_sample
     from .safe_mode import (
         SAFE_MODE_STOP_MARGIN_METERS,
@@ -26,6 +27,7 @@ try:
     )
     from .velocity_slew import configured_velocity_slew_limits, slew_velocity
 except ImportError:
+    from g1_low_state import G1LowStateCache
     from lidar_distance import DistanceSensorError, distance_sensor_status, get_front_distance_sample, get_rear_distance_sample
     from safe_mode import (
         SAFE_MODE_STOP_MARGIN_METERS,
@@ -39,6 +41,8 @@ except ImportError:
 _client = None
 _arm_client = None
 _audio_client = None
+_low_state_subscriber = None
+_low_state_cache = G1LowStateCache()
 _connected_interface = None
 _connection_log_path: Path | None = None
 _log_lock = threading.Lock()
@@ -197,6 +201,36 @@ def _start_connection_log(interface: str, domain: int) -> None:
             detail=f"Could not create the robot session log under {log_dir}: {error}",
         ) from error
     _log_event("connection_attempt", interface=interface, domain=domain)
+
+
+def _start_low_state_subscriber() -> None:
+    global _low_state_subscriber
+    try:
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+        subscriber = ChannelSubscriber("rt/lowstate", LowState_)
+        result = subscriber.Init(_low_state_cache.update, 10)
+        if result not in (None, 0):
+            raise RuntimeError(f"Unitree LowState subscriber initialization failed with code {result}.")
+        _low_state_subscriber = subscriber
+    except Exception as error:
+        _low_state_cache.mark_unavailable(f"Unitree rt/lowstate subscription is unavailable: {error}")
+        _log_event("low_state_subscription_failed", error=str(error))
+
+
+def robot_low_state() -> dict[str, Any]:
+    mapping = _low_state_cache.joint_mapping()
+    if _client is None:
+        return {
+            "status": "unavailable",
+            "reason": "Connect the Legacy SDK before reading Unitree LowState.",
+            "motor_joint_mapping": mapping,
+        }
+    return {
+        **_low_state_cache.snapshot(),
+        "motor_joint_mapping": mapping,
+    }
 
 
 def _number(value: ast.AST, name: str, minimum: float, maximum: float) -> float:
@@ -763,6 +797,7 @@ def connect_robot(interface: str) -> dict[str, Any]:
     _arm_client = arm_client
     _audio_client = audio_client
     _connected_interface = interface
+    _start_low_state_subscriber()
     return {
         "status": "connected",
         "interface": interface,
@@ -774,6 +809,7 @@ def connect_robot(interface: str) -> dict[str, Any]:
             "armActionsReadOnly": False,
             "audio": True,
         },
+        "lowStateTelemetry": robot_low_state(),
         "logFile": str(_connection_log_path),
     }
 

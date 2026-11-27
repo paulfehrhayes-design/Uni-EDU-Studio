@@ -114,6 +114,7 @@ test('SDK connection exposes no-store telemetry and shared recording endpoints',
   };
 
   await connection.jointState();
+  await connection.lowState();
   await connection.pose();
   await connection.recordings();
   await connection.saveRecording(recording);
@@ -121,6 +122,7 @@ test('SDK connection exposes no-store telemetry and shared recording endpoints',
 
   assert.deepEqual(requests.map(([url]) => url), [
     '/api/robot/joint-state',
+    '/api/robot/low-state',
     '/api/robot/pose',
     '/api/robot/recordings',
     '/api/robot/recordings',
@@ -129,8 +131,9 @@ test('SDK connection exposes no-store telemetry and shared recording endpoints',
   assert.deepEqual(requests[0][1], { cache: 'no-store' });
   assert.deepEqual(requests[1][1], { cache: 'no-store' });
   assert.deepEqual(requests[2][1], { cache: 'no-store' });
-  assert.deepEqual(JSON.parse(requests[3][1].body), recording);
-  assert.deepEqual(requests[4][1], { method: 'DELETE' });
+  assert.deepEqual(requests[3][1], { cache: 'no-store' });
+  assert.deepEqual(JSON.parse(requests[4][1].body), recording);
+  assert.deepEqual(requests[5][1], { method: 'DELETE' });
 });
 
 test('WebRTC adapter does not infer command support from an encoder alone', async () => {

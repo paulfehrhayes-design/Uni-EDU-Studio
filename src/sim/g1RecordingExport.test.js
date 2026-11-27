@@ -93,6 +93,70 @@ test('position calibration export preserves timestamped TF pose with joint sampl
   })), /sample 1 is invalid/);
 });
 
+test('legacy position export preserves timestamped LowState motor and IMU measurements', () => {
+  const pose = {
+    frame_id: 'odom',
+    base_frame: 'pelvis',
+    x: 0,
+    y: 0,
+    z: 0,
+    yaw_rad: 0,
+    timestamp: '2026-03-01T10:00:00Z',
+    age_ms: 10,
+    source: 'tf2',
+  };
+  const lowState = {
+    timestamp: '2026-03-01T10:00:00.010Z',
+    age_ms: 20,
+    motor_count: 27,
+    motor_state: Array.from({ length: 27 }, (_, index) => ({
+      index,
+      q: index / 10,
+      dq: index / 100,
+      tau_est: index / 1000,
+    })),
+    imu_state: {
+      rpy: [0.1, 0.2, 0.3],
+      gyroscope: [0.4, 0.5, 0.6],
+      accelerometer: [0.7, 0.8, 0.9],
+    },
+  };
+  const exported = buildG1MotionRecordingExport(makeRecording({
+    controller_version: 'legacy',
+    capture_type: 'position_calibration',
+    joint_names: [...G1_MODEL_INFO.joints],
+    low_state_metadata: {
+      source: 'unitree_sdk2py:rt/lowstate',
+      status: 'recorded',
+      sample_count: 1,
+      failed_polls: 0,
+      reason: null,
+      motor_joint_mapping: G1_MODEL_INFO.joints.map((joint_name, index) => ({
+        joint_name,
+        motor_index: index < 13 ? index : index < 18 ? index + 2 : index + 4,
+      })),
+    },
+    frames: [
+      { time: 0, joints: Array(23).fill(0), pose, low_state: lowState },
+      { time: 0.1, joints: Array(23).fill(0.1), pose },
+    ],
+  }));
+
+  assert.equal(exported.units.low_state_motor_position, 'radians');
+  assert.equal(exported.low_state_capture.sample_count, 1);
+  assert.deepEqual(exported.frames[0].low_state.motor_state[26], {
+    index: 26,
+    q_rad: 2.6,
+    dq_rad_s: 0.26,
+    tau_est_nm: 0.026,
+  });
+  assert.deepEqual(exported.frames[0].low_state.imu_state, {
+    rpy_rad: [0.1, 0.2, 0.3],
+    gyroscope_rad_s: [0.4, 0.5, 0.6],
+    accelerometer_m_s2: [0.7, 0.8, 0.9],
+  });
+});
+
 test('DUET position calibration exports all 23 ROS-measured joints', () => {
   const names = [...G1_MODEL_INFO.joints];
   const pose = {
