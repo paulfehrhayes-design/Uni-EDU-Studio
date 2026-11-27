@@ -211,7 +211,7 @@ def _start_low_state_subscriber() -> None:
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 
         subscriber = ChannelSubscriber("rt/lowstate", LowState_)
-        result = subscriber.Init(_low_state_cache.update, 10)
+        result = subscriber.Init(_low_state_cache.update)
         if result not in (None, 0):
             raise RuntimeError(f"Unitree LowState subscriber initialization failed with code {result}.")
         _low_state_subscriber = subscriber

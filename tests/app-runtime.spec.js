@@ -650,11 +650,12 @@ test('teacher can select and run calibration sections independently', async ({ p
   await page.getByRole('button', { name: 'Log In' }).click();
   await page.getByRole('button', { name: 'Open app settings' }).click();
   await expect(page.getByText('Ready to capture odom → pelvis tf2 pose and all 23 measured joints.')).toBeVisible();
-  await page.getByRole('checkbox', { name: 'Enable independent locomotion calibration sections' }).check();
   await page.getByRole('textbox', { name: 'Position capture name' }).fill('Classroom calibration');
   const sectionSelect = page.getByRole('combobox', { name: 'Calibration section to run' });
   const runSelectedSection = page.getByRole('button', { name: 'Run selected calibration section' });
   const batches = buildG1LocomotionCalibrationSeries().batches;
+  await expect(sectionSelect).toBeVisible();
+  await expect(page.getByRole('checkbox', { name: 'Enable independent locomotion calibration sections' })).toHaveCount(0);
   expect(await sectionSelect.locator('option').count()).toBe(14);
   await sectionSelect.selectOption('8');
   await expect(page.getByText(batches[8].code.split('\n').join(' → '))).toBeVisible();

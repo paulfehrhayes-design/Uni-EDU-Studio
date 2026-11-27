@@ -1429,6 +1429,47 @@ class G1RobotProgramTests(unittest.TestCase):
         finally:
             g1_robot._client = original_client
 
+    def test_low_state_subscriber_uses_non_queued_lightweight_callback(self):
+        class FakeSubscriber:
+            def __init__(self, topic, message_type):
+                self.topic = topic
+                self.message_type = message_type
+                self.init_args = None
+
+            def Init(self, *args):
+                self.init_args = args
+
+        package_names = (
+            "unitree_sdk2py",
+            "unitree_sdk2py.core",
+            "unitree_sdk2py.idl",
+            "unitree_sdk2py.idl.unitree_hg",
+            "unitree_sdk2py.idl.unitree_hg.msg",
+        )
+        modules = {}
+        for name in package_names:
+            module = types.ModuleType(name)
+            module.__path__ = []
+            modules[name] = module
+        channel_module = types.ModuleType("unitree_sdk2py.core.channel")
+        channel_module.ChannelSubscriber = FakeSubscriber
+        low_state_module = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+        low_state_module.LowState_ = object
+        modules.update({
+            channel_module.__name__: channel_module,
+            low_state_module.__name__: low_state_module,
+        })
+        original_subscriber = g1_robot._low_state_subscriber
+        try:
+            with patch.dict(sys.modules, modules):
+                g1_robot._start_low_state_subscriber()
+            subscriber = g1_robot._low_state_subscriber
+            self.assertEqual(subscriber.topic, "rt/lowstate")
+            self.assertEqual(subscriber.message_type, object)
+            self.assertEqual(subscriber.init_args, (g1_robot._low_state_cache.update,))
+        finally:
+            g1_robot._low_state_subscriber = original_subscriber
+
     def test_sdk_probe_3102_keeps_connection_closed_before_motion_dispatch(self):
         class FakeLocoClient:
             def SetTimeout(self, timeout):

@@ -323,7 +323,7 @@ export default function TeacherPositionRecorder({
   const [name, setName] = useState('');
   const [code, setCode] = useState(() => defaultCommand(controllerVersion));
   const [confirmClearArea, setConfirmClearArea] = useState(false);
-  const [useLocomotionSeries, setUseLocomotionSeries] = useState(false);
+  const useLocomotionSeries = controllerVersion === 'legacy';
   const [selectedCalibrationBatchIndex, setSelectedCalibrationBatchIndex] = useState(0);
   const [isStarting, setIsStarting] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
@@ -344,7 +344,6 @@ export default function TeacherPositionRecorder({
   useEffect(() => {
     setCode(defaultCommand(controllerVersion));
     setConfirmClearArea(false);
-    setUseLocomotionSeries(false);
   }, [controllerVersion]);
 
   useEffect(() => {
@@ -1371,23 +1370,11 @@ export default function TeacherPositionRecorder({
           The robot moves only after I explicitly select a run button.
         </span>
       </label>
-      <label className={`mt-3 flex items-start gap-2 rounded-lg border p-3 text-xs leading-5 ${
-        controllerVersion === 'legacy' ? 'border-cyan-200 bg-white text-slate-800' : 'border-slate-200 bg-slate-100 text-slate-500'
-      }`}>
-        <input
-          type="checkbox"
-          aria-label="Enable independent locomotion calibration sections"
-          checked={useLocomotionSeries}
-          onChange={(event) => setUseLocomotionSeries(event.target.checked)}
-          disabled={controllerVersion !== 'legacy' || isStarting || isCapturing || isStopping || isMeasuringRates}
-          className="mt-1 h-4 w-4 shrink-0 accent-cyan-800"
-        />
-        <span>
-          <strong>Enable independent Legacy SDK locomotion calibration sections.</strong>
-          {' '}The 14 sections cover 37 isolated trials and nine progression groups (110 commands total). Select and run one section at a time; it records and saves only that section. No automatic progression or continue step is involved.
-          {controllerVersion !== 'legacy' && ' This uses existing step-based SDK mappings and is unavailable for DUET.'}
-        </span>
-      </label>
+      {controllerVersion === 'legacy' && (
+        <p className="mt-3 rounded-lg border border-cyan-200 bg-white p-3 text-xs leading-5 text-slate-800">
+          Legacy locomotion calibration always runs one selected section per press. Each section is measured and saved independently; there is no all-at-once run.
+        </p>
+      )}
       {useLocomotionSeries && (
         <div className="mt-2 rounded-lg border border-cyan-200 bg-white p-3 text-[11px] leading-4 text-slate-600">
           <p>
@@ -1467,7 +1454,7 @@ export default function TeacherPositionRecorder({
           />
         </label>
         <label className="block text-xs font-semibold text-slate-700">
-          Validated {controllerLabel} command sequence
+          {useLocomotionSeries ? 'Selected Legacy calibration section' : `Validated ${controllerLabel} command sequence`}
           {useLocomotionSeries ? (
             <div className="mt-1 space-y-2 rounded-md border border-cyan-200 bg-white p-3">
               <label className="block font-sans text-xs font-semibold">
@@ -1506,7 +1493,7 @@ export default function TeacherPositionRecorder({
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="submit"
-            disabled={!isReady || isLoading || isStarting || isCapturing || isStopping || isMeasuringRates || !name.trim() || !confirmClearArea || (useLocomotionSeries && controllerVersion !== 'legacy')}
+            disabled={!isReady || isLoading || isStarting || isCapturing || isStopping || isMeasuringRates || !name.trim() || !confirmClearArea}
             className="rounded-lg bg-cyan-800 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
           >
             {isStarting ? 'Checking robot and sensors…' : isCapturing ? `Running & capturing · ${sampleCount} samples` : useLocomotionSeries ? 'Run selected calibration section' : 'Run & capture position'}
